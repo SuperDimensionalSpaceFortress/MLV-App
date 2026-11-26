@@ -215,6 +215,34 @@ TEST(VisualCaptureSourceDifference, TheFirstUnforcedBurstIsSourceBoundButNotAPla
     ASSERT_FALSE(vcsd::isPlayCaptureKind(QStringLiteral("play_first_unbound")));
 }
 
+// EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): the burst's admission check read 124 ms, the next clock
+// read 125 ms, and a capture still STARTED at the 125 ms cutoff, delaying forced play 0. grabVisual now re-reads the tail clock immediately before the
+// capture starts and asks captureMayStartBeforeCutoff; the burst is not unit-reachable (MainWindow.cpp is not linked here), so the decision it takes
+// at that read is tested here with the scripted clock of sol's counterexample, and the wiring test pins where the read sits.
+TEST(VisualCaptureSourceDifference, ABurstCaptureNeverStartsWhenTheReadBeforeItsStartIsAtTheCutoff)
+{
+    const qint64 cutoffMs = 125;   // the first forced play capture's target time
+    const qint64 clockReads[] = { 124, 125 };   // the admission read, then the read immediately before the capture starts
+    int capturesStarted = 0;
+    const bool admitted = vcsd::captureMayStartBeforeCutoff(clockReads[0], 0, cutoffMs);
+    ASSERT_TRUE(admitted);
+    if (admitted && vcsd::captureMayStartBeforeCutoff(clockReads[1], 0, cutoffMs)) ++capturesStarted;
+    ASSERT_EQ(0, capturesStarted);
+
+    // at, past and just before the cutoff, with no earlier burst capture (reserve 0)
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(124, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(125, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(126, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(164, 0, 125));   // an event pump that came back late
+    // a later capture also reserves the longest earlier burst capture: elapsed 35 + longest 90 reaches 125
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(35, 90, 125));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(34, 90, 125));
+    // a capture with no cutoff (every capture outside the burst passes -1) always starts, whatever the clock reads
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(0, 0, -1));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(3000, 0, -1));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(3000, 90, -1));
+}
+
 // r7 (adversary r6 pass 3 A2 on 3663c8a3): the capture path pumps events after the play captures (the post-stop drain at the
 // old MainWindow.cpp:10698, the paused settle) and a QFileOpenEvent handled there replaces m_pMlvObject before the deferred
 // source hashing. 3663c8a3 then hashed "the open clip at display_frame", so clip B's ids were attached to clip A's captures:

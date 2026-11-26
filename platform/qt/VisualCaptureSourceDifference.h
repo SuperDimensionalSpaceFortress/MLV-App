@@ -85,6 +85,17 @@ inline bool isSourceBoundCaptureKind( const QString &kind )
     return isPlayCaptureKind( kind ) || kind == QStringLiteral("play_first_unbound");
 }
 
+/* EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): whether a --visual-capture-dir capture may START, decided
+ * on the tail-clock read taken immediately before it starts (MainWindow::runGuiPlaybackSmoke grabVisual). The early play_first_unbound burst passes
+ * the first forced play capture's target as cutoffMs and the longest burst capture so far as reserveMs: the capture starts only while that read plus
+ * the reserve is strictly before the cutoff, so no burst capture starts at or after it (an admission check that read 124 ms followed by a read of
+ * 125 ms refuses). Every other capture passes cutoffMs < 0: no cutoff, it always starts. Lives here, not in MainWindow.cpp, so console_tests can
+ * call it (MainWindow.cpp is not linked there) and because the capture block is pinned to contain no `return`. */
+inline bool captureMayStartBeforeCutoff( qint64 nowMs, qint64 reserveMs, qint64 cutoffMs )
+{
+    return cutoffMs < 0 || nowMs + reserveMs < cutoffMs;
+}
+
 /* A frame's source_id in visual.json: 16 lowercase hex digits, zero-padded. */
 inline QString sourceIdHex( quint64 hash )
 {

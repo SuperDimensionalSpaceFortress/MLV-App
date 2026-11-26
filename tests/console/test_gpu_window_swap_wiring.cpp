@@ -796,7 +796,7 @@ TEST(VisualCaptureBinding, EveryForcedStopAndPausedCaptureIsPairedWithAnUnforced
     // the unforced play_first_unbound burst before the first forced paint, which has no forced twin by design (a forced twin would paint
     // before the forced loop and spoil what the in-flight tail credit reads); nothing else.
     ASSERT_EQ(7, countOccurrences(block, QStringLiteral("grabVisual( QStringLiteral(")));
-    const QString burst = QStringLiteral("grabVisual( QStringLiteral(\"play_first_unbound\"), visualBurstCount, false );");
+    const QString burst = QStringLiteral("grabVisual( QStringLiteral(\"play_first_unbound\"), visualBurstCount, false, visualFirstForcedMs, visualBurstLongestMs );");
     ASSERT_EQ(1, countOccurrences(block, burst));
     const int burstAt = block.indexOf(burst);
     const int forcedPlayAt = block.indexOf(QStringLiteral("grabVisual( QStringLiteral(\"play\"), k, false );"));
@@ -892,7 +892,7 @@ TEST(VisualCaptureBinding, TheBurstNeverStartsACaptureThatCannotEndBeforeTheFirs
     ASSERT_TRUE(blockAt >= 0 && blockEnd > blockAt);
     const QString block = source.mid(blockAt, blockEnd - blockAt);
     const QString probe = QStringLiteral("&visualBurstProbeSerial, nullptr );");
-    const QString burst = QStringLiteral("grabVisual( QStringLiteral(\"play_first_unbound\"), visualBurstCount, false );");
+    const QString burst = QStringLiteral("grabVisual( QStringLiteral(\"play_first_unbound\"), visualBurstCount, false, visualFirstForcedMs, visualBurstLongestMs );");
     const QString recheck = QStringLiteral("visualTailClock.elapsed() + visualBurstLongestMs >= visualFirstForcedMs");
     ASSERT_EQ(1, countOccurrences(block, probe));
     ASSERT_EQ(1, countOccurrences(block, burst));
@@ -909,6 +909,51 @@ TEST(VisualCaptureBinding, TheBurstNeverStartsACaptureThatCannotEndBeforeTheFirs
     ASSERT_TRUE(block.indexOf(update) > burstAt);
     ASSERT_EQ(1, countOccurrences(block, QStringLiteral("qint64 visualBurstLongestMs = 0;")));
     ASSERT_TRUE(block.indexOf(QStringLiteral("qint64 visualBurstLongestMs = 0;")) < probeAt);
+}
+
+// EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): the admission check above read 124 ms, the next clock read
+// 125 ms, and the burst still started a capture at the cutoff (a 150 ms delay inserted after that check passed every wiring test). grabVisual now
+// re-reads the tail clock immediately before the capture starts, and the burst passes it the cutoff and its reserve: nothing but the capture
+// timer's start sits between that read and the PrintWindow capture, a refused capture is never appended, and the burst stops on a refusal.
+TEST(VisualCaptureBinding, TheBurstRereadsTheClockImmediatelyBeforeEachCaptureStarts)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int blockAt = source.indexOf(QStringLiteral("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"));
+    const int blockEnd = source.indexOf(QStringLiteral("// (4) files:"), blockAt);
+    ASSERT_TRUE(blockAt >= 0 && blockEnd > blockAt);
+    const QString block = source.mid(blockAt, blockEnd - blockAt);
+    const int lambdaAt = block.indexOf(QStringLiteral("auto grabVisual = [&]"));
+    const int lambdaEnd = block.indexOf(QStringLiteral("visualGrabs.append( grab );"), lambdaAt);
+    ASSERT_TRUE(lambdaAt >= 0 && lambdaEnd > lambdaAt);
+    const QString lambda = block.mid(lambdaAt, lambdaEnd - lambdaAt);
+    ASSERT_TRUE(lambda.startsWith(QStringLiteral(
+        "auto grabVisual = [&]( const QString &kind, int index, bool settled, qint64 startCutoffMs = -1, qint64 startReserveMs = 0 )")));
+    const QString gate = QStringLiteral(
+        "if( visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ) )");
+    ASSERT_EQ(1, countOccurrences(block, gate));
+    const int gateAt = lambda.indexOf(gate);
+    ASSERT_TRUE(gateAt > lambda.indexOf(QStringLiteral("grab.clip = ")));
+    const int captureAt = lambda.indexOf(QStringLiteral("captureTopLevelWindowByPrintWindow("));
+    ASSERT_TRUE(captureAt > gateAt);
+    // between the read and the capture: only the capture timer (whitespace normalised; any other statement there is a delay the read does not see)
+    const QString between = lambda.mid(gateAt + gate.size(), captureAt - gateAt - gate.size()).simplified();
+    ASSERT_EQ(QStringLiteral("{ QElapsedTimer captureClock; captureClock.start(); grab.image ="), between);
+    ASSERT_EQ(1, countOccurrences(block, QStringLiteral("visualGrabs.append( grab );")));
+
+    // the burst passes the cutoff and reserve, counts the captures before its call, and stops when the call appended none
+    const QString burst = QStringLiteral(
+        "grabVisual( QStringLiteral(\"play_first_unbound\"), visualBurstCount, false, visualFirstForcedMs, visualBurstLongestMs );");
+    const QString before = QStringLiteral("const int visualBurstGrabsBefore = visualGrabs.size();");
+    const QString refused = QStringLiteral("if( visualGrabs.size() == visualBurstGrabsBefore ) break;");
+    ASSERT_EQ(1, countOccurrences(block, burst));
+    ASSERT_EQ(1, countOccurrences(block, refused));
+    const int burstAt = block.indexOf(burst);
+    ASSERT_TRUE(block.indexOf(before) >= 0 && block.indexOf(before) < burstAt);
+    ASSERT_TRUE(block.indexOf(refused) > burstAt);
+    ASSERT_TRUE(block.indexOf(QStringLiteral("visualBurstLongestMs = qMax(")) > block.indexOf(refused));
+    // every other capture keeps its three-argument call, so it has no cutoff (-1)
+    ASSERT_EQ(6, countOccurrences(block, QStringLiteral("), k, false );")) + countOccurrences(block, QStringLiteral("), 0, false );"))
+                     + countOccurrences(block, QStringLiteral("), 0, visualSettled );")));
 }
 
 // PLAYBACK-PRESENT-TAIL-TIMING-1 (T9): the tail markers around the path-3 paint/swap and at the next setup start are

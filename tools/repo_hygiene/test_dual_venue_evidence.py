@@ -20478,6 +20478,72 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
           "expectedRunNonce": RUN_A, "observedRunNonce": RUN_A}
     LEG = "m16-1243-everyframe-visual-unpaced-fullscreen-s1"
 
+    # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): the burst's admission check read 124 ms, the next clock read
+    # 125 ms, and a capture still STARTED at the 125 ms cutoff and delayed forced play 0; a 150 ms delay inserted after the admission check passed the
+    # old wiring test. grabVisual now re-reads the tail clock immediately before the capture starts and the burst passes it its cutoff and reserve.
+    BURST_START_GATE = ("if( visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ) )")
+    BURST_CALL = 'grabVisual( QStringLiteral("play_first_unbound"), visualBurstCount, false, visualFirstForcedMs, visualBurstLongestMs );'
+
+    @classmethod
+    def burst_start_gate_problems(cls, src: str, header: str) -> list:
+        """Every way the source lets a burst capture start without a clock read immediately before it (empty: none)."""
+        problems = []
+        body = src[src.index("int MainWindow::runGuiPlaybackSmoke("):src.index("//Import a MLV, complete procedure")]
+        block = body[body.index("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"):body.index("// (4) files:")]
+        lam_at = block.index("auto grabVisual = [&]")
+        lam = block[lam_at:block.index("visualGrabs.append( grab );", lam_at)]
+        if not lam.startswith("auto grabVisual = [&]( const QString &kind, int index, bool settled, qint64 startCutoffMs = -1, qint64 startReserveMs = 0 )"):
+            problems.append("grabVisual takes no start cutoff")
+        if block.count(cls.BURST_START_GATE) != 1 or lam.count(cls.BURST_START_GATE) != 1:
+            return problems + ["no single clock read gates the capture start inside grabVisual"]
+        gate_at = lam.index(cls.BURST_START_GATE)
+        if gate_at < lam.index("grab.clip = "):
+            problems.append("the gate reads the clock before the probe and label reads, not immediately before the capture")
+        capture_at = lam.find("captureTopLevelWindowByPrintWindow(", gate_at)
+        if capture_at < 0:
+            return problems + ["the capture does not follow the gate"]
+        # between the read and the capture start only the capture timer may run (comments dropped, whitespace normalised): any other statement is a delay
+        between = " ".join(re.sub(r"//[^\n]*", "", lam[gate_at + len(cls.BURST_START_GATE):capture_at]).split())
+        if between != "{ QElapsedTimer captureClock; captureClock.start(); grab.image =":
+            problems.append(f"code between the clock read and the capture start: {between!r}")
+        if block.count("visualGrabs.append( grab );") != 1:
+            problems.append("a capture is appended outside the gated branch")
+        pre_forced = block[block.index("visualTailClock.start();"):block.index('grabVisual( QStringLiteral("play"), k, false );')]
+        if pre_forced.count(cls.BURST_CALL) != 1:
+            problems.append("the burst does not pass its cutoff and reserve to grabVisual")
+        else:
+            call_at = pre_forced.index(cls.BURST_CALL)
+            before_at = pre_forced.find("const int visualBurstGrabsBefore = visualGrabs.size();")
+            refused_at = pre_forced.find("if( visualGrabs.size() == visualBurstGrabsBefore ) break;", call_at)
+            longest_at = pre_forced.find("visualBurstLongestMs = qMax(", call_at)
+            if not (0 <= before_at < call_at < refused_at < longest_at):
+                problems.append("the burst does not stop on a refused capture before it measures it")
+        if "inline bool captureMayStartBeforeCutoff( qint64 nowMs, qint64 reserveMs, qint64 cutoffMs )" not in header \
+                or "return cutoffMs < 0 || nowMs + reserveMs < cutoffMs;" not in header:
+            problems.append("captureMayStartBeforeCutoff is not the strict before-the-cutoff decision")
+        return problems
+
+    def test_r6_burst_capture_start_rereads_the_clock_with_nothing_between_the_read_and_the_capture(self) -> None:
+        src = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        header = (ROOT / "platform" / "qt" / "VisualCaptureSourceDifference.h").read_text(encoding="utf-8")
+        self.assertEqual(self.burst_start_gate_problems(src, header), [])
+
+    def test_r6_burst_start_gate_refuses_a_delay_between_the_clock_read_and_the_capture(self) -> None:
+        """sol r1's in-memory mutation, moved to the read the fix adds: a 150 ms delay between the clock read and the capture start; and the other ways to
+        lose the read (an event pump there, the burst no longer passing its cutoff, a `<=` cutoff)."""
+        src = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        header = (ROOT / "platform" / "qt" / "VisualCaptureSourceDifference.h").read_text(encoding="utf-8")
+        gate_at = src.index(self.BURST_START_GATE)
+        timer_at = src.index("QElapsedTimer captureClock;", gate_at)
+        delayed = src[:timer_at] + "sleepGuiThreadForSmokeRunner( 150 );\n                " + src[timer_at:]
+        self.assertTrue(any("between the clock read" in p for p in self.burst_start_gate_problems(delayed, header)))
+        pumped = src[:timer_at] + "qApp->processEvents( QEventLoop::AllEvents );\n                " + src[timer_at:]
+        self.assertNotEqual(self.burst_start_gate_problems(pumped, header), [])
+        uncut = src.replace(self.BURST_CALL, 'grabVisual( QStringLiteral("play_first_unbound"), visualBurstCount, false );')
+        self.assertIn("the burst does not pass its cutoff and reserve to grabVisual", self.burst_start_gate_problems(uncut, header))
+        loose = header.replace("nowMs + reserveMs < cutoffMs;", "nowMs + reserveMs <= cutoffMs;")
+        self.assertNotEqual(self.burst_start_gate_problems(src, loose), [])
+
     @staticmethod
     def play(index: int = 0, **over) -> dict:
         """One capture row as the app writes it to visual.json (231ea06e play-0: 126 ms into the tail, display frame 479). r4 (adversary A1 on eabccd6c): the

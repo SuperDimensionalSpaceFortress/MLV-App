@@ -11844,7 +11844,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             : ( ui->graphicsView ? ui->graphicsView->viewport() : nullptr );
         QElapsedTimer visualTailClock;
         int visualForcedPaints = 0;
-        auto grabVisual = [&]( const QString &kind, int index, bool settled )
+        // R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): startCutoffMs >= 0 (the early burst only) makes the capture start only while the tail clock,
+        // read immediately before it starts, plus startReserveMs is before that cutoff; a refused capture is not appended. Every other call
+        // passes no cutoff and always captures.
+        auto grabVisual = [&]( const QString &kind, int index, bool settled, qint64 startCutoffMs = -1, qint64 startReserveMs = 0 )
         {
             VisualGrab grab;
             grab.kind = kind;
@@ -11871,12 +11874,16 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             grab.serial = static_cast<qulonglong>( m_lastPresentedRequestSerial );
             grab.playActive = ui->actionPlay->isChecked();
             grab.clip = visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject );
-            QElapsedTimer captureClock;
-            captureClock.start();
-            grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
-            grab.captureMs = static_cast<double>( captureClock.nsecsElapsed() ) / 1.0e6;
-            grab.capturedUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
-            visualGrabs.append( grab );
+            // R6-BURST-CUTOFF-RESIDUE-1: the clock read that decides the start is the last statement before it; only the capture timer follows
+            if( visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ) )
+            {
+                QElapsedTimer captureClock;
+                captureClock.start();
+                grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
+                grab.captureMs = static_cast<double>( captureClock.nsecsElapsed() ) / 1.0e6;
+                grab.capturedUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+                visualGrabs.append( grab );
+            }
         };
 
         // (1) the measured interval ends HERE, before the first capture.
@@ -11903,6 +11910,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         // starts only while the time left exceeds the longest burst capture so far (a prediction, not a bound: adversary A2 on 4de735e6), so one
         // slower than every earlier one can still end past the target, by at most its own excess over that longest; (c) the pixmap route now
         // reports its composed paint (basis pixmap_composed_paint), so the burst follows that route's own paints too.
+        // R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): the check below is admission only; a read of 124 ms there could still be followed by a
+        // capture starting at 125 ms. The deciding read is inside grabVisual, immediately before the capture starts (visualFirstForcedMs is its
+        // cutoff, visualBurstLongestMs its reserve), so no burst capture starts at or after the first forced target; a refused one ends the burst.
         {
             const qint64 visualFirstForcedMs = static_cast<qint64>( ( 2 * 0 + 1 ) * visualHalfMs / ( 2 * visualPlayFrames ) );
             const int visualBurstMax = 4;
@@ -11921,7 +11931,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 {
                     if( visualTailClock.elapsed() + visualBurstLongestMs >= visualFirstForcedMs ) break;
                     const qint64 visualBurstGrabStartMs = visualTailClock.elapsed();
-                    grabVisual( QStringLiteral("play_first_unbound"), visualBurstCount, false );
+                    const int visualBurstGrabsBefore = visualGrabs.size();
+                    grabVisual( QStringLiteral("play_first_unbound"), visualBurstCount, false, visualFirstForcedMs, visualBurstLongestMs );
+                    if( visualGrabs.size() == visualBurstGrabsBefore ) break;   // R6: refused at the read immediately before the start
                     visualBurstLongestMs = qMax( visualBurstLongestMs, visualTailClock.elapsed() - visualBurstGrabStartMs );
                     visualBurstLastValid = visualGrabs.last().paintedSerialValid;
                     visualBurstLastSerial = static_cast<quint64>( visualGrabs.last().paintedSerial );
