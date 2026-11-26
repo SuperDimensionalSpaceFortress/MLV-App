@@ -339,7 +339,10 @@ class ArmClassifierTests(_Probe):
                     for k in OBSERVER_SPEC_KEYS)
                 # r8 (sibling sweep of r6 A1): a LIGHT word counts only on a 'speed' leg; the 52 committed 'look' legs capture a contact sheet inside the timed Play, so they are UNKNOWN
                 look_light = arm == "LIGHT" and doc.get("legType") != "speed"
-                expected[path.name] = "UNKNOWN" if (arm == "LIGHT" and (observer_on or look_light)) else arm
+                # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A3): a scopes leg emits a launch outside the LIGHT shape (--scope none only, no scope-interval or scopes-mode env)
+                scope_on = (("scope" in args and args["scope"] != "none") or ("scopeIntervalMs" in args and args["scopeIntervalMs"] != -1)
+                            or ("scopesDuringPlayback" in args and args["scopesDuringPlayback"] not in (None, "")))
+                expected[path.name] = "UNKNOWN" if (arm == "LIGHT" and (observer_on or look_light or scope_on)) else arm
         self.assertIn("HEAVY", expected.values())
         self.assertIn("LIGHT", expected.values())
         self.assertGreater(sum(1 for p in specs if json.loads(p.read_text(encoding="utf-8")).get("legType") == "look"), 40, "the corpus holds the look legs this rule narrows")
@@ -620,7 +623,7 @@ class GuiSmokeInheritedEnvironmentRecordTests(_Probe):
 
     def test_the_runner_records_the_inherited_variables_before_it_reports_or_dry_runs_its_launch(self) -> None:
         source = (PROFILING / "run-release-gui-smoke.ps1").read_text(encoding="utf-8")
-        call = source.index("Add-InheritedMlvAppEnvironmentRecord -Target $launchEnv -Cleared $clearedEnvironment")
+        call = source.index("Add-InheritedMlvAppEnvironmentRecord -Target $launchEnv -Cleared (@($clearedEnvironment) + $childReplacedEnvironment)")
         self.assertLess(source.index("$clearedEnvironment = @($clearedEnvironment | Select-Object -Unique)"), call)
         self.assertLess(call, source.index("if ($DryRun) {"))
         self.assertLess(call, source.index("environment = $launchEnv\n        validationPolicy"))
@@ -1322,7 +1325,9 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
     def test_a_refused_pair_repeats_no_cached_fps_derived_suggestion(self) -> None:
         # adversary A9 (pre-existing append, same class): the packet's analysis.suggestedOptimization is derived from the fps delta
         # r15 (adversary r14 pass 18 A7): the fixture's analysis is bound to the judged pair (basis 'candidate', deltaPercent -2), as the producer writes it
-        analysis = "[pscustomobject]@{ comparisonBasis = 'candidate'; suggestedOptimization = 'optimize_playback_cuda_candidate'; evidence = [pscustomobject]@{ presentedFpsDeltaPercent = -2 } }"
+        # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A4): a bound analysis records every compare input its diagnosis read, so the fixture carries the present-interval pair too
+        analysis = ("[pscustomobject]@{ comparisonBasis = 'candidate'; suggestedOptimization = 'optimize_playback_cuda_candidate'; evidence = [pscustomobject]@{ presentedFpsDeltaPercent = -2; "
+                    "presentIntervalDeltaPercent = 5; candidatePresentIntervalMs = 21 } }")
         refused = "\n".join(self.run_summarizer_block("HEAVY", "HEAVY", analysis))
         self.assertNotIn("suggested_optimization=", refused)
         allowed = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", analysis))
@@ -1354,9 +1359,11 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         funcs = _extract_functions(SUMMARIZER_SCRIPT, ["Get-Field", "New-SectionVerdict", "Test-DiagnosticCode", "New-ActionStep", "Add-ActionStep", "Get-ProofSpeedClaimAuthority", "New-ActionPlan"])
         probe = tmp / "run.ps1"
         body = "$ErrorActionPreference = 'Stop'\n" + funcs + "\n$summary = [pscustomobject]@{ inputs = [pscustomobject]@{ clipPath = 'C:\\clip.mlv' } }\n"
+        # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A5): every row passes the compare the section judged; a measured presented-fps pair is part of the speed gate now
+        measured = "([pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = 55; delta = 5; deltaPercent = 10 } })"
         for label, overall, section in (("REFUSED", "QUOTABLE_PASS", "REFUSED"), ("MISSING", "QUOTABLE_PASS", None), ("PASS", "QUOTABLE_PASS", "PASS"), ("NOTQ", "NOT_QUOTABLE", "PASS")):
             verdict = "$null" if section is None else f"(New-SectionVerdict -Status '{section}' -Passed $true -Evidence @() -Blockers @())"
-            body += (f"$a = Get-ProofSpeedClaimAuthority -OverallStatus '{overall}' -PlaybackSpeedVerdict {verdict}\n"
+            body += (f"$a = Get-ProofSpeedClaimAuthority -OverallStatus '{overall}' -PlaybackSpeedVerdict {verdict} -SpeedCompare {measured}\n"
                      f"$plan = New-ActionPlan -Status '{overall}' -Diagnostics @() -DiagnosticSummary $null -Summary $summary -ClaimAuthority $a\n"
                      f"Write-Host ('{label}=' + $a.speed + '|' + (@($plan.steps | ForEach-Object {{ $_.id }}) -join ','))\n")
         probe.write_text(body, encoding="utf-8")
@@ -1381,7 +1388,9 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         for name in ("package-local-cuda-proof-result.ps1", "import-local-cuda-proof-result.ps1"):
             text = (PROFILING / name).read_text(encoding="utf-8")
             with self.subTest(name):
-                self.assertIn('speedQuotable = (($proofReport.status -ceq "QUOTABLE_PASS") -and ($null -ne $proofReport.claimAuthority) -and ($proofReport.claimAuthority.speed -is [bool]) -and $proofReport.claimAuthority.speed)', text)
+                # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6): both read the one module predicate over the parsed report AND its raw text
+                self.assertIn("speedQuotable = (Test-FpsProofReportSpeedQuotable -Report $proofReport -RawText $proofReportRaw)", text)
+                self.assertIn('Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force', text)
                 self.assertNotIn("support or speed only from proofReport.status=QUOTABLE_PASS", text)
                 self.assertNotIn("support or speed remains quotable only when proofReport.status is QUOTABLE_PASS", text)
 
@@ -2269,6 +2278,152 @@ class LightShapeAllowlistTests(_Probe):
             f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; launch = {launch} }})": "UNKNOWN",
             f"Get-FpsArmFromJobResult ([pscustomobject]@{{ telemetryArm = 'LIGHT'; launch = {launch} }}) -ObserversFromSpec ({SPEC_LIGHT})": "UNKNOWN",
         })
+
+
+@requires_pwsh
+class EnvelopePreemptR1ResidueTests(_Probe):
+    """ENVELOPE-PREEMPT-R1-RESIDUE-1 r1: the close-or-narrow round on #871 over the introduced majors the adversary passes on 8747fced and 835a5faf left open."""
+
+    def test_p3_a2_an_arm_object_outside_its_closed_shape_is_not_light(self) -> None:
+        # adversary 835a5faf A2: Get-FpsArmFromLegRecord returned an arm OBJECT unchecked, so {arm:'LIGHT', observerControls:{utilSample:true}} beside LIGHT generatorArgs read LIGHT and the pair was
+        # allowed; Get-FpsArmFromSmokeRecord read the same object beside a LIGHT launch as LIGHT. An arm object is {arm, source, reason}; any other key is outside the shape.
+        bad = "[pscustomobject]@{ arm = 'LIGHT'; observerControls = [pscustomobject]@{ utilSample = $true } }"
+        good = "[pscustomobject]@{ arm = 'LIGHT'; source = 'environment'; reason = 'telemetryArm=LIGHT' }"
+        ga = "legType = 'speed'; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; "
+        body = ""
+        for label, expr in (
+                ("LEG_BAD", f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = {bad}; {ga}hostLoadState = 'quiet' }})"),
+                ("LEG_GOOD", f"Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = {good}; {ga}hostLoadState = 'quiet' }})"),
+                ("SMOKE_BAD", f"Get-FpsArmFromSmokeRecord ([pscustomobject]@{{ telemetryArm = {bad}; {RECORDED_LIGHT_LAUNCH} }})"),
+                ("SMOKE_GOOD", f"Get-FpsArmFromSmokeRecord ([pscustomobject]@{{ telemetryArm = {good}; {RECORDED_LIGHT_LAUNCH} }})")):
+            body += f"Write-Host ('{label}=' + ({expr}).arm)\n"
+        body += (f"$v = Get-FpsPairVerdict -Baseline (Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = {bad}; {ga}hostLoadState = 'quiet' }})) -Candidate 'LIGHT'\n"
+                 "Write-Host ('PAIR_BAD=' + $v.allowed)\n")
+        out = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(out, {"LEG_BAD": "UNKNOWN", "LEG_GOOD": "LIGHT", "SMOKE_BAD": "UNKNOWN", "SMOKE_GOOD": "LIGHT", "PAIR_BAD": "False"})
+
+    def test_p3_a3_a_scopes_spec_reads_as_its_launch_does(self) -> None:
+        # adversary 835a5faf A3 / 8747fced A3: the committed m16-1243-scopes-cuda-windowed-s1-histogram-i0 spec (scope histogram, interval 0, throttled) read LIGHT from the spec, the saved
+        # leg's generatorArgs and spec+result, while the launch it emits reads UNKNOWN (--scope histogram and the scope env are outside the LIGHT launch shape). Every spec-side reader agrees now.
+        spec_path = LEGS_DIR / "m16-1243-scopes-cuda-windowed-s1-histogram-i0.json"
+        ga_bad = "telemetryArm = 'LIGHT'; scope = 'histogram'; scopeIntervalMs = 0; scopesDuringPlayback = 'throttled'"
+        body = (f"$s = Get-Content -LiteralPath '{spec_path}' -Raw | ConvertFrom-Json\n"
+                "Write-Host ('COMMITTED=' + (Get-FpsArmFromLegSpec $s).arm)\n"
+                "Write-Host ('COMMITTED_RESULT=' + (Get-FpsArm -Spec $s -Result ([pscustomobject]@{ telemetryArm = 'LIGHT' })).arm)\n"
+                f"Write-Host ('SAVED_LEG=' + (Get-FpsArmFromLegRecord ([pscustomobject]@{{ telemetryArm = 'LIGHT'; legType = 'speed'; generatorArgs = [pscustomobject]@{{ {ga_bad} }} }})).arm)\n")
+        for label, ga in (("SCOPE_NONE", "scope = 'none'"), ("INTERVAL_DEFAULT", "scopeIntervalMs = -1"), ("MODE_EMPTY", "scopesDuringPlayback = ''"),
+                          ("SCOPE_NULL", "scope = $null"), ("INTERVAL_ZERO", "scopeIntervalMs = 0"), ("MODE_SET", "scopesDuringPlayback = 'show'")):
+            body += f"Write-Host ('{label}=' + (Get-FpsArmFromLegSpec ([pscustomobject]@{{ legType = 'speed'; generatorArgs = [pscustomobject]@{{ telemetryArm = 'LIGHT'; {ga} }} }})).arm)\n"
+        out = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(out, {"COMMITTED": "UNKNOWN", "COMMITTED_RESULT": "UNKNOWN", "SAVED_LEG": "UNKNOWN", "SCOPE_NONE": "LIGHT", "INTERVAL_DEFAULT": "LIGHT",
+                               "MODE_EMPTY": "LIGHT", "SCOPE_NULL": "UNKNOWN", "INTERVAL_ZERO": "UNKNOWN", "MODE_SET": "UNKNOWN"})
+
+    def test_p3_a4_a_cached_analysis_is_bound_only_by_exact_equal_evidence(self) -> None:
+        # adversary 835a5faf A4 / 8747fced A2: the binding compared the presented-fps delta within 1e-6 (-1.0000004 and -1.0 sit on opposite sides of the -1 % diagnosis threshold) and nothing
+        # else, so cached queue-wait advice was republished beside a compare with no queue-wait regression and a 40 % llrawproc regression.
+        body = ("function A($ev) { [pscustomobject]@{ comparisonBasis = 'candidateSpeed'; evidence = $ev } }\n"
+                "function M($dp) { [pscustomobject]@{ deltaPercent = $dp } }\n")
+        cases = (
+            ("TOLERANCE", "[pscustomobject]@{ presentedFpsDeltaPercent = -1.0000004 }", "[pscustomobject]@{ presentedFps = (M (-1.0)) }"),
+            ("STAGE", "[pscustomobject]@{ presentedFpsDeltaPercent = -2.0; queueWaitDeltaPercent = 30.0 }", "[pscustomobject]@{ presentedFps = (M (-2.0)); avgLlrawprocMs = (M 40.0) }"),
+            ("CANDIDATE_MS", "[pscustomobject]@{ presentedFpsDeltaPercent = 12.0; candidateQueueWaitMs = 20.0 }", "[pscustomobject]@{ presentedFps = (M 12.0); avgQueueWaitMs = [pscustomobject]@{ candidate = 5.0 } }"),
+            ("EXACT", "[pscustomobject]@{ presentedFpsDeltaPercent = -2.0; queueWaitDeltaPercent = 30.0; llrawprocDeltaPercent = 40.0; candidateQueueWaitMs = 20.0 }",
+             "[pscustomobject]@{ presentedFps = (M (-2)); avgQueueWaitMs = [pscustomobject]@{ deltaPercent = 30; candidate = 20 }; avgLlrawprocMs = (M 40.0) }"),
+        )
+        for label, ev, cmp in cases:
+            body += f"Write-Host ('{label}=' + (Test-FpsCachedAnalysisBound -Analysis (A ({ev})) -Compare ({cmp}) -ComparisonBasis 'candidateSpeed'))\n"
+        out = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(out, {"TOLERANCE": "False", "STAGE": "False", "CANDIDATE_MS": "False", "EXACT": "True"})
+
+    def test_p3_a6_speed_authority_needs_a_pass_section_one_authority_object_and_no_repeated_key(self) -> None:
+        # adversary 835a5faf A6 / 8747fced A6: package and import granted speedQuotable from status + claimAuthority.speed alone: a REFUSED playbackSpeed section, singleton arrays and a
+        # repeated speed key all read true. One module predicate now, over the parsed report and its raw text.
+        auth = '"claimAuthority":{"speed":true}'
+        section = '"playbackSpeed":{"status":"PASS"}'
+        cases = {
+            "GOOD": '{"status":"QUOTABLE_PASS",' + auth + ',' + section + '}',
+            "REFUSED": '{"status":"QUOTABLE_PASS",' + auth + ',"playbackSpeed":{"status":"REFUSED"}}',
+            "NO_SECTION": '{"status":"QUOTABLE_PASS",' + auth + '}',
+            "AUTH_ARRAY": '{"status":"QUOTABLE_PASS","claimAuthority":[{"speed":true}],' + section + '}',
+            "STATUS_ARRAY": '{"status":["QUOTABLE_PASS"],' + auth + ',' + section + '}',
+            "REPEATED": '{"status":"QUOTABLE_PASS","claimAuthority":{"speed":false,"speed":true},' + section + '}',
+            "SPEED_TEXT": '{"status":"QUOTABLE_PASS","claimAuthority":{"speed":"true"},' + section + '}',
+            "NOT_QUOTABLE": '{"status":"NOT_QUOTABLE",' + auth + ',' + section + '}',
+        }
+        body = ""
+        for label, text in cases.items():
+            body += (f"$t = '{text}'\n"
+                     f"try {{ $r = $t | ConvertFrom-Json; Write-Host ('{label}=' + (Test-FpsProofReportSpeedQuotable -Report $r -RawText $t)) }} catch {{ Write-Host '{label}=PARSE_THREW' }}\n")
+        out = dict(line.split("=", 1) for line in self.ok(body).split())
+        want = {label: "False" for label in cases}
+        want["GOOD"] = "True"
+        if out.get("REPEATED") == "PARSE_THREW":
+            want["REPEATED"] = "PARSE_THREW"
+        self.assertEqual(out, want)
+
+    def test_p3_a5_a_pass_section_without_a_measured_presented_fps_pair_grants_no_speed(self) -> None:
+        # adversary 835a5faf A5 / 8747fced A4: compare:{} (or a compare holding only stage metrics) passed the missing-compare check, the evidence printed "presented FPS: n/a", the section read
+        # PASS and claimAuthority.speed was true.
+        funcs = _extract_functions(SUMMARIZER_SCRIPT, ["Get-Field", "New-SectionVerdict", "Get-ProofSpeedClaimAuthority"])
+        body = funcs + "\n$pass = New-SectionVerdict -Status 'PASS' -Passed $true -Evidence @() -Blockers @()\n"
+        for label, cmp in (("EMPTY", "[pscustomobject]@{}"), ("NULL", "$null"),
+                           ("STAGE_ONLY", "[pscustomobject]@{ avgRenderTotalMs = [pscustomobject]@{ baseline = 10; candidate = 9 } }"),
+                           ("FPS_TEXT", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = '50'; candidate = '55' } }"),
+                           ("FPS_ONE_SIDE", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = $null } }"),
+                           ("MEASURED", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = 55.5 } }")):
+            body += (f"$a = Get-ProofSpeedClaimAuthority -OverallStatus 'QUOTABLE_PASS' -PlaybackSpeedVerdict $pass -SpeedCompare ({cmp})\n"
+                     f"Write-Host ('{label}=' + $a.speed + '|' + $a.speedRefusal)\n")
+        out = dict(line.split("=", 1) for line in self.ok(body).split())
+        for label in ("EMPTY", "NULL", "STAGE_ONLY", "FPS_TEXT", "FPS_ONE_SIDE"):
+            self.assertEqual(out[label], "False|presented-fps-not-measured", label)
+        self.assertEqual(out["MEASURED"], "True|")
+        self.assertIn("-PlaybackSpeedVerdict $playbackAbVerdict -SpeedCompare $playbackAbSpeedCompare", SUMMARIZER_SCRIPT.read_text(encoding="utf-8"))
+
+    def test_p2_a5_packaging_never_reuses_a_report_an_earlier_run_left(self) -> None:
+        # adversary 8747fced A5: the summarizer refuses a repeated key BEFORE it writes, with exit 1 (the same code as NOT_QUOTABLE); the packager accepted exit 1 and read the stale passing report
+        # an earlier run had left at the same path. Both reports are removed first, and a run that writes none is a packaging error.
+        repo = self.tmp / "repo"
+        (repo / "tools" / "profiling").mkdir(parents=True)
+        fake = repo / "tools" / "profiling" / "summarize-local-cuda-proof.ps1"
+        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Invoke-ProofSummarizer"])
+        md, js = self.tmp / "proof-report.md", self.tmp / "proof-report.json"
+        body = funcs + "\n"
+        for label, fake_body in (("REFUSES", "exit 1\n"),
+                                 ("WRITES", "param($RepoRoot, $SummaryPath, $Output, [switch]$Json)\n[IO.File]::WriteAllText($Output, 'fresh')\nexit 1\n")):
+            body += (f"[IO.File]::WriteAllText('{fake}', @'\n{fake_body}'@)\n"
+                     f"[IO.File]::WriteAllText('{md}', 'stale'); [IO.File]::WriteAllText('{js}', 'stale')\n"
+                     f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary 's.json' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
+                     f"$left = if (Test-Path -LiteralPath '{js}') {{ [IO.File]::ReadAllText('{js}') }} else {{ 'none' }}\n"
+                     f"Write-Host ('{label}=' + $res + '|' + $left)\n")
+        out = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(out, {"REFUSES": "THREW|none", "WRITES": "OK|fresh"})
+
+    def test_p3_a1_a_purpose_free_plan_is_not_refused_by_a_stalled_arm_read(self) -> None:
+        # adversary 835a5faf A1: a purpose-free plan whose arm read got no answer exited SPEC_READ_TIMEOUT item=1 before staging, where the base gave up on the optional ID read and returned
+        # BUILD_NOT_STAGED item=1. The arm only decides anything for a plan that declares a purpose, so only such a plan refuses on its arm read's timeout.
+        source = LEASE_BATCH_SCRIPT.read_text(encoding="utf-8")
+        declared = "$planPurposeDeclared = ($doc -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $doc.PSObject.Properties['purpose'])"
+        self.assertEqual(source.count(declared), 1)
+        self.assertLess(source.index(declared), source.index("for ($i = 0; $i -lt $rawItems.Count; $i++) {"))
+        self.assertIn("if ($armRead.readTimedOut -and $planPurposeDeclared) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n ", source)
+        self.assertNotIn("if ($armRead.readTimedOut) { Stop-PlanRefused", source)
+
+    def test_p2_a7_the_smoke_receipt_records_no_inherited_value_the_child_never_gets(self) -> None:
+        # adversary 8747fced A7: with -PreserveExperimentalEnvironment and a blank -GpuPlaybackReconBackend the child's environment block removes MLVAPP_GPU_PLAYBACK_RECON_BACKEND, but the
+        # receipt recorded the parent's 'bogus' as inherited, so the readers refused an actual LIGHT pair. The runner's own lines run here against the real record function.
+        script = PROFILING / "run-release-gui-smoke.ps1"
+        source = script.read_text(encoding="utf-8")
+        block = _extract_block(source, "$childReplacedEnvironment =", "Add-InheritedMlvAppEnvironmentRecord -Target $launchEnv -Cleared (", trailing_lines=0)
+        funcs = _extract_functions(script, ["Add-InheritedMlvAppEnvironmentRecord"])
+        body = funcs + "\n$script:GuiSmokePaceModeEnvironment = 'MLVAPP_PLAY_PACE_MODE'\n"
+        body += ("$env:MLVAPP_GPU_PLAYBACK_RECON_BACKEND = 'bogus'; $env:MLVAPP_RUN_NONCE = 'parent'; $env:MLVAPP_PLAY_PACE_MODE = 'informational'; $env:MLVAPP_STAGE_TIMING = '1'\n"
+                 "$clearedEnvironment = @()\n$launchEnv = [ordered]@{}\n" + block +
+                 "Write-Host ('BLANK=' + ((@('MLVAPP_GPU_PLAYBACK_RECON_BACKEND', 'MLVAPP_RUN_NONCE', 'MLVAPP_PLAY_PACE_MODE', 'MLVAPP_STAGE_TIMING') | Where-Object { $launchEnv.Contains($_) }) -join ','))\n"
+                 "$launchEnv = [ordered]@{ MLVAPP_GPU_PLAYBACK_RECON_BACKEND = 'cuda' }\n" + block +
+                 "Write-Host ('SET=' + $launchEnv['MLVAPP_GPU_PLAYBACK_RECON_BACKEND'])\n")
+        out = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(out["BLANK"], "MLVAPP_STAGE_TIMING", "of the four, only the variable the child really inherits is recorded")
+        self.assertEqual(out["SET"], "cuda")
 
 
 if __name__ == "__main__":

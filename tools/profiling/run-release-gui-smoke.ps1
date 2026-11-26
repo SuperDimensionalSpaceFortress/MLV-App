@@ -1770,7 +1770,10 @@ if (-not $PreserveExperimentalEnvironment) {
 }
 $clearedEnvironment = @($clearedEnvironment | Select-Object -Unique)
 # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A1): the recorded launch environment shows every MLVAPP_* variable the child inherits (same values, so what runs is unchanged)
-Add-InheritedMlvAppEnvironmentRecord -Target $launchEnv -Cleared $clearedEnvironment
+# ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 8747fced A7): the child's own environment block (below) also removes these when this launch does not set them (a blank -GpuPlaybackReconBackend,
+# no informational pace mode) or sets them itself (the two run nonces), so a parent value never reaches the child and is not recorded as inherited either
+$childReplacedEnvironment = @(@("MLVAPP_GPU_PLAYBACK_RECON_BACKEND", $script:GuiSmokePaceModeEnvironment, "MLVAPP_GUI_SMOKE_RUN_NONCE", "MLVAPP_RUN_NONCE") | Where-Object { -not $launchEnv.Contains($_) })
+Add-InheritedMlvAppEnvironmentRecord -Target $launchEnv -Cleared (@($clearedEnvironment) + $childReplacedEnvironment)
 $effectiveExpectedVisualScaleRequest = if ($ExpectedVisualScaleRequest -eq -2) {
     $ExpectedScaleRequest
 } else {

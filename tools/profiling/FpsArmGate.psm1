@@ -186,6 +186,26 @@ function Get-FpsSpecHolderProblem {
     if (Test-FaHasProp $Holder 'observerControls') { return 'its generatorArgs carries an observerControls entry, which no producer records (outside the LIGHT shape)' }
     $observer = Get-FpsSpecObserverOn $Holder
     if ($null -ne $observer) { return "its generatorArgs.$($observer.specKey) enables an observer ($($observer.id))" }
+    $scopeProblem = Get-FpsSpecScopeProblem $Holder
+    if ($null -ne $scopeProblem) { return "its $scopeProblem" }
+    $null
+}
+
+function Get-FpsSpecScopeProblem {
+    # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A3, 8747fced A3): the spec and record readers read a scopes leg (scope histogram, scopeIntervalMs 0, scopesDuringPlayback throttled) as LIGHT,
+    # while the launch it emits is outside the LIGHT launch shape (--scope exact:none; no MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS or MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK row), so the launch reader
+    # says UNKNOWN. The spec side now predicts the same: by the way Invoke-VenueLeg forwards each key (scope [string], scopeIntervalMs [int], the job's `-ge 0`; scopesDuringPlayback [string], the
+    # job's non-empty test), a scope other than exactly 'none', an interval other than the default -1, or a non-empty scopes mode is outside the shape. Returns the problem text, else $null.
+    param([AllowNull()]$Holder)
+    if ((Test-FaHasProp $Holder 'scope') -and -not (Test-FaTextEq (Get-FaProp $Holder 'scope') 'none')) { return "generatorArgs.scope is not 'none' (the LIGHT launch passes --scope none only)" }
+    if (Test-FaHasProp $Holder 'scopeIntervalMs') {
+        $v = Get-FaProp $Holder 'scopeIntervalMs'
+        if (-not (($v -is [int] -or $v -is [long] -or $v -is [double] -or $v -is [decimal]) -and $v -eq -1)) { return 'generatorArgs.scopeIntervalMs sets MLVAPP_PLAYBACK_SCOPE_INTERVAL_MS (outside the LIGHT launch shape)' }
+    }
+    if (Test-FaHasProp $Holder 'scopesDuringPlayback') {
+        $v = Get-FaProp $Holder 'scopesDuringPlayback'
+        if (-not ($null -eq $v -or ($v -is [string] -and $v.Length -eq 0))) { return 'generatorArgs.scopesDuringPlayback sets MLVAPP_PLAYBACK_SCOPES_DURING_PLAYBACK (outside the LIGHT launch shape)' }
+    }
     $null
 }
 
@@ -233,8 +253,23 @@ function Get-FpsArmFromLegRecord {
     }
     $problem = Get-FpsRecordLightProblem $Leg
     if ($null -ne $problem) { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but $problem" }
+    # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A2): an arm OBJECT was returned unchecked, so {arm:'LIGHT', observerControls:{...}} read LIGHT; it is a LIGHT arm only in the closed shape
+    $shapeProblem = Get-FpsArmObjectShapeProblem $field
+    if ($null -ne $shapeProblem) { return New-FpsArm 'UNKNOWN' 'record' "telemetryArm=LIGHT but $shapeProblem" }
     if ($field -isnot [string]) { return $field }
     New-FpsArm 'LIGHT' 'record' 'telemetryArm=LIGHT'
+}
+
+function Get-FpsArmObjectShapeProblem {
+    # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A2): an arm OBJECT (what New-FpsArm writes, and the smoke summaries carry) has exactly the keys arm, source and reason. Any other key (an
+    # observerControls entry, a forwarded switch) is outside that shape, so the object is not proof of LIGHT. A plain arm word has no shape to check. Returns the problem text, else $null.
+    param([AllowNull()]$Field)
+    if ($null -eq $Field -or $Field -is [string]) { return $null }
+    $names = if ($Field -is [System.Collections.IDictionary]) { @($Field.Keys) } else { @($Field.PSObject.Properties | ForEach-Object { $_.Name }) }
+    foreach ($name in $names) {
+        if (-not (Test-FaTextIn ([string]$name) @('arm', 'source', 'reason'))) { return "its telemetryArm object carries '$name', outside the arm object shape (arm, source, reason)" }
+    }
+    $null
 }
 
 $script:FpsArmHeavyReason = 'fps-verdict-refused:heavy-arm'
@@ -289,6 +324,8 @@ function Get-FpsArmFromLegSpec {
         # r14 (sol r13 B2): the record reader's rule for the same generatorArgs (Get-FpsSpecHolderProblem): an observerControls entry is outside the LIGHT shape, so a spec and a record that
         # embeds the same generatorArgs cannot disagree about it.
         if (Test-FaHasProp $ga 'observerControls') { return New-FpsArm 'UNKNOWN' 'spec' 'generatorArgs.telemetryArm=LIGHT but generatorArgs carries an observerControls entry, which no producer records (outside the LIGHT shape)' }
+        $scopeProblem = Get-FpsSpecScopeProblem $ga
+        if ($null -ne $scopeProblem) { return New-FpsArm 'UNKNOWN' 'spec' "generatorArgs.telemetryArm=LIGHT but $scopeProblem" }
         return New-FpsArm 'LIGHT' 'spec' 'generatorArgs.telemetryArm=LIGHT'
     }
     if (Test-FaTextEq $arm 'HEAVY') { return New-FpsArm 'HEAVY' 'spec' 'generatorArgs.telemetryArm=HEAVY' }
@@ -495,6 +532,9 @@ function Get-FpsArmFromSmokeRecord {
         if ((Test-FaHasProp $Record 'telemetryArm') -and (ConvertTo-FpsArmName (Get-FaProp $Record 'telemetryArm')) -cne 'LIGHT') {
             return New-FpsArm 'UNKNOWN' 'environment' 'the recorded launch reads LIGHT but the record names a telemetryArm that is not LIGHT'
         }
+        # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A2, sibling :495): a LIGHT arm object beside the launch must be in the closed arm-object shape too
+        $shapeProblem = if (Test-FaHasProp $Record 'telemetryArm') { Get-FpsArmObjectShapeProblem (Get-FaProp $Record 'telemetryArm') } else { $null }
+        if ($null -ne $shapeProblem) { return New-FpsArm 'UNKNOWN' 'environment' "the recorded launch reads LIGHT but $shapeProblem" }
     }
     $arm
 }
@@ -523,11 +563,61 @@ function Test-FpsCachedAnalysisBound {
     $basis = Get-FaProp $Analysis 'comparisonBasis'
     # ENVELOPE-PREEMPT-RESIDUE-1 r1 (adversary r1 A2): ORDINAL, not -cne: PowerShell's culture-aware compare ignores a soft hyphen, so 'candidate<U+00AD>Speed' matched 'candidateSpeed'
     if ($basis -isnot [string] -or -not [string]::Equals($basis, $ComparisonBasis, [StringComparison]::Ordinal)) { return $false }
-    $cached = Get-FaProp (Get-FaProp $Analysis 'evidence') 'presentedFpsDeltaPercent'
-    $judged = Get-FaProp (Get-FaProp $Compare 'presentedFps') 'deltaPercent'
+    $evidence = Get-FaProp $Analysis 'evidence'
     $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long] -or $v -is [int16] -or $v -is [byte]) }
+    # The presented-fps delta must be a number on both sides (the diagnosis is undefined without it).
+    $cached = Get-FaProp $evidence 'presentedFpsDeltaPercent'
+    $judged = Get-FaProp (Get-FaProp $Compare 'presentedFps') 'deltaPercent'
     if (-not (& $isNumber $cached) -or -not (& $isNumber $judged)) { return $false }
-    ([math]::Abs(([double]$cached) - ([double]$judged)) -lt 0.000001)
+    # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A4, 8747fced A2): EXACT, never within a tolerance (-1.0000004 and -1.0 sit on opposite sides of the -1 % diagnosis threshold), and
+    # over EVERY input the producer's diagnosis read (New-PlaybackAbAnalysis, run-release-cuda-playback-ab.ps1), not the fps delta alone: cached queue-wait advice beside a compare with no
+    # queue-wait regression is another pair's diagnosis. Each recorded evidence field must equal the compare's own value (both absent / null, or the same number); anything else is not bound.
+    foreach ($pair in $script:FpsCachedAnalysisEvidence) {
+        $c = Get-FaProp $evidence $pair[0]
+        $j = Get-FaProp (Get-FaProp $Compare $pair[1]) $pair[2]
+        if ($null -eq $c -and $null -eq $j) { continue }
+        if (-not (& $isNumber $c) -or -not (& $isNumber $j)) { return $false }
+        if (([double]$c) -ne ([double]$j)) { return $false }
+    }
+    $true
+}
+# analysis.evidence field -> compare metric and the metric's field, as New-PlaybackAbAnalysis (run-release-cuda-playback-ab.ps1) records them
+$script:FpsCachedAnalysisEvidence = @(
+    , @('presentedFpsDeltaPercent', 'presentedFps', 'deltaPercent')
+    , @('presentIntervalDeltaPercent', 'avgPresentIntervalMs', 'deltaPercent')
+    , @('renderWorkDeltaPercent', 'avgRenderWorkMs', 'deltaPercent')
+    , @('queueWaitDeltaPercent', 'avgQueueWaitMs', 'deltaPercent')
+    , @('llrawprocDeltaPercent', 'avgLlrawprocMs', 'deltaPercent')
+    , @('drawTotalDeltaPercent', 'avgDrawTotalMs', 'deltaPercent')
+    , @('presentUiSignalLatencyDeltaPercent', 'avgPresentUiSignalLatencyMs', 'deltaPercent')
+    , @('presentDrawPresentDeltaPercent', 'avgPresentDrawPresentMs', 'deltaPercent')
+    , @('presentPacingDeltaPercent', 'avgPresentPacingMs', 'deltaPercent')
+    , @('prepBeforeFinishDeltaPercent', 'avgPrepBeforeFinishMs', 'deltaPercent')
+    , @('candidateQueueWaitMs', 'avgQueueWaitMs', 'candidate')
+    , @('candidateDrawTotalMs', 'avgDrawTotalMs', 'candidate')
+    , @('candidateTextureTotalMs', 'avgTextureTotalMs', 'candidate')
+    , @('candidateTextureWallMs', 'avgTextureWallMs', 'candidate')
+    , @('candidatePresentIntervalMs', 'avgPresentIntervalMs', 'candidate')
+)
+
+function Test-FpsProofReportSpeedQuotable {
+    <#
+    .SYNOPSIS
+    ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6, 8747fced A6): may a local CUDA proof report (summarize-local-cuda-proof.ps1 -Json) be quoted for playback SPEED? The packager and the
+    importer both ask this one question. Only when its raw text repeats no key, its status is the string QUOTABLE_PASS, its claimAuthority is ONE object whose speed is exactly $true, and its
+    playbackSpeed section is ONE object whose status is the string PASS. A REFUSED section, a singleton array, a repeated key or any other shape grants no speed authority.
+    #>
+    param([AllowNull()]$Report, [AllowNull()][string]$RawText)
+    if ($null -eq $Report -or [string]::IsNullOrWhiteSpace($RawText)) { return $false }
+    if ($null -ne (Get-FpsJsonRepeatedKeyProblem $RawText)) { return $false }
+    if (-not (Test-FaTextEq (Get-FaProp $Report 'status') 'QUOTABLE_PASS')) { return $false }
+    $authority = Get-FaProp $Report 'claimAuthority'
+    if ($authority -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    $speed = Get-FaProp $authority 'speed'
+    if (-not ($speed -is [bool] -and $speed)) { return $false }
+    $section = Get-FaProp $Report 'playbackSpeed'
+    if ($section -isnot [System.Management.Automation.PSCustomObject]) { return $false }
+    Test-FaTextEq (Get-FaProp $section 'status') 'PASS'
 }
 
 function Get-FpsJsonRepeatedKeyProblem {
@@ -680,4 +770,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Test-FpsProofReportSpeedQuotable, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal

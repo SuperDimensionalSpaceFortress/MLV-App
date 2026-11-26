@@ -258,10 +258,15 @@ function Get-ProofSpeedClaimAuthority {
     # r15 (adversary r14 pass 18 A6): QUOTABLE_PASS is the SUPPORT gate (a REFUSED playback-speed section keeps `passed`, so the overall status can pass); it never by itself grants SPEED
     # authority. Speed is quotable only when the packet is QUOTABLE_PASS AND its playbackSpeed section reads exactly PASS: a REFUSED section (its presented-fps pair refused by the arm gate),
     # a BLOCKED one or a missing one carries no authority to quote playback speed.
-    param([Parameter(Mandatory = $true)][string]$OverallStatus, [AllowNull()]$PlaybackSpeedVerdict)
+    # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A5, 8747fced A4): -SpeedCompare is the compare the section judged. A PASS section whose compare holds no presented-fps pair (compare:{},
+    # or only stage metrics) printed "presented FPS: n/a" and still granted speed; speed now also needs a numeric baseline and candidate presented fps in that compare.
+    param([Parameter(Mandatory = $true)][string]$OverallStatus, [AllowNull()]$PlaybackSpeedVerdict, [AllowNull()]$SpeedCompare)
     $sectionStatus = if ($null -eq $PlaybackSpeedVerdict) { $null } else { $PlaybackSpeedVerdict.status }
-    $speed = ($OverallStatus -ceq "QUOTABLE_PASS") -and ($sectionStatus -is [string]) -and ($sectionStatus -ceq "PASS")
-    $reason = if ($speed) { "" } elseif ($OverallStatus -cne "QUOTABLE_PASS") { "packet-not-quotable" } else { "playback-speed-section-$(if ($sectionStatus -is [string] -and $sectionStatus) { $sectionStatus } else { 'missing' })" }
+    $presentedFps = Get-Field $SpeedCompare "presentedFps"
+    $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long]) }
+    $fpsMeasured = ($null -ne $presentedFps) -and (& $isNumber (Get-Field $presentedFps "baseline")) -and (& $isNumber (Get-Field $presentedFps "candidate"))
+    $speed = ($OverallStatus -ceq "QUOTABLE_PASS") -and ($sectionStatus -is [string]) -and ($sectionStatus -ceq "PASS") -and $fpsMeasured
+    $reason = if ($speed) { "" } elseif ($OverallStatus -cne "QUOTABLE_PASS") { "packet-not-quotable" } elseif (($sectionStatus -is [string]) -and ($sectionStatus -ceq "PASS")) { "presented-fps-not-measured" } else { "playback-speed-section-$(if ($sectionStatus -is [string] -and $sectionStatus) { $sectionStatus } else { 'missing' })" }
     [pscustomobject]@{
         support = ($OverallStatus -ceq "QUOTABLE_PASS")
         speed = [bool]$speed
@@ -1094,7 +1099,7 @@ foreach ($section in @($playbackVerdict, $playbackAbVerdict, $cdngVerdict)) {
 $overallStatus = if ($overallBlockers.Count -eq 0) { "QUOTABLE_PASS" } else { "NOT_QUOTABLE" }
 $diagnosticList = @($diagnostics)
 $diagnosticSummary = Get-DiagnosticSummary -Diagnostics $diagnosticList
-$claimAuthority = Get-ProofSpeedClaimAuthority -OverallStatus $overallStatus -PlaybackSpeedVerdict $playbackAbVerdict
+$claimAuthority = Get-ProofSpeedClaimAuthority -OverallStatus $overallStatus -PlaybackSpeedVerdict $playbackAbVerdict -SpeedCompare $playbackAbSpeedCompare
 $actionPlan = New-ActionPlan `
     -Status $overallStatus `
     -Diagnostics $diagnosticList `

@@ -9,6 +9,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6): the speed-authority predicate the packager shares
+Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force
 
 function Resolve-RepoPath {
     param(
@@ -128,11 +130,13 @@ if (!(Test-Path -LiteralPath $proofReportMarkdownPath -PathType Leaf)) {
 $manifest = $null
 $summary = $null
 $proofReport = $null
+$proofReportRaw = $null
 if ($failures.Count -eq 0) {
     try {
         $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -Depth 100
         $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json -Depth 100
-        $proofReport = Get-Content -LiteralPath $proofReportJsonPath -Raw | ConvertFrom-Json -Depth 100
+        $proofReportRaw = Get-Content -LiteralPath $proofReportJsonPath -Raw
+        $proofReport = $proofReportRaw | ConvertFrom-Json -Depth 100
     }
     catch {
         Add-Message $failures "Failed to parse packet JSON: $($_.Exception.Message)"
@@ -230,7 +234,8 @@ $result = [ordered]@{
             path = $proofReportJsonPath
             status = $proofReport.status
             # r15 (adversary r14 pass 18 A6): speed authority is the report's claimAuthority.speed (exactly $true), never the support status; a report without it grants none
-            speedQuotable = (($proofReport.status -ceq "QUOTABLE_PASS") -and ($null -ne $proofReport.claimAuthority) -and ($proofReport.claimAuthority.speed -is [bool]) -and $proofReport.claimAuthority.speed)
+            # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6): one predicate with the packager (Test-FpsProofReportSpeedQuotable): the PASS playbackSpeed section, no singleton arrays, no repeated key
+            speedQuotable = (Test-FpsProofReportSpeedQuotable -Report $proofReport -RawText $proofReportRaw)
             claimAuthority = $proofReport.claimAuthority
             topLevelStatus = $proofReport.topLevelStatus
             blockers = @($proofReport.blockers)

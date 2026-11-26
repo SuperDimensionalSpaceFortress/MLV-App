@@ -1656,6 +1656,8 @@ if ($legPlanMode) {
         }
         if ($null -eq $rawItems -or $rawItems.Count -eq 0) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' names no legs (an array of items, or an object with a legs array)" }
         $planDir = Split-Path -Parent $planPath
+        # (read here, before the item loop, because the arm read's timeout refusal applies only to a plan that declares a purpose; the purpose itself is judged after the loop)
+        $planPurposeDeclared = ($doc -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $doc.PSObject.Properties['purpose'])
         $items = [System.Collections.Generic.List[object]]::new()
         for ($i = 0; $i -lt $rawItems.Count; $i++) {
             $it = $rawItems[$i]; $n = $i + 1
@@ -1678,7 +1680,9 @@ if ($legPlanMode) {
             $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce $path   # r6 (adversary A7): one judged digest per spec path
             if ($judgedConflict) { Stop-PlanRefused 'SPEC_CHANGED_BETWEEN_PLAN_ITEMS' $n $judgedConflict }
             $armRead = Get-LegSpecTelemetryArm $path
-            if ($armRead.readTimedOut) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n "'$path' cannot be run: the leg spec could not be read for its telemetry arm within the time left before -DeadlineUtc; no claim or lease is taken on it" }   # r6 (adversary pass 5 A5)
+            # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A1): the arm only decides anything for a plan that declares a purpose. A purpose-free plan records the arm (UNKNOWN when its read got no
+            # answer) and goes on to the base's own reads, so a stalled arm read never pre-empts its staging refusal (BUILD_NOT_STAGED item=<n>).
+            if ($armRead.readTimedOut -and $planPurposeDeclared) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n "'$path' cannot be run: the leg spec could not be read for its telemetry arm within the time left before -DeadlineUtc; no claim or lease is taken on it" }   # r6 (adversary pass 5 A5)
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
                     telemetryArm = $armRead.arm })
         }
@@ -1687,7 +1691,6 @@ if ($legPlanMode) {
         # purpose: nothing is refused here, and every gain/cost reader still refuses an fps verdict from a HEAVY / UNKNOWN pair. Checked with the items, before any claim, lease or staging read.
         # The purpose is passed AS PARSED, never coerced to a string: a one-element ["fps-ab"] would otherwise read as 'fps-ab' (adversary A3). A declared purpose that is not the scalar string is BAD_PURPOSE.
         $planPurpose = $null
-        $planPurposeDeclared = ($doc -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $doc.PSObject.Properties['purpose'])
         if ($planPurposeDeclared) { $planPurpose = $doc.PSObject.Properties['purpose'].Value }
         $purposeRefusal = Get-FpsLegPlanRefusal -Purpose $planPurpose -Items @($items | ForEach-Object { [pscustomobject]@{ item = $_.item; arm = $_.telemetryArm } }) -Declared:$planPurposeDeclared
         if ($purposeRefusal[0]) { Stop-PlanRefused ([string]$purposeRefusal[0]) ([int]$purposeRefusal[1]) ([string]$purposeRefusal[2]) }

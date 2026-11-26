@@ -9,6 +9,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6): the speed-authority predicate the importer shares
+Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force
 
 function Resolve-RepoPath {
     param(
@@ -108,6 +110,11 @@ function Invoke-ProofSummarizer {
     if (!(Test-Path -LiteralPath $summaryScript -PathType Leaf)) {
         throw "Proof summarizer not found: $summaryScript"
     }
+    # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 8747fced A5): exit 1 also means the summarizer refused its input before writing (a repeated key), so a report an EARLIER run left here would be
+    # packaged as this summary's. Both reports are removed first, and each must exist after its run.
+    foreach ($stale in @($MarkdownReport, $JsonReport)) {
+        if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
+    }
 
     & pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
         -File $summaryScript `
@@ -117,6 +124,9 @@ function Invoke-ProofSummarizer {
     $markdownExit = $LASTEXITCODE
     if ($markdownExit -notin @(0, 1)) {
         throw "Markdown proof report generation exited with code $markdownExit."
+    }
+    if (!(Test-Path -LiteralPath $MarkdownReport -PathType Leaf)) {
+        throw "Markdown proof report generation exited with code $markdownExit and wrote no report at $MarkdownReport (the summary was refused)."
     }
 
     & pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
@@ -128,6 +138,9 @@ function Invoke-ProofSummarizer {
     $jsonExit = $LASTEXITCODE
     if ($jsonExit -notin @(0, 1)) {
         throw "JSON proof report generation exited with code $jsonExit."
+    }
+    if (!(Test-Path -LiteralPath $JsonReport -PathType Leaf)) {
+        throw "JSON proof report generation exited with code $jsonExit and wrote no report at $JsonReport (the summary was refused)."
     }
 
     [pscustomobject]@{
@@ -186,7 +199,8 @@ $summarizerResult = Invoke-ProofSummarizer `
     -Summary $summaryFullPath `
     -MarkdownReport $ReportPath `
     -JsonReport $jsonReportPath
-$proofReport = Get-Content -LiteralPath $jsonReportPath -Raw | ConvertFrom-Json -Depth 100
+$proofReportRaw = Get-Content -LiteralPath $jsonReportPath -Raw
+$proofReport = $proofReportRaw | ConvertFrom-Json -Depth 100
 
 $hostSafe = if ([string]::IsNullOrWhiteSpace([string]$summary.host.name)) {
     [Environment]::MachineName
@@ -239,7 +253,8 @@ $manifest = [ordered]@{
         json = Get-FileArtifact -Path $jsonReportPath
         status = $proofReport.status
         # r15 (adversary r14 pass 18 A6): speed authority is the report's claimAuthority.speed (exactly $true), never the support status; a report without it grants none
-        speedQuotable = (($proofReport.status -ceq "QUOTABLE_PASS") -and ($null -ne $proofReport.claimAuthority) -and ($proofReport.claimAuthority.speed -is [bool]) -and $proofReport.claimAuthority.speed)
+        # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6): one predicate with the importer (Test-FpsProofReportSpeedQuotable): the PASS playbackSpeed section, no singleton arrays, no repeated key
+        speedQuotable = (Test-FpsProofReportSpeedQuotable -Report $proofReport -RawText $proofReportRaw)
         claimAuthority = $proofReport.claimAuthority
         topLevelStatus = $proofReport.topLevelStatus
         markdownExitCode = $summarizerResult.markdownExitCode
