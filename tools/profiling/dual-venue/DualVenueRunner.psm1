@@ -2873,6 +2873,12 @@ function Get-DvLegSetPlan {
             Import-Module (Join-Path $PSScriptRoot 'VenueChain.psm1') -Function Get-VenuePlannedLegType -DisableNameChecking
         }
         $specPlannedLegType = Get-VenuePlannedLegType -SpecText $specText
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A6, NARROWED): a spec the strict reader types 'unknown' (a repeated member in any spelling, not one JSON
+        # object, unreadable) is refused here, typed. It used to be planned with plannedLegType 'unknown' beside a cellId and downstream branches (preflight, dispatch) made by the
+        # last-wins object, so two readers disagreed about one leg: an ambiguous ProRes spec took the 'cpu-export-prores' cell and collided with an unambiguous one.
+        if ([string]::Equals($specPlannedLegType, 'unknown', [StringComparison]::Ordinal)) {
+            throw "DVE_LEGSET_INVALID leg '$($spec.legId)' has a legType the strict spec reader cannot judge (a member repeated in any spelling, or a spec that is not one JSON object); a spec whose legType is ambiguous is never planned"
+        }
         $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256; plannedLegType = $specPlannedLegType })
     }
     $backends = [System.Collections.Generic.List[string]]::new()

@@ -614,7 +614,8 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         # ReadAllBytes; the matrix runner (which calls the reader) ends through Complete-VenueProcess so an abandoned read cannot hold its exit.
         dv = ROOT / "tools" / "profiling" / "dual-venue"
         batch = (dv / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
-        self.assertIn("-ExpectReceiptSha256 $receiptSha -ReadTimeoutSec ([Math]::Min(20.0, ($deadline - [DateTime]::UtcNow).TotalSeconds))", batch)
+        # R4-NARROW-1 r2 (adversary-6596e055.json A4): the remainder is no longer sampled as a number; the reader is handed the absolute UTC end (-CallDeadlineUtc) and judges it itself
+        self.assertIn("-ExpectReceiptSha256 $receiptSha -ReadTimeoutSec 20.0 -CallDeadlineUtc $deadline", batch)
         module = MODULE.read_text(encoding="utf-8")
         reader = module[module.index("function Get-VenueLegHostLoad {"):module.index("function Get-VenueReferenceHostLoadRefusal {")]
         self.assertNotIn("ReadAllBytes", reader)
@@ -653,6 +654,90 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertEqual(got["M1"], "False", "the worker was started after the caller's end: " + p.stdout)
         self.assertTrue(got["C"].startswith("THROWN") and "did not finish" in got["C"], p.stdout)
         self.assertEqual((got["B"], got["M2"]), ("True", "True"), "a read inside its budget still runs: " + p.stdout)
+
+    def test_r4n2_a3_a_budget_spent_during_worker_setup_starts_no_read(self) -> None:
+        # adversary-6596e055.json A3, its input: the caller is descheduled after the budget check and the worker is created / given its script and argument, and resumes past the shared
+        # end before BeginInvoke. RED on 077be843: the budget was checked once, BEFORE Create/AddScript/AddArgument, so the worker still started and ran its I/O (marker written).
+        # The seam VenueTestPreBeginDelayMs is that pause (after AddArgument, before BeginInvoke). Now the budget is looked at again right before BeginInvoke: nothing starts.
+        with tempfile.TemporaryDirectory() as d:
+            gone, live = Path(d) / "marker-expired.txt", Path(d) / "marker-live.txt"
+            body = (
+                "$vc = Get-Module VenueChain; $script = 'param($p) [IO.File]::WriteAllText($p, ''x'')'; "
+                "& $vc { $script:VenueTestPreBeginDelayMs = 700 }; "
+                "$sw = [Diagnostics.Stopwatch]::StartNew(); "
+                f"$a = & $vc {{ param($sw, $m, $s) Invoke-VenueBoundedRead -ScriptText $s -Argument $m -TimeoutSec 5 -Clock $sw -EndSec 0.3 }} $sw '{gone}' $script; "
+                "Start-Sleep -Milliseconds 1500; "
+                "Write-Output ('A=' + $a.answered); Write-Output ('AERR=' + $a.error); "
+                f"Write-Output ('M1=' + (Test-Path -LiteralPath '{gone}')); "
+                "& $vc { $script:VenueTestPreBeginDelayMs = 0 }; "
+                "$sw2 = [Diagnostics.Stopwatch]::StartNew(); "
+                f"$b = & $vc {{ param($sw, $m, $s) Invoke-VenueBoundedRead -ScriptText $s -Argument $m -TimeoutSec 5 -Clock $sw -EndSec 30 }} $sw2 '{live}' $script; "
+                "Write-Output ('B=' + $b.answered); "
+                f"Write-Output ('M2=' + (Test-Path -LiteralPath '{live}'))")
+            p = run_ps(body)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["A"], "False", p.stdout)
+        self.assertIn("no time is left", got["AERR"], p.stdout)
+        self.assertEqual(got["M1"], "False", "the worker was started after the caller's end: " + p.stdout)
+        self.assertEqual((got["B"], got["M2"]), ("True", "True"), "a read inside its budget still runs: " + p.stdout)
+
+    def test_r4n2_a3_the_file_read_worker_is_handed_the_call_end_and_reads_nothing_past_it(self) -> None:
+        # adversary-6596e055.json A3 (the worker half): the worker (Test-Path then ReadAllBytes) received neither a clock nor an end, so a read that started in time still ran its I/O past
+        # the end. Now it is handed the absolute UTC end and checks it before the existence probe and again before ReadAllBytes. The worker text is run here as the bounded read runs it.
+        with tempfile.TemporaryDirectory() as d:
+            blob = Path(d) / "f.bin"
+            blob.write_bytes(b"abc")
+            body = (
+                "$vc = Get-Module VenueChain; $w = & $vc { $script:VenueFileReadWorkerText }; $sb = [scriptblock]::Create([string]$w); "
+                "$past = [DateTime]::UtcNow.AddSeconds(-1).Ticks; $future = [DateTime]::UtcNow.AddSeconds(60).Ticks; "
+                f"$r1 = try {{ $x = & $sb @{{ path = '{blob}'; missingOk = $false; delayMs = 0; endUtcTicks = $past }}; 'READ' + @($x).Count }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('PAST=' + $r1); "
+                f"$r2 = try {{ $x = & $sb @{{ path = '{blob}'; missingOk = $true; delayMs = 0; endUtcTicks = $past }}; 'READ' + @($x).Count }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('PASTMISSINGOK=' + $r2); "
+                f"$r3 = try {{ $x = & $sb @{{ path = '{blob}'; missingOk = $false; delayMs = 700; endUtcTicks = [DateTime]::UtcNow.AddMilliseconds(300).Ticks }}; 'READ' + @($x).Count }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('EXPIRESDURINGDELAY=' + $r3); "
+                f"$r4 = try {{ $x = & $sb @{{ path = '{blob}'; missingOk = $false; delayMs = 0; endUtcTicks = $future }}; 'READ' + @($x).Count }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('FUTURE=' + $r4)")
+            p = run_ps(body)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        for key in ("PAST", "PASTMISSINGOK", "EXPIRESDURINGDELAY"):
+            self.assertTrue(got[key].startswith("THROWN") and "call end" in got[key], (key, p.stdout))
+        self.assertEqual(got["FUTURE"], "READ3", "a read inside its end still reads its three bytes: " + p.stdout)
+        module = MODULE.read_text(encoding="utf-8")
+        self.assertEqual(module.count("endUtcTicks = "), 1, "the one bounded file read hands its worker the end")
+
+    def test_r4n2_a4_the_reader_ends_by_the_absolute_utc_deadline_the_caller_hands_it(self) -> None:
+        # adversary-6596e055.json A4, its input: the caller sampled "remaining = 1.25 s" as a number, was paused past the UTC deadline, and the reader started its own stopwatch then, so both reads
+        # ran after the deadline. RED on 077be843: there was no way to hand the reader the end (no -CallDeadlineUtc), only a relative number. The deadline passed here is already behind us while
+        # -ReadTimeoutSec still says 20: the reader judges the ABSOLUTE end at its own start, so no read starts and the standing is unknown (uncounted). A deadline far off reads quiet; one
+        # under 1 s away is not started either; the reader's -ReadTimeoutSec still caps a far deadline.
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            quiet = json.dumps({"hostLoad": QUIET})
+            sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            rid = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+            path = self.write_leg(Path(d), rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+            base = f"Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20"
+            p = run_ps(
+                "& (Get-Module VenueChain) { $script:VenueTestFileReadDelayMs = 0 }; "
+                f"$a = {base} -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(-1)); Write-Output ('A=' + $a.state + '/' + $a.provisional); Write-Output ('AWHY=' + $a.reason); "
+                f"$b = {base} -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(0.5)); Write-Output ('B=' + $b.state + '/' + $b.provisional); "
+                f"$c = {base} -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(60)); Write-Output ('C=' + $c.state + '/' + $c.provisional); "
+                # the absolute end also cuts a SECOND read that no longer fits: each read alone answers in 0.9 s, the deadline is 2.0 s out and the budget under it is shared
+                "& (Get-Module VenueChain) { $script:VenueTestFileReadDelayMs = 900 }; "
+                f"$d = {base} -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(1.5)); Write-Output ('D=' + $d.state + '/' + $d.provisional); "
+                "& (Get-Module VenueChain) { $script:VenueTestFileReadDelayMs = 0 }; "
+                "Complete-VenueProcess -ExitCode 0; Write-Output 'NOT-REACHED-WHEN-A-READ-WAS-ABANDONED'")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["A"], "unknown/True", "a deadline already behind us starts no read: " + p.stdout)
+        self.assertIn("no time was left", got["AWHY"], p.stdout)
+        self.assertEqual(got["B"], "unknown/True", "under 1 s to the deadline starts no read: " + p.stdout)
+        self.assertEqual(got["C"], "quiet/False", "a far deadline still reads its own standing: " + p.stdout)
+        self.assertEqual(got["D"], "unknown/True", "two reads that do not both fit before the deadline: the second is cut: " + p.stdout)
+        chain = (ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        batch = (ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        for label, text in (("chain", chain), ("batch", batch)):
+            self.assertIn("-ExpectReceiptSha256 $receiptSha -ReadTimeoutSec 20.0 -CallDeadlineUtc $deadline", text, label)
+            self.assertNotIn("[Math]::Min(20.0, ($deadline - [DateTime]::UtcNow).TotalSeconds)", text, f"{label}: the remainder is no longer sampled as a number")
 
     def test_r2_pass2_a5_a7_a13_the_matrix_refuses_a_replaced_receipt_the_planner_refuses_a_duplicated_legtype_the_verdict_keeps_a_list(self) -> None:
         # adversary-b3d61554.json A5: the matrix drops the receipt whose bytes are not the ones the child published (as the baseline refuses them), so a replacement's outcome and

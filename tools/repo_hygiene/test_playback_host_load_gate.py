@@ -3796,7 +3796,7 @@ def _report_write_probe(tmp: str, before: Path, after: Path, report: Path, outdi
     block = _extract_report_write_block(COMPARE_SCRIPT.read_text(encoding="utf-8"))
     script = Path(tmp) / "write-probe.ps1"
     script.write_text(
-        "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity"]) +
+        "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity", "Get-SmokeReparsePointComponent"]) +
         f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $outputDir = '{outdir}'; $json = '{{\"report\":true}}'\n"
         "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
         "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
@@ -4079,7 +4079,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
                 p.write_text("{}", encoding="utf-8", newline="")
             script = Path(tmp) / "write.ps1"
             script.write_text(
-                "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity"]) +
+                "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity", "Get-SmokeReparsePointComponent"]) +
                 f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $outputDir = '{tmp}'; $json = '{{\"report\":true}}'\n"
                 "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
                 "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
@@ -4124,7 +4124,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
                 p.write_text("{}", encoding="utf-8", newline="")
             script = Path(tmp) / "write.ps1"
             script.write_text(
-                "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity"]) +
+                "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity", "Get-SmokeReparsePointComponent"]) +
                 f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $outputDir = '{outdir}'; $json = '{{\"report\":true}}'\n"
                 "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
                 "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
@@ -4201,6 +4201,77 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
                     self.assertFalse(left, f"{label}: the empty folder(s) this call created are removed\n" + proc.stdout + proc.stderr)
             finally:
                 subprocess.run(["icacls", str(evidence), "/remove:d", user], capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=60)
+
+    @staticmethod
+    def _dir_link(link: Path, target: Path) -> None:
+        """A directory junction on Windows (no privilege needed), a symlink elsewhere: the link a path component can be swapped for."""
+        if os.name == "nt":
+            made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=60)
+            if made.returncode != 0:
+                raise unittest.SkipTest("mklink /J failed: " + made.stdout + made.stderr)
+        else:
+            os.symlink(target, link, target_is_directory=True)
+
+    @requires_pwsh
+    def test_r4n2_a1_an_input_or_output_path_with_a_reparse_point_component_is_refused_and_nothing_is_written(self) -> None:
+        # adversary-6596e055.json A1, its input class (NARROWED, MLV R4-NARROW-1 r2): `current` is a directory junction/symlink to a folder holding before.json. A path component that
+        # can be swapped for a link to the report folder after the identity checks is exactly what the move replaces, and a rename protects only a separate hard-link name. RED on
+        # 077be843: the report was written through the link. Now an input or output path with a reparse-point component is a typed refusal and nothing is written.
+        for label in ("before-input", "after-input", "output-folder"):
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix="r4n2-a1-") as tmp:
+                root = Path(tmp)
+                real = root / "real"
+                real.mkdir()
+                (real / "before.json").write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+                (real / "after.json").write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+                link = root / "current"
+                self._dir_link(link, real)
+                before, after, out = real / "before.json", real / "after.json", root / "report.json"
+                if label == "before-input":
+                    before = link / "before.json"
+                elif label == "after-input":
+                    after = link / "after.json"
+                else:
+                    out = link / "report.json"
+                proc = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", str(out))
+                text = _flat_pwsh_text(proc.stdout + proc.stderr)
+                self.assertNotEqual(proc.returncode, 0, text)
+                self.assertIn("reparse-point", text, text)
+                self.assertFalse((real / "report.json").exists() or out.exists(), "nothing is written through a link\n" + text)
+                self.assertEqual(sorted(x.name for x in real.iterdir()), ["after.json", "before.json"], "no temporary file is left in the target folder")
+        cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        block = _extract_report_write_block(cmp)
+        self.assertGreaterEqual(block.count("Get-SmokeReparsePointComponent"), 2, "the refusal runs at the start of the write block and again right before the temporary file is made")
+
+    @requires_pwsh
+    def test_r4n2_a7_a_one_element_root_array_is_not_unwrapped_into_a_figure_object(self) -> None:
+        # adversary-6596e055.json A7, its input: Before is [{"playbackFps":{"smokePresentedFps":99},"hostLoad":{...quiet...}}] (a ONE-element root array), After is {}. RED on 077be843: ConvertFrom-Json
+        # unwrapped the singleton into its member, so no parse error was recorded and the report published the invalid root's raw before-FPS 99 beside an INCONCLUSIVE verdict. -NoEnumerate keeps
+        # the array, so the root is refused as "not one object", its figures read empty, and nothing of it is published. A plain object root still publishes its figure.
+        member = '{"playbackFps":{"smokePresentedFps":99},"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        for label, text, published in (("one-element-array", "[" + member + "]", None), ("object", member, 99)):
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix="r4n2-a7-") as tmp:
+                before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+                before.write_text(text, encoding="utf-8", newline="")
+                after.write_text("{}", encoding="utf-8", newline="")
+                proc, report = self._compare(before, after, out)
+                self.assertIsNotNone(report, proc.stdout + proc.stderr)
+                self.assertEqual(report["fps"]["smokePresentedFps"]["before"], published, report["fps"]["smokePresentedFps"])
+                if published is None:
+                    self.assertTrue(any("not one object" in str(f) for f in report["failures"]), report["failures"])
+                    self.assertEqual(report["verdict"], "INCONCLUSIVE")
+        source = _extract_functions(COMPARE_SCRIPT, ["Read-SmokeSourceOnce"])
+        self.assertIn("ConvertFrom-Json -InputObject $parseText -Depth 100 -NoEnumerate", source)
+
+    @requires_pwsh
+    def test_r4n2_a1_plain_paths_still_publish_the_report(self) -> None:
+        # the narrowing refuses only a link component: ordinary distinct paths, and a folder this call creates, still publish
+        with tempfile.TemporaryDirectory(prefix="r4n2-a1ok-") as tmp:
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "new" / "deeper" / "report.json"
+            for p in (before, after):
+                p.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            proc, report = self._compare(before, after, out)
+            self.assertIsNotNone(report, proc.stdout + proc.stderr)
 
     def test_r3_a3_a_one_element_candidate_list_is_provisional_not_unrolled_into_its_clean_member(self) -> None:
         # adversary-7efea617.json A3, its input: candidate = [one clean leg]. RED: `$x = if (...) { $Record.candidate }` unrolled the one-element list into its

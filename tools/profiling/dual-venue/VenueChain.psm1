@@ -1229,6 +1229,12 @@ $script:VenueTestUtcStepSec = 0
 # Test-only (VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r2, adversary-7efea617.json A4): Read-VenueFileBytesBounded's worker sleeps this many ms before it reads, as a share that
 # answers late does. Production leaves it 0.
 $script:VenueTestFileReadDelayMs = 0
+# Test-only (VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2, adversary-6596e055.json A3): Invoke-VenueBoundedRead sleeps this many ms after it created the worker and gave it its script and
+# argument, right before the budget is looked at again and BeginInvoke runs, as a caller descheduled during worker setup does. Production leaves it 0.
+$script:VenueTestPreBeginDelayMs = 0
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the worker of Read-VenueFileBytesBounded. It is handed the ABSOLUTE UTC end of the caller's budget (endUtcTicks, 0 = none) and
+# checks it before the existence probe and again before ReadAllBytes, so a read that was started in time still performs no I/O once the end has passed. (No apostrophe in the messages: this is single-quoted text.)
+$script:VenueFileReadWorkerText = 'param($a) $ErrorActionPreference = ''Stop''; if ($a.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$a.delayMs) }; if ($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) { throw ''the call end had passed before the read started; no file was touched'' }; if ($a.missingOk -and -not (Test-Path -LiteralPath $a.path -PathType Leaf)) { return }; if ($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) { throw ''the call end passed during the existence probe; the file was not read'' }; ,[IO.File]::ReadAllBytes($a.path)'
 
 function Complete-VenueProcess {
     <#
@@ -1272,6 +1278,12 @@ function Invoke-VenueBoundedRead {
     try {
         [void]$ps.AddScript($ScriptText)
         [void]$ps.AddArgument($Argument)
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the budget is looked at AGAIN right before BeginInvoke. The check above runs before the worker is created and given
+        # its script and argument; a caller descheduled during that setup used to resume past its end and still start the I/O. (Disposed unstarted by the finally below.)
+        if ($script:VenueTestPreBeginDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreBeginDelayMs) }
+        if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -le 0) {
+            return [pscustomobject]@{ answered = $false; value = @(); error = "no time is left of the caller's budget to start the read (its end passed $([Math]::Round($Clock.Elapsed.TotalSeconds - $EndSec, 2)) s ago, during the worker's setup); nothing was started" }
+        }
         $async = $ps.BeginInvoke()
         if ($script:VenueTestPreWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreWaitDelayMs) }
         # r13 (Grok G20 on #814): $endCut = the caller's end, not -TimeoutSec, set the wait (as the nightly's capCut), so the message reports the wait actually given
@@ -1308,9 +1320,13 @@ function Read-VenueFileBytesBounded {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][double]$TimeoutSec, [switch]$MissingIsNull, [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0)
     # (-VenueTestFileReadDelayMs is a test-only seam: the worker sleeps that long first, as a share that answers late does; production leaves it 0)
     # pass 2 (A11): $ErrorActionPreference Stop, so a failed read is a terminating error the bounded read reports (its message names the cause), never an empty answer read as "no file"
-    $worker = 'param($a) $ErrorActionPreference = ''Stop''; if ($a.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$a.delayMs) }; if ($a.missingOk -and -not (Test-Path -LiteralPath $a.path -PathType Leaf)) { return }; ,[IO.File]::ReadAllBytes($a.path)'
-    $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $worker -Argument @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs } -TimeoutSec ([Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))) -Clock $Clock -EndSec $EndSec -EndIsBoundEnd }
-           else { Invoke-VenueBoundedRead -ScriptText $worker -Argument @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs } -TimeoutSec ([Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))) })
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the worker is handed the ABSOLUTE UTC end of this read (the wait it is given: -TimeoutSec, cut to what is left of the caller's
+    # -Clock/-EndSec) and refuses to touch the file once it has passed ($script:VenueFileReadWorkerText checks it before the probe and before ReadAllBytes)
+    $boundSec = [Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))
+    $waitSec = $(if ($null -ne $Clock) { [Math]::Min($boundSec, $EndSec - $Clock.Elapsed.TotalSeconds) } else { $boundSec })
+    $workerArg = @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs; endUtcTicks = ([DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $waitSec)).Ticks) }
+    $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd }
+           else { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec })
     if (-not $r.answered) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: $($r.error)" }
     $got = @($r.value)
     if ($got.Count -eq 0) {
@@ -1958,14 +1974,23 @@ function Get-VenueLegHostLoad {
     # (Read-VenueFileBytesBounded, on Invoke-VenueBoundedRead's worker), so a deadline stop is bounded by what the caller says is left. A caller near a deadline passes what remains;
     # under 1 s the read is not started and the standing is 'unknown' (uncounted, the safe side). A read not answered in time is 'unknown' with that reason, never a hang.
     param([string]$ReceiptPath, [AllowNull()][AllowEmptyString()][string]$ExpectResultJsonSha256, [AllowNull()][AllowEmptyString()][string]$PlannedLegType,
-        [AllowNull()][AllowEmptyString()][string]$ExpectReceiptSha256, [double]$ReadTimeoutSec = 20.0)
+        [AllowNull()][AllowEmptyString()][string]$ExpectReceiptSha256, [double]$ReadTimeoutSec = 20.0, [DateTime]$CallDeadlineUtc)
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A4): -CallDeadlineUtc is the caller's ABSOLUTE end (the chain's and the batch's -DeadlineUtc). The caller used to sample "what is left"
+    # as a number and hand that over, so a caller paused between the sample and this call's own stopwatch read after its deadline. The end is judged HERE, at this call's start, on the wall clock: the
+    # shared budget of the two reads is min(-ReadTimeoutSec, the seconds to that end), and under 1 s to it nothing is started (unknown, provisional, uncounted: the safe side). Absent: -ReadTimeoutSec alone.
     $unknown = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no smoke result.json for the leg'; applies = $true }
     try {
         if (-not $ReceiptPath) { return $unknown }
         if (-not ($ReadTimeoutSec -ge 1.0)) { $unknown.reason = 'no time was left to read the leg''s receipt and smoke result'; return $unknown }
         # pass 2 (adversary-b3d61554.json A1): ONE budget for both reads (this Stopwatch and the same end), never a fresh bound per read, and an answer past the end is not acted on
         $readClock = [Diagnostics.Stopwatch]::StartNew()
-        $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $ReadTimeoutSec -Clock $readClock -EndSec $ReadTimeoutSec
+        $budgetSec = $ReadTimeoutSec
+        if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) {
+            $toDeadline = ($CallDeadlineUtc.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds
+            if (-not ($toDeadline -ge 1.0)) { $unknown.reason = 'no time was left before the caller''s deadline to read the leg''s receipt and smoke result'; return $unknown }
+            if ($toDeadline -lt $budgetSec) { $budgetSec = $toDeadline }
+        }
+        $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $budgetSec -Clock $readClock -EndSec $budgetSec
         if ($PSBoundParameters.ContainsKey('ExpectReceiptSha256')) {
             $rcGot = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes))
             if ([string]::IsNullOrEmpty($ExpectReceiptSha256) -or -not [string]::Equals($rcGot, $ExpectReceiptSha256, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the bytes the figures were read from'; return $unknown }
@@ -1994,7 +2019,7 @@ function Get-VenueLegHostLoad {
         $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
         $evidence = Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))
         $result = Join-Path $evidence 'result.json'
-        $bytes = Read-VenueFileBytesBounded -Path $result -TimeoutSec $ReadTimeoutSec -MissingIsNull -Clock $readClock -EndSec $ReadTimeoutSec
+        $bytes = Read-VenueFileBytesBounded -Path $result -TimeoutSec $budgetSec -MissingIsNull -Clock $readClock -EndSec $budgetSec
         if ($null -eq $bytes) { return $unknown }
         $got =[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
         if (-not [string]::Equals($got, $want, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = "result.json does not match the receipt's evidence.resultJsonSha256"; return $unknown }

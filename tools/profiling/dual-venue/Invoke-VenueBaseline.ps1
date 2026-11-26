@@ -483,7 +483,12 @@ foreach ($b in $StandardBackends) {
             # evidence manifest, an INVALID or incomplete verdict) is not this leg's receipt, so it binds no host load either: the standing is read from NO receipt (the reader's own unknown, provisional and
             # uncollected answer), never from a result.json that merely hashes to what the refused receipt claims. Get-RowFigures sets resultJsonSha256 BEFORE it validates, so that field alone cannot say so.
             $figRefused = (-not [string]::IsNullOrEmpty([string]$fig.identity)) -or (-not [string]::IsNullOrEmpty([string]$fig.rejected))
-            $hl = $(if ($figRefused) { Get-VenueLegHostLoad -ReceiptPath '' -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' }
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A5, NARROWED): the chain's own host-load refusal survives this handoff. A chain row that says HOSTLOAD_PROVISIONAL (its class), or whose
+            # hostLoadProvisional member is anything but the boolean false, was judged by the chain (at its deadline it skips the read: the unknown, provisional standing). Re-reading the standing here on a fresh
+            # default 20 s budget promoted such a row to quiet and counted it in measuredRows, so a row the chain refused reads unknown, provisional and uncollected: no read is made. A legacy row with neither member is unchanged.
+            $chainRefusedHostLoad = ($leg.PSObject.Properties['class'] -and [string]::Equals([string]$leg.class, 'HOSTLOAD_PROVISIONAL', [StringComparison]::Ordinal)) -or
+                ($leg.PSObject.Properties['hostLoadProvisional'] -and -not ($leg.hostLoadProvisional -is [bool] -and -not $leg.hostLoadProvisional))
+            $hl = $(if ($figRefused -or $chainRefusedHostLoad) { Get-VenueLegHostLoad -ReceiptPath '' -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' }
                     elseif ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned -ExpectReceiptSha256 $hlExpectSha }
                     else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' })
             $hlLine = Get-VenueReferenceHostLoadRefusal -LegId $(if ($hlReceipt) { [IO.Path]::GetFileNameWithoutExtension($hlReceipt) } else { [string]$planLeg.legId }) -Standing $hl

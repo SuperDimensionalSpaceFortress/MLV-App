@@ -554,7 +554,8 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual(len(ran), 1, r.stdout + r.stderr)
         self.assertEqual((ran[0]["class"], ran[0].get("hostLoadState"), ran[0].get("hostLoadProvisional")), ("HOSTLOAD_PROVISIONAL", "unknown", True), r.stdout)
         chain = (RUNNER).read_text(encoding="utf-8")
-        self.assertIn("-ExpectReceiptSha256 $receiptSha -ReadTimeoutSec ([Math]::Min(20.0, ($deadline - [DateTime]::UtcNow).TotalSeconds))", chain)
+        # R4-NARROW-1 r2 (adversary-6596e055.json A4): the reader is handed the absolute UTC deadline, never a remainder sampled before a pause
+        self.assertIn("-ExpectReceiptSha256 $receiptSha -ReadTimeoutSec 20.0 -CallDeadlineUtc $deadline", chain)
 
     # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1: Wait-VenueQuiet's FOREIGN_FLOOR early exit prints a typed line and then the same COOLDOWN_UNMET line; the chain must
     # still classify the leg COOLDOWN_UNMET (contended, never counted), never QUIET_PRELOAD_* and never VENUE_QUIET_UNKNOWN.

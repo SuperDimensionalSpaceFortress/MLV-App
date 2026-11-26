@@ -80,6 +80,28 @@ public static class MlvSmokeFileIdentityV2 {
     return ([string]$stat).Trim()
 }
 
+function Get-SmokeReparsePointComponent {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A1, NARROWED): the first existing component of $Path, from the root down (the leaf
+    # included), that is a reparse point (a symlink or a directory junction), else $null. A component that can be swapped for a link to the report folder after the
+    # identity checks is what the report move would replace, so an input or output path holding one is refused, typed, before anything is written. A component that does not
+    # exist yet (a folder this call is about to make) is no link; one whose attributes cannot be read cannot be ruled out and is returned.
+    param([string]$Path)
+
+    $full = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($full)
+    $chain = @()
+    for ($probe = $full; -not [string]::IsNullOrEmpty($probe) -and $probe.Length -gt $root.Length; $probe = [IO.Path]::GetDirectoryName($probe)) { $chain += $probe }
+    [array]::Reverse($chain)
+    foreach ($component in $chain) {
+        try { $attributes = [IO.File]::GetAttributes($component) }
+        catch [IO.FileNotFoundException] { continue }
+        catch [IO.DirectoryNotFoundException] { continue }
+        catch { return $component }
+        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $component }
+    }
+    return $null
+}
+
 function Read-SmokeSourceOnce {
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): the comparator's ONE read of a smoke file. One ReadAllBytes feeds both the parse (the
     # figures) and the strict host-load reader (the text). A text the parser refuses (keys differing only in case, malformed JSON) does not throw: the
@@ -123,7 +145,9 @@ function Read-SmokeSourceOnce {
     $parseText = if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text.Substring(1) } else { $text }
     if ($null -eq $parseError) {
         try {
-            $smoke = ConvertFrom-Json -InputObject $parseText -Depth 100
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A7): -NoEnumerate, so a root that is a ONE-element array stays an array (refused below as "not one object"),
+            # never unwrapped into its member and read as the figure object
+            $smoke = ConvertFrom-Json -InputObject $parseText -Depth 100 -NoEnumerate
         }
         catch {
             $parseError = ($_.Exception.Message -replace '\s+', ' ')
@@ -1374,6 +1398,13 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         for ($probe = $outputDir; -not [string]::IsNullOrEmpty($probe) -and -not (Test-Path -LiteralPath $probe -PathType Container); $probe = Split-Path -Parent $probe) { $firstMissingDir = $probe }
     }
     try {
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A1, NARROWED): an input or output path with a reparse-point component (a symlink or junction) is refused before
+        # anything is made or written; the same check runs again right before the temporary file below, so a link put in place since is refused too
+        foreach ($linkCheck in @([pscustomobject]@{ Name = 'before smoke JSON'; Path = $beforeJsonPath }, [pscustomobject]@{ Name = 'after smoke JSON'; Path = $afterJsonPath }, [pscustomobject]@{ Name = 'report folder'; Path = $outputDir }, [pscustomobject]@{ Name = 'report'; Path = $resolvedOutput })) {
+            if ([string]::IsNullOrWhiteSpace($linkCheck.Path)) { continue }
+            $linkComponent = Get-SmokeReparsePointComponent -Path $linkCheck.Path
+            if ($null -ne $linkComponent) { throw "Output refused: the $($linkCheck.Name) path has a reparse-point (symlink or junction) component ($linkComponent), so a swap of it for a link to the report cannot be ruled out; nothing was written." }
+        }
         if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
             $createdDir = $null -ne $firstMissingDir
             New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
@@ -1401,7 +1432,12 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
             finally { if ($null -ne $currentStream) { $currentStream.Dispose() } }
             if ($null -ne $outIdentity -and [string]::Equals([string]$currentIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
         }
-        $tempOutput = Join-Path $outputDir ('.' + [IO.Path]::GetFileName($resolvedOutput) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        foreach ($linkCheck in @([pscustomobject]@{ Name = 'before smoke JSON'; Path = $beforeJsonPath }, [pscustomobject]@{ Name = 'after smoke JSON'; Path = $afterJsonPath }, [pscustomobject]@{ Name = 'report folder'; Path = $outputDir }, [pscustomobject]@{ Name = 'report'; Path = $resolvedOutput })) {
+            if ([string]::IsNullOrWhiteSpace($linkCheck.Path)) { continue }
+            $linkComponent = Get-SmokeReparsePointComponent -Path $linkCheck.Path
+            if ($null -ne $linkComponent) { throw "Output refused: the $($linkCheck.Name) path has a reparse-point (symlink or junction) component ($linkComponent), so a swap of it for a link to the report cannot be ruled out; nothing was written." }
+        }
+        $tempOutput = Join-Path $outputDir ('.' +[IO.Path]::GetFileName($resolvedOutput) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
         $tempStream = [IO.FileStream]::new($tempOutput, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try {
             $tempStream.Write($outBytes, 0, $outBytes.Length)
