@@ -7067,7 +7067,7 @@ exit 0
     # hash was published as THIS child's observed digest. The primary now classifies the child's own captured STDOUT, as the supplementary route does.
     FOREIGN_DIGEST = "f" * 64
     # (r2, adversary pass 1 A7: injected AFTER the operator's copy is written, so a primary that re-read the transcript for its refusal would publish the foreign digest)
-    CHAIN_FOREIGN_ANCHOR = "            try { $legLines | Out-File -LiteralPath $out } catch { [Console]::Error.WriteLine(\"leg transcript write failed for $($leg.name): $($_.Exception.Message -replace '\\s+', ' ')\") }\n"
+    CHAIN_FOREIGN_ANCHOR = "            try { $legLines | Out-File -LiteralPath $out } catch { Write-ChainDiag \"leg transcript write failed for $($leg.name): $($_.Exception.Message -replace '\\s+', ' ')\" }\n"
     CHAIN_FOREIGN_INJECT = ("            if ($env:DVT_FOREIGN_TRANSCRIPT -and $legCode -ne 0) { [IO.File]::WriteAllText($out, $env:DVT_FOREIGN_TRANSCRIPT + [Environment]::NewLine + "
                             "$(if (Test-Path -LiteralPath $out) { [IO.File]::ReadAllText($out) } else { '' })) }   # TEST FIXTURE: another run sharing the RunDir wrote the leg's transcript first\n")
 
@@ -7127,6 +7127,21 @@ exit 0
         fx["env"]["DVT_OBSTRUCT_TRANSCRIPT"] = "1"
         proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
         self.assertEqual(proc.returncode, 7, "old: Out-File threw and the chain died before classifying\n" + proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row.get("specRefusal")), ("LEG_FAILED", "DVE_CHAIN_SPEC_CHANGED"), proc.stdout + proc.stderr)
+
+    # r2 (adversary pass 2, A2): the diagnostic written from that catch must itself be best-effort (a caller that closed or disposed the process's stderr writer).
+    def test_planned_hash_bind_r9_residue_r2_a2b_a_stderr_the_caller_disposed_does_not_cost_the_chain_result_either(self) -> None:
+        anchor = "            $legCode = $LASTEXITCODE\n"
+        inject = ("            if ($env:DVT_OBSTRUCT_TRANSCRIPT) { New-Item -ItemType Directory -Force -Path $out | Out-Null; $dw = [IO.StreamWriter]::new([IO.MemoryStream]::new()); [Console]::SetError($dw); $dw.Dispose() }"
+                  "   # TEST FIXTURE: the transcript leaf cannot be written and the caller's stderr writer is disposed\n")
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", anchor, anchor + inject)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        fx = self.chain_fixture(dv, target, source)
+        fx["env"]["DVT_OBSTRUCT_TRANSCRIPT"] = "1"
+        proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+        self.assertEqual(proc.returncode, 7, "old: the catch's own stderr write threw and the chain died\n" + proc.stdout + proc.stderr)
         result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
         row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
         self.assertEqual((row["status"], row.get("specRefusal")), ("LEG_FAILED", "DVE_CHAIN_SPEC_CHANGED"), proc.stdout + proc.stderr)

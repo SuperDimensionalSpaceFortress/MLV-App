@@ -176,6 +176,9 @@ function L([string]$Message) {
     Add-Content -LiteralPath $ChainLog -Value $line
     Write-Output $line
 }
+# DV-PLANNED-SPEC-HASH-BIND-R9-RESIDUE-1 r2 (adversary pass 2 A2): a diagnostic written from a catch is best-effort too: a stderr that cannot be written (closed or disposed by the
+# caller) never replaces the observed result, CHAIN_RESULT or the next leg.
+function Write-ChainDiag([string]$Text) { try { [Console]::Error.WriteLine($Text) } catch { } }
 
 # The planned legs: name, spec path, backend ('' = whatever the spec lists, as Invoke-VenueLeg does with no -Backend).
 $plan = [System.Collections.Generic.List[object]]::new()
@@ -415,7 +418,7 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         # (BATCH-3 r9, adversary pass 11 A4: on every status but RAN, a TIMEOUT included: a child that printed its refusal and was then cut at the cap still refused the bytes)
         $sSpecRefusal = $(if ($sStatus -cne 'RAN' -and -not $sReceipt) { Get-LegSpecRefusalLine $sLines $Leg } else { '' })
         # (r2, adversary A5: the label's log write may fail; it never replaces the observed child failure recorded by Add-SuppResult below)
-        if ($sSpecRefusal) { try { L "$sSpecRefusal venue=$suppVenue role=supplementary (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" } catch { [Console]::Error.WriteLine("$sSpecRefusal venue=$suppVenue role=supplementary (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))") } }
+        if ($sSpecRefusal) { try { L "$sSpecRefusal venue=$suppVenue role=supplementary (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" } catch { Write-ChainDiag "$sSpecRefusal venue=$suppVenue role=supplementary (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))" } }
         # Whatever the leg printed, a leg that died or timed out is INVALID evidence, never a measurement (the Bachelor rule); and nothing here is read as a timing verdict.
         $shownOutcome = $(if ($sStatus -ceq 'RAN') { $sOutcome } else { 'INVALID' })
         $extra = @{ quietVerdict = $sq.verdict; quietMean = $sq.mean; outcome = $shownOutcome; printedOutcome = $sOutcome; legExit = $sr.exit; timedOut = $sr.timedOut; receipt = $sReceipt; receiptRole = $sRole
@@ -571,7 +574,7 @@ foreach ($leg in $plan) {
             $legLines = @($legCaptured | ForEach-Object { [string]$_ })
             $legStdoutLines = @($legCaptured | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
             # (r2, adversary pass 1 A2: the operator's copy is written best-effort; a write failure never costs the refusal, exit 7, CHAIN_RESULT or the next leg)
-            try { $legLines | Out-File -LiteralPath $out } catch { [Console]::Error.WriteLine("leg transcript write failed for $($leg.name): $($_.Exception.Message -replace '\s+', ' ')") }
+            try { $legLines | Out-File -LiteralPath $out } catch { Write-ChainDiag "leg transcript write failed for $($leg.name): $($_.Exception.Message -replace '\s+', ' ')" }
             # (r2, adversary pass 1 A1: outcome, receipt and detail are the child's STDOUT records too; a DVE_ line on its stderr is no result of the leg)
             $o = $legStdoutLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
             $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
@@ -593,7 +596,7 @@ foreach ($leg in $plan) {
                 if ($specRefusal) {
                     $results[$results.Count - 1] | Add-Member -NotePropertyName specRefusal -NotePropertyValue (($specRefusal -split ' ', 2)[0]) -Force
                     try { L "$specRefusal (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }
-                    catch { [Console]::Error.WriteLine("$specRefusal (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))") }
+                    catch { Write-ChainDiag "$specRefusal (chain log write failed: $($_.Exception.Message -replace '\s+', ' '))" }
                 }
             } else {
                 $preLoad = Get-LegPreLoadMean $receipt
