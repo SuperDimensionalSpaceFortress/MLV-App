@@ -2051,17 +2051,29 @@ function Invoke-VenueBoundedProcess {
     # false confirmation), so a quick child pays no scan. A listing that cannot be read is cached as unknown for the same 30 s: the tree is then unknown.
     # sol A2 on 91e548f8: the listing may not push this call past the caller's absolute deadline. It is refreshed only when the caller granted at least 3 s, under a 1 s CIM timeout, and the
     # time it took is taken OFF the child's wait below (the call still ends $TimeoutSec after it began); under 3 s the listing already cached (or none: an unknown tree on a timeout) is used.
+    # r2 (sol r2 A4 on b428e461): ONE clock for the whole call, started first; the child's wait is what is left of -TimeoutSec after the listing, the launch and the stream setup, so none of them
+    # can push a successful run past the caller's deadline. The census runs only when the caller granted 5 s or more (a cold listing costs up to its 1 s CIM timeout plus decoding).
     $censusClock = [Diagnostics.Stopwatch]::StartNew()
-    if ($script:VenueProcessTreeHelpersLoaded -and $TimeoutSec -ge 3 -and ($null -eq $script:VenueBaselineClock -or $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30)) {
+    if ($script:VenueProcessTreeHelpersLoaded -and $TimeoutSec -ge 5 -and ($null -eq $script:VenueBaselineClock -or $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30)) {
         $script:VenueBaseline = $null
         try { $script:VenueBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 1 } catch { $script:VenueBaseline = $null }
         $script:VenueBaselineClock = [Diagnostics.Stopwatch]::StartNew()
     }
-    $censusMs = $censusClock.Elapsed.TotalMilliseconds
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
-    $timedOut = -not $p.WaitForExit([int][Math]::Max(1.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusMs)))
+    # r2 (sol r2 A3 on b428e461): the descendants must be recorded while their parents live, but the kill belongs at the bound, not after a scan that can take seconds. The tree is recorded
+    # ONE LEAD (2 s) BEFORE the bound (a 1 s CIM timeout), the child keeps running for the rest of its allowance, and the kill follows at the bound itself. A child that exits first costs
+    # nothing; a descendant it starts after the record is found by the wait (a child of a recorded member, or an unproven row). A call granted under 5 s records the tree at its timeout instead (below).
+    $tree = $null
+    $exitedEarly = $false
+    $earlyRecord = $script:VenueProcessTreeHelpersLoaded -and $TimeoutSec -ge 5
+    if ($earlyRecord) {
+        $leadWaitMs = $TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds - 2000.0
+        if ($leadWaitMs -ge 1.0) { $exitedEarly = $p.WaitForExit([int][Math]::Floor($leadWaitMs)) }
+        if (-not $exitedEarly) { try { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -Baseline $script:VenueBaseline -OperationTimeoutSec 1 } catch { $tree = $null } }
+    }
+    $timedOut = -not ($exitedEarly -or $p.WaitForExit([int][Math]::Max(1.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds))))
     $killErrored = $false
     $treeGone = $true
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
@@ -2069,13 +2081,13 @@ function Invoke-VenueBoundedProcess {
         # EXPORT-KILL-DESCENDANT-CONFIRM-1 (adversary pass 26 A1 sibling): the root's exit alone confirmed the tree, while Kill($true) may return with a descendant alive. The
         # descendants are recorded before the kill and each must be seen gone inside the same -CleanupWaitMs budget; a survivor or an unreadable tree is an unconfirmed kill.
         # (r1 fix iteration, adversary A3 on 2223cc4d: a snapshot that ends past the budget is no snapshot, and the tree wait gets only what is left; each CIM scan has a 1 s floor)
-        $tree = $null
+        # (r2: with 5 s or more granted the tree was already recorded before the bound, above, so the kill is at the bound; only a call granted under 5 s records it here, at the timeout, under the budget rules below)
         # (r1 fix 2, adversary A2 on 348c4357: the snapshot scan starts only when CIM's 1 s floor fits the budget; under 1 s the tree is unknown, an unconfirmed kill)
         # (r3, adversary A3 on 4d69f211: the budget is re-read from the one $cleanup stopwatch, and the scan gets only the whole seconds still left; when less than the
         # 1 s floor is left no scan starts and the tree is unknown. r7b: the helpers were defined when this module loaded, above; the clock is read to the fraction of
         # a millisecond (adversary A3 on 1413e30f: a truncated 500.6 ms granted a 1 s scan with 999.4 ms left))
-        if ($script:VenueProcessTreeHelpersLoaded -and $CleanupWaitMs -ge 1000) { try { $grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0); if ($grantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -Baseline $script:VenueBaseline -OperationTimeoutSec ([int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0)) } } catch { $tree = $null } }
         # (r6, adversary pass 7 A2 sibling: the whole seconds left are read at the moment the scan's timeout is granted, not from a value taken earlier, and under the 1 s floor no scan starts)
+        if (-not $earlyRecord -and $script:VenueProcessTreeHelpersLoaded -and $CleanupWaitMs -ge 1000) { try { $grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0); if ($grantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -Baseline $script:VenueBaseline -OperationTimeoutSec ([int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0)) } } catch { $tree = $null } }
         if ($cleanup.Elapsed.TotalMilliseconds -ge $CleanupWaitMs) { $tree = $null }
         # r2 (sol r1 A2): every grant below is the whole milliseconds of the exact remaining time (a double); a truncated ElapsedMilliseconds read granted up to a millisecond too much.
         try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit([int][Math]::Floor([Math]::Max(0.0, $CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds)))

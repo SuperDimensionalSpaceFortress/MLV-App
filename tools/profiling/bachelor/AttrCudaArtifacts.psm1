@@ -5133,8 +5133,9 @@ function Get-AttrCudaProcessTreeSnapshot {
                 if ($null -eq $child.ProcessId -or $null -eq $child.CreationDate) { return (& $unknown "descendant-unreadable parent=$($parent.processId)") }
                 $childPid = [int64]$child.ProcessId
                 $childTicks = ([datetime]$child.CreationDate).ToUniversalTime().Ticks
-                # a baseline process (same pid AND stamp) was alive before the root started: a holder of a member's number that is one is no descendant, and neither is anything it started
-                if (& $inBase $childPid $childTicks $child.ParentProcessId) { continue }
+                # r2 (sol r2 A1 on b428e461): a child of the root or of a member is ALWAYS a member, even when its pid, stamp and parent number match a baseline row. No process alive before the root
+                # started can be a real child of the root (or of a process it started), so such a row is a recycled-number impostor, or an old process whose parent number the root reused: the two read
+                # the same from a scan, and the kill is then unconfirmed (fail closed), never confirmed on a baseline match.
                 if ($seen.Contains($childPid)) { continue }
                 [void]$seen.Add($childPid)
                 $member = [pscustomobject]@{ processId = $childPid; creationTicks = $childTicks }
@@ -5169,7 +5170,9 @@ function Get-AttrCudaProcessTreeSnapshot {
         }
         $others = @{}
         foreach ($q in @($late.Keys)) {
-            if ($late[$q]) { $members.Add([pscustomobject]@{ processId = [int64]$q; creationTicks = $rowTicks[$q] }) } else { $others[[int64]$q] = $rowTicks[$q] }
+            # r2 (sol r2 A2): an outsider is recorded by pid, stamp AND parent pid (immutable): a replacement that reuses the number and, after a rollback, the stamp is another process unless it names the same parent
+            if ($late[$q]) { $members.Add([pscustomobject]@{ processId = [int64]$q; creationTicks = $rowTicks[$q] }) }
+            else { $others[[int64]$q] = $(if ($null -eq $rowTicks[$q]) { $null } elseif ($null -eq $rowParent[$q]) { [int64[]]@($rowTicks[$q]) } else { [int64[]]@($rowTicks[$q], $rowParent[$q]) }) }
         }
         [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $rootTicks; members = @($members); others = $others; baseline = $baseTable; error = $null }
     } catch { & $unknown "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
@@ -5221,7 +5224,8 @@ function Wait-AttrCudaProcessTreeGone {
         foreach ($m in @($(if ($null -ne $snapProps['members']) { $snapProps['members'].Value } else { @() }))) { $recorded[[int64]$m.processId] = $(if ($null -eq $m.creationTicks) { $null } else { [int64]$m.creationTicks }) }
         # r3 fix 2 (adversary A1 on 6b788356): the outsiders the snapshot saw (pid -> creation ticks). A snapshot without them knows no outsider: every orphan is unproven.
         $othersRaw = $(if ($null -ne $snapProps['others']) { $snapProps['others'].Value } else { $null })
-        if ($othersRaw -is [hashtable]) { foreach ($k in @($othersRaw.Keys)) { $known[[int64]$k] = $(if ($null -eq $othersRaw[$k]) { $null } else { [int64]$othersRaw[$k] }) } }
+        # r2 (sol r2 A2): an entry is (stamp) or (stamp, parent pid); a bare number is the older stamp-only form
+        if ($othersRaw -is [hashtable]) { foreach ($k in @($othersRaw.Keys)) { $known[[int64]$k] = $(if ($null -eq $othersRaw[$k]) { $null } else { [int64[]]@($othersRaw[$k]) }) } }
         # A1-CLOCK-FREE-ANCESTRY-1 r1: the listing taken before the root started (pid -> creation ticks). A snapshot without it proves no baseline process.
         $baseRaw = $(if ($null -ne $snapProps['baseline']) { $snapProps['baseline'].Value } else { $null })
         if ($baseRaw -is [hashtable]) { foreach ($k in @($baseRaw.Keys)) { if ($null -ne $baseRaw[$k]) { $baseTable[[int64]$k] = [int64[]]@($baseRaw[$k]) } } }
@@ -5263,7 +5267,10 @@ function Wait-AttrCudaProcessTreeGone {
             # r7 (sol r6d hardening, fable EKDC-WAIT-NULL-PID-ROW-FAIL-CLOSED-1): a row with no readable pid is kept by its parent, and one under the tree (checked once the
             # walk below has found the tree) makes this scan unable to confirm, as the snapshot's descendant-unreadable does; it was dropped and the kill confirmed.
             $noPidParents = [System.Collections.Generic.List[int64]]::new()
+            # r2 (sol r2 A9): a row with neither a pid nor a parent is no evidence at all, so a scan holding one cannot confirm (it was dropped, and an otherwise empty scan confirmed)
+            $blindRow = $false
             foreach ($row in $rows) {
+                if ($null -ne $row -and $null -eq $row.ProcessId -and $null -eq $row.ParentProcessId) { $blindRow = $true }
                 if ($null -ne $row -and $null -eq $row.ProcessId -and $null -ne $row.ParentProcessId) { $noPidParents.Add([int64]$row.ParentProcessId) }
                 if ($null -eq $row -or $null -eq $row.ProcessId) { continue }
                 $rowPid = [int64]$row.ProcessId
@@ -5289,8 +5296,7 @@ function Wait-AttrCudaProcessTreeGone {
                 $parentPid = $queue.Dequeue()
                 if (-not $byParent.ContainsKey($parentPid)) { continue }
                 foreach ($childPid in $byParent[$parentPid]) {
-                    # a baseline process (same pid AND stamp, alive before the root started) holding a member's number is no descendant, and neither is anything it started
-                    if (& $inBase $childPid $rowTicks[$childPid] $rowParent[$childPid]) { continue }
+                    # r2 (sol r2 A1 on b428e461): a child of a recorded member (or the root) is a survivor even when it matches a baseline row: see the snapshot's walk
                     if ($adopted.Add($childPid)) { $found.Add($childPid); $discovered.Add($childPid) }
                     if ($expanded.Add($childPid)) { $queue.Enqueue($childPid) }
                 }
@@ -5308,7 +5314,7 @@ function Wait-AttrCudaProcessTreeGone {
             foreach ($start in @($rowTicks.Keys)) {
                 if ($adopted.Contains([int64]$start)) { continue }
                 $startTicks = $rowTicks[$start]
-                $outsider = [bool](& $inBase $start $startTicks $rowParent[$start]) -or (($null -ne $startTicks) -and $known.ContainsKey([int64]$start) -and ($null -ne $known[[int64]$start]) -and ([int64]$known[[int64]$start] -eq [int64]$startTicks))
+                $outsider = [bool](& $inBase $start $startTicks $rowParent[$start]) -or (($null -ne $startTicks) -and $known.ContainsKey([int64]$start) -and ($null -ne $known[[int64]$start]) -and ([int64]$known[[int64]$start][0] -eq [int64]$startTicks) -and (($known[[int64]$start].Count -eq 1) -or (($null -ne $rowParent[$start]) -and ([int64]$known[[int64]$start][1] -eq [int64]$rowParent[$start]))))
                 if (-not $outsider) {
                     $up = $rowParent[$start]
                     if ($null -ne $up -and [int64]$up -ne [int64]$start -and $rowTicks.ContainsKey([int64]$up) -and (& $inBase $up $rowTicks[[int64]$up] $rowParent[[int64]$up])) { $outsider = $true }
@@ -5322,7 +5328,8 @@ function Wait-AttrCudaProcessTreeGone {
             $lastError = 'survivors'
             $noPidUnder = $null
             foreach ($np in $noPidParents) { if ($expanded.Contains($np) -or $adopted.Contains($np)) { $noPidUnder = $np; break } }
-            if ($null -ne $noPidUnder) { $lastError = "descendant-unreadable parent=$noPidUnder" }
+            if ($blindRow -and $null -eq $noPidUnder) { $noPidUnder = 'none'; $lastError = 'descendant-unreadable row-without-pid' }
+            elseif ($null -ne $noPidUnder) { $lastError = "descendant-unreadable parent=$noPidUnder" }
             if ($clock.Elapsed.TotalMilliseconds -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
             if ($survivors.Count -eq 0 -and $null -eq $noPidUnder) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
         } catch { $lastError = "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }

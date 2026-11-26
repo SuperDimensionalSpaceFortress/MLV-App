@@ -349,7 +349,8 @@ try {
     # after the root's wait. A survivor, or a tree that could not be read, leaves the kill unconfirmed (EXPORT_KILL_UNCONFIRMED, exit 48) and the survivors are traced.
     $killConfirmed = $true
     if ($timedOut) {
-        $exportTree = try { Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline } catch { $null }
+        # r2 (sol r2 A3): the record before the kill is read under a 5 s CIM timeout (it was 20 s), so a slow provider delays the kill by seconds, not tens of seconds; no record is an unknown tree
+        $exportTree = try { Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline -OperationTimeoutSec 5 } catch { $null }
         try { $app.Kill($true) } catch { $killConfirmed = $false; Write-JobTrace "step export kill tree error=$([string]$_.CategoryInfo.Reason)"; try { $app.Kill() } catch { Write-JobTrace "step export kill root error=$([string]$_.CategoryInfo.Reason)" } }
         if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }
         $exportTreeGone = try { Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000 } catch { [pscustomobject]@{ confirmed = $false; survivors = @(); error = 'tree-unknown: helper unavailable' } }

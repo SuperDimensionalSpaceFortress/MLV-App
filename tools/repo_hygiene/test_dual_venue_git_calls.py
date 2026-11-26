@@ -496,6 +496,9 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         # r2 (sol r1 A5): anchored to a line start (an `UNSEEN pid=8 ...` substring is no record) and ASCII only (a non-ASCII digit such as U+0661 is no pid)
         seen = re.search(r"(?m)^SEEN pid=([1-9][0-9]*) ok=(\w+) win32=([0-9]+) injob=(\w+) alive=(\w+)\r?$", out, re.ASCII)
         self.assertIsNotNone(seen, f"the cleanup gate never saw a created child: {out}")
+        # sol r2 A10: ONE observed membership and ONE termination result; contradictory repeats (SEEN twice, GONE True then GONE False) are not evidence
+        self.assertEqual(len(re.findall(r"(?m)^SEEN pid=", out)), 1, f"the cleanup gate reported more than one membership observation: {out}")
+        self.assertLessEqual(len(re.findall(r"(?m)^GONE ", out)), 1, f"more than one termination result: {out}")
         self.assertEqual(seen.group(2), "True", f"IsProcessInJob failed (GetLastError={seen.group(3)}), so its membership answer was never given: {out}")
         self.assertIn(seen.group(4), ("True", "False"), f"IsProcessInJob returned no 0/1 membership answer: {out}")
         return seen.group(4), seen.group(5)
@@ -507,7 +510,8 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         # r2 (sol r1 A5): a CRLF line end is still a line start, but an `UNSEEN` substring and a mixed-script pid are refused
         self.assertEqual(self.read_child_probe("HITS \r\nSEEN pid=8 ok=True win32=0 injob=False alive=True\r\nGONE True"), ("False", "True"))
         for line in ("SEEN pid=0 ok=True win32=0 injob=False alive=True", "SEEN pid= ok=True win32=0 injob=False alive=True",
-                     "UNSEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True", "SEEN pid=8١ ok=True win32=0 injob=False alive=True", "SEEN pid=8 ok=True win32=0 injob=False alive=True!\r\nGONE Trueish"):
+                     "UNSEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True", "SEEN pid=8١ ok=True win32=0 injob=False alive=True", "SEEN pid=8 ok=True win32=0 injob=False alive=True!\r\nGONE Trueish",
+                     "SEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True\nSEEN pid=8 ok=True win32=0 injob=True alive=True\nGONE False"):
             with self.assertRaises(AssertionError):
                 self.read_child_probe(line)
 
