@@ -1072,7 +1072,8 @@ class CompareMachinePerfFpsGateTests(_Probe):
                 "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
                 f"baseline = {leg(baseline_arm, 10.0)}; candidate = {leg(candidate_arm, 20.0)}; candidateSpeed = $null; "
                 # r15 (adversary r14 pass 18 A7): the cached analysis is trusted only when bound to the judged pair (its basis and presented-fps deltaPercent), as the producer writes it
-                "analysis = [pscustomobject]@{ comparisonBasis = 'candidate'; dominantBottleneck = 'recon-bound'; suggestedOptimization = 'optimize_cuda_recon_kernel_or_state_setup'; "
+                # R3-MERGE-RESIDUE-1 (sol 07d50621 A11): and its label is the producer's own for that evidence (fps +100 %, no stage field: none / validate_same_clip_on_second_machine)
+                "analysis = [pscustomobject]@{ comparisonBasis = 'candidate'; dominantBottleneck = 'none'; suggestedOptimization = 'validate_same_clip_on_second_machine'; "
                 "evidence = [pscustomobject]@{ presentedFpsDeltaPercent = 100.0 } }; "
                 "compare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 10.0; candidate = 20.0; deltaPercent = 100.0 } } }")
 
@@ -1083,7 +1084,7 @@ class CompareMachinePerfFpsGateTests(_Probe):
     def test_a_light_record_publishes_the_delta(self) -> None:
         r = self.row(self.record("LIGHT", "LIGHT"))
         self.assertEqual(r["playback_fps_delta_pct"], 100.0)
-        self.assertEqual(r["dominant_bottleneck"], "recon-bound")
+        self.assertEqual(r["dominant_bottleneck"], "none")
         self.assertEqual(r["playback_fps_arm_verdict"], "allowed")
 
     def test_a_heavy_or_mixed_record_refuses_the_delta_with_the_typed_reason(self) -> None:
@@ -1189,8 +1190,12 @@ class CompareMachinePerfFpsGateTests(_Probe):
         light = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
         heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
         fingerprint = "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
-        analysis = ("[pscustomobject]@{ dominantBottleneck = 'render-work'; suggestedOptimization = 'optimize_playback_cuda_candidate' }" if legacy else
-                    f"[pscustomobject]@{{ comparisonBasis = '{analysis_basis}'; dominantBottleneck = 'render-work'; suggestedOptimization = 'optimize_playback_cuda_candidate'; "
+        # R3-MERGE-RESIDUE-1 (sol 07d50621 A11): the speed pair's OWN analysis (basis candidateSpeed, +10 %, no stage field) carries the producer's label for it (none / validate_same_clip_on_second_machine);
+        # every other analysis here belongs to another pair or to none, and carries a label that is not the speed pair's ('render-work' is nobody's)
+        own = analysis_basis == "candidateSpeed" and analysis_delta == "10.0"
+        label = "dominantBottleneck = 'none'; suggestedOptimization = 'validate_same_clip_on_second_machine'" if own else "dominantBottleneck = 'render-work'; suggestedOptimization = 'optimize_playback_cuda_candidate'"
+        analysis = (f"[pscustomobject]@{{ {label} }}" if legacy else
+                    f"[pscustomobject]@{{ comparisonBasis = '{analysis_basis}'; {label}; "
                     f"evidence = [pscustomobject]@{{ presentedFpsDeltaPercent = {analysis_delta} }} }}")
         # R2-RESIDUE-1 r1 (adversary 698fffb1 A7): each leg records the presentedFps its compare was measured from (baseline 50, HEAVY candidate 40, LIGHT candidateSpeed 55)
         baseline_leg = light.replace("hostLoadProvisional", "presentedFps = 50.0; hostLoadProvisional", 1)
@@ -1212,7 +1217,7 @@ class CompareMachinePerfFpsGateTests(_Probe):
                 self.assertNotEqual(r["dominant_bottleneck"], "render-work")
                 self.assertNotEqual(r["suggested_optimization"], "optimize_playback_cuda_candidate")
         bound = self.row(self.a7_record("candidateSpeed", "10.0"))
-        self.assertEqual((bound["dominant_bottleneck"], bound["suggested_optimization"]), ("render-work", "optimize_playback_cuda_candidate"))
+        self.assertEqual((bound["dominant_bottleneck"], bound["suggested_optimization"]), ("none", "validate_same_clip_on_second_machine"))
 
 
 @requires_pwsh
@@ -1247,7 +1252,7 @@ class CompareMachinePerfSuggestionFpsGateTests(_Probe):
         for label, playback_ab in (("other-basis", record("candidate", "-20.0")), ("legacy", record("", "", legacy=True))):
             with self.subTest(label):
                 self.assertEqual(suggestion(playback_ab), "S=run_dng_hash_export_proof", "the gated pair's own delta (+5 fps) suggests nothing; the next proof step follows")
-        self.assertEqual(suggestion(record("candidateSpeed", "10.0")), "S=optimize_playback_cuda_candidate", "a bound cached suggestion is still repeated")
+        self.assertEqual(suggestion(record("candidateSpeed", "10.0")), "S=validate_same_clip_on_second_machine", "a bound cached suggestion is still repeated")
 
 
 @requires_pwsh
@@ -1449,12 +1454,13 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         # adversary A9 (pre-existing append, same class): the packet's analysis.suggestedOptimization is derived from the fps delta
         # r15 (adversary r14 pass 18 A7): the fixture's analysis is bound to the judged pair (basis 'candidate', deltaPercent -2), as the producer writes it
         # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A4): a bound analysis records every compare input its diagnosis read, so the fixture carries the present-interval pair too
-        analysis = ("[pscustomobject]@{ comparisonBasis = 'candidate'; suggestedOptimization = 'optimize_playback_cuda_candidate'; evidence = [pscustomobject]@{ presentedFpsDeltaPercent = -2; "
+        # R3-MERGE-RESIDUE-1 (sol 07d50621 A11): and the suggestion is the producer's own for that evidence (fps -2 %, present interval +5 %: a cadence regression with no stage over its threshold)
+        analysis = ("[pscustomobject]@{ comparisonBasis = 'candidate'; suggestedOptimization = 'profile_playback_cadence_with_stage_timing'; evidence = [pscustomobject]@{ presentedFpsDeltaPercent = -2; "
                     "presentIntervalDeltaPercent = 5; candidatePresentIntervalMs = 21 } }")
         refused = "\n".join(self.run_summarizer_block("HEAVY", "HEAVY", analysis))
         self.assertNotIn("suggested_optimization=", refused)
         allowed = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", analysis))
-        self.assertIn("suggested_optimization=optimize_playback_cuda_candidate", allowed)
+        self.assertIn("suggested_optimization=profile_playback_cadence_with_stage_timing", allowed)
 
     def test_r15_a7_an_allowed_pair_repeats_no_cached_suggestion_of_another_pair(self) -> None:
         # r15 (adversary r14 pass 18 A7 sibling summarize-local-cuda-proof.ps1:764): an allowed pair repeated whatever suggestion the packet cached, whichever pair it came from

@@ -749,7 +749,7 @@ function Test-FpsCachedAnalysisBound {
 function Get-FpsEvidenceDiagnosis {
     <#
     .SYNOPSIS
-    R3-MERGE-RESIDUE-1 (sol 07d50621 A11): the (dominantBottleneck, suggestedOptimization) pair New-PlaybackAbAnalysis (run-release-cuda-playback-ab.ps1) gives for a recorded analysis.evidence
+    R3-MERGE-RESIDUE-1 (sol 07d50621 A11): the (dominantBottleneck, suggestedOptimization) pair New-PlaybackAbAnalysis (the CUDA playback A/B runner's analysis) gives for a recorded analysis.evidence
     object (a gated pair: neither host-load provisional nor arm refused). The thresholds and the order of the branches are the producer's own; a field that is absent or not a finite number
     reads as no regression, as the producer's Test-DeltaAtLeast reads a null delta.
     #>
