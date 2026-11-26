@@ -37,6 +37,40 @@ function Test-ThirdPartyProducerEngine([string]$Engine) {
     return ($THIRD_PARTY_PRODUCER_ENGINES -contains $Engine)
 }
 
+# THIRD-PARTY-PRODUCER-LANES-1 r2: THE LAUNCH FENCE (hub ruling 2026-11-26). Both rows stay in the lane table and all of
+# their code stays in this file, but NEITHER may start a process, write a ledger row or touch git, because nothing
+# mechanically confines what a producer CLI does outside its worktree:
+#   kimicode     kimi -p runs in auto permission with no sandbox and no filesystem confinement of any kind.
+#                Successor: KIMI-PRODUCER-CONFINEMENT-1.
+#   antigravity  the A1 sandbox gate FAILED on 2026-11-26: with `agy --sandbox` (agy 1.5.17, "Run in a sandbox with
+#                terminal restrictions enabled") one live call in a scratch worktree wrote inside the worktree (a: ok),
+#                WROTE a canary file at an absolute path OUTSIDE it (b: NOT refused) and OPENED a credential file under
+#                the user profile (c: NOT refused). Evidence: fleet-runs\lane-THIRD-PARTY-PRODUCER-LANES-1-r2-20261126T0200Z\
+#                gate\neon-001.receipt.json (+ gate-driver-output.txt). The row reopens only when a successor card proves
+#                confinement with the same gate (a ok, b refused, c refused) and changes the entry below.
+# The typed line is the contract: `LANE_REFUSED <lane> reason=<reason> card=<card>`; the launcher prints it and exits 126.
+$THIRD_PARTY_PRODUCER_FENCE = @{
+    kimicode    = @{ reason = 'no-mechanical-confinement'; card = 'KIMI-PRODUCER-CONFINEMENT-1' }
+    antigravity = @{ reason = 'sandbox-gate-failed'; card = 'THIRD-PARTY-PRODUCER-LANES-1' }
+}
+$THIRD_PARTY_PRODUCER_REFUSED_EXIT = 126
+
+# $null when the engine is not fenced, else the typed refusal line. PURE: no process, no file, no git.
+function Get-ThirdPartyProducerLaunchRefusal([string]$Lane, [string]$Engine) {
+    if (-not $THIRD_PARTY_PRODUCER_FENCE.ContainsKey($Engine)) { return $null }
+    $f = $THIRD_PARTY_PRODUCER_FENCE[$Engine]
+    return ('LANE_REFUSED {0} reason={1} card={2}' -f $Lane, $f.reason, $f.card)
+}
+
+# True when $Path names the REAL producer CLI. The test seam (-ExeForTest) may stand a fixture in for the CLI, never the CLI itself.
+function Test-ProducerExeIsRealCli([string]$Path) {
+    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
+    $full = try { [System.IO.Path]::GetFullPath($Path) } catch { return $true }
+    $real = @((Join-Path $env:LOCALAPPDATA 'agy\bin\agy.exe'), (Join-Path $env:USERPROFILE '.kimi-code\bin\kimi.exe'))
+    foreach ($r in $real) { if ([string]::Equals($full, [System.IO.Path]::GetFullPath($r), [System.StringComparison]::OrdinalIgnoreCase)) { return $true } }
+    return $false
+}
+
 # Absolute launcher paths. Neither CLI is guaranteed on PATH, and a bare name resolves differently per shell.
 function Resolve-ThirdPartyProducerExe([string]$Engine) {
     $path = switch ($Engine) {
@@ -121,7 +155,8 @@ function Get-ThirdPartyProducerArgv {
             # \z, not $: a trailing newline must not pass as a model id.
             if ($Model -cnotmatch '\A[A-Za-z0-9._-]+-high\z') { throw "producer-model-not-high: '$Model' is not a -high model id (owner effort rule)" }
             if ([string]::IsNullOrWhiteSpace($SettingsPath)) { throw 'producer-settings-missing: agy needs the per-session --settings file' }
-            return @('-p', $promptArg, '--model', $Model, '--output-format', 'json', '--print-timeout', ('{0}s' -f $TimeoutSec), '--settings', $SettingsPath)
+            # --sandbox ("Run in a sandbox with terminal restrictions enabled", agy --help) is ALWAYS passed: the A1 gate.
+            return @('-p', $promptArg, '--model', $Model, '--sandbox', '--output-format', 'json', '--print-timeout', ('{0}s' -f $TimeoutSec), '--settings', $SettingsPath)
         }
         'kimicode' {
             # ALWAYS pin -m: the CLI default is "K2.8 Preview" at effort max. kimi 2.8.0 has no effort flag (its
@@ -517,6 +552,12 @@ function Invoke-ThirdPartyProducerLane {
         # Test seam only: a fixture executable replaces the real CLI. NEVER set by Invoke-Lane.ps1.
         [string]$ExeForTest = ''
     )
+    # THE FENCE, before the slot, the ledger, the prompt file or any process: the launcher already refused, so reaching
+    # this line means a direct caller. Only a fixture stand-in (-ExeForTest, never the real CLI) is let through.
+    if (-not $ExeForTest -or (Test-ProducerExeIsRealCli -Path $ExeForTest)) {
+        $fence = Get-ThirdPartyProducerLaunchRefusal -Lane $Lane -Engine ([string]$Cfg.engine)
+        if ($fence) { throw $fence }
+    }
     # Reserve the slot atomically (same scheme as the claude/codex path: CreateNew decides the winner).
     $base = $null
     for ($n = 1; $n -le 999; $n++) {
@@ -577,7 +618,7 @@ function Invoke-ThirdPartyProducerLane {
             $settingsInfo = New-AgyProducerSettings -WorkDir $WorkDir -Path $settingsPath
             $authority = [ordered]@{
                 permissionMode = "agy -p (auto when agentMode is unset, per docs/cli/headless); deny rules apply in every mode"
-                allowedTools = ($settingsInfo.allow -join ', '); sandbox = 'none (no --sandbox flag; scoped by permissions.allow)'
+                allowedTools = ($settingsInfo.allow -join ', '); sandbox = 'agy --sandbox (terminal restrictions only; the r2 gate showed it does NOT confine writes or reads outside the worktree, so the row is fenced)'
                 writableRoot = $WorkDir; settings = $settingsInfo
                 callerAllowedToolsIgnored = $AllowedTools
                 hookGovernance = 'none: agy does not load the Claude PreToolUse hooks (NA-1..NA-10 do not govern this lane)'

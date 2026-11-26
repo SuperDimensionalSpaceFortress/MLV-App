@@ -126,7 +126,8 @@ def argv(engine, model, prompt="do the thing", timeout=900, settings="C:/r/neon-
 
 def test_agy_argv_is_headless_json_pinned_with_timeout_and_a_per_session_settings_file():
     a = argv("antigravity", "gemini-4-neon-high", prompt="two words\nand a newline", timeout=900)
-    assert a == ["-p", "two words\nand a newline", "--model", "gemini-4-neon-high", "--output-format", "json",
+    # r2 A1: --sandbox is always on the agy argv (it is NOT sufficient: the r2 gate showed it does not confine; see the fence tests).
+    assert a == ["-p", "two words\nand a newline", "--model", "gemini-4-neon-high", "--sandbox", "--output-format", "json",
                  "--print-timeout", "900s", "--settings", "C:/r/neon-001.agy-settings.json"]
     assert "--dangerously-skip-permissions" not in a
 
@@ -380,7 +381,7 @@ def test_lane_receipt_for_a_successful_neon_run(tmp_path):
 def test_the_receipt_redacts_only_the_prompt_argument_by_position(tmp_path):
     # A17: redaction by value replaced the format value too when the prompt was `json` / `stream-json`.
     res, r = run_lane(tmp_path, "antigravity", make_cli(tmp_path, stdout=AGY_SUCCESS), prompt_expr="'json'")
-    assert r["producerArgv"][1] == "<prompt: see promptPath>" and r["producerArgv"][5] == "json"
+    assert r["producerArgv"][1] == "<prompt: see promptPath>" and r["producerArgv"][6] == "json"
     sub = tmp_path / "k"
     sub.mkdir()
     res, r = run_lane(sub, "kimicode", make_cli(sub, stdout=KIMI_STREAM), prompt_expr="'stream-json'")
@@ -682,37 +683,98 @@ def invoke_lane(args, cwd):
                           capture_output=True, text=True, encoding="utf-8", cwd=str(cwd), timeout=120)
 
 
-@pytest.mark.parametrize("lane", ["neon", "kimi"])
-def test_retire_worktree_is_refused_for_a_producer_lane_before_any_run_dir(tmp_path, lane):
-    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path), "-RetireWorktree", "-AllowEdits", "-AllowedTools", "Read"], tmp_path)
-    assert "producer-retire-worktree-unsupported" in done.stdout + done.stderr
-    assert not (tmp_path / ".claude-state" / "fleet-runs").exists()
+# ------------------------------------------------------------------ r2: THE LAUNCH FENCE (hub ruling 2026-11-26)
+# `kimi` has no mechanical confinement; `neon` FAILED the A1 sandbox gate (b: a write outside the worktree was not refused,
+# c: a read of a credential file under the profile was not refused; receipt gate\neon-001.receipt.json in the r2 run dir).
+# Both rows stay in the table and refuse to launch: typed line, non-zero exit, before any process, ledger row, git write or run dir.
+FENCE_LINES = {
+    "kimi": "LANE_REFUSED kimi reason=no-mechanical-confinement card=KIMI-PRODUCER-CONFINEMENT-1",
+    "neon": "LANE_REFUSED neon reason=sandbox-gate-failed card=THIRD-PARTY-PRODUCER-LANES-1",
+}
+# Every argument shape the r1 launcher tests used (a plain edit launch, no -AllowEdits, -RetireWorktree, -ModelOverride, a
+# sub-second budget, -AllowedTools ALL, an image): the fence answers all of them identically and first.
+FENCE_SHAPES = [
+    ["-AllowEdits", "-AllowedTools", "Read"],
+    [],
+    ["-RetireWorktree", "-AllowEdits", "-AllowedTools", "Read"],
+    ["-AllowEdits", "-AllowedTools", "Read", "-ModelOverride", "fixture-other-model"],
+    ["-AllowEdits", "-AllowedTools", "Read", "-TimeoutSec", "0"],
+    ["-AllowEdits", "-AllowedTools", "ALL"],
+]
 
 
 @pytest.mark.parametrize("lane", ["neon", "kimi"])
-def test_a_producer_lane_without_allow_edits_is_refused_before_any_run_dir(tmp_path, lane):
-    # A1
-    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path)], tmp_path)
-    assert "producer-allow-edits-required" in done.stdout + done.stderr
-    assert not (tmp_path / ".claude-state" / "fleet-runs").exists()
+@pytest.mark.parametrize("shape", FENCE_SHAPES, ids=lambda s: " ".join(s) or "no-flags")
+def test_a_fenced_producer_lane_prints_the_typed_refusal_and_exits_nonzero_before_any_side_effect(tmp_path, lane, shape):
+    ledger_dir = tmp_path / ".claude-state" / "coordination"
+    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path)] + shape, tmp_path)
+    assert done.returncode == 126, done.stdout + done.stderr
+    assert FENCE_LINES[lane] in done.stdout.splitlines(), done.stdout + done.stderr
+    assert not (tmp_path / ".claude-state").exists() and not ledger_dir.exists(), "no run dir, no ledger row, no scratch"
+
+
+def _git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd)] + list(args), capture_output=True, text=True, encoding="utf-8", timeout=60)
 
 
 @pytest.mark.parametrize("lane", ["neon", "kimi"])
-@pytest.mark.parametrize("flag,value,typed", [("-ModelOverride", "fixture-other-model", "producer-model-override-unsupported"),
-                                              ("-TimeoutSec", "0", "producer-timeout-invalid"),
-                                              ("-TimeoutSec", "-1", "producer-timeout-invalid")])
-def test_a_producer_lane_refuses_a_model_override_and_a_sub_second_budget_before_any_run_dir(tmp_path, lane, flag, value, typed):
-    # A3, A18
-    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path), "-AllowEdits", "-AllowedTools", "Read", flag, value], tmp_path)
-    assert typed in done.stdout + done.stderr
-    assert not (tmp_path / ".claude-state" / "fleet-runs").exists()
+def test_a_refused_producer_launch_writes_no_git_config_into_the_named_worktree(tmp_path, lane):
+    # A15: the worktree fsmonitor disable (a git config write, and a daemon stop) used to run before the producer refusal.
+    main = tmp_path / "main"
+    main.mkdir()
+    for args in (["init", "-q"], ["config", "user.email", "t@example.invalid"], ["config", "user.name", "t"], ["commit", "-q", "--allow-empty", "-m", "base"],
+                 ["config", "extensions.worktreeConfig", "true"]):
+        assert _git(main, *args).returncode == 0
+    linked = tmp_path / "linked"
+    assert _git(main, "worktree", "add", "-q", "--detach", str(linked)).returncode == 0
+    assert _git(linked, "config", "--worktree", "core.fsmonitor", "true").returncode == 0
+    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(linked)], linked)
+    assert done.returncode == 126 and FENCE_LINES[lane] in done.stdout
+    assert _git(linked, "config", "--worktree", "--get", "core.fsmonitor").stdout.strip() == "true", "the refusal must not touch the worktree's git config"
 
 
-@pytest.mark.parametrize("lane", ["neon", "kimi"])
-def test_the_allowlist_gate_and_the_image_gate_still_apply_to_a_producer_lane(tmp_path, lane):
-    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path), "-AllowEdits", "-AllowedTools", "ALL"], tmp_path)
-    assert "allowlist-required" in done.stdout + done.stderr
-    png = tmp_path / "s.png"
-    png.write_bytes(b"\x89PNG")
-    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path), "-AllowEdits", "-AllowedTools", "Read", "-ImagePaths", str(png)], tmp_path)
-    assert "image-paths-codex-only" in done.stdout + done.stderr
+def test_the_fence_line_precedes_the_worktree_fsmonitor_git_write_and_every_run_dir():
+    # A15 (mooted for the fenced rows): the refusal sits before `Disable-LaneWorktreeFsmonitor`, which writes worktree git config.
+    body = LANE.read_text(encoding="utf-8")
+    fence = body.index("Get-ThirdPartyProducerLaunchRefusal -Lane $Lane")
+    assert fence < body.index("Disable-LaneWorktreeFsmonitor -WorkDir $WorkDir")
+    assert fence < body.index("New-Item -ItemType Directory -Path $RunDir -Force")
+    assert fence < body.index("Add-DispatchLedgerRow -Path $DispatchLedgerPath")
+    assert fence < body.index("[MlvLaneJob]::CreateKillOnClose()")
+
+
+def test_the_launch_refusal_is_pure_and_names_only_the_fenced_engines():
+    out = pwsh_json("[ordered]@{ kimi = (Get-ThirdPartyProducerLaunchRefusal -Lane kimi -Engine kimicode); neon = (Get-ThirdPartyProducerLaunchRefusal -Lane neon -Engine antigravity); "
+                    "opus = (Get-ThirdPartyProducerLaunchRefusal -Lane opus -Engine claude); sol = (Get-ThirdPartyProducerLaunchRefusal -Lane sol -Engine codex); "
+                    "exit = $THIRD_PARTY_PRODUCER_REFUSED_EXIT } | ConvertTo-Json -Compress")
+    assert out == {"kimi": FENCE_LINES["kimi"], "neon": FENCE_LINES["neon"], "opus": None, "sol": None, "exit": 126}
+
+
+@pytest.mark.parametrize("engine,lane", [("antigravity", "neon"), ("kimicode", "kimi")])
+def test_the_helper_refuses_a_direct_call_and_the_real_cli_path_even_with_the_test_seam(tmp_path, engine, lane):
+    # A direct caller of Invoke-ThirdPartyProducerLane reaches the same fence: no slot file, no ledger callback, no process.
+    run = tmp_path / "run"
+    run.mkdir()
+    cfg = ("@{ engine = '%s'; model = '%s'; effort = 'high'; role = 'trial-implementer' }"
+           % (engine, "gemini-4-neon-high" if engine == "antigravity" else "kimi-code/k3.1-pro"))
+    real = ("(Join-Path $env:LOCALAPPDATA 'agy\\bin\\agy.exe')" if engine == "antigravity" else "(Join-Path $env:USERPROFILE '.kimi-code\\bin\\kimi.exe')")
+    for exe_arg in ("", "-ExeForTest %s" % real):
+        script = ("$script:ledgerCalls = 0; try { Invoke-ThirdPartyProducerLane -Lane %s -Cfg %s -Prompt x -WorkDir $env:T_WT -RunDir $env:T_RUN -TimeoutSec 30 -AllowEdits $true "
+                  "-LedgerWriter { $script:ledgerCalls++ } %s | Out-Null; 'NO-THROW' } catch { $_.Exception.Message }; \"calls=$($script:ledgerCalls)\"") % (lane, cfg, exe_arg)
+        done = pwsh(script, {"T_WT": str(tmp_path), "T_RUN": str(run)})
+        assert done.returncode == 0, done.stdout + done.stderr
+        assert FENCE_LINES[lane] in done.stdout and "calls=0" in done.stdout and "NO-THROW" not in done.stdout
+        assert list(run.iterdir()) == [], "the fence runs before the receipt slot is reserved"
+
+
+def test_the_agy_sandbox_gate_evidence_is_pinned_in_the_helper():
+    # The neon row reopens only through a successor card that re-runs the gate (a ok, b refused, c refused) and edits this entry.
+    code = HELPER.read_text(encoding="utf-8")
+    assert "antigravity = @{ reason = 'sandbox-gate-failed'; card = 'THIRD-PARTY-PRODUCER-LANES-1' }" in code
+    assert "kimicode    = @{ reason = 'no-mechanical-confinement'; card = 'KIMI-PRODUCER-CONFINEMENT-1' }" in code
+    assert "gate\\neon-001.receipt.json" in code and "NOT refused" in code
+
+
+def test_invoke_lane_never_sets_the_helper_test_seam():
+    # -ExeForTest is for fixtures only; the launcher must never pass it, or the fence would be a switch.
+    assert "ExeForTest" not in LANE.read_text(encoding="utf-8")

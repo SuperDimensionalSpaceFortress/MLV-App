@@ -261,6 +261,13 @@ $LANES = @{
     kimi   = @{ engine = 'kimicode';    model = 'kimi-code/k3.1-pro'; effort = 'high'; role = 'trial-implementer' }
 }
 . (Join-Path $PSScriptRoot 'lane-third-party-producer.ps1')
+# THIRD-PARTY-PRODUCER-LANES-1 r2: the producer rows are FENCED. Typed refusal, before any process start, any ledger write, any git
+# write (the fsmonitor disable below is one) and any run dir; the rows stay in the table and the code stays in the helper.
+$producerFence = Get-ThirdPartyProducerLaunchRefusal -Lane $Lane -Engine ([string]$LANES[$Lane].engine)
+if ($producerFence) {
+    Write-Host $producerFence
+    exit $THIRD_PARTY_PRODUCER_REFUSED_EXIT
+}
 
 # Absolute launcher paths. NEITHER is on the Git Bash PATH on this host, and a
 # bare name resolves differently per shell - measured 2026-08-29.
