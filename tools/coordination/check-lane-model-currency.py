@@ -361,6 +361,10 @@ def is_live_running(receipt, now):
 
 def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    # THIRD-PARTY-PRODUCER-LANES-1: a trial producer's receipt names no comparable model id, so it is dropped BEFORE any
+    # family maximum, liveness or per-lane judgement reads it (a producer's resolvedModel can never become the newest id of
+    # a claude/codex family).
+    receipts = [r for r in receipts if r.get("engine") not in TRIAL_PRODUCER_ENGINES]
     # The family's newest id is judged over every receipt that is not `running`, however old; the window only decides
     # what is reported. A `running` receipt is never evidence, live or expired (r5, B1), so it cannot raise the newest id.
     live_ids = {id(r) for r in receipts if is_live_running(r, now)}
@@ -374,10 +378,6 @@ def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None
             pass            # a window wider than any representable date reaches every receipt
     lanes = {}
     for receipt in window:
-        # THIRD-PARTY-PRODUCER-LANES-1: a trial producer's receipt names no comparable model id (the CLI reports none),
-        # so it would read NO-DATA and turn the whole verdict INCOMPLETE. Currency is a claude/codex family question.
-        if receipt.get("engine") in TRIAL_PRODUCER_ENGINES:
-            continue
         lanes.setdefault(receipt["lane"], []).append(receipt)
     report = {}
     for lane in sorted(lanes):

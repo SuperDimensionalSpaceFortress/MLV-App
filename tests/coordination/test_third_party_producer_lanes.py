@@ -3,11 +3,14 @@
 Fixtures only, never a live provider call: classification is pure (Get-ThirdPartyProducerOutcome), and the
 receipt/exit-code/timeout path runs a tiny .cmd stand-in for the CLI through the real
 Invoke-ThirdPartyProducerLane. The one live smoke per row is a separate, receipted run (see the PR body).
+
+The A<n> comments name the adversary finding (pass 1 on a0fa61cb) each test pins.
 """
 import json
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -18,27 +21,36 @@ HELPER = ROOT / "tools" / "coordination" / "lane-third-party-producer.ps1"
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="the producer CLIs and the .cmd stand-in are Windows-only")
 
+# The tree walker the direct Codex path uses (Stop-CodexDirectChildTree), loaded from Invoke-Lane.ps1 itself the way
+# test_lane_detached_child.py does, so the verified-kill path runs here too.
+WALKER = ("$src = [IO.File]::ReadAllText('%s'); "
+          "$m = [regex]::Match($src, \"(?s)if \\(-not \\('MlvLaneJob' -as \\[type\\]\\)\\) \\{\\s*Add-Type -TypeDefinition @'\\r?\\n(.*?)\\r?\\n'@\"); "
+          "if (-not $m.Success) { throw 'job-class-not-found' }; if (-not ('MlvLaneJob' -as [type])) { Add-Type -TypeDefinition $m.Groups[1].Value }; "
+          % LANE.as_posix())
 
-def pwsh(script, env=None, timeout=180):
+
+def pwsh(script, env=None, timeout=240, walker=False):
     full = ("$ErrorActionPreference='Stop'; Set-StrictMode -Version Latest; "
-            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); . '%s'; %s" % (HELPER.as_posix(), script))
+            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); %s. '%s'; %s"
+            % (WALKER if walker else "", HELPER.as_posix(), script))
     run_env = dict(os.environ)
     run_env.update(env or {})
     return subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", full],
                           capture_output=True, text=True, encoding="utf-8", env=run_env, timeout=timeout)
 
 
-def pwsh_json(script, env=None):
-    done = pwsh(script, env)
+def pwsh_json(script, env=None, walker=False):
+    done = pwsh(script, env, walker=walker)
     assert done.returncode == 0, done.stdout + done.stderr
     return json.loads(done.stdout)
 
 
-def outcome(engine, exit_code, stdout="", stderr="", timed_out=False):
+def outcome(engine, exit_code, stdout="", stderr="", timed_out=False, incomplete=False):
     return pwsh_json(
         "Get-ThirdPartyProducerOutcome -Engine $env:T_ENGINE -ExitCode ([int]$env:T_EXIT) -TimedOut ($env:T_TO -eq '1') "
-        "-Stdout $env:T_OUT -Stderr $env:T_ERR | ConvertTo-Json -Depth 6 -Compress",
-        {"T_ENGINE": engine, "T_EXIT": str(exit_code), "T_OUT": stdout, "T_ERR": stderr, "T_TO": "1" if timed_out else "0"})
+        "-Stdout $env:T_OUT -Stderr $env:T_ERR -OutputIncomplete ($env:T_INC -eq '1') | ConvertTo-Json -Depth 6 -Compress",
+        {"T_ENGINE": engine, "T_EXIT": str(exit_code), "T_OUT": stdout, "T_ERR": stderr,
+         "T_TO": "1" if timed_out else "0", "T_INC": "1" if incomplete else "0"})
 
 
 AGY_SUCCESS = json.dumps({"conversation_id": "c1", "status": "SUCCESS", "response": "OK", "duration_seconds": 2.6,
@@ -90,9 +102,7 @@ def test_the_helper_never_grants_blanket_approval_or_touches_the_global_agy_sett
     code = "\n".join(line for line in HELPER.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("#"))
     assert "--dangerously-skip-permissions" not in code
     assert "'--yolo'" not in code and "'-y'" not in code and "'--auto'" not in code, "no approval-mode flag is ever passed as an argument"
-    # the only mention is the receipt's prose `scope` string; no path to the global file is ever built or opened
-    assert not re.search(r"Join-Path[^\n]*\.gemini|'\.gemini|\\\.gemini\\", code), "the global settings.json must never be written"
-    assert code.count("antigravity-cli") == 1 and "is never written" in code[code.index("antigravity-cli"):][:80]
+    assert not re.search(r"\.gemini|antigravity-cli", code), "no path to the global agy settings.json is ever built or opened"
     assert not re.search(r"[^\x00-\x7f]", HELPER.read_text(encoding="utf-8")), "ASCII-only by project convention"
 
 
@@ -121,8 +131,10 @@ def test_agy_argv_is_headless_json_pinned_with_timeout_and_a_per_session_setting
     assert "--dangerously-skip-permissions" not in a
 
 
-def test_agy_refuses_a_model_that_is_not_a_high_id():
-    done = pwsh("Get-ThirdPartyProducerArgv -Engine antigravity -Model gemini-4-neon-xhigh -Prompt x -TimeoutSec 5 -SettingsPath s")
+@pytest.mark.parametrize("model", ["gemini-4-neon-xhigh", "gemini-4-neon-high\n", "gemini-4-neon-high ", " gemini-4-neon-high", "gemini-4-neon"])
+def test_agy_refuses_a_model_that_is_not_exactly_a_high_id(model):
+    # A18: `$` accepted a terminal newline; the anchor is \z now.
+    done = pwsh("Get-ThirdPartyProducerArgv -Engine antigravity -Model $env:T_MODEL -Prompt x -TimeoutSec 5 -SettingsPath s", {"T_MODEL": model})
     assert done.returncode != 0 and "producer-model-not-high" in (done.stdout + done.stderr)
 
 
@@ -133,10 +145,28 @@ def test_kimi_argv_always_pins_the_model_and_has_no_yolo_or_auto_flag():
     assert done.returncode != 0, "an unpinned kimi model must be refused (the CLI default is K2.8 Preview at effort max)"
 
 
+@pytest.mark.parametrize("engine,model", [("kimicode", "kimi-code/k3.1-pro"), ("antigravity", "gemini-4-neon-high")])
+@pytest.mark.parametrize("timeout", [0, -1])
+def test_a_budget_below_one_second_is_refused_before_any_argv_exists(engine, model, timeout):
+    # A3: kimi accepted -1 / 0 and started a child it could not bound.
+    done = pwsh("Get-ThirdPartyProducerArgv -Engine %s -Model %s -Prompt x -TimeoutSec %d -SettingsPath s" % (engine, model, timeout))
+    assert done.returncode != 0 and "producer-timeout-invalid" in (done.stdout + done.stderr)
+
+
 def test_a_prompt_that_starts_with_a_dash_cannot_read_as_a_flag_and_an_oversized_one_is_refused():
     assert argv("kimicode", "kimi-code/k3.1-pro", prompt="--yolo please")[1].startswith("\n--yolo")
     done = pwsh("Get-ThirdPartyProducerArgv -Engine kimicode -Model m -Prompt ('x' * 28001) -TimeoutSec 5")
     assert done.returncode != 0 and "producer-prompt-too-long" in (done.stdout + done.stderr)
+
+
+def test_the_serialized_command_line_is_bounded_not_just_the_prompt_characters(tmp_path):
+    # A10: 20,000 quote characters pass the 28,000-character check but serialize to over 40,000.
+    n = pwsh_json("Get-ProducerCommandLineLength -Exe 'C:\\x\\agy.exe' -Argv @('-p', ('\"' * 20000), '--model', 'm') | ConvertTo-Json")
+    assert n > 40000
+    assert pwsh_json("Get-ProducerCommandLineLength -Exe 'C:\\x\\agy.exe' -Argv @('-p', 'hi there') | ConvertTo-Json") == len('C:\\x\\agy.exe -p "hi there" ')
+    res, r = run_lane(tmp_path, "kimicode", make_cli(tmp_path, stdout=KIMI_STREAM), prompt_expr="('\"' * 20000)")
+    assert r["failure"].startswith("producer-command-line-too-long") and res["state"] == "failed"
+    assert not (tmp_path / "cli" / "started.txt").exists(), "no child may start for an over-long command line"
 
 
 def test_the_agy_settings_file_grants_only_the_producer_tool_set_scoped_to_the_worktree(tmp_path):
@@ -173,10 +203,46 @@ def test_every_agy_status_other_than_success_is_not_complete(status):
     assert o["complete"] is False and o["reason"] == "status-" + status
 
 
+@pytest.mark.parametrize("stdout", [
+    '[{"status":"SUCCESS","response":"OK"}]',            # a one-element array root (ConvertFrom-Json unrolled it)
+    '{"status":["SUCCESS"],"response":["OK"]}',          # one-element field arrays (unrolled to their element)
+    '{"status":"success","response":"OK"}',              # -ne is case-insensitive in PowerShell
+    '{"status":"SUCCESS","status":"ERROR","response":"OK"}',   # a duplicate key
+    '{"status":"SUCCESS","response":{"text":"OK"}}',     # response is not a string
+    '"SUCCESS"',
+])
+def test_agy_completion_needs_an_object_with_a_string_status_SUCCESS_and_a_string_response(stdout):
+    # A7
+    o = outcome("antigravity", 0, stdout)
+    assert o["complete"] is False and o["state"] == "ended-incomplete", o
+
+
+def test_an_iso_looking_answer_keeps_its_text_and_type_for_both_engines():
+    # A8: ConvertFrom-Json turned a quoted ISO timestamp into DateTime, dropping the answer.
+    o = outcome("antigravity", 0, json.dumps({"status": "SUCCESS", "response": "2026-11-25T12:00:00Z"}))
+    assert o["complete"] is True and o["final"] == "2026-11-25T12:00:00Z"
+    stream = "\n".join(['{"role":"assistant","content":"earlier"}', '{"role":"assistant","content":"2026-11-25T12:00:00Z"}'])
+    o = outcome("kimicode", 0, stream)
+    assert o["complete"] is True and o["final"] == "2026-11-25T12:00:00Z"
+
+
 def test_agy_soft_deny_on_stderr_is_refused_never_complete_even_with_status_success_and_exit_0():
     o = outcome("antigravity", 0, AGY_SUCCESS, AGY_SOFT_DENY_STDERR)
     assert o["state"] == "refused" and o["complete"] is False and o["reason"] == "tool-soft-deny"
     assert o["providerRefusal"]["kind"] == "tool-soft-deny" and "write_file" in o["providerRefusal"]["match"]
+
+
+@pytest.mark.parametrize("stderr", [
+    "warning: write_file(C:/w/fixture.txt) requires your approval",     # A9: 'requires your approval'
+    "notice: tool command(git push) needs explicit permission",
+    "warn: command(rm) has not been approved; add it to permissions.allow",
+    "info: write_file blocked by policy",
+    "tool write_file was rejected: approval is required",
+    "WARNING: action write_file skipped, permission not granted",
+])
+def test_agy_soft_deny_notices_are_recognised_in_more_than_one_wording(stderr):
+    o = outcome("antigravity", 0, AGY_SUCCESS, stderr + "\n")
+    assert o["state"] == "refused" and o["complete"] is False, stderr
 
 
 def test_ordinary_agy_stderr_noise_is_not_a_soft_deny():
@@ -199,6 +265,13 @@ def test_agy_other_nonzero_exit_unparseable_output_and_empty_response_are_not_co
     assert outcome("antigravity", 0, "not json at all")["reason"] == "json-unparseable"
     assert outcome("antigravity", 0, json.dumps({"status": "SUCCESS", "response": "  "}))["reason"] == "empty-response"
     assert outcome("antigravity", 0, json.dumps({"response": "x"}))["reason"] == "status-missing"
+
+
+@pytest.mark.parametrize("engine,stdout", [("antigravity", AGY_SUCCESS), ("kimicode", KIMI_STREAM)])
+def test_output_that_was_not_fully_read_is_never_complete(engine, stdout):
+    # A5: a drain that timed out (or faulted) kept the prefix, which then read as a clean success.
+    o = outcome(engine, 0, stdout, incomplete=True)
+    assert o["complete"] is False and o["reason"] == "output-incomplete" and o["state"] == "ended-incomplete"
 
 
 def test_timeout_is_ended_incomplete_for_both_engines():
@@ -226,20 +299,30 @@ def test_kimi_exit_4_is_refused_session_held():
     assert o["state"] == "refused" and o["providerRefusal"]["kind"] == "session-held" and o["complete"] is False
 
 
-def test_kimi_exit_0_without_events_or_with_an_error_event_is_not_complete():
-    assert outcome("kimicode", 0, "plain text, no json")["reason"] == "no-stream-json-events"
-    err = json.dumps({"type": "error", "error": "rate limited"})
-    o = outcome("kimicode", 0, KIMI_STREAM + "\n" + err)
-    assert o["complete"] is False and o["reason"] == "stream-error-event"
+@pytest.mark.parametrize("stdout,reason", [
+    ("plain text, no json", "unparseable-stream-line"),
+    ("{}", "no-assistant-answer"),                                                     # A6
+    ('{"role":"meta","type":"system.version","version":"2.8.0"}', "no-assistant-answer"),   # A6
+    ('{"role":"assistant","content":"OK"}\n{"type":"error"', "unparseable-stream-line"),    # A6: a torn error line
+    ('{"role":"assistant","content":"OK"}\n{"role":"assistant","content":"x"', "unparseable-stream-line"),
+    ('{"role":"assistant","content":["OK"]}', "no-assistant-answer"),                  # A7: a one-element content array
+    ('{"role":"assistant","content":"OK"}\n{"type":"error","error":"rate limited"}', "stream-error-event"),
+    ('{"role":"assistant","content":"OK"}\n{"role":"meta","error":"x"}', "stream-error-event"),
+])
+def test_kimi_needs_a_clean_object_stream_with_an_assistant_answer_and_no_error_event(stdout, reason):
+    o = outcome("kimicode", 0, stdout)
+    assert o["complete"] is False and o["reason"] == reason, o
 
 
 # ------------------------------------------------------------------ the real lane function against a stand-in CLI
-def make_cli(tmp_path, stdout="", stderr="", code=0, hang=False):
+def make_cli(tmp_path, stdout="", stderr="", code=0, hang=False, background=False):
     d = tmp_path / "cli"
-    d.mkdir()
+    d.mkdir(exist_ok=True)
     (d / "stdout.txt").write_text(stdout, encoding="utf-8")
     (d / "stderr.txt").write_text(stderr, encoding="utf-8")
-    lines = ["@echo off"]
+    lines = ["@echo off", 'echo started> "%~dp0started.txt"']
+    if background:
+        lines.append("start \"\" /b ping -n 25 127.0.0.1")
     if hang:
         lines.append("ping -n 120 127.0.0.1 >nul")
     lines += ['type "%~dp0stdout.txt"', 'type "%~dp0stderr.txt" 1>&2', "exit /b %d" % code]
@@ -248,19 +331,20 @@ def make_cli(tmp_path, stdout="", stderr="", code=0, hang=False):
     return cli
 
 
-def run_lane(tmp_path, engine, cli, timeout=60, extra=""):
-    wt = tmp_path / "wt"
-    run = tmp_path / "run"
+def run_lane(tmp_path, engine, cli, timeout=60, extra="", prompt_expr="'say ok'", prelude="", wt_name="wt", run_name="run", walker=False):
+    wt = tmp_path / wt_name
+    run = tmp_path / run_name
     wt.mkdir(exist_ok=True)
     run.mkdir(exist_ok=True)
     cfg = ("@{ engine = 'antigravity'; model = 'gemini-4-neon-high'; effort = 'high'; role = 'trial-implementer' }"
            if engine == "antigravity" else
            "@{ engine = 'kimicode'; model = 'kimi-code/k3.1-pro'; effort = 'high'; role = 'trial-implementer' }")
     lane = "neon" if engine == "antigravity" else "kimi"
-    script = ("$r = Invoke-ThirdPartyProducerLane -Lane %s -Cfg %s -Prompt 'say ok' -WorkDir $env:T_WT -RunDir $env:T_RUN "
-              "-TimeoutSec %d -Card T-1 -ExeForTest $env:T_CLI %s; "
-              "[ordered]@{ exit = $r.ExitCode; state = $r.Receipt.state } | ConvertTo-Json -Compress") % (lane, cfg, timeout, extra)
-    res = pwsh_json(script, {"T_WT": str(wt), "T_RUN": str(run), "T_CLI": str(cli)})
+    allow = "" if "-AllowEdits" in extra else "-AllowEdits $true"
+    script = ("%s$r = Invoke-ThirdPartyProducerLane -Lane %s -Cfg %s -Prompt %s -WorkDir $env:T_WT -RunDir $env:T_RUN "
+              "-TimeoutSec %d -Card T-1 -ExeForTest $env:T_CLI %s %s; "
+              "[ordered]@{ exit = $r.ExitCode; state = $r.Receipt.state } | ConvertTo-Json -Compress") % (prelude, lane, cfg, prompt_expr, timeout, allow, extra)
+    res = pwsh_json(script, {"T_WT": str(wt), "T_RUN": str(run), "T_CLI": str(cli)}, walker=walker)
     receipt = json.loads((run / ("%s-001.receipt.json" % lane)).read_text(encoding="utf-8"))
     return res, receipt
 
@@ -270,12 +354,23 @@ def test_lane_receipt_for_a_successful_neon_run(tmp_path):
     assert res == {"exit": 0, "state": "complete"}
     assert r["complete"] is True and r["engine"] == "antigravity" and r["role"] == "trial-implementer"
     assert r["effort"] == "high" and r["requestedModel"] == "gemini-4-neon-high"
-    assert r["resolvedModel"] == "pinned, not reported"
+    assert r["resolvedModel"] == "pinned, not reported" and r["allowEdits"] is True
     assert r["producerArgv"][0] == "-p" and r["producerArgv"][1] == "<prompt: see promptPath>"
     assert "--dangerously-skip-permissions" not in r["producerArgv"]
     assert r["spend"]["usage"]["total_tokens"] == 15003 and r["spend"]["numTurns"] == 1
     assert r["authority"]["settings"]["allow"][0] == "command(git)"
     assert Path(r["promptPath"]).read_text(encoding="utf-8") == "say ok"
+    assert Path(r["receiptPath"]) == tmp_path / "run" / "neon-001.receipt.json"
+
+
+def test_the_receipt_redacts_only_the_prompt_argument_by_position(tmp_path):
+    # A17: redaction by value replaced the format value too when the prompt was `json` / `stream-json`.
+    res, r = run_lane(tmp_path, "antigravity", make_cli(tmp_path, stdout=AGY_SUCCESS), prompt_expr="'json'")
+    assert r["producerArgv"][1] == "<prompt: see promptPath>" and r["producerArgv"][5] == "json"
+    sub = tmp_path / "k"
+    sub.mkdir()
+    res, r = run_lane(sub, "kimicode", make_cli(sub, stdout=KIMI_STREAM), prompt_expr="'stream-json'")
+    assert r["producerArgv"][1] == "<prompt: see promptPath>" and r["producerArgv"][5] == "stream-json"
 
 
 def test_lane_receipt_for_a_soft_denied_neon_run_is_refused_and_exits_125(tmp_path):
@@ -299,7 +394,9 @@ def test_lane_receipt_for_kimi_complete_exit_1_and_exit_4(tmp_path):
     res, r = run_lane(tmp_path, "kimicode", make_cli(tmp_path, stdout=KIMI_STREAM))
     assert res == {"exit": 0, "state": "complete"} and r["requestedModel"] == "kimi-code/k3.1-pro"
     assert r["resolvedModel"] == "pinned, not reported" and "no effort flag" in r["effortNote"]
+    assert "kimi-code/k3.1-pro" in r["effortNote"]
     assert r["producerArgv"][2:4] == ["-m", "kimi-code/k3.1-pro"]
+    assert Path(r["outputPath"]).read_text(encoding="utf-8") == "DONE"
     sub = tmp_path / "one"
     sub.mkdir()
     res, r = run_lane(sub, "kimicode", make_cli(sub, stderr="boom", code=1))
@@ -310,17 +407,159 @@ def test_lane_receipt_for_kimi_complete_exit_1_and_exit_4(tmp_path):
     assert res == {"exit": 125, "state": "refused"} and r["providerRefusal"]["kind"] == "session-held"
 
 
-def test_the_lane_enforces_its_own_timeout_by_killing_the_process_tree(tmp_path):
-    res, r = run_lane(tmp_path, "kimicode", make_cli(tmp_path, hang=True), timeout=3)
+def test_the_lane_enforces_its_own_timeout_by_killing_the_process_tree_and_says_what_it_observed(tmp_path):
+    res, r = run_lane(tmp_path, "kimicode", make_cli(tmp_path, hang=True), timeout=3, walker=True)
     assert res == {"exit": 124, "state": "ended-incomplete"}
-    assert r["timedOut"] is True and r["complete"] is False
-    assert r["killOutcome"] == "killed-tree"
+    assert r["timedOut"] is True and r["complete"] is False and r["processEnded"] is True
+    assert r["killOutcome"] == "killed", "with the tree walker loaded every walked descendant was observed to exit"
     assert r["durationSec"] < 30, "the watchdog must end a hung child at the deadline, not wait for it"
+
+
+def test_without_a_tree_walker_the_kill_label_does_not_claim_descendants_died(tmp_path):
+    # A4: 'killed-tree' was claimed as soon as the root exited.
+    res, r = run_lane(tmp_path, "kimicode", make_cli(tmp_path, hang=True), timeout=3)
+    assert r["killOutcome"] == "killed-root-descendants-unverified"
+
+
+def test_a_kill_that_is_not_known_to_have_worked_is_a_typed_failure_and_the_process_is_not_called_ended(tmp_path):
+    # A4: a Kill that throws left exitCode -1 and processEnded true. The stand-in kill really stops the child, but
+    # reports what a failed kill would.
+    override = "function Stop-ProducerProcessTree { param($Proc, $LimitMs) try { $Proc.Kill($true) } catch { }; 'uncertain:kill-failed' }; "
+    res, r = run_lane(tmp_path, "kimicode", make_cli(tmp_path, hang=True), timeout=3, prelude=override)
+    assert res["state"] == "failed" and r["failure"].startswith("producer-kill-uncertain: uncertain:kill-failed")
+    assert r["complete"] is False and res["exit"] == 124
+
+
+def test_stop_producer_process_tree_never_calls_an_exited_root_killed():
+    out = pwsh_json("$p = Start-Process -FilePath cmd.exe -ArgumentList '/c','exit 0' -PassThru -WindowStyle Hidden; $p.WaitForExit(); "
+                    "Stop-ProducerProcessTree -Proc $p | ConvertTo-Json", walker=True)
+    assert out == "uncertain:already-exited"
+
+
+def test_a_child_that_outlives_the_drain_makes_the_run_incomplete_never_a_clean_success(tmp_path):
+    # A5: a descendant keeps the stdout pipe open; the bounded drain keeps only a prefix, which must not read as success.
+    cli = make_cli(tmp_path, stdout=AGY_SUCCESS, background=True)
+    out = pwsh_json(
+        "$r = Invoke-ThirdPartyProducerProcess -Exe $env:T_CLI -Argv @('-p','x') -WorkDir $env:T_WT -TimeoutSec 30 -DrainGraceMs 700; "
+        "$o = Get-ThirdPartyProducerOutcome -Engine antigravity -ExitCode $r.exitCode -Stdout $r.stdout -Stderr $r.stderr -OutputIncomplete $r.outputIncomplete; "
+        "[ordered]@{ drainTimedOut = $r.drainTimedOut; incomplete = $r.outputIncomplete; complete = $o.complete; reason = $o.reason } | ConvertTo-Json -Compress",
+        {"T_CLI": str(cli), "T_WT": str(tmp_path)})
+    assert out == {"drainTimedOut": True, "incomplete": True, "complete": False, "reason": "output-incomplete"}
+
+
+def test_a_producer_lane_without_allow_edits_starts_no_child(tmp_path):
+    # A1: the default call ran write-capable while the receipt said allowEdits=false.
+    cli = make_cli(tmp_path, stdout=AGY_SUCCESS)
+    res, r = run_lane(tmp_path, "antigravity", cli, extra="-AllowEdits $false")
+    assert res["state"] == "failed" and r["failure"].startswith("producer-allow-edits-required")
+    assert not (tmp_path / "cli" / "started.txt").exists()
+
+
+def test_the_lane_budget_is_one_stopwatch_setup_spends_it_and_a_spent_budget_starts_nothing(tmp_path):
+    # A2: the ledger write took 2 s of a 1 s budget and the child was still started with a fresh second.
+    cli = make_cli(tmp_path, stdout=AGY_SUCCESS)
+    res, r = run_lane(tmp_path, "antigravity", cli, timeout=1, extra="-LedgerWriter { param($row) Start-Sleep -Seconds 2 }")
+    assert res == {"exit": 124, "state": "ended-incomplete"} and r["timedOut"] is True and r["complete"] is False
+    assert not (tmp_path / "cli" / "started.txt").exists(), "a spent budget must not start the provider"
+
+
+def test_the_helper_refuses_a_zero_or_negative_budget_before_any_child(tmp_path):
+    # A3
+    for budget in (0, -1):
+        sub = tmp_path / ("b%d" % abs(budget))
+        sub.mkdir()
+        res, r = run_lane(sub, "kimicode", make_cli(sub, stdout=KIMI_STREAM), timeout=budget)
+        assert res["state"] == "failed" and r["failure"].startswith("producer-timeout-invalid") and r["complete"] is False
+        assert not (sub / "cli" / "started.txt").exists()
+
+
+def test_two_runs_in_one_worktree_get_distinct_scratch_dirs_and_each_removes_only_its_own(tmp_path):
+    # A11: the scratch leaf hashed only the run-dir leaf and slot, so two run dirs in one worktree shared a TEMP.
+    cli = make_cli(tmp_path, stdout=KIMI_STREAM)
+    _, a = run_lane(tmp_path, "kimicode", cli, extra="-KeepScratch $true", run_name="runA")
+    _, b = run_lane(tmp_path, "kimicode", cli, extra="-KeepScratch $true", run_name="runB")
+    assert a["scratch"]["path"] != b["scratch"]["path"]
+    assert Path(a["scratch"]["path"]).is_dir() and Path(b["scratch"]["path"]).is_dir()
+    _, c = run_lane(tmp_path, "kimicode", cli, run_name="runC")
+    assert c["scratch"]["removed"] is True and not Path(c["scratch"]["path"]).exists()
+    assert Path(a["scratch"]["path"]).is_dir() and Path(b["scratch"]["path"]).is_dir()
+
+
+def test_the_scratch_overrides_and_bulk_cleanup_apply_to_a_producer_lane(tmp_path):
+    # A12: -KeepScratch, -ScratchRoot (including ''), and the bulk-scratch manifest were all ignored.
+    cli = make_cli(tmp_path, stdout=KIMI_STREAM)
+    custom = tmp_path / "custom-scratch"
+    _, r = run_lane(tmp_path, "kimicode", cli, extra="-ScratchBase $env:T_CUSTOM -KeepScratch $true", run_name="r1", prelude="$env:T_CUSTOM = '%s'; " % custom)
+    assert Path(r["scratch"]["path"]).parent == custom and Path(r["scratch"]["path"]).is_dir()
+    _, r = run_lane(tmp_path, "kimicode", cli, extra="-ScratchBase ''", run_name="r2")
+    assert r["scratch"] is None, "-ScratchRoot '' means no scratch directory at all"
+    _, r = run_lane(tmp_path, "kimicode", cli, run_name="r3", extra="-BulkScratchCleanup { [ordered]@{ entries = @('cleaned'); error = $null } }")
+    assert r["bulkScratch"]["entries"] == ["cleaned"]
+
+
+def test_a_reader_holding_the_receipt_open_does_not_lose_the_terminal_receipt(tmp_path):
+    # A13: one unguarded Move threw on a transient sharing violation and left a reserved receipt.
+    target = tmp_path / "t.json"
+    target.write_text("{}", encoding="utf-8")
+    holder = subprocess.Popen(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                               "$f = [IO.File]::Open('%s','Open','Read','Read'); 'held' | Out-File '%s'; Start-Sleep -Milliseconds 700; $f.Dispose()"
+                               % (target.as_posix(), (tmp_path / "held.flag").as_posix())])
+    try:
+        for _ in range(200):
+            if (tmp_path / "held.flag").exists():
+                break
+            time.sleep(0.05)
+        assert (tmp_path / "held.flag").exists()
+        done = pwsh("Write-ProducerFileAtomic -Path $env:T_P -Content '{\"final\":true}'", {"T_P": str(target)})
+        assert done.returncode == 0, done.stdout + done.stderr
+    finally:
+        holder.wait(timeout=30)
+    assert json.loads(target.read_text(encoding="utf-8")) == {"final": True}
+    assert not list(tmp_path.glob("t.json.*.tmp")), "the temp file is removed"
+
+
+def test_an_artifact_that_cannot_be_written_still_yields_a_terminal_failed_receipt(tmp_path):
+    # A13: a stderr artifact write that threw skipped receipt construction and left only the reserved marker.
+    cli = make_cli(tmp_path, stdout=AGY_SUCCESS)
+    run = tmp_path / "run"
+    run.mkdir()
+    holder = subprocess.Popen(["pwsh", "-NoProfile", "-NonInteractive", "-Command",
+                               "$f = [IO.File]::Open('%s','OpenOrCreate','ReadWrite','None'); 'held' | Out-File '%s'; Start-Sleep -Seconds 25; $f.Dispose()"
+                               % ((run / "neon-001.err.txt").as_posix(), (tmp_path / "held2.flag").as_posix())])
+    try:
+        for _ in range(300):
+            if (tmp_path / "held2.flag").exists():
+                break
+            time.sleep(0.05)
+        res, r = run_lane(tmp_path, "antigravity", cli)
+    finally:
+        holder.kill()
+        holder.wait(timeout=30)
+    assert res["state"] == "failed" and r["failure"].startswith("producer-artifact-write-failed") and r["complete"] is False
+    assert r["state"] == "failed", "the receipt is terminal, not the reserved marker"
+
+
+def test_the_fsmonitor_stop_runs_after_the_last_git_read_and_is_recorded(tmp_path):
+    # A14: the producer left the worktree's fsmonitor daemon running after its git snapshots.
+    cli = make_cli(tmp_path, stdout=AGY_SUCCESS)
+    extra = ("-BaseSha 'abc' -ReadHead { $global:CALLS += 'head'; 'abc' } "
+             "-SnapshotDirty { $global:CALLS += 'snap'; @{ ok = $true; map = [ordered]@{}; reason = $null } } "
+             "-AfterGit { $global:CALLS += 'stop'; [ordered]@{ action = 'stopped'; reason = $null } }")
+    res, r = run_lane(tmp_path, "antigravity", cli, extra=extra, prelude="$global:CALLS = @(); ")
+    assert r["fsmonitorStop"] == {"action": "stopped", "reason": None}
+    assert r["dirtyCheck"] == "clean"
+
+
+def test_a_failed_prelaunch_git_read_is_unavailable_not_not_applicable(tmp_path):
+    # A16
+    cli = make_cli(tmp_path, stdout=AGY_SUCCESS)
+    res, r = run_lane(tmp_path, "antigravity", cli, extra="-BaseShaFailureReason 'pre-launch rev-parse HEAD failed: boom'")
+    assert r["dirtyCheck"] == "unavailable" and "boom" in r["dirtyCheckReason"]
 
 
 def test_a_producer_lane_that_edits_tracked_files_without_committing_is_not_complete(tmp_path):
     cli = make_cli(tmp_path, stdout=AGY_SUCCESS)
-    extra = ("-AllowEdits $true -BaseSha 'abc' -ReadHead { 'abc' } "
+    extra = ("-BaseSha 'abc' -ReadHead { 'abc' } "
              "-SnapshotDirty { $script:n = 1 + $(if (Test-Path variable:script:n) { $script:n } else { 0 }); "
              "@{ ok = $true; map = $(if ($script:n -eq 1) { [ordered]@{} } else { [ordered]@{ 'src/a.cpp' = 'h1' } }); reason = $null } }")
     res, r = run_lane(tmp_path, "antigravity", cli, extra=extra)
@@ -336,8 +575,27 @@ def invoke_lane(args, cwd):
 
 @pytest.mark.parametrize("lane", ["neon", "kimi"])
 def test_retire_worktree_is_refused_for_a_producer_lane_before_any_run_dir(tmp_path, lane):
-    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path), "-RetireWorktree"], tmp_path)
+    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path), "-RetireWorktree", "-AllowEdits", "-AllowedTools", "Read"], tmp_path)
     assert "producer-retire-worktree-unsupported" in done.stdout + done.stderr
+    assert not (tmp_path / ".claude-state" / "fleet-runs").exists()
+
+
+@pytest.mark.parametrize("lane", ["neon", "kimi"])
+def test_a_producer_lane_without_allow_edits_is_refused_before_any_run_dir(tmp_path, lane):
+    # A1
+    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path)], tmp_path)
+    assert "producer-allow-edits-required" in done.stdout + done.stderr
+    assert not (tmp_path / ".claude-state" / "fleet-runs").exists()
+
+
+@pytest.mark.parametrize("lane", ["neon", "kimi"])
+@pytest.mark.parametrize("flag,value,typed", [("-ModelOverride", "fixture-other-model", "producer-model-override-unsupported"),
+                                              ("-TimeoutSec", "0", "producer-timeout-invalid"),
+                                              ("-TimeoutSec", "-1", "producer-timeout-invalid")])
+def test_a_producer_lane_refuses_a_model_override_and_a_sub_second_budget_before_any_run_dir(tmp_path, lane, flag, value, typed):
+    # A3, A18
+    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path), "-AllowEdits", "-AllowedTools", "Read", flag, value], tmp_path)
+    assert typed in done.stdout + done.stderr
     assert not (tmp_path / ".claude-state" / "fleet-runs").exists()
 
 
@@ -347,5 +605,5 @@ def test_the_allowlist_gate_and_the_image_gate_still_apply_to_a_producer_lane(tm
     assert "allowlist-required" in done.stdout + done.stderr
     png = tmp_path / "s.png"
     png.write_bytes(b"\x89PNG")
-    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path), "-ImagePaths", str(png)], tmp_path)
+    done = invoke_lane(["-Lane", lane, "-Prompt", "x", "-WorkDir", str(tmp_path), "-AllowEdits", "-AllowedTools", "Read", "-ImagePaths", str(png)], tmp_path)
     assert "image-paths-codex-only" in done.stdout + done.stderr

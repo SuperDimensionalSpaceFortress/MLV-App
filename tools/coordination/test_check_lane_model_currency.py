@@ -98,6 +98,15 @@ class ThirdPartyProducerReceiptTests(CurrencyFixture):
         self.assertNotIn("neon", result["lanes"])
         self.assertNotIn("kimi", result["lanes"])
 
+    def test_a_producer_receipt_can_never_raise_a_claude_family_newest_id(self):
+        # A15: the exemption ran after the family maximum, so a producer's resolvedModel could mark sonnet STALE.
+        self.receipt("sonnet", "claude-sonnet-5-5", 3)
+        self.receipt("sonnet", "claude-sonnet-5-5", 2)
+        self.producer_receipt("kimi", "kimicode", 1, resolved="claude-sonnet-99-0")
+        result = self.evaluate()
+        self.assertEqual(result["verdict"], "CURRENT", result)
+        self.assertEqual(result["familyNewest"].get("claude-sonnet"), "claude-sonnet-5-5")
+
     def test_the_exemption_is_keyed_on_engine_not_on_the_lane_name(self):
         # A claude-engine receipt that merely carries the lane name 'neon' is still judged (NO-DATA here).
         self.receipt("neon", "unknown", 1, state="failed")

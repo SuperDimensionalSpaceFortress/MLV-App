@@ -1184,8 +1184,23 @@ if ($AllowEdits -and $LANES[$Lane].engine -eq 'codex') {
 # lane was handed even if the source is replaced after validation (A2). Keyed on ENGINE, not lane name.
 # (a3) THIRD-PARTY-PRODUCER-LANES-1: a producer lane is never retired by this launcher (its receipt records `kept`), so
 # the flag is refused rather than silently ignored. Keyed on ENGINE, before any run dir or receipt exists.
-if ($RetireWorktree -and (Test-ThirdPartyProducerEngine $LANES[$Lane].engine)) {
-    throw "producer-retire-worktree-unsupported: -Lane $Lane is a producer-only lane; -RetireWorktree is not honoured for it"
+if (Test-ThirdPartyProducerEngine $LANES[$Lane].engine) {
+    if ($RetireWorktree) {
+        throw "producer-retire-worktree-unsupported: -Lane $Lane is a producer-only lane; -RetireWorktree is not honoured for it"
+    }
+    # A producer lane has write authority and no Claude hook governs it (neither CLI loads the PreToolUse hooks), so the
+    # caller must ask for that authority out loud: -AllowEdits brings the allowlist-required and worktree-hook-receipt
+    # gates below with it. Without it the lane would run write-capable while the receipt said allowEdits=false.
+    if (-not $AllowEdits) {
+        throw "producer-allow-edits-required: -Lane $Lane is a write-capable producer; run it with -AllowEdits and -AllowedTools"
+    }
+    # -ModelOverride would forward an unmeasured model id to a pinned-model trial; the row IS the pin.
+    if ($ModelOverride) {
+        throw "producer-model-override-unsupported: -Lane $Lane pins its model in the lane table; -ModelOverride is not honoured"
+    }
+    if ($TimeoutSec -lt 1) {
+        throw "producer-timeout-invalid: -TimeoutSec $TimeoutSec (a producer lane needs a budget of at least 1 second)"
+    }
 }
 $ImageAttachments = @()
 # r4 B2: one held read handle per snapshot, kept open from the copy until the codex child has exited (never serialised into the receipt).
@@ -2225,15 +2240,27 @@ if ($ReasoningEffort) { $cfg.effort = $ReasoningEffort }
 # allowlist and worktree-hook receipt, the codex/image guards, the run dir), so the producer path inherits them.
 # Dispatch is keyed on ENGINE, never on a lane name. The helper writes the receipt and returns the exit code.
 if (Test-ThirdPartyProducerEngine $cfg.engine) {
+    # -ScratchRoot / -KeepScratch / -KeepBulkScratch are honoured exactly as on the claude/codex path: an unbound
+    # -ScratchRoot means <WorkDir>\.claude-state\ls, a bound '' means no scratch dir at all.
+    $producerScratch = @{ KeepScratch = [bool]$KeepScratch }
+    if ($PSBoundParameters.ContainsKey('ScratchRoot')) { $producerScratch['ScratchBase'] = [string]$ScratchRoot }
     $producerResult = Invoke-ThirdPartyProducerLane -Lane $Lane -Cfg $cfg -Prompt $Prompt -WorkDir $WorkDir -RunDir $RunDir `
         -TimeoutSec $TimeoutSec -AllowEdits ([bool]$AllowEdits) -AllowedTools $AllowedTools -Card $Card `
         -LanePromptPath ([string]$LanePromptPath) -DispatchReservationId $DispatchReservationId `
-        -BaseSha ([string]$BaseSha) -HookSha256 ([string]$WorkDirHookSha256) -ModelOverride $ModelOverride `
+        -BaseSha ([string]$BaseSha) -BaseShaFailureReason ([string]$BaseShaCaptureFailureReason) -HookSha256 ([string]$WorkDirHookSha256) `
+        @producerScratch `
         -LedgerWriter { param($row) Add-DispatchLedgerRow -Path $DispatchLedgerPath -Row $row } `
         -SnapshotDirty { Get-TrackedDirtyContentIdentity -WorkDir $WorkDir } `
-        -ReadHead { $h = Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('rev-parse', 'HEAD'); if (-not $h.ok) { throw $h.error }; $h.stdout }
+        -ReadHead { $h = Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('rev-parse', 'HEAD'); if (-not $h.ok) { throw $h.error }; $h.stdout } `
+        -AfterGit { $s = Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir; [ordered]@{ action = [string]$s.action; reason = $s.reason } } `
+        -BulkScratchCleanup {
+            if (Test-Path -LiteralPath (Join-Path $RunDir 'scratch-paths.txt') -PathType Leaf) {
+                . (Join-Path $PSScriptRoot 'Remove-LaneBulkScratch.ps1')
+                Invoke-RemoveLaneBulkScratch -RunDir $RunDir -WorkDir $WorkDir -Root $BulkScratchRoot -LaneScratchRoot $ScratchRoot -Keep:$KeepBulkScratch
+            }
+        }
     Write-Host ("[{0}] {1}/{2} effort={3} exit={4} {5}s state={6} -> {7}" -f $Lane, $producerResult.Receipt.engine, $producerResult.Receipt.requestedModel,
-        $producerResult.Receipt.effort, $producerResult.Receipt.exitCode, $producerResult.Receipt.durationSec, $producerResult.Receipt.state, $producerResult.Receipt.promptPath.Replace('.prompt.txt', '.receipt.json'))
+        $producerResult.Receipt.effort, $producerResult.Receipt.exitCode, $producerResult.Receipt.durationSec, $producerResult.Receipt.state, $producerResult.Receipt.receiptPath)
     if ($null -ne $producerResult.Receipt.providerRefusal) {
         Write-Host ("  PRODUCER REFUSED ({0}): {1}" -f $producerResult.Receipt.providerRefusal.kind, $producerResult.Receipt.providerRefusal.match)
         Write-Host ("  remedy: {0}" -f $producerResult.Receipt.providerRefusal.remedy)
