@@ -11234,8 +11234,8 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames {labelled} -SourceDifference known-differ "
                                       "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
             self.assertTrue(out["reason"].startswith("the repeat count supplied"), out["reason"])
-        # ... while a repeat count the labelled frames can hold still speaks (3 labelled frames hold 2 repeats)
-        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 3 -SourceDifference known-differ "
+        # ... while a repeat count the labelled frames can hold still speaks (all 4 labelled hold 3 repeats; a known source difference needs every frame labelled)
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 4 -SourceDifference known-differ "
                                   "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
         self.assertTrue(out["reason"].startswith("2 of the 4 judged play frames repeat"), out["reason"])
         # A3: one labelled frame cannot show two distinct labels; every source value and the known-identical waiver
@@ -11251,6 +11251,23 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         # a tuple that fits is still quoted
         out = self.visual_verdict("unknown", 4, 0, 1, app=2, extra="-LabelledPlayFrames 4 ")
         self.assertIn("the app presented 2 distinct frames across them", out["reason"])
+        # sol r1c pass 2 A1 (its input verbatim, and the app 2 variant it names): a known source difference needs a label on EVERY judged frame, so beside 3 labelled
+        # of 4 the reason claims no repeat, no known source difference and no cause (verdict and counted unchanged)
+        for app in (4, 2):
+            with self.subTest(pass2_a1=app):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames {app} -LabelledPlayFrames 3 -SourceDifference known-differ "
+                                          "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertTrue(out["reason"].startswith("the repeat count and source difference supplied for the 4 judged play frames disagree with the 3 labelled"), out["reason"])
+                for claim in ("2 of the 4", "repeat the picture", "known to differ", "stopped landing", "label advanced"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+        out = self.visual_verdict("known-differ", 4, 0, 1, app=2, extra="-LabelledPlayFrames 3 ")
+        self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+        self.assertNotIn("are known to differ", out["reason"])
+        self.assertIn("disagrees with the 3 labelled of the 4 judged frames", out["reason"])
+        # every judged frame labelled: the source difference is quoted as before
+        out = self.visual_verdict("known-differ", 4, 0, 1, app=2, extra="-LabelledPlayFrames 4 ")
+        self.assertIn("the source frames are known to differ", out["reason"])
 
     def test_the_visual_gate_ranks_not_a_motion_witness_after_blank_and_before_the_paused_and_exposure_verdicts(self) -> None:
         """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 precedence: NOT_REQUESTED, VISUAL_ASSESSMENT_UNAVAILABLE, NOT_CAPTURED and CAPTURE_BLANK outrank it; it outranks

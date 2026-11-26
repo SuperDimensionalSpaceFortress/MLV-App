@@ -4388,8 +4388,12 @@ function Get-DvVisualVerdict {
     # sol r1c pass A3: distinct labels cannot outnumber the labelled frames, so a count over a known labelled count is not quoted either (nor waived on)
     $appCountFits = ($AppDistinctDisplayFrames -le $PlayFrames -and ($null -eq $labelledCount -or $AppDistinctDisplayFrames -le $labelledCount))
     $appFramesText = $(if ($appCountFits) { "$AppDistinctDisplayFrames distinct frames" } else { 'a distinct-frame count that cannot be true for them and is not quoted' })
+    # sol r1c pass 2 A1: a known source difference (either value) needs a valid label on EVERY judged frame (the <2 branch above says the same), so beside a labelled
+    # count under PlayFrames the tuple disagrees and no reason claims a known source difference, a repeat or a cause on it
+    $sourceIncoherent = ($SourceDifference -ne 'unknown' -and $null -ne $labelledCount -and $labelledCount -lt $PlayFrames)
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
-        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them and the source frames are known to differ" }
+        $differText = $(if ($sourceIncoherent) { "the source difference supplied disagrees with the $labelledCount labelled of the $PlayFrames judged frames and is not quoted" } else { 'the source frames are known to differ' })
+        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them and $differText" }
     }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'unknown') {
         return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY_SUSPECTED'; counted = $true; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them, but nothing records whether the source frames differ (a static clip shows one picture legitimately): suspected, not excluded" }
@@ -4404,6 +4408,9 @@ function Get-DvVisualVerdict {
         # all), so the reason says the count cannot be true and speaks of what was SUPPLIED, never of what the judged frames show
         # R1C-REASON-RESIDUE-1 (sol r1c A1): and an impossible count supports neither an observed repeat ("as supplied, they repeat") nor the freeze
         # diagnosis ("the display's own paint stopped landing"): the verdict is what it was, the reason names the impossible input and claims nothing
+        if ($sourceIncoherent -and $RepeatedPlayFrames -le $repeatMax) {
+            return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "the repeat count and source difference supplied for the $PlayFrames judged play frames disagree with the $labelledCount labelled of them and are not quoted: they establish no repeat, no source difference and no cause (the verdict follows the counts supplied, not an observation)" }
+        }
         if ($RepeatedPlayFrames -gt $repeatMax) {
             return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "the repeat count supplied for the $PlayFrames judged play frames cannot be true for them and is not quoted: it establishes no repeat and no cause, so the judged frames are not described as repeating (the verdict follows the count supplied, not an observation)" }
         }
@@ -4418,7 +4425,7 @@ function Get-DvVisualVerdict {
         return [pscustomobject]@{ verdict = 'VISUAL_DIVERGENCE'; counted = $true; reason = "the playback-path frame is $PlayVsPausedMeanAbsDiff (per-channel mean absolute difference, 0..255) from its paused full-quality re-render; the threshold is $Threshold" }
     }
     # one picture over source frames the app itself records as identical: the frozen check was waived on its word, so the receipt says so
-    $waivedReason = $(if ($appCountFits -and $DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
+    $waivedReason = $(if ($appCountFits -and -not $sourceIncoherent -and $DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
     # VISUAL-GATE-EXPOSURE-FLOOR-1: last, so every other verdict keeps its precedence; counted, a flag and never an exclusion
     if ($null -ne $ExposureBand -and $null -ne $ExposureMedianLuma -and $null -ne $ExposureMedianNearBlackFraction -and $null -ne $ExposureMedianClippedFraction) {
         # compared UNROUNDED; the reason rounds to 6 places for display (a median 0.000434 against a cap of 0.00042 is over, and reads as 0.000434)
