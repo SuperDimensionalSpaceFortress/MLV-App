@@ -32,9 +32,26 @@ DOC = ROOT / "docs" / "dual-venue-evidence.md"
 TMP_PREFIX = "dvp-o'neil-"
 
 
+PS_SINGLE_QUOTES = ("'", chr(0x2018), chr(0x2019), chr(0x201A), chr(0x201B))   # r1 pass-3 A7: PowerShell ends a '...' literal on each of these
+
+
 def psq(path) -> str:
-    """A path as the body of a PowerShell single-quoted literal (a ' doubles)."""
-    return str(path).replace("'", "''")
+    """A path as the body of a PowerShell single-quoted literal (every quote character PowerShell accepts as a single quote doubles)."""
+    text = str(path)
+    for q in PS_SINGLE_QUOTES:
+        text = text.replace(q, q + q)
+    return text
+
+
+def cases_line(proc, n: int, what: str) -> list[dict]:
+    """The one CASES= line of a harness run, holding exactly one result per input (r1 pass-3 A8: an empty table must never pass a zip loop)."""
+    for line in proc.stdout.splitlines():
+        if line.startswith("CASES="):
+            got = json.loads(line[len("CASES="):])
+            got = got if isinstance(got, list) else [got]
+            assert len(got) == n, f"the {what} harness returned {len(got)} results for {n} inputs"
+            return got
+    raise AssertionError(f"the {what} harness printed no CASES line: rc={proc.returncode} stdout={proc.stdout[-2000:]} stderr={proc.stderr[-2000:]}")
 
 GOOD_BLOCK_TEXT = ('{"schema": "mlv-app/venue-display-path/v2", "source": "health-probe", '
                    '"adapters": ["Intel(R) Iris(R) Xe Graphics", "NVIDIA GeForce RTX 3060 Laptop GPU"], '
@@ -90,10 +107,7 @@ def read_texts(texts: list[str], reader: str = "Read-DvReceiptDisplayPath", pref
             "Write-Output ('CASES=' + (ConvertTo-Json -InputObject $out -Depth 8 -Compress))\n"
         )
         proc = run_pwsh(["-Command", script])
-    for line in proc.stdout.splitlines():
-        if line.startswith("CASES="):
-            return json.loads(line[len("CASES="):])
-    raise AssertionError(f"the reader harness printed no CASES line: rc={proc.returncode} stdout={proc.stdout[-2000:]} stderr={proc.stderr[-2000:]}")
+    return cases_line(proc, len(texts), "reader")
 
 
 def cfj_reads(texts: list[str]) -> list[dict]:
@@ -111,10 +125,7 @@ def cfj_reads(texts: list[str]) -> list[dict]:
             "Write-Output ('CASES=' + (ConvertTo-Json -InputObject $out -Depth 5 -Compress))\n"
         )
         proc = run_pwsh(["-Command", script])
-    for line in proc.stdout.splitlines():
-        if line.startswith("CASES="):
-            return json.loads(line[len("CASES="):])
-    raise AssertionError(f"the ConvertFrom-Json harness printed no CASES line: {proc.stdout[-2000:]} {proc.stderr[-2000:]}")
+    return cases_line(proc, len(texts), "ConvertFrom-Json")
 
 
 # (a) texts that System.Text.Json and ConvertFrom-Json read differently. Each is (label, text, expected state, cfj premise).
@@ -261,20 +272,25 @@ class LegacyNoBlockTests(unittest.TestCase):
         self.assertTrue(out["valid"])
 
 
-def writer_round_trip(probes: list[dict]) -> list[dict]:
-    """For each probe dict: ConvertTo-Json -> DVE_PROBE line -> ConvertFrom-DvProbeStdout (the runner's own probe parse) -> New-DvDisplayPathBlock ->
-    a receipt written by Write-DvReceipt -> its file text -> Read-DvReceiptDisplayPath."""
+def probe_stdout(probe) -> str:
+    """The health probe job's stdout for a probe dict (one `DVE_PROBE=<json>` line, as the job prints it), or a hand-made stdout text as is."""
+    return probe if isinstance(probe, str) else "pwsh 7\nDVE_PROBE=" + json.dumps(probe) + "\n"
+
+
+def writer_round_trip(probes: list) -> list[dict]:
+    """For each probe (a dict, or a raw stdout text): the probe job's stdout -> New-DvDisplayPathBlock -ProbeStdout (r1 pass-3 A2: the writer reads the
+    probe LINE with System.Text.Json) -> a receipt written by Write-DvReceipt -> its file text -> Read-DvReceiptDisplayPath."""
     with tempfile.TemporaryDirectory(prefix=TMP_PREFIX) as d:
         cases = Path(d) / "probes.json"
-        cases.write_text(json.dumps(probes), encoding="utf-8")
+        cases.write_text(json.dumps([probe_stdout(p) for p in probes], ensure_ascii=True), encoding="utf-8")
         root = Path(d) / "receipts"
         script = (
             f"Import-Module '{psq(MODULE)}' -Force\n"
             f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{psq(cases)}'))\n"
             "$out = @(foreach ($e in $doc.RootElement.EnumerateArray()) {\n"
-            "  $probe = ConvertFrom-DvProbeStdout ('DVE_PROBE=' + $e.GetRawText())\n"
+            "  $stdout = $e.GetString()\n"
             "  $threw = $null; $block = $null\n"
-            "  try { $block = New-DvDisplayPathBlock -Probe $probe } catch { $threw = [string]$_.Exception.Message }\n"
+            "  try { $block = New-DvDisplayPathBlock -ProbeStdout $stdout } catch { $threw = [string]$_.Exception.Message }\n"
             "  $r = New-DvReceipt -Card 'DUAL-VENUE-EVIDENCE-1' -LegId 'unit-leg' -DeclaredVenue 'bachelor'\n"
             "  $r.outcome = 'UNRESOLVED'\n"
             "  if ($null -ne $block) { $r.venue['displayPath'] = $block }\n"
@@ -285,10 +301,7 @@ def writer_round_trip(probes: list[dict]) -> list[dict]:
             "Write-Output ('CASES=' + (ConvertTo-Json -InputObject $out -Depth 8 -Compress))\n"
         )
         proc = run_pwsh(["-Command", script])
-    for line in proc.stdout.splitlines():
-        if line.startswith("CASES="):
-            return json.loads(line[len("CASES="):])
-    raise AssertionError(f"the writer harness printed no CASES line: rc={proc.returncode} {proc.stdout[-2000:]} {proc.stderr[-2000:]}")
+    return cases_line(proc, len(probes), "writer")
 
 
 @requires_windows_pwsh
@@ -298,14 +311,18 @@ class RoundTripTests(unittest.TestCase):
     def test_a_valid_block_round_trips_through_the_receipt_file(self) -> None:
         bachelor = dict(HEALTHY_PROBE, hostName="BACHELOR", gpuNames=["Intel(R) Iris(R) Xe Graphics", "NVIDIA GeForce RTX 3060 Laptop GPU"],
                         driverVersion="31.0.101.5186", displayDevice="\\\\.\\DISPLAY1")
-        nulls = dict(HEALTHY_PROBE, gpuNames=[], driverVersion=None, displayDevice=None)
+        nulls = dict(HEALTHY_PROBE, gpuNames=["Microsoft Basic Display Adapter"], driverVersion=None, displayDevice=None)
         one = dict(HEALTHY_PROBE)
-        got = writer_round_trip([bachelor, nulls, one])
+        # the writer reads the probe line with System.Text.Json, so a time-looking device name is copied as the text the probe printed
+        timeish = dict(HEALTHY_PROBE, displayDevice="2026-11-24T00:00:00Z")
+        got = writer_round_trip([bachelor, nulls, one, timeish])
         want = [
             GOOD_BLOCK,
-            {"schema": SCHEMA, "source": "health-probe", "adapters": [], "firstAdapterDriverVersion": None, "primaryDisplayDevice": None},
+            {"schema": SCHEMA, "source": "health-probe", "adapters": ["Microsoft Basic Display Adapter"], "firstAdapterDriverVersion": None, "primaryDisplayDevice": None},
             {"schema": SCHEMA, "source": "health-probe", "adapters": ["NVIDIA GeForce RTX 4090"], "firstAdapterDriverVersion": "32.0.1", "primaryDisplayDevice": "\\\\.\\DISPLAY2"},
+            {"schema": SCHEMA, "source": "health-probe", "adapters": ["NVIDIA GeForce RTX 4090"], "firstAdapterDriverVersion": "32.0.1", "primaryDisplayDevice": "2026-11-24T00:00:00Z"},
         ]
+        self.assertEqual(len(got), len(want))
         for i, (g, w) in enumerate(zip(got, want)):
             with self.subTest(i=i):
                 self.assertIsNone(g["threw"])
@@ -315,13 +332,15 @@ class RoundTripTests(unittest.TestCase):
                 self.assertEqual(list(g["block"].keys()), list(w.keys()), "the block's field order is the contract's")
 
     def test_a_probe_the_writer_cannot_copy_writes_no_block_and_reads_no_signal(self) -> None:
-        """gpuNames missing / not a list / holding a non-string, or a non-string driver or device (a time-looking text ConvertFrom-Json made a [datetime]):
-        the writer writes NO block (never a throw, never a malformed block) and the receipt reads NO_SIGNAL."""
+        """gpuNames missing / not a list / holding a non-string / empty, or a non-string driver or device: the writer writes NO block (never a throw, never a
+        malformed block) and the receipt reads NO_SIGNAL."""
         no_names = dict(HEALTHY_PROBE)
         del no_names["gpuNames"]
         rows = [no_names, dict(HEALTHY_PROBE, gpuNames="NVIDIA"), dict(HEALTHY_PROBE, gpuNames=["NVIDIA", 7]),
-                dict(HEALTHY_PROBE, driverVersion=32), dict(HEALTHY_PROBE, displayDevice="2026-11-24T00:00:00Z")]
-        for i, g in enumerate(writer_round_trip(rows)):
+                dict(HEALTHY_PROBE, driverVersion=32), dict(HEALTHY_PROBE, displayDevice=True), dict(HEALTHY_PROBE, gpuNames=[])]
+        got = writer_round_trip(rows)
+        self.assertEqual(len(got), len(rows))
+        for i, g in enumerate(got):
             with self.subTest(i=i):
                 self.assertIsNone(g["threw"])
                 self.assertFalse(g["wrote"])
@@ -400,19 +419,101 @@ class AdversaryPass1Tests(unittest.TestCase):
                 self.assertFalse(g["wrote"], "a probe text ConvertFrom-Json could not give back as reported is never present evidence")
                 self.assertEqual(g["state"], "NO_SIGNAL")
 
-    def test_a4_a_rank_two_gpu_names_array_writes_no_block(self) -> None:
+    def test_a4_the_writer_takes_no_powershell_object(self) -> None:
+        """A rank-two array (pass-1 A4) can no longer reach the writer: since pass-3 A2 it takes only the probe's stdout TEXT (a JSON list is rank one)."""
         script = (
             f"Import-Module '{psq(MODULE)}' -Force\n"
-            "$g = [string[,]]::new(2, 2); $g[0, 0] = 'A'; $g[0, 1] = 'B'; $g[1, 0] = 'C'; $g[1, 1] = 'D'\n"
-            "$b = New-DvDisplayPathBlock -Probe @{ gpuNames = $g; driverVersion = $null; displayDevice = $null }\n"
-            "Write-Output ('OUT=' + ($null -eq $b))\n"
+            "$names = @((Get-Command New-DvDisplayPathBlock).Parameters.Keys | Where-Object { $_ -notin [System.Management.Automation.PSCmdlet]::CommonParameters })\n"
+            "$t = (Get-Command New-DvDisplayPathBlock).Parameters['ProbeStdout'].ParameterType.FullName\n"
+            "Write-Output ('OUT=' + ($names -join ',') + '|' + $t)\n"
         )
         proc = run_pwsh(["-Command", script])
-        self.assertIn("OUT=True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("OUT=ProbeStdout|System.String", proc.stdout, proc.stdout + proc.stderr)
 
     def test_a7_a_temp_path_with_an_apostrophe_still_reaches_the_reader(self) -> None:
         got = read_texts([with_block(GOOD_BLOCK_TEXT)], prefix=TMP_PREFIX)[0]
         self.assertEqual(got["state"], "present", got["reason"])
+
+
+# r1 adversary pass-3 (f7a24744).
+LOSSY = "Carte vid?o de base Microsoft"   # A1: a venue agent writes its result as ASCII, so a non-ASCII name arrives with a '?'
+PROBE_JSON = json.dumps(HEALTHY_PROBE)
+A2_PROBE_LINES = [
+    ("gpuNames twice, the first null", "DVE_PROBE=" + PROBE_JSON[:-1] + ', "gpuNames": null}'),
+    ("gpuNames twice, the first a list", "DVE_PROBE=" + PROBE_JSON[:-1] + ', "gpuNames": ["Other GPU"]}'),
+    ("driverVersion twice", "DVE_PROBE=" + PROBE_JSON[:-1] + ', "driverVersion": "1.0"}'),
+    ("displayDevice twice", "DVE_PROBE=" + PROBE_JSON[:-1] + ', "displayDevice": null}'),
+    ("a case variant GpuNames beside gpuNames", "DVE_PROBE=" + PROBE_JSON[:-1] + ', "GpuNames": ["Other GPU"]}'),
+    ("a singleton array root", "DVE_PROBE=[" + PROBE_JSON + "]"),
+    ("a // comment in the probe line", "DVE_PROBE=" + PROBE_JSON[:-1] + " // x\n}"),
+    ("no DVE_PROBE line", "pwsh 7\n"),
+    ("a probe line that is not JSON", "DVE_PROBE={gpuNames}"),
+]
+A4_READER_ROWS = [
+    ("an unreadable string outside the block, beside a good block",
+     with_block(GOOD_BLOCK_TEXT).replace('"gpuNames": ["Intel(R) Iris(R) Xe Graphics"]', '"gpuNames": ["\\ud800"]')),
+    ("an unreadable string in a receipt with no block", json.dumps(legacy_receipt()).replace('"actor": "unit-test"', '"actor": "\\ud800"')),
+    ("an unreadable member name in a receipt with no block", json.dumps(legacy_receipt()).replace('"actor": "unit-test"', '"\\udc00": "unit-test"')),
+]
+
+
+@requires_windows_pwsh
+class AdversaryPass3Tests(RunnerHarness, unittest.TestCase):
+    """r1 adversary pass-3 on f7a24744: A1-A5 (introduced majors) and the in-scope advisories A7, A8."""
+
+    def setUp(self) -> None:
+        self.make_harness()
+
+    def test_a1_a3_a4_reader_rows_read_malformed(self) -> None:
+        rows = [
+            ("a1 an adapter name that lost a character to ASCII", with_block(GOOD_BLOCK_TEXT.replace("Intel(R) Iris(R) Xe Graphics", LOSSY))),
+            ("a1 a driver version with a ?", with_block(GOOD_BLOCK_TEXT.replace("31.0.101.5186", "31.0.?"))),
+            ("a1 a display device with a ?", with_block(GOOD_BLOCK_TEXT.replace("DISPLAY1", "DISPLAY?"))),
+            ("a3 an empty adapters list", with_block(GOOD_BLOCK_TEXT.replace('["Intel(R) Iris(R) Xe Graphics", "NVIDIA GeForce RTX 3060 Laptop GPU"]', "[]"))),
+        ] + A4_READER_ROWS
+        got = read_texts([t for _, t in rows])
+        self.assertEqual(len(got), len(rows))
+        for (label, _), g in zip(rows, got):
+            with self.subTest(label):
+                self.assertIsNone(g["threw"], g["threw"])
+                self.assertEqual(g["state"], "malformed", f"{label}: read {g['state']} ({g['reason']})")
+
+    def test_a1_a2_a3_a_probe_the_writer_cannot_copy_as_reported_writes_no_block(self) -> None:
+        rows = [("a1 an ASCII-lossy adapter name", dict(HEALTHY_PROBE, gpuNames=[LOSSY])),
+                ("a1 an ASCII-lossy driver", dict(HEALTHY_PROBE, driverVersion="32.0.?")),
+                ("a3 no adapter at all (a failed controller read)", dict(HEALTHY_PROBE, gpuNames=[], driverVersion=None))] + A2_PROBE_LINES
+        got = writer_round_trip([p for _, p in rows])
+        self.assertEqual(len(got), len(rows))
+        for (label, _), g in zip(rows, got):
+            with self.subTest(label):
+                self.assertIsNone(g["threw"], g["threw"])
+                self.assertFalse(g["wrote"], f"{label}: the writer wrote {g['block']}")
+                self.assertEqual(g["state"], "NO_SIGNAL")
+
+    def test_a5_a_pass_receipt_lists_the_block_as_unbound(self) -> None:
+        self.write_artifacts()
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "PASS", receipt["outcomeDetail"])
+        self.assertIn("displayPath", receipt["venue"])
+        unbound = receipt["verification"]["unbound"]
+        self.assertTrue(any(u.startswith("DISPLAY_PATH_UNBOUND") for u in unbound), unbound)
+
+    def test_a5_the_sheet_pair_record_names_the_block_unbound(self) -> None:
+        text = (DV / "New-VenueSheetPair.ps1").read_text(encoding="utf-8")
+        self.assertRegex(text, r"unbound = @\([^)]*'venue\.displayPath'")
+
+    def test_a7_a_smart_apostrophe_in_the_temp_path_still_reaches_the_reader(self) -> None:
+        got = read_texts([with_block(GOOD_BLOCK_TEXT)], prefix="dvp-o" + chr(0x2019) + "neil-")[0]
+        self.assertEqual(got["state"], "present", got["reason"])
+
+    def test_a8_an_empty_result_table_fails_the_harness(self) -> None:
+        class P:
+            returncode = 0
+            stdout = "CASES=[]\n"
+            stderr = ""
+        with self.assertRaises(AssertionError):
+            cases_line(P, 3, "reader")
 
 
 class DocsTests(unittest.TestCase):
