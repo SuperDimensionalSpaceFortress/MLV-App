@@ -62,13 +62,20 @@ function Get-ThirdPartyProducerLaunchRefusal([string]$Lane, [string]$Engine) {
     return ('LANE_REFUSED {0} reason={1} card={2}' -f $Lane, $f.reason, $f.card)
 }
 
-# True when $Path names the REAL producer CLI. The test seam (-ExeForTest) may stand a fixture in for the CLI, never the CLI itself.
-function Test-ProducerExeIsRealCli([string]$Path) {
+# True only for a FIXTURE stand-in: an existing, small (<= 64 KiB) .cmd batch file that is not a reparse point. The test seam
+# (-ExeForTest) may stand such a file in for the CLI. It is decided by WHAT THE FILE IS, never by comparing its path with the
+# real CLI's path: a path comparison is bypassed by any alias (`\\?\C:\...\agy.exe`, an 8.3 name, a junction), and a real CLI is
+# an .exe far over 64 KiB, so no alias of one is ever a fixture. Anything unreadable or unclear is NOT a fixture (fail closed).
+function Test-ProducerExeIsFixtureStandIn([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-    $full = try { [System.IO.Path]::GetFullPath($Path) } catch { return $true }
-    $real = @((Join-Path $env:LOCALAPPDATA 'agy\bin\agy.exe'), (Join-Path $env:USERPROFILE '.kimi-code\bin\kimi.exe'))
-    foreach ($r in $real) { if ([string]::Equals($full, [System.IO.Path]::GetFullPath($r), [System.StringComparison]::OrdinalIgnoreCase)) { return $true } }
-    return $false
+    try {
+        $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+        if ($item -isnot [System.IO.FileInfo]) { return $false }
+        if (-not [string]::Equals($item.Extension, '.cmd', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
+        if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
+        if ($item.Length -gt 65536) { return $false }
+        return $true
+    } catch { return $false }
 }
 
 # Absolute launcher paths. Neither CLI is guaranteed on PATH, and a bare name resolves differently per shell.
@@ -553,8 +560,8 @@ function Invoke-ThirdPartyProducerLane {
         [string]$ExeForTest = ''
     )
     # THE FENCE, before the slot, the ledger, the prompt file or any process: the launcher already refused, so reaching
-    # this line means a direct caller. Only a fixture stand-in (-ExeForTest, never the real CLI) is let through.
-    if (-not $ExeForTest -or (Test-ProducerExeIsRealCli -Path $ExeForTest)) {
+    # this line means a direct caller. Only a fixture stand-in (-ExeForTest naming a small .cmd file) is let through.
+    if (-not $ExeForTest -or -not (Test-ProducerExeIsFixtureStandIn -Path $ExeForTest)) {
         $fence = Get-ThirdPartyProducerLaunchRefusal -Lane $Lane -Engine ([string]$Cfg.engine)
         if ($fence) { throw $fence }
     }

@@ -758,7 +758,11 @@ def test_the_helper_refuses_a_direct_call_and_the_real_cli_path_even_with_the_te
     cfg = ("@{ engine = '%s'; model = '%s'; effort = 'high'; role = 'trial-implementer' }"
            % (engine, "gemini-4-neon-high" if engine == "antigravity" else "kimi-code/k3.1-pro"))
     real = ("(Join-Path $env:LOCALAPPDATA 'agy\\bin\\agy.exe')" if engine == "antigravity" else "(Join-Path $env:USERPROFILE '.kimi-code\\bin\\kimi.exe')")
-    for exe_arg in ("", "-ExeForTest %s" % real):
+    # r2 pass-4 A1: the seam is decided by what the file IS (a small .cmd), so no alias of the real CLI gets through: the plain
+    # path, the extended-length prefix, an 8.3-style spelling, a missing file and a non-.cmd file are ALL refused.
+    (tmp_path / "not-a-fixture.exe").write_bytes(b"MZ")
+    for exe_arg in ("", "-ExeForTest %s" % real, "-ExeForTest ('\\\\?\\' + %s)" % real, "-ExeForTest ((%s) -replace 'layib', 'LAYIB')" % real,
+                    "-ExeForTest (Join-Path $env:T_WT 'missing-fixture.cmd')", "-ExeForTest (Join-Path $env:T_WT 'not-a-fixture.exe')"):
         script = ("$script:ledgerCalls = 0; try { Invoke-ThirdPartyProducerLane -Lane %s -Cfg %s -Prompt x -WorkDir $env:T_WT -RunDir $env:T_RUN -TimeoutSec 30 -AllowEdits $true "
                   "-LedgerWriter { $script:ledgerCalls++ } %s | Out-Null; 'NO-THROW' } catch { $_.Exception.Message }; \"calls=$($script:ledgerCalls)\"") % (lane, cfg, exe_arg)
         done = pwsh(script, {"T_WT": str(tmp_path), "T_RUN": str(run)})
