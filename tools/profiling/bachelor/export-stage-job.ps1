@@ -334,7 +334,10 @@ try {
     Write-JobTrace "step export start format=$Format maxFrames=$MaxFrames timeoutSec=$ExportTimeoutSec"
     # A1-CLOCK-FREE-ANCESTRY-1 r1: the identities (pid + creation stamp) of every process alive BEFORE the export root starts. The kill confirmation below calls only those, and what they
     # started directly, outsiders: no clock ordering decides ancestry. No listing ($null) is an unknown tree: an unconfirmed kill, never a confirmed one.
-    $exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 10
+    # sol A4 on 91e548f8: a helper the job does not carry (its source could not be read while the job was generated) is an unknown tree and an unconfirmed kill, never an abort before the
+    # root starts or before the typed terminal result (every call below is guarded).
+    $exportBaseline = $null
+    try { $exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 10 } catch { Write-JobTrace "step export baseline listing unavailable error=$([string]$_.CategoryInfo.Reason)" }
     $exportWatch = [Diagnostics.Stopwatch]::StartNew()
     $app = [Diagnostics.Process]::Start($psi)
     $timedOut = -not $app.WaitForExit([int]($ExportTimeoutSec * 1000))
@@ -346,10 +349,10 @@ try {
     # after the root's wait. A survivor, or a tree that could not be read, leaves the kill unconfirmed (EXPORT_KILL_UNCONFIRMED, exit 48) and the survivors are traced.
     $killConfirmed = $true
     if ($timedOut) {
-        $exportTree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline
+        $exportTree = try { Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline } catch { $null }
         try { $app.Kill($true) } catch { $killConfirmed = $false; Write-JobTrace "step export kill tree error=$([string]$_.CategoryInfo.Reason)"; try { $app.Kill() } catch { Write-JobTrace "step export kill root error=$([string]$_.CategoryInfo.Reason)" } }
         if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }
-        $exportTreeGone = Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000
+        $exportTreeGone = try { Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000 } catch { [pscustomobject]@{ confirmed = $false; survivors = @(); error = 'tree-unknown: helper unavailable' } }
         if (-not $exportTreeGone.confirmed) { $killConfirmed = $false; Write-JobTrace "step export kill descendants unconfirmed reason=$($exportTreeGone.error) survivors=$(@($exportTreeGone.survivors) -join ',')" }
     }
     $exportWatch.Stop()

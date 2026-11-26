@@ -2049,15 +2049,19 @@ function Invoke-VenueBoundedProcess {
     # A1-CLOCK-FREE-ANCESTRY-1 r1: ancestry is proved from a listing of the identities (pid + creation stamp) taken BEFORE the root starts, never from comparing creation stamps. One listing is
     # reused for 30 s (a process in it was alive before ANY later root started, so reuse stays sound; a process started since is simply not an outsider: an unconfirmed kill, never a
     # false confirmation), so a quick child pays no scan. A listing that cannot be read is cached as unknown for the same 30 s: the tree is then unknown.
-    if ($script:VenueProcessTreeHelpersLoaded -and ($null -eq $script:VenueBaselineClock -or $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30)) {
+    # sol A2 on 91e548f8: the listing may not push this call past the caller's absolute deadline. It is refreshed only when the caller granted at least 3 s, under a 1 s CIM timeout, and the
+    # time it took is taken OFF the child's wait below (the call still ends $TimeoutSec after it began); under 3 s the listing already cached (or none: an unknown tree on a timeout) is used.
+    $censusClock = [Diagnostics.Stopwatch]::StartNew()
+    if ($script:VenueProcessTreeHelpersLoaded -and $TimeoutSec -ge 3 -and ($null -eq $script:VenueBaselineClock -or $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30)) {
         $script:VenueBaseline = $null
-        try { $script:VenueBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 5 } catch { $script:VenueBaseline = $null }
+        try { $script:VenueBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 1 } catch { $script:VenueBaseline = $null }
         $script:VenueBaselineClock = [Diagnostics.Stopwatch]::StartNew()
     }
+    $censusMs = $censusClock.Elapsed.TotalMilliseconds
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
-    $timedOut = -not $p.WaitForExit($TimeoutSec * 1000)
+    $timedOut = -not $p.WaitForExit([int][Math]::Max(1.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusMs)))
     $killErrored = $false
     $treeGone = $true
     $cleanup = [Diagnostics.Stopwatch]::StartNew()

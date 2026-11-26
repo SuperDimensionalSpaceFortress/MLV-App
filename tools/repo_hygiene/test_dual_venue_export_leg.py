@@ -4360,7 +4360,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         """Run the job's own export-wait-through-classification block (sliced from the generator's template) on a real two-process tree that times out."""
         src = EXPORT_JOB.read_text(encoding="utf-8")
         # A1-CLOCK-FREE-ANCESTRY-1 r1: the block starts at the listing of the processes alive BEFORE the root starts (it sits just ahead of the export stopwatch, so the scan is never timed)
-        start = src.index("    $exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly")
+        start = src.index("    $exportBaseline = $null\n    try { $exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly")
         self.assertLess(start, src.index("    $exportWatch = [Diagnostics.Stopwatch]::StartNew()\n"))
         end_anchor = src.index("    $exitFor = @{", start)
         end = src.index("\n", end_anchor) + 1
@@ -4424,12 +4424,12 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
 
     def test_the_job_records_the_tree_before_the_kill_and_confirms_it_after_the_root_wait(self) -> None:
         text = EXPORT_JOB.read_text(encoding="utf-8")
-        snap = text.index("$exportTree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline")
-        self.assertLess(text.index("$exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly"), text.index("$app = [Diagnostics.Process]::Start($psi)"),
+        snap = text.index("$exportTree = try { Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline } catch { $null }")
+        self.assertLess(text.index("try { $exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly"), text.index("$app = [Diagnostics.Process]::Start($psi)"),
                         "the listing of the processes alive before the root is taken BEFORE the root starts")
         kill = text.index("try { $app.Kill($true) }")
         root_wait = text.index("if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }")
-        tree_wait = text.index("$exportTreeGone = Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000")
+        tree_wait = text.index("$exportTreeGone = try { Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000 } catch {")
         self.assertLess(snap, kill, "the descendants are recorded while their parents still exist")
         self.assertLess(root_wait, tree_wait)
         self.assertLess(tree_wait, text.index("$logText = try {"), "the tree is settled before any output is read")
@@ -4947,11 +4947,12 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             "$sWait = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 500 201 $t.AddHours(-2)))) }\n"
             # a baseline pid holding ANOTHER stamp is a new process: under member 201 it is a survivor
             "$diff = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 500 201 $t.AddHours(-1)))) }\n"
-            "[ordered]@{ blKeys = @($bl.Keys | Sort-Object); blTicks = $bl[[int64]600]; blWant = $t.AddHours(-1).Ticks; none = ($null -eq $none); noBase = $noBase.ok; noBaseWhy = $noBase.error; emptyBase = $emptyBase.ok;\n"
+            "[ordered]@{ blKeys = @($bl.Keys | Sort-Object); blTicks = $bl[[int64]600][0]; blParent = $bl[[int64]600][1]; blWant = $t.AddHours(-1).Ticks; none = ($null -eq $none); noBase = $noBase.ok; noBaseWhy = $noBase.error; emptyBase = $emptyBase.ok;\n"
             "            rootIn = $rootIn.ok; rootInWhy = $rootIn.error; sOk = $s.ok; sMembers = @($s.members | ForEach-Object { $_.processId }); sOthers = @($s.others.Keys | Sort-Object);\n"
             "            sWait = $sWait.confirmed; diff = $diff.confirmed; diffSurvivors = @($diff.survivors) } | ConvertTo-Json -Compress")
         self.assertEqual(sorted(got["blKeys"]), [0, 4, 600], f"a row with no readable stamp is not in the listing: {got}")
         self.assertEqual(got["blTicks"], got["blWant"], got)
+        self.assertEqual(got["blParent"], 999, f"the listing keeps the parent pid beside the stamp: {got}")
         self.assertTrue(got["none"], got)
         self.assertFalse(got["noBase"], got)
         self.assertEqual(got["noBaseWhy"], "baseline-unknown", got)
@@ -4980,6 +4981,48 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         unproven = wait[wait.index("$unproven = @{}"):wait.index("$adopted.Add([int64]$q)")]
         self.assertNotRegex(unproven, r"-(lt|gt|le|ge)\b", "no ordering of two stamps decides ancestry in the wait")
         self.assertNotIn("$climb", cut + unproven, "no ParentProcessId climb through processes the listing does not hold")
+
+    def test_a1_clock_free_a_recycled_pid_that_repeats_a_baseline_stamp_is_not_that_process_unless_its_parent_matches(self) -> None:
+        """sol A1 on 91e548f8. The listing records pid, stamp AND parent pid. Baseline process 600 (stamp t-1h, parent 999) died; after a clock rollback a live DESCENDANT took
+        pid 600 and the very same stamp, under member 201. Pid and stamp alone would call it the baseline process; its parent (201, not 999) proves it is not. Control: the
+        real 600 (parent 999) alive is an outsider and the kill is confirmed."""
+        got = self.snapshot_and_wait(
+            "$realSnapshot = 'AttrCudaArtifacts\\Get-AttrCudaProcessTreeSnapshot'\n"
+            "$sys0 = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$tree = @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$bl = & $realSnapshot -BaselineOnly -Processes @($sys0 + @((Row 600 999 $t.AddHours(-1))))\n"
+            "$a = & $realSnapshot -RootProcessId 100 -Processes @($sys0 + $tree + @((Row 600 201 $t.AddHours(-1)))) -Baseline $bl\n"
+            "$aWait = Wait-AttrCudaProcessTreeGone -Snapshot $a -WaitMs 1200 -Scan { @($sys0 + @((Row 600 201 $t.AddHours(-1)))) }\n"
+            "$b = & $realSnapshot -RootProcessId 100 -Processes @($sys0 + $tree + @((Row 600 999 $t.AddHours(-1)))) -Baseline $bl\n"
+            "$bWait = Wait-AttrCudaProcessTreeGone -Snapshot $b -WaitMs 1200 -Scan { @($sys0 + @((Row 600 999 $t.AddHours(-1)))) }\n"
+            "[ordered]@{ aMembers = @($a.members | ForEach-Object { $_.processId }); aOthers = @($a.others.Keys | Sort-Object); aWait = $aWait.confirmed; aSurvivors = @($aWait.survivors);\n"
+            "            bMembers = @($b.members | ForEach-Object { $_.processId }); bOthers = @($b.others.Keys | Sort-Object); bWait = $bWait.confirmed } | ConvertTo-Json -Compress")
+        self.assertIn(600, got["aMembers"], f"a pid + stamp repeat under a member is a member: {got}")
+        self.assertNotIn(600, got["aOthers"], got)
+        self.assertFalse(got["aWait"], got)
+        self.assertEqual(got["aSurvivors"], [600], got)
+        self.assertEqual(got["bMembers"], [201], f"control: the real baseline process is no member: {got}")
+        self.assertIn(600, got["bOthers"], got)
+        self.assertTrue(got["bWait"], got)
+
+    def test_a1_clock_free_sol_r4_a2_a3_a4_the_listing_cannot_delay_the_deadline_the_wait_clock_starts_first_and_a_missing_helper_never_aborts_the_job(self) -> None:
+        """sol A2, A3, A4 on 91e548f8 (source). A2: Invoke-VenueBoundedProcess refreshes the listing only when the caller granted at least 3 s, under a 1 s CIM timeout, and takes the
+        listing's time OFF the child's wait. A3: the wait's stopwatch is its first statement, before the snapshot is decoded. A4: the job guards the three helper calls, so a helper the
+        job does not carry is an unknown tree (an unconfirmed kill, typed EXPORT_KILL_UNCONFIRMED), never an abort before the root starts or before the typed result."""
+        venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = venue[venue.index("function Invoke-VenueBoundedProcess"):venue.index("function Get-VenueDriverScriptMissing")]
+        self.assertIn("$TimeoutSec -ge 3 -and", body)
+        self.assertIn("-BaselineOnly -OperationTimeoutSec 1 }", body)
+        self.assertIn("$timedOut = -not $p.WaitForExit([int][Math]::Max(1.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusMs)))", body)
+        self.assertLess(body.index("$censusMs = $censusClock.Elapsed.TotalMilliseconds"), body.index("[Diagnostics.Process]::Start($psi)"))
+        src = ARTIFACTS_MODULE.read_text(encoding="utf-8")
+        wait = src[src.index("function Wait-AttrCudaProcessTreeGone"):src.index("function Get-AttrCudaProcessCpuSnapshot")]
+        self.assertLess(wait.index("$clock = [Diagnostics.Stopwatch]::StartNew()"), wait.index("$snapProps = $null"), "the bound's clock starts before the snapshot is decoded")
+        self.assertEqual(wait.count("$clock = [Diagnostics.Stopwatch]::StartNew()"), 1, wait)
+        job = EXPORT_JOB.read_text(encoding="utf-8")
+        self.assertIn("try { $exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 10 } catch {", job)
+        self.assertIn("$exportTree = try { Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline } catch { $null }", job)
+        self.assertIn("$exportTreeGone = try { Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000 } catch { [pscustomobject]@{ confirmed = $false;", job)
 
     def test_r2_a2_no_scan_starts_without_its_floor_plus_margin_left_and_the_grants_are_floored_doubles(self) -> None:
         """r2, sol r1 A2 on 76dd1e12 (margin 50 -> 100 ms and the timeout re-read inside the call's argument: sol r2 A3 on 8cf9cae3). A scan needs CIM's 1 s floor plus the

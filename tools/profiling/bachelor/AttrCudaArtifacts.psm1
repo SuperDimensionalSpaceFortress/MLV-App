@@ -5073,9 +5073,16 @@ function Get-AttrCudaProcessTreeSnapshot {
           [Parameter(ParameterSetName = 'Tree')][AllowNull()][hashtable]$Baseline, [object[]]$Processes, [ValidateRange(1, 120)][int]$OperationTimeoutSec = 20, [int64]$NowTicks)
     if ($BaselineOnly) {
         try {
-            $baseRows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, CreationDate -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
+            $baseRows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, CreationDate -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
             $baseTable = @{}
-            foreach ($baseRow in $baseRows) { if ($null -ne $baseRow -and $null -ne $baseRow.ProcessId -and $null -ne $baseRow.CreationDate) { $baseTable[[int64]$baseRow.ProcessId] = ([datetime]$baseRow.CreationDate).ToUniversalTime().Ticks } }
+            # sol A1 on 91e548f8: the identity is the pid, the creation stamp AND the parent pid (immutable for a process's whole life): a replacement that reuses the number and, after a
+            # rollback, even the stamp is another process unless it also names the same parent. A row with no readable parent is recorded by pid and stamp alone.
+            foreach ($baseRow in $baseRows) {
+                if ($null -ne $baseRow -and $null -ne $baseRow.ProcessId -and $null -ne $baseRow.CreationDate) {
+                    $baseStamp = ([datetime]$baseRow.CreationDate).ToUniversalTime().Ticks
+                    $baseTable[[int64]$baseRow.ProcessId] = $(if ($null -eq $baseRow.ParentProcessId) { [int64[]]@($baseStamp) } else { [int64[]]@($baseStamp, [int64]$baseRow.ParentProcessId) })
+                }
+            }
             if ($baseTable.Count -eq 0) { return $null }
             return $baseTable
         } catch { return $null }
@@ -5083,9 +5090,10 @@ function Get-AttrCudaProcessTreeSnapshot {
     $unknown = { param([string]$Why) [pscustomobject]@{ ok = $false; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $null; members = @(); error = $Why } }
     try {
         $baseTable = @{}
-        if ($null -ne $Baseline) { foreach ($bk in @($Baseline.Keys)) { if ($null -ne $Baseline[$bk]) { $baseTable[[int64]$bk] = [int64]$Baseline[$bk] } } }
+        if ($null -ne $Baseline) { foreach ($bk in @($Baseline.Keys)) { if ($null -ne $Baseline[$bk]) { $baseTable[[int64]$bk] = [int64[]]@($Baseline[$bk]) } } }
         if ($baseTable.Count -eq 0) { return (& $unknown 'baseline-unknown') }
-        $inBase = { param($BasePid, $BaseTicks) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid] -eq [int64]$BaseTicks) }
+        # an entry is (stamp) or (stamp, parent pid): a row is that baseline process only when its pid, stamp AND (when the entry has one) parent pid all match
+        $inBase = { param($BasePid, $BaseTicks, $BaseParent) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid][0] -eq [int64]$BaseTicks) -and (($baseTable[[int64]$BasePid].Count -lt 2) -or (($null -ne $BaseParent) -and ([int64]$baseTable[[int64]$BasePid][1] -eq [int64]$BaseParent))) }
         $rows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
         # r5b fix (adversary A1 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started, so the
         # creation-time ordering the orphan classification below relies on is untrustworthy: the tree is unknown (fail closed), never classified by a rolled-back clock.
@@ -5112,7 +5120,7 @@ function Get-AttrCudaProcessTreeSnapshot {
         }
         if ($null -eq $rootTicks) { return (& $unknown "root-not-in-scan pid=$RootProcessId") }
         # a root that is itself in the baseline was NOT started after it: the listing proves nothing about this tree (fail closed)
-        if (& $inBase $RootProcessId $rootTicks) { return (& $unknown "root-in-baseline pid=$RootProcessId") }
+        if ($baseTable.ContainsKey([int64]$RootProcessId) -and ([int64]$baseTable[[int64]$RootProcessId][0] -eq [int64]$rootTicks)) { return (& $unknown "root-in-baseline pid=$RootProcessId") }
         $members = [System.Collections.Generic.List[object]]::new()
         $seen = [System.Collections.Generic.HashSet[int64]]::new()
         [void]$seen.Add([int64]$RootProcessId)
@@ -5126,7 +5134,7 @@ function Get-AttrCudaProcessTreeSnapshot {
                 $childPid = [int64]$child.ProcessId
                 $childTicks = ([datetime]$child.CreationDate).ToUniversalTime().Ticks
                 # a baseline process (same pid AND stamp) was alive before the root started: a holder of a member's number that is one is no descendant, and neither is anything it started
-                if (& $inBase $childPid $childTicks) { continue }
+                if (& $inBase $childPid $childTicks $child.ParentProcessId) { continue }
                 if ($seen.Contains($childPid)) { continue }
                 [void]$seen.Add($childPid)
                 $member = [pscustomobject]@{ processId = $childPid; creationTicks = $childTicks }
@@ -5152,10 +5160,10 @@ function Get-AttrCudaProcessTreeSnapshot {
         $late = @{}
         foreach ($start in @($rowTicks.Keys)) {
             if ($memberIds.ContainsKey([int64]$start)) { continue }
-            $outsider = [bool](& $inBase $start $rowTicks[$start])
+            $outsider = [bool](& $inBase $start $rowTicks[$start] $rowParent[$start])
             if (-not $outsider) {
                 $up = $rowParent[$start]
-                if ($null -ne $up -and [int64]$up -ne [int64]$start -and $rowTicks.ContainsKey([int64]$up) -and (& $inBase $up $rowTicks[[int64]$up])) { $outsider = $true }
+                if ($null -ne $up -and [int64]$up -ne [int64]$start -and $rowTicks.ContainsKey([int64]$up) -and (& $inBase $up $rowTicks[[int64]$up] $rowParent[[int64]$up])) { $outsider = $true }
             }
             $late[[int64]$start] = -not $outsider
         }
@@ -5186,6 +5194,9 @@ function Wait-AttrCudaProcessTreeGone {
     no survivor. Anything else is $false (fail closed). Never throws. -Scan is the test seam: a scriptblock returning the rows of one scan.
     #>
     param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [ValidateRange(0, 600000)][int]$WaitMs = 15000, [scriptblock]$Scan, [int64]$NowTicks)
+    # sol A3 on 91e548f8: the bound's clock starts at the FIRST statement, so the time spent decoding the snapshot (members, outsiders, the listing before the root) is spent from -WaitMs, never
+    # added to it: a scan is granted only what the caller's shared cleanup budget still holds.
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     # r3 fix 2 (adversary A2 advisory on 6b788356): every snapshot field is read through PSObject.Properties, so a snapshot missing one (under strict mode) is an
     # unknown tree, never a throw. r5b fix (adversary A4 on 2420b65f): a property getter that throws is read inside the same guard.
     $snapProps = $null
@@ -5201,7 +5212,7 @@ function Wait-AttrCudaProcessTreeGone {
     $recorded = @{}
     $known = @{}
     $baseTable = @{}
-    $inBase = { param($BasePid, $BaseTicks) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid] -eq [int64]$BaseTicks) }
+    $inBase = { param($BasePid, $BaseTicks, $BaseParent) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid][0] -eq [int64]$BaseTicks) -and (($baseTable[[int64]$BasePid].Count -lt 2) -or (($null -ne $BaseParent) -and ([int64]$baseTable[[int64]$BasePid][1] -eq [int64]$BaseParent))) }
     $skewTicks = 20000000L
     try {
         $recorded[[int64]$Snapshot.rootProcessId] = [int64]$Snapshot.rootCreationTicks
@@ -5213,7 +5224,7 @@ function Wait-AttrCudaProcessTreeGone {
         if ($othersRaw -is [hashtable]) { foreach ($k in @($othersRaw.Keys)) { $known[[int64]$k] = $(if ($null -eq $othersRaw[$k]) { $null } else { [int64]$othersRaw[$k] }) } }
         # A1-CLOCK-FREE-ANCESTRY-1 r1: the listing taken before the root started (pid -> creation ticks). A snapshot without it proves no baseline process.
         $baseRaw = $(if ($null -ne $snapProps['baseline']) { $snapProps['baseline'].Value } else { $null })
-        if ($baseRaw -is [hashtable]) { foreach ($k in @($baseRaw.Keys)) { if ($null -ne $baseRaw[$k]) { $baseTable[[int64]$k] = [int64]$baseRaw[$k] } } }
+        if ($baseRaw -is [hashtable]) { foreach ($k in @($baseRaw.Keys)) { if ($null -ne $baseRaw[$k]) { $baseTable[[int64]$k] = [int64[]]@($baseRaw[$k]) } } }
     } catch { return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: unreadable snapshot identity" } }
     # r1 fix 2 (adversary A2 on 348c4357): a scan is STARTED only while at least $scanFloorMs (CIM's own 1 s OperationTimeoutSec floor) is left, under a timeout no
     # longer than what is left, and no sleep runs into that floor; so no scan is granted past the bound. A bound under 1 s is no time to confirm.
@@ -5223,7 +5234,6 @@ function Wait-AttrCudaProcessTreeGone {
     # r2b (sol r2 A3): the margin is 100 ms and the timeout is read AGAIN inside the call's own argument, so only a pause between that read and the dispatch itself can start a late scan;
     # a scan that then ends past the bound confirms nothing (below), and a grant under 1 s is refused by the cmdlet's own validation (an unconfirmed kill).
     $scanMarginMs = 100
-    $clock = [Diagnostics.Stopwatch]::StartNew()
     $survivors = @()
     $lastError = 'no-time-to-confirm'
     # r7b (adversary A3 on 1413e30f): the clock is read to the fraction of a millisecond; ElapsedMilliseconds truncates, so 1200.6 ms read as inside a 1200 ms bound.
@@ -5280,7 +5290,7 @@ function Wait-AttrCudaProcessTreeGone {
                 if (-not $byParent.ContainsKey($parentPid)) { continue }
                 foreach ($childPid in $byParent[$parentPid]) {
                     # a baseline process (same pid AND stamp, alive before the root started) holding a member's number is no descendant, and neither is anything it started
-                    if (& $inBase $childPid $rowTicks[$childPid]) { continue }
+                    if (& $inBase $childPid $rowTicks[$childPid] $rowParent[$childPid]) { continue }
                     if ($adopted.Add($childPid)) { $found.Add($childPid); $discovered.Add($childPid) }
                     if ($expanded.Add($childPid)) { $queue.Enqueue($childPid) }
                 }
@@ -5298,10 +5308,10 @@ function Wait-AttrCudaProcessTreeGone {
             foreach ($start in @($rowTicks.Keys)) {
                 if ($adopted.Contains([int64]$start)) { continue }
                 $startTicks = $rowTicks[$start]
-                $outsider = [bool](& $inBase $start $startTicks) -or (($null -ne $startTicks) -and $known.ContainsKey([int64]$start) -and ($null -ne $known[[int64]$start]) -and ([int64]$known[[int64]$start] -eq [int64]$startTicks))
+                $outsider = [bool](& $inBase $start $startTicks $rowParent[$start]) -or (($null -ne $startTicks) -and $known.ContainsKey([int64]$start) -and ($null -ne $known[[int64]$start]) -and ([int64]$known[[int64]$start] -eq [int64]$startTicks))
                 if (-not $outsider) {
                     $up = $rowParent[$start]
-                    if ($null -ne $up -and [int64]$up -ne [int64]$start -and $rowTicks.ContainsKey([int64]$up) -and (& $inBase $up $rowTicks[[int64]$up])) { $outsider = $true }
+                    if ($null -ne $up -and [int64]$up -ne [int64]$start -and $rowTicks.ContainsKey([int64]$up) -and (& $inBase $up $rowTicks[[int64]$up] $rowParent[[int64]$up])) { $outsider = $true }
                 }
                 if (-not $outsider) { $unproven[[int64]$start] = $true }
             }
