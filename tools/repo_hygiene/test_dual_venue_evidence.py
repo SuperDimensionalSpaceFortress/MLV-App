@@ -11078,7 +11078,8 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         # r1 adversary pass 2 A2: a count that is not a whole number in 1..PlayFrames is not known, never "all", never "-1 of", never a throw.
         # r1 adversary pass 3 A3 (its input verbatim): -LabelledPlayFrames 0 beside one declared display frame contradicts it, so it is not known either:
         # on 59b7ceee the reason said "0 of the 2 judged play frames are labelled display frame 479 and the other 2 carry no valid display frame label".
-        for bad in ("$null", "-1", "1.5", "2147483648", "3", "'1'", "0"):
+        # (the "0" case moved to the r2 test below: sol r1c pass A1 says a VALID zero beside one declared display frame is a disagreement, not "not known")
+        for bad in ("$null", "-1", "1.5", "2147483648", "3", "'1'"):
             with self.subTest(labelled=bad):
                 out = self.visual_verdict("unknown", 2, 0, 2, app=1, extra=f"-SoleDisplayFrame 479 -LabelledPlayFrames {bad} ")
                 self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
@@ -11206,6 +11207,50 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                   "-ViewportUnavailablePlayFrames 3 | ConvertTo-Json -Compress")
         self.assertEqual(out["verdict"], "VISUAL_ASSESSMENT_UNAVAILABLE")
         self.assertNotIn("-1", out["reason"])
+
+    def test_the_visual_gate_reason_never_outruns_the_labelled_frame_count(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R1C-REASON-RESIDUE-1 r2 (sol r1c pass A1-A3, their inputs verbatim): -LabelledPlayFrames is how many judged frames carry
+        a valid label. A valid zero beside one declared display frame disagrees (A1); L labelled frames hold at most L - 1 repeats (A2); L labelled frames hold at
+        most L distinct labels, so a larger distinct-label count is not quoted (A3). The verdict and counted never change; only the reason abstains."""
+        base = "Get-DvVisualVerdict -Requested $true -Captured $true -FlatPlayFrames 0 "
+        # A1 (and -SoleDisplayFrame absent): "all valid labels are frame 479" over no valid label
+        for extra in ("-SoleDisplayFrame 479 ", ""):
+            with self.subTest(a1=extra):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 1 {extra}-LabelledPlayFrames 0 | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                self.assertTrue(out["reason"].startswith("the 4 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                         "on how many carry a valid one)"), out["reason"])
+                for claim in ("are all", "479", "none of the", "carry display frame number"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+        # A2: two labelled frames hold one adjacent pair at most, so two repeats cannot be true; the verdict stays PARTIAL_FREEZE
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 2 -SourceDifference known-differ "
+                                  "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+        self.assertIn("cannot be true for them", out["reason"])
+        for claim in ("as supplied", "they repeat", "stopped landing", "label advanced", "paint"):
+            self.assertNotIn(claim, out["reason"], out["reason"])
+        for labelled in (0, 1):
+            proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames {labelled} -SourceDifference known-differ "
+                                      "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+            self.assertTrue(out["reason"].startswith("the repeat count supplied"), out["reason"])
+        # ... while a repeat count the labelled frames can hold still speaks (3 labelled frames hold 2 repeats)
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 3 -SourceDifference known-differ "
+                                  "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("2 of the 4 judged play frames repeat"), out["reason"])
+        # A3: one labelled frame cannot show two distinct labels; every source value and the known-identical waiver
+        for src, verdict, counted in (("unknown", "FROZEN_DISPLAY_SUSPECTED", True), ("known-differ", "FROZEN_DISPLAY", False), ("known-identical", "OK", True)):
+            with self.subTest(a3=src):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 1 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 1 -SourceDifference {src} | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
+                reason = out["reason"] or ""
+                self.assertNotIn("2 distinct frames", reason)
+                self.assertNotIn("a static clip", reason)
+                if verdict != "OK":
+                    self.assertIn("a distinct-frame count that cannot be true for them and is not quoted", reason)
+        # a tuple that fits is still quoted
+        out = self.visual_verdict("unknown", 4, 0, 1, app=2, extra="-LabelledPlayFrames 4 ")
+        self.assertIn("the app presented 2 distinct frames across them", out["reason"])
 
     def test_the_visual_gate_ranks_not_a_motion_witness_after_blank_and_before_the_paused_and_exposure_verdicts(self) -> None:
         """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 precedence: NOT_REQUESTED, VISUAL_ASSESSMENT_UNAVAILABLE, NOT_CAPTURED and CAPTURE_BLANK outrank it; it outranks

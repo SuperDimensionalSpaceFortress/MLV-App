@@ -4359,10 +4359,13 @@ function Get-DvVisualVerdict {
     # (a distinct-picture count outside 1..PlayFrames, a distinct-display-frame count outside 0..PlayFrames, a repeat count over PlayFrames minus the distinct pictures) is never quoted
     # as observed evidence. The verdict is whatever it was (production derives every count from the judged set, so none of these fires there); only the
     # reason drops the number, in words that state no more than the verdict's own condition.
+    # R1C-REASON-RESIDUE-1 r2 (sol r1c pass A1-A3): -LabelledPlayFrames is how many judged frames carry a valid label, so a VALID ZERO is a statement (no judged
+    # frame carries one) and a distinct-label count over it, or a repeat count over (labelled - 1), cannot be true; $labelledCount is that count (0..PlayFrames) or $null
+    $labelledCount = Get-DvFrameNumber $LabelledPlayFrames
+    if ($null -ne $labelledCount -and $labelledCount -gt $PlayFrames) { $labelledCount = $null }
     if ($AppDistinctDisplayFrames -lt 2) {
         $sole = Get-DvFrameNumber $SoleDisplayFrame
-        $labelled = Get-DvFrameNumber $LabelledPlayFrames
-        if ($null -ne $labelled -and ($labelled -gt $PlayFrames -or $labelled -lt 1)) { $labelled = $null }
+        $labelled = $(if ($null -ne $labelledCount -and $labelledCount -ge 1) { $labelledCount } else { $null })
         $numberText = $(if ($null -ne $sole) { "display frame number $sole" } else { 'one display frame number' })
         $pictureText = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { " ($DistinctContentHashes distinct picture(s) among them)" } else { '' })
         # pass 2 A2: "none carries a valid number" needs the rest of the tuple to agree: a sole frame number or a labelled count beside -AppDistinctDisplayFrames 0
@@ -4371,7 +4374,9 @@ function Get-DvVisualVerdict {
         # every judged frame and two distinct ones) and a repeat (a pair with two distinct valid labels) both need two distinct display frame numbers, so
         # either beside fewer than two disagrees with the count, and the reason claims neither "none" nor "all one number" (Get-DvVisualSourceDifference, Read-DvVisualCaptures)
         $needsTwoLabels = ($SourceDifference -ne 'unknown' -or $RepeatedPlayFrames -ge 1)   # -ne: the binder accepts any case of the enum (sol r1c A4 is open, not mine)
-        $contradicted = (($AppDistinctDisplayFrames -eq 0 -and ($null -ne $sole -or $null -ne $labelled)) -or ($AppDistinctDisplayFrames -ge 0 -and $needsTwoLabels))
+        # sol r1c pass A1: an explicit labelled count of 0 beside one declared display frame disagrees too ("all valid labels are frame 479" over no valid label)
+        $contradicted = (($AppDistinctDisplayFrames -eq 0 -and ($null -ne $sole -or $null -ne $labelled)) -or ($AppDistinctDisplayFrames -ge 0 -and $needsTwoLabels) -or
+                         ($AppDistinctDisplayFrames -ge 1 -and $null -ne $labelledCount -and $labelledCount -eq 0))
         $position = $(if ($AppDistinctDisplayFrames -lt 0) { "the $PlayFrames judged play frames do not establish two distinct display frame numbers" }
                       elseif ($contradicted) { "the $PlayFrames judged play frames do not establish two distinct display frame numbers (the counts supplied disagree on how many carry a valid one)" }
                       elseif ($AppDistinctDisplayFrames -eq 0) { "none of the $PlayFrames judged play frames carries a valid display frame number" }
@@ -4380,7 +4385,9 @@ function Get-DvVisualVerdict {
                       else { "all $PlayFrames judged play frames carry ${numberText}: one display frame number across them" })
         return [pscustomobject]@{ verdict = 'NOT_A_MOTION_WITNESS'; counted = $true; reason = "${position}${pictureText}, so they cannot witness motion during playback (one known cause: an unpaced Play holds its last required frame through the capture tail)" }
     }
-    $appFramesText = $(if ($AppDistinctDisplayFrames -le $PlayFrames) { "$AppDistinctDisplayFrames distinct frames" } else { 'a distinct-frame count that cannot be true for them and is not quoted' })
+    # sol r1c pass A3: distinct labels cannot outnumber the labelled frames, so a count over a known labelled count is not quoted either (nor waived on)
+    $appCountFits = ($AppDistinctDisplayFrames -le $PlayFrames -and ($null -eq $labelledCount -or $AppDistinctDisplayFrames -le $labelledCount))
+    $appFramesText = $(if ($appCountFits) { "$AppDistinctDisplayFrames distinct frames" } else { 'a distinct-frame count that cannot be true for them and is not quoted' })
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
         return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them and the source frames are known to differ" }
     }
@@ -4391,6 +4398,8 @@ function Get-DvVisualVerdict {
         # a repeat is a judged frame equal to the one before it: N frames over D distinct pictures hold at most N - D of them (N - 1 when D itself cannot be true)
         # (sol r1 pass A1: 4 repeats over 6 frames and 3 pictures, or 6 repeats over 6 frames, were quoted although no judged set holds them)
         $repeatMax = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { $PlayFrames - $DistinctContentHashes } else { $PlayFrames - 1 })
+        # sol r1c pass A2: a repeat needs two adjacent labelled frames (the label advanced), so L labelled frames hold at most L - 1 of them
+        if ($null -ne $labelledCount) { $repeatMax = [Math]::Min($repeatMax, [Math]::Max(0, $labelledCount - 1)) }
         # pass 2 A1: when the supplied count is over that bound, "two or more of them repeat" is the same impossible claim in words (N = D = 2 holds no repeat at
         # all), so the reason says the count cannot be true and speaks of what was SUPPLIED, never of what the judged frames show
         # R1C-REASON-RESIDUE-1 (sol r1c A1): and an impossible count supports neither an observed repeat ("as supplied, they repeat") nor the freeze
@@ -4409,7 +4418,7 @@ function Get-DvVisualVerdict {
         return [pscustomobject]@{ verdict = 'VISUAL_DIVERGENCE'; counted = $true; reason = "the playback-path frame is $PlayVsPausedMeanAbsDiff (per-channel mean absolute difference, 0..255) from its paused full-quality re-render; the threshold is $Threshold" }
     }
     # one picture over source frames the app itself records as identical: the frozen check was waived on its word, so the receipt says so
-    $waivedReason = $(if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
+    $waivedReason = $(if ($appCountFits -and $DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
     # VISUAL-GATE-EXPOSURE-FLOOR-1: last, so every other verdict keeps its precedence; counted, a flag and never an exclusion
     if ($null -ne $ExposureBand -and $null -ne $ExposureMedianLuma -and $null -ne $ExposureMedianNearBlackFraction -and $null -ne $ExposureMedianClippedFraction) {
         # compared UNROUNDED; the reason rounds to 6 places for display (a median 0.000434 against a cap of 0.00042 is over, and reads as 0.000434)
