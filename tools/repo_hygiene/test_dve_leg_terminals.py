@@ -869,7 +869,8 @@ class ProductionLegNeverEndsWithoutAReceiptTests(dve.EvidenceFactory, ModuleMuta
         self.assertNotIn("the receipt writer refuses", written["outcomeDetail"])
 
     def test_mutation_without_the_demotion_the_leg_ends_with_no_receipt_again(self) -> None:
-        guard = "if ($Outcome -cin @('PASS', 'FAIL') -and $refusal.StartsWith($invalidPrefix, [StringComparison]::Ordinal)) {"
+        # R4-NARROW-1 r2 (hosted CI on 55dcf49e, shard 4/8): the demotion guard reads the outcome through Test-DvOrdinalIn (Invoke-VenueLeg.ps1, the ordinal membership the PR introduced), so the mutation anchor is that text
+        guard = "if ((Test-DvOrdinalIn $Outcome @('PASS', 'FAIL')) -and $refusal.StartsWith($invalidPrefix, [StringComparison]::Ordinal)) {"
         mutated = self.mutated_runner([("Invoke-VenueLeg.ps1", guard, "if ($false) {")])
         receipt = self.all_cpu_cuda_receipt("mut")
         code, written, out = self.complete(receipt, "FAIL", dv=mutated, name="w-mut")

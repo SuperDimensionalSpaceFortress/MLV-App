@@ -2522,15 +2522,16 @@ class ReceiptOracleVerdictTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["outcome"], "PASS")
 
     def test_mutation_without_the_writer_validation_a_proofless_pass_is_written(self) -> None:
-        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {", "if ($false) {"),
-                                       ("Invoke-VenueLeg.ps1", "if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {", "if ($false) {")])
+        # R4-NARROW-1 r2 (hosted CI on 55dcf49e, heavy 12/14): the writer's PASS/FAIL check reads the outcome through Test-DvOrdinalIn (the ordinal membership the PR introduced); the mutation anchor is that text
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if (Test-DvOrdinalIn $Receipt['outcome'] @('PASS', 'FAIL')) {", "if ($false) {"),
+                                       ("Invoke-VenueLeg.ps1","if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {", "if ($false) {")])
         self.write_artifacts(line={"source_advanced": 100})
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), dv=mutated)
         self.assertEqual(receipt["outcome"], "PASS", "with both layers removed a proofless capture is a PASS -- each layer is needed")
 
     def test_mutation_the_runner_layer_alone_still_stops_a_proofless_pass(self) -> None:
         # Defence in depth: removing only the WRITER's check, the runner's own downgrade still yields INVALID ...
-        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {", "if ($false) {")])
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if (Test-DvOrdinalIn $Receipt['outcome'] @('PASS', 'FAIL')) {", "if ($false) {")])
         self.write_artifacts(line={"source_advanced": 100})
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), dv=mutated)
         self.assertEqual(receipt["outcome"], "INVALID")
