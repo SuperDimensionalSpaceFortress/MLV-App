@@ -5029,6 +5029,237 @@ TEST( PlaybackFrameRangeArgOverflow, SmokeSecondsQtTokensOutOfRange )
     }
 }
 
+namespace
+{
+// GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r5: helpers that read main.cpp's code structure, not its raw characters.
+// A copy of `source` with the same length (so offsets agree) in which every comment is blanked (newlines kept). With
+// blankLiterals the contents of string and character literals are blanked too, leaving only real code: a brace, a
+// `return` or a `#if` inside a comment or a literal then cannot move a block boundary or count as an exit.
+QString maskCppSource( const QString &source, bool blankLiterals )
+{
+    QString out = source;
+    const int n = source.size();
+    int i = 0;
+    while( i < n )
+    {
+        const QChar c = source.at( i );
+        const QChar next = ( i + 1 < n ) ? source.at( i + 1 ) : QChar();
+        const bool digitSeparator = c == QLatin1Char( '\'' ) && i > 0 && source.at( i - 1 ).isDigit() && next.isLetterOrNumber();
+        if( c == QLatin1Char( '/' ) && next == QLatin1Char( '/' ) )
+        {
+            while( i < n )
+            {
+                const QChar d = source.at( i );
+                if( d == QLatin1Char( '\n' ) )
+                {
+                    const bool spliced = ( i > 0 && source.at( i - 1 ) == QLatin1Char( '\\' ) )
+                        || ( i > 1 && source.at( i - 1 ) == QLatin1Char( '\r' ) && source.at( i - 2 ) == QLatin1Char( '\\' ) );
+                    if( !spliced )
+                        break;
+                }
+                else if( d != QLatin1Char( '\r' ) )
+                    out[i] = QLatin1Char( ' ' );
+                ++i;
+            }
+        }
+        else if( c == QLatin1Char( '/' ) && next == QLatin1Char( '*' ) )
+        {
+            out[i] = QLatin1Char( ' ' );
+            out[i + 1] = QLatin1Char( ' ' );
+            int j = i + 2;
+            while( j < n && !( source.at( j ) == QLatin1Char( '*' ) && j + 1 < n && source.at( j + 1 ) == QLatin1Char( '/' ) ) )
+            {
+                if( source.at( j ) != QLatin1Char( '\n' ) && source.at( j ) != QLatin1Char( '\r' ) )
+                    out[j] = QLatin1Char( ' ' );
+                ++j;
+            }
+            if( j < n )
+            {
+                out[j] = QLatin1Char( ' ' );
+                out[j + 1] = QLatin1Char( ' ' );
+                j += 2;
+            }
+            i = j;
+        }
+        else if( c == QLatin1Char( '"' ) || ( c == QLatin1Char( '\'' ) && !digitSeparator ) )
+        {
+            int j = i + 1;
+            while( j < n && source.at( j ) != c && source.at( j ) != QLatin1Char( '\n' ) )
+            {
+                const int step = ( source.at( j ) == QLatin1Char( '\\' ) && j + 1 < n ) ? 2 : 1;
+                if( blankLiterals )
+                {
+                    for( int k = j; k < j + step; ++k )
+                    {
+                        if( source.at( k ) != QLatin1Char( '\n' ) && source.at( k ) != QLatin1Char( '\r' ) )
+                            out[k] = QLatin1Char( ' ' );
+                    }
+                }
+                j += step;
+            }
+            i = ( j < n && source.at( j ) == c ) ? j + 1 : j;
+        }
+        else
+            ++i;
+    }
+    return out;
+}
+
+bool isIdentifierChar( const QChar c )
+{
+    return c.isLetterOrNumber() || c == QLatin1Char( '_' );
+}
+
+// Offsets of `word` as a whole token (any whitespace, including a tab, may follow it) inside text[from, to).
+std::vector<int> wholeWordOffsets( const QString &text, const QString &word, int from, int to )
+{
+    std::vector<int> hits;
+    for( int at = text.indexOf( word, from ); at >= 0 && at + word.size() <= to; at = text.indexOf( word, at + 1 ) )
+    {
+        const int end = at + word.size();
+        const bool leftOk = at == 0 || !isIdentifierChar( text.at( at - 1 ) );
+        const bool rightOk = end >= text.size() || !isIdentifierChar( text.at( end ) );
+        if( leftOk && rightOk )
+            hits.push_back( at );
+    }
+    return hits;
+}
+
+// True when a line inside text[from, to) starts (after blanks) with `#`: a preprocessor directive.
+bool hasPreprocessorLine( const QString &text, int from, int to )
+{
+    bool lineStart = true;
+    for( int i = from; i < to; ++i )
+    {
+        const QChar c = text.at( i );
+        if( c == QLatin1Char( '\n' ) )
+            lineStart = true;
+        else if( c != QLatin1Char( ' ' ) && c != QLatin1Char( '\t' ) && c != QLatin1Char( '\r' ) )
+        {
+            if( lineStart && c == QLatin1Char( '#' ) )
+                return true;
+            lineStart = false;
+        }
+    }
+    return false;
+}
+
+// Open #if / #ifdef / #ifndef groups at offset `pos`; 0 means the code there is not inside a conditional group.
+int conditionalDepthBefore( const QString &text, int pos )
+{
+    int depth = 0;
+    int lineBegin = 0;
+    while( lineBegin < pos )
+    {
+        int j = lineBegin;
+        while( j < pos && ( text.at( j ) == QLatin1Char( ' ' ) || text.at( j ) == QLatin1Char( '\t' ) ) )
+            ++j;
+        if( j < pos && text.at( j ) == QLatin1Char( '#' ) )
+        {
+            ++j;
+            while( j < pos && ( text.at( j ) == QLatin1Char( ' ' ) || text.at( j ) == QLatin1Char( '\t' ) ) )
+                ++j;
+            int k = j;
+            while( k < pos && text.at( k ).isLetter() )
+                ++k;
+            const QString word = text.mid( j, k - j );
+            if( word == QStringLiteral( "if" ) || word == QStringLiteral( "ifdef" ) || word == QStringLiteral( "ifndef" ) )
+                ++depth;
+            else if( word == QStringLiteral( "endif" ) )
+                --depth;
+        }
+        const int eol = text.indexOf( QLatin1Char( '\n' ), lineBegin );
+        lineBegin = ( eol < 0 ) ? pos : eol + 1;
+    }
+    return depth;
+}
+} // namespace
+
+namespace
+{
+#define WIRING_REQUIRE( cond, tag ) \
+    do { if( !( cond ) ) return QStringLiteral( tag ); } while( 0 )
+// GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r6 (sol r4 B1/B2/B3/A4): the checks on main.cpp's --seconds refusal, as a function of
+// the source text so the RED mutants below can feed it edited text. Returns an empty string when the wiring holds, else the tag
+// of the first failed check. Braces and tokens are read on a comment-and-literal-masked copy (B1), `return` is a token whatever
+// blank follows it (B2), and the diagnostic is read only up to the exit (B3).
+QString secondsRefusalWiringDefect( const QString &source )
+{
+    const QString code = maskCppSource( source, false );        // comments blanked, literals kept
+    const QString structure = maskCppSource( source, true );    // comments AND literal contents blanked
+    WIRING_REQUIRE( source.size() == code.size() && source.size() == structure.size(), "mask-size" );
+    const int parse = code.indexOf( QStringLiteral( "const double seconds = parser.value(secondsOpt).toDouble(&ok);" ) );
+    const int range = code.indexOf( QStringLiteral( "if (!playback_frame_range::smokeSecondsFitDurationMs(seconds))" ) );
+    const int positive = code.indexOf( QStringLiteral( "ERROR: --seconds must be greater than 0." ) );
+    const int convert = code.indexOf( QStringLiteral( "options.durationMs = qRound(seconds * 1000.0);" ) );
+    WIRING_REQUIRE( parse >= 0 && range >= 0 && positive >= 0 && convert >= 0, "anchors" );
+    WIRING_REQUIRE( parse < range && range < positive && positive < convert, "order" );   // RED on d9c1e61b: the range check came after
+    WIRING_REQUIRE( code.count( QStringLiteral( "smokeSecondsFitDurationMs(" ) ) == 1, "single-call" );
+    // A4 (hardening): the anchors are live code, not a disabled region.
+    WIRING_REQUIRE( conditionalDepthBefore( structure, parse ) == 0, "conditional-depth" );
+    WIRING_REQUIRE( !hasPreprocessorLine( structure, parse, convert ), "preprocessor-line" );
+    // The refusal is the brace-matched `if` block itself, matched on `structure` so a brace in a comment or literal is ignored.
+    const int condEnd = structure.indexOf( QStringLiteral( "))" ), range ) + 2;
+    WIRING_REQUIRE( condEnd > range, "condition" );
+    int open = condEnd;
+    while( open < structure.size() && structure.at( open ).isSpace() )
+        ++open;
+    WIRING_REQUIRE( open < structure.size() && structure.at( open ) == QLatin1Char( '{' ), "open-brace" );
+    int depth = 0;
+    int close = -1;
+    for( int i = open; i < structure.size(); ++i )
+    {
+        if( structure.at( i ) == QLatin1Char( '{' ) )
+            ++depth;
+        else if( structure.at( i ) == QLatin1Char( '}' ) && --depth == 0 )
+        {
+            close = i;
+            break;
+        }
+    }
+    WIRING_REQUIRE( close > open && close < positive, "close-brace" );   // closed, and before the "> 0" refusal
+    const QString refusalCode = code.mid( range, close + 1 - range );
+    const QString refusalStructure = structure.mid( range, close + 1 - range );
+    WIRING_REQUIRE( refusalStructure.count( QStringLiteral( "{" ) ) == 1 && refusalStructure.count( QStringLiteral( "}" ) ) == 1, "nested-block" );
+    // B2: exactly one `return` TOKEN (a tab after it counts), and no other way out of the block.
+    const std::vector<int> returns = wholeWordOffsets( refusalStructure, QStringLiteral( "return" ), 0, refusalStructure.size() );
+    WIRING_REQUIRE( returns.size() == 1, "returns" );
+    const char *const otherExits[] = { "exit", "_exit", "_Exit", "quick_exit", "abort", "terminate", "throw", "goto", "break", "continue" };
+    for( const char *word : otherExits )
+    {
+        WIRING_REQUIRE( wholeWordOffsets( refusalStructure, QString::fromLatin1( word ), 0, refusalStructure.size() ).empty(), "other-exit" );
+    }
+    const int ret = returns[0];
+    // It is `return 2;` (blanks allowed), is the last statement of the block, and follows the diagnostic statement.
+    int tail = ret + 6;
+    while( tail < refusalStructure.size() && refusalStructure.at( tail ).isSpace() )
+        ++tail;
+    WIRING_REQUIRE( tail < refusalStructure.size() && refusalStructure.at( tail ) == QLatin1Char( '2' ), "exit-code" );
+    ++tail;
+    while( tail < refusalStructure.size() && refusalStructure.at( tail ).isSpace() )
+        ++tail;
+    WIRING_REQUIRE( tail < refusalStructure.size() && refusalStructure.at( tail ) == QLatin1Char( ';' ), "exit-code" );
+    ++tail;
+    for( ; tail < refusalStructure.size() - 1; ++tail )
+    {
+        WIRING_REQUIRE( refusalStructure.at( tail ).isSpace(), "tail" );   // nothing but blanks up to the closing brace
+    }
+    int before = ret - 1;
+    while( before >= 0 && refusalStructure.at( before ).isSpace() )
+        --before;
+    WIRING_REQUIRE( before >= 0 && refusalStructure.at( before ) == QLatin1Char( ';' ), "preceding-statement" );   // not `if (...) return 2;`
+    // B3: the diagnostic assertions read only what runs BEFORE the exit, never text emitted after `return 2;`.
+    const QString diagnostic = refusalCode.left( ret );
+    WIRING_REQUIRE( diagnostic.contains( QStringLiteral( "err <<" ) ), "diagnostic-stream" );
+    WIRING_REQUIRE( diagnostic.contains( QStringLiteral( "SECONDS_OUT_OF_RANGE" ) ), "diagnostic-tag" );
+    WIRING_REQUIRE( diagnostic.contains( QStringLiteral( "parser.value(secondsOpt).trimmed()" ) ), "diagnostic-token" );   // RED: raw token
+    WIRING_REQUIRE( diagnostic.contains( QStringLiteral( "at most 2147483647" ) ), "diagnostic-cap" );                       // RED: 2147483.647
+    WIRING_REQUIRE( !source.contains( QStringLiteral( "at most 2147483.647" ) ), "old-cap" );
+    return QString();
+}
+#undef WIRING_REQUIRE
+} // namespace
+
 // r1 adversary A1/A2/A3/A7: main.cpp needs a full GUI build, so its wiring is read as text (as
 // test_gui_smoke_display_select_wiring.cpp does). The range refusal runs after the parse and BEFORE the "> 0" check, so an
 // out-of-range token is refused by its own typed reason (A1); it prints the trimmed token (A7) and the cap it really
@@ -5040,42 +5271,119 @@ TEST( PlaybackFrameRangeArgOverflow, MainRefusesSecondsOutOfRangeFirst )
     QFile file( path );
     ASSERT_TRUE( file.open( QIODevice::ReadOnly | QIODevice::Text ) );
     const QString source = QTextStream( &file ).readAll();
-    const int parse = source.indexOf( QStringLiteral( "const double seconds = parser.value(secondsOpt).toDouble(&ok);" ) );
-    const int range = source.indexOf( QStringLiteral( "if (!playback_frame_range::smokeSecondsFitDurationMs(seconds))" ) );
-    const int positive = source.indexOf( QStringLiteral( "ERROR: --seconds must be greater than 0." ) );
-    const int convert = source.indexOf( QStringLiteral( "options.durationMs = qRound(seconds * 1000.0);" ) );
-    ASSERT_TRUE( parse >= 0 && range >= 0 && positive >= 0 && convert >= 0 );
-    ASSERT_TRUE( parse < range );
-    ASSERT_TRUE( range < positive );                                   // RED on d9c1e61b: the range check came after
-    ASSERT_TRUE( positive < convert );
-    ASSERT_EQ( 1, source.count( QStringLiteral( "smokeSecondsFitDurationMs(" ) ) );
-    // GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r1: the refusal is the brace-matched `if` block itself, not the text up to the
-    // next `return 2;` (a mutated `return 0;` there let the later "> 0" branch's `return 2;` end the slice and stay green).
-    const int condEnd = source.indexOf( QStringLiteral( "))" ), range ) + 2;           // the `if (!...(seconds))` condition
-    ASSERT_TRUE( condEnd > range );
-    int open = condEnd;
-    while( open < source.size() && source.at( open ).isSpace() )
-        ++open;
-    ASSERT_TRUE( open < source.size() && source.at( open ) == QLatin1Char( '{' ) );   // the block opens right after the condition
-    int depth = 0;
-    int close = -1;
-    for( int i = open; i < source.size(); ++i )
-    {
-        if( source.at( i ) == QLatin1Char( '{' ) )
-            ++depth;
-        else if( source.at( i ) == QLatin1Char( '}' ) && --depth == 0 )
-        {
-            close = i;
-            break;
-        }
-    }
-    ASSERT_TRUE( close > open && close < positive );                  // closed, and before the "> 0" refusal
-    const QString refusal = source.mid( range, close + 1 - range );
-    ASSERT_EQ( 1, refusal.count( QStringLiteral( "return " ) ) );     // one exit in the block ...
-    ASSERT_EQ( 1, refusal.count( QStringLiteral( "return 2;" ) ) );   // ... and it is exit code 2
-    ASSERT_TRUE( refusal.indexOf( QStringLiteral( "SECONDS_OUT_OF_RANGE" ) ) < refusal.indexOf( QStringLiteral( "return 2;" ) ) );
-    ASSERT_TRUE( refusal.contains( QStringLiteral( "SECONDS_OUT_OF_RANGE" ) ) );
-    ASSERT_TRUE( refusal.contains( QStringLiteral( "parser.value(secondsOpt).trimmed()" ) ) );       // RED: raw token
-    ASSERT_TRUE( refusal.contains( QStringLiteral( "at most 2147483647" ) ) );                       // RED: 2147483.647
-    ASSERT_FALSE( source.contains( QStringLiteral( "at most 2147483.647" ) ) );
+    const QString defect = secondsRefusalWiringDefect( source );
+    if( !defect.isEmpty() )
+        std::fprintf( stderr, "main.cpp --seconds refusal wiring defect: %s\n", defect.toLocal8Bit().constData() );
+    ASSERT_TRUE( defect.isEmpty() );
+}
+
+// GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r6: RED/GREEN for each hole sol r4 found. Each mutant is the real main.cpp text with
+// ONE additive edit made in memory (the edit must change the text, so a stale anchor cannot pass as a no-op); the checker must
+// name the exact check that catches it. The unmodified text is the GREEN case (the TEST above).
+namespace
+{
+QString mutateOnce( const QString &source, const QString &from, const QString &to )
+{
+    if( source.count( from ) != 1 )
+        return QString();                                              // a stale anchor: the caller's ASSERT_FALSE( isEmpty ) fails
+    QString out = source;
+    out.replace( from, to );
+    return out;
+}
+
+QString mainSource()
+{
+    const QString path = repo_file_path( QStringLiteral( "platform/qt/main.cpp" ) );
+    QFile file( path );
+    if( path.isEmpty() || !file.open( QIODevice::ReadOnly | QIODevice::Text ) )
+        return QString();
+    return QTextStream( &file ).readAll();
+}
+
+const QString kRefusalEnd = QStringLiteral( "        return 2;\n    }\n    if (!ok || seconds <= 0.0)" );
+const QString kRefusalBegin = QStringLiteral( "    {\n        err << \"[GUI-SMOKE] ERROR: SECONDS_OUT_OF_RANGE" );
+} // namespace
+
+// B1: a `}` inside a comment ends the naive slice early, hiding a second exit after it.
+TEST( PlaybackFrameRangeArgOverflow, SecondsRefusalWiringRedB1CommentBrace )
+{
+    const QString source = mainSource();
+    ASSERT_FALSE( source.isEmpty() );
+    const QString mutant = mutateOnce( source, kRefusalEnd,
+        QStringLiteral( "        return 2; // }\n        if (seconds < 0) return 0;\n    }\n    if (!ok || seconds <= 0.0)" ) );
+    ASSERT_FALSE( mutant.isEmpty() );
+    ASSERT_EQ( std::string( "returns" ), secondsRefusalWiringDefect( mutant ).toStdString() );
+}
+
+// B1 (literal form): a `}` inside a string literal must not move the boundary either.
+TEST( PlaybackFrameRangeArgOverflow, SecondsRefusalWiringRedB1LiteralBrace )
+{
+    const QString source = mainSource();
+    ASSERT_FALSE( source.isEmpty() );
+    const QString mutant = mutateOnce( source, kRefusalEnd,
+        QStringLiteral( "        err << \"}\";\n        return 2;\n        if (seconds < 0) return 0;\n    }\n    if (!ok || seconds <= 0.0)" ) );
+    ASSERT_FALSE( mutant.isEmpty() );
+    ASSERT_EQ( std::string( "returns" ), secondsRefusalWiringDefect( mutant ).toStdString() );
+}
+
+// B2: `return<TAB>0;` is a return token even though it is not "return " with one space.
+TEST( PlaybackFrameRangeArgOverflow, SecondsRefusalWiringRedB2TabReturn )
+{
+    const QString source = mainSource();
+    ASSERT_FALSE( source.isEmpty() );
+    const QString mutant = mutateOnce( source, kRefusalBegin,
+        QStringLiteral( "    {\n        if (seconds < 0) return\t0;\n        err << \"[GUI-SMOKE] ERROR: SECONDS_OUT_OF_RANGE" ) );
+    ASSERT_FALSE( mutant.isEmpty() );
+    ASSERT_EQ( std::string( "returns" ), secondsRefusalWiringDefect( mutant ).toStdString() );
+}
+
+// B3: the token and the cap are only emitted AFTER `return 2;`: the diagnostic the user sees would not carry them.
+TEST( PlaybackFrameRangeArgOverflow, SecondsRefusalWiringRedB3TextAfterReturn )
+{
+    const QString source = mainSource();
+    ASSERT_FALSE( source.isEmpty() );
+    const QString stripped = mutateOnce( source,
+        QStringLiteral( "<< parser.value(secondsOpt).trimmed()\n            << \": its milliseconds must be finite and round to an int, at most 2147483647).\\n\";" ),
+        QStringLiteral( "<< \"x\";" ) );
+    ASSERT_FALSE( stripped.isEmpty() );
+    const QString mutant = mutateOnce( stripped, kRefusalEnd,
+        QStringLiteral( "        return 2;\n        err << parser.value(secondsOpt).trimmed() << \"at most 2147483647\";\n    }\n    if (!ok || seconds <= 0.0)" ) );
+    ASSERT_FALSE( mutant.isEmpty() );
+    ASSERT_EQ( std::string( "tail" ), secondsRefusalWiringDefect( mutant ).toStdString() );
+}
+
+// B3 (ordering form): the exit runs before the diagnostic, so nothing is printed; the diagnostic text sits after it.
+TEST( PlaybackFrameRangeArgOverflow, SecondsRefusalWiringRedB3ReturnBeforeDiagnostic )
+{
+    const QString source = mainSource();
+    ASSERT_FALSE( source.isEmpty() );
+    const QString mutant = mutateOnce( source, kRefusalBegin,
+        QStringLiteral( "    {\n        return 2;\n        err << \"[GUI-SMOKE] ERROR: SECONDS_OUT_OF_RANGE" ) );
+    ASSERT_FALSE( mutant.isEmpty() );
+    const QString defect = secondsRefusalWiringDefect( mutant );
+    ASSERT_FALSE( defect.isEmpty() );                                  // 'returns' (a second return) or 'tail': either names it
+}
+
+// A4: the parse is inside a disabled region.
+TEST( PlaybackFrameRangeArgOverflow, SecondsRefusalWiringRedA4ParseInsideIfZero )
+{
+    const QString source = mainSource();
+    ASSERT_FALSE( source.isEmpty() );
+    const QString mutant = mutateOnce( source,
+        QStringLiteral( "    const double seconds = parser.value(secondsOpt).toDouble(&ok);" ),
+        QStringLiteral( "#if 0\n    const double seconds = parser.value(secondsOpt).toDouble(&ok);" ) );
+    ASSERT_FALSE( mutant.isEmpty() );
+    ASSERT_EQ( std::string( "conditional-depth" ), secondsRefusalWiringDefect( mutant ).toStdString() );
+}
+
+// A4: a preprocessor line between the parse and the conversion can disable the refusal branch.
+TEST( PlaybackFrameRangeArgOverflow, SecondsRefusalWiringRedA4IfZeroAroundBranch )
+{
+    const QString source = mainSource();
+    ASSERT_FALSE( source.isEmpty() );
+    const QString mutant = mutateOnce( source,
+        QStringLiteral( "    if (!playback_frame_range::smokeSecondsFitDurationMs(seconds))\n" ),
+        QStringLiteral( "#if 0\n    if (!playback_frame_range::smokeSecondsFitDurationMs(seconds))\n" ) );
+    ASSERT_FALSE( mutant.isEmpty() );
+    ASSERT_EQ( std::string( "preprocessor-line" ), secondsRefusalWiringDefect( mutant ).toStdString() );
 }
