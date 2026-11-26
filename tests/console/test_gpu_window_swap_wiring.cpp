@@ -792,8 +792,16 @@ TEST(VisualCaptureBinding, EveryForcedStopAndPausedCaptureIsPairedWithAnUnforced
         ASSERT_TRUE(unforcedAt >= 0 && forcedAt > unforcedAt);
         ASSERT_FALSE(block.mid(unforcedAt, forcedAt - unforcedAt).contains(QStringLiteral("processEvents(")));
     }
-    // No forced kind exists without its twin: three forced grabs, three unforced, nothing else.
-    ASSERT_EQ(6, countOccurrences(block, QStringLiteral("grabVisual( QStringLiteral(")));
+    // No forced kind exists without its twin: three forced grabs, three unforced, plus (EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1)
+    // the unforced play_first_unbound burst before the first forced paint, which has no forced twin by design (a forced twin would paint
+    // before the forced loop and spoil what the in-flight tail credit reads); nothing else.
+    ASSERT_EQ(7, countOccurrences(block, QStringLiteral("grabVisual( QStringLiteral(")));
+    const QString burst = QStringLiteral("grabVisual( QStringLiteral(\"play_first_unbound\"), visualBurstCount, false );");
+    ASSERT_EQ(1, countOccurrences(block, burst));
+    const int burstAt = block.indexOf(burst);
+    const int forcedPlayAt = block.indexOf(QStringLiteral("grabVisual( QStringLiteral(\"play\"), k, false );"));
+    ASSERT_TRUE(burstAt >= 0 && forcedPlayAt > burstAt);
+    ASSERT_EQ(1, countOccurrences(block.mid(0, forcedPlayAt), QStringLiteral("grabVisual( QStringLiteral(")));
 }
 
 // PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r3 (Dot 7dc103f1 B2): r2 took unforced play k and then forced play k in each

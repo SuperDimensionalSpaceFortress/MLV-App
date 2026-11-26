@@ -76,6 +76,15 @@ inline bool isPlayCaptureKind( const QString &kind )
     return kind == QStringLiteral("play") || kind == QStringLiteral("play_unbound");
 }
 
+/* EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1: which capture kinds are bound to their clip by a source_id. The two play
+ * kinds above, plus "play_first_unbound": the short unforced burst taken before the tail's first forced paint (the only captures the
+ * runner's in-flight tail credit can use, and it requires a source_id). That burst is NOT a play capture for decide(): it would add
+ * pictures from the first instant of the tail to the source_difference verdict, so isPlayCaptureKind stays the two kinds above. */
+inline bool isSourceBoundCaptureKind( const QString &kind )
+{
+    return isPlayCaptureKind( kind ) || kind == QStringLiteral("play_first_unbound");
+}
+
 /* A frame's source_id in visual.json: 16 lowercase hex digits, zero-padded. */
 inline QString sourceIdHex( quint64 hash )
 {
@@ -117,7 +126,7 @@ struct CaptureClip
 };
 
 /* Per capture (same order as the input): whether it has a source id, and the id. playIdentities holds
- * the play captures only, in order, for decide(). */
+ * the play captures only (isPlayCaptureKind), in order, for decide(). */
 struct BoundSourceIds
 {
     QVector<bool> valid;
@@ -153,7 +162,7 @@ inline BoundSourceIds bindSourceIds( const QVector<CaptureClip> &captures, const
     {
         bool valid = false;
         quint64 hash = 0;
-        if( isPlayCaptureKind( capture.kind ) )
+        if( isSourceBoundCaptureKind( capture.kind ) )
         {
             const bool fromCaptureClip = sameClip( capture.clip, captureClip );
             if( !fromCaptureClip ) ++out.clipChangedCaptures;
@@ -183,11 +192,14 @@ inline BoundSourceIds bindSourceIds( const QVector<CaptureClip> &captures, const
             {
                 ++out.clipChangedCaptures;   // the open clip, or its bytes, are no longer the capture's
             }
-            PlayIdentity identity;
-            identity.displayFrame = capture.displayFrame;
-            identity.valid = valid;
-            identity.hash = hash;
-            out.playIdentities.append( identity );
+            if( isPlayCaptureKind( capture.kind ) )   // R4-RESIDUE-1: the play_first_unbound burst is source-bound but never decide() input
+            {
+                PlayIdentity identity;
+                identity.displayFrame = capture.displayFrame;
+                identity.valid = valid;
+                identity.hash = hash;
+                out.playIdentities.append( identity );
+            }
         }
         out.valid.append( valid );
         out.hash.append( hash );

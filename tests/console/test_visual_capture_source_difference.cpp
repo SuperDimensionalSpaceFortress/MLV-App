@@ -190,11 +190,29 @@ TEST(VisualCaptureSourceDifferenceWiring, BothPlayCaptureKindsCarryASourceId)
     const QString header = readRepoFile(QStringLiteral("platform/qt/VisualCaptureSourceDifference.h"));
     ASSERT_TRUE(header.contains(QStringLiteral(
         "return kind == QStringLiteral(\"play\") || kind == QStringLiteral(\"play_unbound\");")));
+    // EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1: the binding sites take every source-bound kind (the play_first_unbound
+    // burst included); decide() still sees only the two play kinds (bindSourceIds' playIdentities, pinned below)
     ASSERT_TRUE(source.contains(QStringLiteral(
-        "if( !visual_capture_source_difference::isPlayCaptureKind( grab.kind ) ) continue;")));
+        "if( !visual_capture_source_difference::isSourceBoundCaptureKind( grab.kind ) ) continue;")));
     ASSERT_TRUE(source.contains(QStringLiteral(
-        "if( visual_capture_source_difference::isPlayCaptureKind( grab.kind ) && grab.displayFrame >= 0 )")));
+        "if( visual_capture_source_difference::isSourceBoundCaptureKind( grab.kind ) && grab.displayFrame >= 0 )")));
     ASSERT_FALSE(source.contains(QStringLiteral("if( grab.kind != QStringLiteral(\"play\") ) continue;")));
+}
+
+// EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1 C1: the unforced burst the capture block takes before its first forced paint
+// (play_first_unbound) is source-bound (the runner's in-flight tail credit requires a source_id), but it is not a play capture.
+TEST(VisualCaptureSourceDifference, TheFirstUnforcedBurstIsSourceBoundButNotAPlayCapture)
+{
+    ASSERT_TRUE(vcsd::isSourceBoundCaptureKind(QStringLiteral("play")));
+    ASSERT_TRUE(vcsd::isSourceBoundCaptureKind(QStringLiteral("play_unbound")));
+    ASSERT_TRUE(vcsd::isSourceBoundCaptureKind(QStringLiteral("play_first_unbound")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QStringLiteral("stop")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QStringLiteral("stop_unbound")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QStringLiteral("paused")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QStringLiteral("paused_unbound")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QStringLiteral("Play_First_Unbound")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QString()));
+    ASSERT_FALSE(vcsd::isPlayCaptureKind(QStringLiteral("play_first_unbound")));
 }
 
 // r7 (adversary r6 pass 3 A2 on 3663c8a3): the capture path pumps events after the play captures (the post-stop drain at the
@@ -335,6 +353,44 @@ TEST(VisualCaptureSourceDifference, AClipThatStaysOpenKeepsEveryIdentityAndOnlyP
     ASSERT_TRUE(bound.valid.at(3));
     ASSERT_EQ(2, clips.hashCalls);     // one hash per distinct display frame
     ASSERT_EQ(0, bound.clipChangedCaptures);
+}
+
+// EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1 C2: a play_first_unbound capture gets a source id like a play capture, and is
+// refused like one when its clip is not the capture run's, but it never reaches decide(): the verdict's input is the play captures alone.
+TEST(VisualCaptureSourceDifference, TheFirstUnforcedBurstGetsASourceIdButNeverReachesDecide)
+{
+    ClipHarness clips;
+    const vcsd::ClipToken captureClip = clips.now();
+    QVector<vcsd::CaptureClip> captures;
+    vcsd::CaptureClip burst = playCapture(9, clips.now());
+    burst.kind = QStringLiteral("play_first_unbound");
+    captures.append(burst);
+    captures.append(playCapture(10, clips.now()));
+    captures.append(playCapture(12, clips.now()));
+    const vcsd::BoundSourceIds bound = clips.bind(captures, captureClip);
+    ASSERT_EQ(3, bound.valid.size());
+    ASSERT_TRUE(bound.valid.at(0));     // the burst is bound to its clip by a source id
+    ASSERT_EQ(kStaticAHash, bound.hash.at(0));
+    ASSERT_EQ(2, bound.playIdentities.size());   // decide() input is unchanged: the two play captures only
+    ASSERT_EQ(10, bound.playIdentities.at(0).displayFrame);
+    ASSERT_EQ(12, bound.playIdentities.at(1).displayFrame);
+    ASSERT_EQ(0, bound.clipChangedCaptures);
+
+    // a burst capture taken from another clip is counted as clip-changed and gets no id, still without entering decide()
+    ClipHarness moved;
+    const vcsd::ClipToken movedClip = moved.now();
+    QVector<vcsd::CaptureClip> movedCaptures;
+    vcsd::CaptureClip foreignBurst = playCapture(9, moved.now());
+    foreignBurst.kind = QStringLiteral("play_first_unbound");
+    foreignBurst.clip.generation = movedClip.generation + 1;   // not the capture run's clip
+    movedCaptures.append(foreignBurst);
+    movedCaptures.append(playCapture(10, moved.now()));
+    movedCaptures.append(playCapture(12, moved.now()));
+    const vcsd::BoundSourceIds movedBound = moved.bind(movedCaptures, movedClip);
+    ASSERT_FALSE(movedBound.valid.at(0));
+    ASSERT_EQ(1, movedBound.clipChangedCaptures);
+    ASSERT_EQ(2, movedBound.playIdentities.size());
+    ASSERT_TRUE(vcsd::decide(movedBound.playIdentities) == vcsd::Verdict::Identical);
 }
 
 TEST(VisualCaptureSourceDifferenceWiring, TheCaptureRunBindsItsSourceIdsToTheClipItStartedOn)

@@ -4743,8 +4743,10 @@ function Read-DvVisualCaptures {
     foreach ($f in @($appFrames)) {
         if ($null -eq $f) { continue }
         $kind = [string](Get-DvProp $f 'kind'); $index = [int](Get-DvProp $f 'index'); $file = [string](Get-DvProp $f 'file')
-        if ($kind -cnotin @('play', 'play_unbound', 'stop_unbound', 'stop', 'paused_unbound', 'paused') -or $file -cnotmatch '^(play-\d+|play-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$') { continue }
-        $isPlayKind = $kind -cin @('play', 'play_unbound')
+        # R4-RESIDUE-1: play_first_unbound (the unforced burst before the first forced paint) is collected and hashed like the play kinds; the frozen check
+        # below judges play_unbound (or play) only, so these rows never enter it
+        if ($kind -cnotin @('play', 'play_unbound', 'play_first_unbound', 'stop_unbound', 'stop', 'paused_unbound', 'paused') -or $file -cnotmatch '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$') { continue }
+        $isPlayKind = $kind -cin @('play', 'play_unbound', 'play_first_unbound')
         $legName = $(if ($isPlayKind) { "$LegId-$($kind.Replace('_', '-'))-$index.png" } else { "$LegId-$($kind.Replace('_', '-')).png" })
         $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null; viewportAvailable = $true
                              exposureLumaMean = $null; exposureNearBlackFraction = $null; exposureClippedFraction = $null; exposureLetterboxRowsDropped = $null
@@ -4903,8 +4905,9 @@ function Read-DvVisualCaptures {
     if ($pixels.ContainsKey('paused_unbound') -and $pixels.ContainsKey('paused')) {
         $block.pausedUnboundVsPausedMeanAbsDiff = (Get-DvVisualMeanAbsDiff -A $pixels['paused_unbound'] -B $pixels['paused'] | Measure-Object -Maximum).Maximum
     }
-    $tiles = @($frames | Sort-Object @{ Expression = { @{ play_unbound = 0; play = 1; stop_unbound = 2; stop = 3; paused_unbound = 4; paused = 5 }[$_.kind] } }, index | ForEach-Object {
+    $tiles = @($frames | Sort-Object @{ Expression = { @{ play_first_unbound = -1; play_unbound = 0; play = 1; stop_unbound = 2; stop = 3; paused_unbound = 4; paused = 5 }[$_.kind] } }, index | ForEach-Object {
         $label = $(if ($_.kind -ceq 'play') { "play $($_.index)  f=$($_.displayFrame)" } elseif ($_.kind -ceq 'play_unbound') { "play $($_.index), unforced  f=$($_.displayFrame)" }
+                   elseif ($_.kind -ceq 'play_first_unbound') { "tail start $($_.index), unforced  f=$($_.displayFrame)" }
                    elseif ($_.kind -ceq 'stop_unbound') { "paused instant, unforced  f=$($_.displayFrame)" }
                    elseif ($_.kind -ceq 'paused_unbound') { "paused full quality, unforced  f=$($block.pausedFrame)" }
                    elseif ($_.kind -ceq 'stop') { "paused instant  f=$($_.displayFrame)$(if ($null -ne $_.labelBound) { "  bound=$([bool]$_.labelBound)" })" } else { "paused full quality  f=$($block.pausedFrame)" })
@@ -7599,6 +7602,9 @@ $script:ConformCriteriaMetrics = [ordered]@{ conformSourceFps = 'conformSourceFp
 # engine reaches its last target before the pipeline has presented it). The CPU route holds one target in prep and one rendering behind the last presented frame
 # (231ea06e: 479 rendering, 478 in prep, 477 presented), so 2 is the pipeline's own depth; a longer unpainted tail is a frozen presentation, never in flight.
 $script:TailInFlightCapFrames = 2L
+# R4-RESIDUE-1 (r4 pass-5 A8): the launcher's 32-hex run nonce, anchored with \z (`$` also matches before a final newline: the r4 pass-5 A6 lesson),
+# for the three nonces the tail credit binds: visual.json's run_nonce, result.json's (expectedRunNonce) and the summary line's echo (observedRunNonce)
+$script:TailRunNoncePattern = '^[0-9a-f]{32}\z'
 # r2 (adversary A4 on 9f327333): the diagnostics only Get-DvCriteriaMetrics derives; a verbatim summary.json key of one of these names is dropped, never trusted
 $script:CriteriaDerivedOnlyMetrics = @('conformTailUnpaintedAtCloseFrames', 'conformTailInFlightCreditedFrames', 'conformTailInFlightCreditNote',
     'conformFrozenTailFrames', 'conformTailAllowanceFrames', 'conformPaintStepsImpliedMaxJump')
@@ -7659,6 +7665,9 @@ function Get-DvTailVisualEvidence {
     the receipt's visual.frames); a PNG replaced since, a capture with no single recorded hash, or no recorded frames at all is not counted. Adversary A2: two
     play rows with the same kind and index (one PNG on disk for two labels) make the document ambiguous: no tail evidence. A5: schema must be a JSON string
     and measured_session a JSON integer (an array is not coerced).
+    R4-RESIDUE-1 (r4 pass-5 A8): runNonce is the app's top-level run_nonce when it is a JSON string (else $null; Get-DvTailInFlightCredit judges its form and
+    binds it to the launcher's nonce). The play_first_unbound burst (the unforced captures the app takes before its first forced paint) is read exactly like
+    play_unbound: its own kind-index file name, the duplicate check, its PNG read (typed when unreadable) and the recorded sha.
     Pure apart from reading files; never throws.
     #>
     param([AllowNull()][AllowEmptyString()][string]$EvidenceDir, [AllowNull()][AllowEmptyString()][string]$LegId, [AllowNull()][AllowEmptyString()][string]$ExpectedSha256,
@@ -7681,8 +7690,8 @@ function Get-DvTailVisualEvidence {
         # r4 (adversary A7 on eabccd6c): a file that exists but cannot be read (held with FileShare.None) is a TYPED refusal naming the path, never $null
         # (which erased the I/O cause): no credit, and the receipt validator re-throws it as an evidence-validation I/O failure (Test-DvReceiptValid)
         $unreadable = { param($path, $err) [pscustomobject]@{ refused = "TAIL_VISUAL_UNREADABLE: '$path' could not be read ($($err.Exception.GetType().Name)), so the post-close tail is not credited"
-                                                              unreadablePath = [string]$path; measuredSession = $null; tailBeginUtc = $null; frames = @() } }
-        $refuse = { param($why) [pscustomobject]@{ refused = $why; unreadablePath = $null; measuredSession = $null; tailBeginUtc = $null; frames = @() } }
+                                                              unreadablePath = [string]$path; measuredSession = $null; tailBeginUtc = $null; runNonce = $null; frames = @() } }
+        $refuse = { param($why) [pscustomobject]@{ refused = $why; unreadablePath = $null; measuredSession = $null; tailBeginUtc = $null; runNonce = $null; frames = @() } }
         try { $jsonBytes = [IO.File]::ReadAllBytes($jsonPath) } catch { return (& $unreadable $jsonPath $_) }
         if ((Get-DvSha256OfBytes $jsonBytes) -cne $ExpectedSha256.ToLowerInvariant()) { return $null }
         $app = ConvertFrom-DvStrictJsonBytes -Bytes $jsonBytes
@@ -7699,6 +7708,8 @@ function Get-DvTailVisualEvidence {
         if ($rows -isnot [array]) { return $null }
         # r4 (adversary A2 on eabccd6c): the tail's own start time, compared by Get-DvTailInFlightCredit with the hashed run log's begin record (the run binding)
         $tailBegin = Get-DvProp $app 'tail_begin_utc'
+        # R4-RESIDUE-1 (r4 pass-5 A8): the launcher's run nonce the app wrote into visual.json; a JSON string only (a number, null or an array is no nonce)
+        $runNonce = Get-DvProp $app 'run_nonce'
         $frames = [System.Collections.Generic.List[object]]::new()
         $seenPlay = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $seenFile = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
@@ -7709,7 +7720,9 @@ function Get-DvTailVisualEvidence {
             if ($kind -isnot [string]) { continue }
             if (-not (($index -is [int]) -or ($index -is [long]))) { continue }
             if ([int64]$index -lt 0) { continue }
-            $isPlay = [string]::Equals($kind, 'play', [StringComparison]::Ordinal) -or [string]::Equals($kind, 'play_unbound', [StringComparison]::Ordinal)
+            # R4-RESIDUE-1: an unforced kind (play_unbound, or the play_first_unbound burst) is the only kind whose PNG can supply credit
+            $isUnforcedPlay = [string]::Equals($kind, 'play_unbound', [StringComparison]::Ordinal) -or [string]::Equals($kind, 'play_first_unbound', [StringComparison]::Ordinal)
+            $isPlay = [string]::Equals($kind, 'play', [StringComparison]::Ordinal) -or $isUnforcedPlay
             if (-not $isPlay) { continue }
             if (-not $seenPlay.Add("$kind|$([int64]$index)")) { return $null }   # adversary A2: one PNG cannot carry two rows' labels
             # r4 (adversary A3 on eabccd6c): the app names each play capture's file after its own kind and index (MainWindow.cpp `<kind-stem>-<index>.png`), so a
@@ -7725,8 +7738,8 @@ function Get-DvTailVisualEvidence {
             $tailOk = ($tail -is [int] -or $tail -is [long] -or $tail -is [double]) -and -not [double]::IsNaN([double]$tail) -and -not [double]::IsInfinity([double]$tail) -and [double]$tail -ge 0
             $png = Join-Path $dir "$LegId-$($kind.Replace('_', '-'))-$index.png"
             $pngSha = $null
-            # r4 adversary fix 2 (A3 on b6c53917): only a play_unbound PNG can supply credit, so only it is read (a locked forced play PNG is no tail evidence I/O)
-            if ([string]::Equals($kind, 'play_unbound', [StringComparison]::Ordinal) -and (($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
+            # r4 adversary fix 2 (A3 on b6c53917): only an unforced play PNG can supply credit, so only it is read (a locked forced play PNG is no tail evidence I/O)
+            if ($isUnforcedPlay -and (($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
                 try { $pngBytes = [IO.File]::ReadAllBytes($png) } catch { return (& $unreadable $png $_) }   # r4 (A7): typed, never $null
                 $recordedSha = $null
                 [void]$recorded.TryGetValue("$kind|$([int64]$index)", [ref]$recordedSha)
@@ -7749,7 +7762,8 @@ function Get-DvTailVisualEvidence {
                                            sourceId = $(if ($sourceId -is [string] -and $sourceId -cmatch '^[0-9a-f]{16}\z') { $sourceId } else { $null }) })
         }
         return [pscustomobject]@{ refused = $null; unreadablePath = $null; measuredSession = [string]$sessionNumber
-                                  tailBeginUtc = $(if ($tailBegin -is [string] -or $tailBegin -is [datetime]) { ConvertTo-DvVisualUtcText $tailBegin } else { $null }); frames = @($frames) }
+                                  tailBeginUtc = $(if ($tailBegin -is [string] -or $tailBegin -is [datetime]) { ConvertTo-DvVisualUtcText $tailBegin } else { $null })
+                                  runNonce = $(if ($runNonce -is [string]) { $runNonce } else { $null }); frames = @($frames) }
     }
     catch { return $null }
 }
@@ -7772,6 +7786,11 @@ function Get-DvTailInFlightCredit {
     (480) proves nothing about 479, an unbound capture (serial 484, painted_serial 483) does not show the frame it is labelled with, and a 5-byte "PNG" is no
     picture. A target the tail never shows exactly stays unpainted: an endpoint sample showing 479 still does not credit 478 (superseded after the close is
     possible: MainWindow.cpp playbackPrepTaskShouldCompute), and it counts in conformTailUnpaintedFrames until a capture or the app itself shows it.
+    R4-RESIDUE-1 (r4 pass-5 A8): right after the session check, visual.json's run_nonce (Visual.runNonce) must be 32 lowercase hex (`\z`-anchored), else
+    TAIL_VISUAL_NONCE_ABSENT, and ordinal-equal to BOTH Playback.expectedRunNonce (the launcher's, result.json) and Playback.observedRunNonce (the summary
+    line's echo), each itself well-formed, else TAIL_VISUAL_NONCE_MISMATCH: two runs can share a session number and a millisecond tail_begin_utc. The
+    qualifying captures are the unforced kinds play_unbound and play_first_unbound (the app's burst before its first forced paint), each with
+    forced_paints_before = JSON integer 0.
     Pure: no I/O; a missing or malformed input is a reason, never a credit.
     #>
     param([Parameter(Mandatory)][int64]$Unpainted, [Parameter(Mandatory)][int64]$Target, $Playback, $Visual)
@@ -7800,6 +7819,19 @@ function Get-DvTailInFlightCredit {
     if ($refusedWhy -ne '') { return (& $no $refusedWhy) }   # r4 (A3, A7): a typed refusal of the whole tail
     $summarySession = $(if ($null -ne $Playback) { [string](Get-DvProp $Playback 'summarySession') } else { '' })
     if ($summarySession -eq '' -or [string](Get-DvProp $Visual 'measuredSession') -cne $summarySession) { return (& $no "the visual capture is of another session (measured_session=$([string](Get-DvProp $Visual 'measuredSession'))), not the measured session $summarySession") }
+    # R4-RESIDUE-1 (r4 pass-5 A8): the tail is THIS run's by its launcher nonce. A session number and a millisecond tail_begin_utc can repeat across runs and
+    # hosts, so another run's genuine visual.json, collected into this run's evidence, matched them; the app now writes MLVAPP_RUN_NONCE into visual.json and it
+    # must equal, ordinally, BOTH the nonce the launcher generated (result.json) and the one the app echoed on its summary line (each itself well-formed)
+    $visualNonce = Get-DvProp $Visual 'runNonce'
+    if ($visualNonce -isnot [string] -or $visualNonce -cnotmatch $script:TailRunNoncePattern) {
+        return (& $no "TAIL_VISUAL_NONCE_ABSENT: visual.json carries no well-formed run_nonce (the launcher's 32 lowercase hex), so the post-close tail cannot be bound to this run and is not credited")
+    }
+    $expectedNonce = $(if ($null -ne $Playback) { Get-DvProp $Playback 'expectedRunNonce' } else { $null })
+    $observedNonce = $(if ($null -ne $Playback) { Get-DvProp $Playback 'observedRunNonce' } else { $null })
+    if ($expectedNonce -isnot [string] -or $expectedNonce -cnotmatch $script:TailRunNoncePattern -or $observedNonce -isnot [string] -or $observedNonce -cnotmatch $script:TailRunNoncePattern -or
+        -not [string]::Equals($visualNonce, $expectedNonce, [StringComparison]::Ordinal) -or -not [string]::Equals($visualNonce, $observedNonce, [StringComparison]::Ordinal)) {
+        return (& $no "TAIL_VISUAL_NONCE_MISMATCH: visual.json's run_nonce=$visualNonce is not both the launcher's nonce for this run (expected=$([string]$expectedNonce)) and the nonce the app echoed on its summary line (observed=$([string]$observedNonce)), so the post-close tail may be another run's and is not credited")
+    }
     # r4 (adversary A2 on eabccd6c): the tail is THIS run's: the hashed run log's one gui_smoke.visual_capture.begin record names the measured session and the same
     # tail_begin_utc visual.json carries (another run's genuine visual.json, re-digested into the receipt, carries its own), and no clip_changed record exists
     $beginSession = $(if ($null -ne $Playback) { [string](Get-DvProp $Playback 'visualCaptureBeginSession') } else { '' })
@@ -7827,8 +7859,11 @@ function Get-DvTailInFlightCredit {
         $display = Get-DvProp $f 'displayFrame'
         $tailMs = Get-DvProp $f 'tailElapsedMs'
         $forcedBefore = Get-DvProp $f 'forcedPaintsBefore'
+        # R4-RESIDUE-1: the unforced kinds are play_unbound and the play_first_unbound burst (taken before the first forced paint, so it can qualify)
+        $fKind = [string](Get-DvProp $f 'kind')
+        $unforcedKind = [string]::Equals($fKind, 'play_unbound', [StringComparison]::Ordinal) -or [string]::Equals($fKind, 'play_first_unbound', [StringComparison]::Ordinal)
         if ((Get-DvProp $f 'saved') -eq $true -and (Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'labelBound') -eq $true -and
-            [string]::Equals([string](Get-DvProp $f 'kind'), 'play_unbound', [StringComparison]::Ordinal) -and $null -ne $forcedBefore -and [int64]$forcedBefore -eq 0 -and
+            $unforcedKind -and $null -ne $forcedBefore -and [int64]$forcedBefore -eq 0 -and
             -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'sourceId')) -and $null -ne (Get-DvProp $f 'serial') -and
             -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'pngSha256')) -and $null -ne $tailMs -and $null -ne $display) {
             $ordered.Add($f)
@@ -7836,7 +7871,7 @@ function Get-DvTailInFlightCredit {
             if ($d -gt ($Target - $Unpainted) -and $d -le $Target) { [void]$shown.Add($d) }
         }
     }
-    if ($shown.Count -eq 0) { return (& $no "no play capture (unforced play_unbound taken before any forced repaint, saved, label-bound, bound to its clip by a source_id, its PNG on disk and decodable, Play active) in the post-close tail shows exactly an in-flight target ($(($Target - $Unpainted + 1))..$Target)") }
+    if ($shown.Count -eq 0) { return (& $no "no play capture (unforced play_unbound or play_first_unbound taken before any forced repaint, saved, label-bound, bound to its clip by a source_id, its PNG on disk and decodable, Play active) in the post-close tail shows exactly an in-flight target ($(($Target - $Unpainted + 1))..$Target)") }
     # r4 (adversary A5 on eabccd6c): the qualifying captures, in the order they were taken (tail_elapsed_ms), must show a non-decreasing display frame and paint
     # serial: 479 at 126 ms then 478 at 376 ms is a backward paint after the close, never two credits. Two captures at the same instant cannot be ordered.
     $byTime = @($ordered | Sort-Object -Property @{ Expression = { [double](Get-DvProp $_ 'tailElapsedMs') } })

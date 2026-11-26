@@ -9819,6 +9819,42 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
             self.assertIs(out["stopUnboundObserverClean"], True)
 
     @requires_windows_imaging
+    def test_r4r_r5_a_moving_play_first_unbound_burst_never_hides_a_frozen_display(self) -> None:
+        """EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1 R5 (the Dot 7dc103f1 B2 guard): the forced-first stuck fixture plus three MOVING
+        play_first_unbound rows (the app's unforced burst before the first forced paint: three distinct pictures, forced_paints_before=0) still reads
+        FROZEN_DISPLAY, judged on play_unbound, with appDistinctDisplayFrames unchanged; the burst PNGs are copied under the leg's names with their sha256
+        in visual.frames. RED on 9a5baab0: its collector skipped the kind, so the burst was neither copied nor hashed."""
+        with tempfile.TemporaryDirectory(prefix="vis-r4r-burst-") as d:
+            _, base = self.read(d, "forced-first", "stuck")
+        with tempfile.TemporaryDirectory(prefix="vis-r4r-burst-") as d:
+            art = Path(d) / "artifacts"
+            dest = art / "visual"
+            write_stateful_visual_captures(dest, "forced-first", "stuck")
+            visual = json.loads((dest / "visual.json").read_text(encoding="utf-8"))
+            burst = [{"kind": "play_first_unbound", "index": n, "file": f"play-first-unbound-{n}.png", "display_frame": 597 + n, "serial": 897 + n,
+                      "painted_serial": 897 + n, "painted_serial_valid": True, "label_bound": True, "label_bound_basis": "gl_window_paint",
+                      "play_active": True, "tail_elapsed_ms": 3 + 30 * n, "capture_ms": 40.0, "viewport": VIEWPORT, "saved": True, "reason": "",
+                      "forced_paints_before": 0, "source_id": f"{597 + n:016x}"} for n in range(3)]
+            visual["frames"] = burst + visual["frames"]
+            (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
+            calls = [f"New-VisPng '{dest / row['file']}' {n + 4} {200 + 7 * n} {40 * n} $false" for n, row in enumerate(burst)]
+            proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      "| ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+            self.assertEqual((out["frozenJudgedOn"], out["playFrames"], out["distinctContentHashes"]), ("play_unbound", 6, 1))
+            self.assertEqual(out["appDistinctDisplayFrames"], base["appDistinctDisplayFrames"])
+            copied = [f for f in out["frames"] if f["kind"] == "play_first_unbound"]
+            self.assertEqual([f["file"] for f in copied], [f"unit-leg-play-first-unbound-{n}.png" for n in range(3)], out["frames"])
+            for f in copied:
+                local = Path(d) / "evidence" / "visual" / f["file"]
+                self.assertTrue(local.is_file(), f)
+                self.assertEqual(f["sha256"], hashlib.sha256(local.read_bytes()).hexdigest(), f)
+            self.assertEqual(len({f["contentHash"] for f in copied}), 3, "the burst itself moved")
+
+    @requires_windows_imaging
     def test_the_visual_reader_says_ok_over_a_healthy_display_on_the_r3_order(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-r3-healthy-") as d:
             _, out = self.read(d, "forced-first", "healthy")
@@ -10856,6 +10892,21 @@ class VisualCaptureVenueHelperTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.strip().splitlines()[-1],
                              "paused-unbound.png,paused.png,play-0.png,play-unbound-0.png,stop-unbound.png,stop.png,visual-capture-request.json,visual.json")
+
+    def test_r4r_r6_the_visual_publish_carries_the_play_first_unbound_burst(self) -> None:
+        # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1 R6: the app's unforced burst before the first forced paint (play-first-unbound-<n>.png) is
+        # the only capture the in-flight tail credit can use; a publish filter that drops it leaves the credit dormant on every venue leg (RED on 9a5baab0)
+        with tempfile.TemporaryDirectory(prefix="vis-pub-r4r-") as d:
+            src = Path(d, "src")
+            src.mkdir()
+            Path(d, "pub").mkdir()
+            for name in ("play-first-unbound-0.png", "play-first-unbound-3.png", "play-unbound-0.png", "visual.json", "play-first-unbound.png", "play-first-unbound-0.png.tmp"):
+                Path(src, name).write_bytes(b"x")
+            proc = self.run_module(f"$pub = Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}'; "
+                                   "(Get-ChildItem -LiteralPath $pub -File | ForEach-Object Name | Sort-Object) -join ','")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines()[-1],
+                             "play-first-unbound-0.png,play-first-unbound-3.png,play-unbound-0.png,visual-capture-request.json,visual.json")
 
     def test_the_visual_tail_is_cut_off_the_presentmon_window_and_never_extends_it(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-pm-") as d:
@@ -12281,6 +12332,27 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         # where the painted serial came from is named (the pixmap route's binding holds by construction)
         for basis in ('"gl_window_paint"', '"gl_viewport_paint"', '"pixmap_item_by_construction"', '"none"'):
             self.assertIn(f"QStringLiteral({basis})", src)
+        # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1. S1 (r4 pass-5 A8): visual.json carries the launcher's run nonce, the one the summary echoes.
+        self.assertIn('visualJson.insert( QStringLiteral("run_nonce"), automationRunNonce() );', block)
+        # S2: an unforced play_first_unbound burst between the tail clock's start and the first forced play capture (the only captures no forced paint
+        # precedes, so the in-flight tail credit can fire); it never paints: its kind ends "_unbound" and its serial probe passes paint=false
+        burst_kind = "play_first_unbound"
+        burst = f'grabVisual( QStringLiteral("{burst_kind}"),'
+        self.assertTrue(burst_kind.endswith("_unbound"))
+        self.assertEqual(block.count(burst), 1)
+        self.assertLess(block.index("visualTailClock.start();"), block.index(burst))
+        self.assertLess(block.index(burst), block.index(play))
+        pre_forced = block[block.index("visualTailClock.start();"):block.index(play)]
+        self.assertEqual(pre_forced.count("grabVisual("), 1, "the burst is the only capture before the forced loop")
+        self.assertIn("m_graphicsItemPresentedSerial, false, &visualBurstProbeSerial, nullptr );", pre_forced, "the burst's serial probe never paints")
+        for painting in ("repaint(", "paintPendingNowIfActive(", "->update("):
+            self.assertNotIn(painting, pre_forced)
+        # S3: the three source-binding sites bind every source-bound kind (the burst included); decide() still sees the two play kinds only (the header)
+        self.assertEqual(block.count("visual_capture_source_difference::isSourceBoundCaptureKind( grab.kind )"), 3)
+        self.assertNotIn("isPlayCaptureKind( grab.kind )", block)
+        header = (ROOT / "platform" / "qt" / "VisualCaptureSourceDifference.h").read_text(encoding="utf-8")
+        self.assertIn('return kind == QStringLiteral("play") || kind == QStringLiteral("play_unbound");', header)
+        self.assertIn("isSourceBoundCaptureKind(", header)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -20361,10 +20433,14 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
     # prep_generation_drops=1, so 231ea06e is no longer credited), a conform line with paint_wait_escapes=0, and the hashed run log's visual-capture begin record
     # (the run binding: session and tail_begin_utc, no clip_changed record), so the credited fixture carries all three.
     BEGIN_UTC = "2026-11-25T18:00:00.000Z"
+    # R4-RESIDUE-1 (r4 pass-5 A8): run A's launcher nonce (result.json runNonce = the summary line's echo = visual.json run_nonce) and another run B's
+    RUN_A = "0123456789abcdef0123456789abcdef"
+    RUN_B = "fedcba9876543210fedcba9876543210"
     PB = {"conformLinePresent": True, "summarySession": "1", "conformSession": "1", "conformSourceFps": 11.906, "conformMaxJump": 1, "conformAudioSyncRequests": 0,
           "conformRepeats": 0, "conformPresented": 477, "sourceAdvanced": 480, "conformSourceAdvanced": 476, "conformFirstFrame": 1, "conformLastFrame": 477,
           "conformEngineTarget": 479, "conformBackward": 0, "prepReplacedBefore": 0, "prepReplacedAfter": 0, "prepStaleDrops": 0, "prepGenerationDrops": 0,
-          "conformPaintWaitEscapes": 0, "visualCaptureBeginSession": "1", "visualCaptureBeginUtc": BEGIN_UTC, "visualCaptureClipChanged": 0, "visualTailPrepDrops": 0}
+          "conformPaintWaitEscapes": 0, "visualCaptureBeginSession": "1", "visualCaptureBeginUtc": BEGIN_UTC, "visualCaptureClipChanged": 0, "visualTailPrepDrops": 0,
+          "expectedRunNonce": RUN_A, "observedRunNonce": RUN_A}
     LEG = "m16-1243-everyframe-visual-unpaced-fullscreen-s1"
 
     @staticmethod
@@ -20383,7 +20459,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
     @classmethod
     def app_json(cls, *frames: dict, **top) -> dict:
         doc = {"schema": "mlv-app/visual-capture/v1", "error": "", "measured_session": 1, "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
-               "tail_begin_utc": cls.BEGIN_UTC, "frames": list(frames or (cls.play(0), cls.play(1), cls.play(2)))}
+               "tail_begin_utc": cls.BEGIN_UTC, "run_nonce": cls.RUN_A, "frames": list(frames or (cls.play(0), cls.play(1), cls.play(2)))}
         doc.update(top)
         return doc
 
@@ -20425,7 +20501,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 rows = (parsed[0] if isinstance(parsed, list) and parsed else parsed).get("frames") if isinstance(parsed, (dict, list)) and parsed else None
                 if png != "none":
                     for row in rows if isinstance(rows, list) else []:
-                        if not isinstance(row, dict) or row.get("kind") not in ("play", "play_unbound") or not isinstance(row.get("index"), int):
+                        if not isinstance(row, dict) or row.get("kind") not in ("play", "play_unbound", "play_first_unbound") or not isinstance(row.get("index"), int):
                             continue
                         if png == "first-missing" and row["index"] == 0:
                             continue
@@ -21047,6 +21123,95 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         out = self.metrics(self.HELD, criteria=self.BOTH)
         self.assertTrue(out["detail"].startswith("; tail in-flight credit: 1 of 1 target(s)"), out)
         self.assertNotIn(out["detail"], "CAPTURED; every criterion for this role/backend held")
+
+    # ---- R4-RESIDUE-1 r1 (r4 pass-5 A8 on b6c53917, design ruling 2026-11-26T06:30Z). Each is RED on 9a5baab0 unless marked (control) or (guard). ----
+    def test_r4r_r1_another_runs_visual_json_with_the_same_session_and_begin_time_is_never_credited(self) -> None:
+        """R1 (A8, its input): runs A and B share measured_session=1 and tail_begin_utc=2026-11-25T18:00:00.000Z, with launcher nonces A and B. A's result.json
+        and log (expected = observed = A) plus B's visual.json (run_nonce=B) and its recorded PNG. 9a5baab0 bound by session and millisecond time only, so B's
+        frame credited A's held target. (control) The same document with run_nonce=A credits."""
+        out = self.metrics(self.HELD, app=self.app_json(self.play(0), run_nonce=self.RUN_B), criteria=self.BOTH)
+        self.assert_no_credit(out, 1)
+        self.assertTrue(out["m"]["conformTailInFlightCreditNote"].startswith("TAIL_VISUAL_NONCE_MISMATCH"), out)
+        with self.subTest(case="(control) run A's own visual.json credits"):
+            out = self.metrics(self.HELD, app=self.app_json(self.play(0), run_nonce=self.RUN_A), criteria=self.BOTH)
+            self.assertEqual((out["m"]["conformTailInFlightCreditedFrames"], out["m"]["conformTailUnpaintedFrames"]), (1, 0), out)
+            self.assertTrue(out["v"]["pass"], out)
+
+    def test_r4r_r2_a_visual_json_without_a_well_formed_run_nonce_is_never_credited(self) -> None:
+        """R2: visual.json with no run_nonce, or one that is not the launcher's exact 32-lowercase-hex form: "none" (the app's noRunNonce when the launcher set
+        none), upper case, 31 hex, the nonce plus a final newline (`$` matches before it: the \\z lesson), a JSON number, null. Each is TAIL_VISUAL_NONCE_ABSENT.
+        (guard) A duplicate run_nonce member is the strict-JSON refusal: no tail evidence at all."""
+        bare = {k: v for k, v in self.app_json(self.play(0)).items() if k != "run_nonce"}
+        cases = {"absent": bare, "none": self.app_json(self.play(0), run_nonce="none"), "upper case": self.app_json(self.play(0), run_nonce=self.RUN_A.upper()),
+                 "31 hex": self.app_json(self.play(0), run_nonce=self.RUN_A[:31]), "a trailing newline": self.app_json(self.play(0), run_nonce=self.RUN_A + "\n"),
+                 "a JSON number": self.app_json(self.play(0), run_nonce=12345678901234567890), "null": self.app_json(self.play(0), run_nonce=None)}
+        for name, app in cases.items():
+            with self.subTest(case=name):
+                out = self.metrics(self.HELD, app=app, criteria=self.BOTH)
+                self.assert_no_credit(out, 1)
+                self.assertTrue(out["m"]["conformTailInFlightCreditNote"].startswith("TAIL_VISUAL_NONCE_ABSENT"), out)
+        with self.subTest(case="(guard) a duplicate run_nonce member"):
+            good = json.dumps(self.app_json(self.play(0)))
+            dup = good.replace(f'"run_nonce": "{self.RUN_A}"', f'"run_nonce": "{self.RUN_B}", "run_nonce": "{self.RUN_A}"', 1)
+            self.assertNotEqual(dup, good)
+            out = self.metrics(self.HELD, app=dup.encode("utf-8"), criteria=self.BOTH)
+            self.assertFalse(out["haveVisual"], out)
+            self.assert_no_credit(out, 1)
+
+    def test_r4r_r3_the_visual_nonce_must_equal_both_the_launchers_and_the_apps_echo(self) -> None:
+        """R3: visual.json's run_nonce equals the launcher's expectedRunNonce but the summary line's observedRunNonce differs, and the reverse; and a launcher or
+        echo nonce that is not itself well-formed (a trailing newline, absent). Each is TAIL_VISUAL_NONCE_MISMATCH."""
+        cases = {"equals expected, observed differs": {"observedRunNonce": self.RUN_B},
+                 "equals observed, expected differs": {"expectedRunNonce": self.RUN_B},
+                 "expected carries a trailing newline": {"expectedRunNonce": self.RUN_A + "\n"},
+                 "observed absent": {"observedRunNonce": None}}
+        for name, pb in cases.items():
+            with self.subTest(case=name):
+                out = self.metrics({**self.HELD, **pb}, app=self.app_json(self.play(0)), criteria=self.BOTH)
+                self.assert_no_credit(out, 1)
+                self.assertTrue(out["m"]["conformTailInFlightCreditNote"].startswith("TAIL_VISUAL_NONCE_MISMATCH"), out)
+
+    def test_r4r_r4_the_play_first_unbound_burst_before_the_first_forced_paint_is_credited(self) -> None:
+        """R4: the app's play_first_unbound burst (index 0, play-first-unbound-0.png, forced_paints_before=0, saved, Play active, label-bound, a 16-hex source_id,
+        display_frame = the in-flight target 479, its recorded PNG) with no qualifying play_unbound row: credited. 9a5baab0's reader ignored the kind (dormant
+        credit). Subtests: forced_paints_before=1, file play-first-unbound-1.png on index 0, a duplicate kind|index, a locked PNG, no source_id."""
+        first = self.play(0, kind="play_first_unbound", tail_elapsed_ms=4)
+        late = self.play(0, forced_paints_before=6, tail_elapsed_ms=1625)   # the play_unbound row after the forced loop: not qualifying
+        out = self.metrics(self.HELD, app=self.app_json(first, late), criteria=self.BOTH)
+        self.assertEqual(first["file"], "play-first-unbound-0.png")
+        self.assertEqual((out["m"].get("conformTailInFlightCreditedFrames"), out["m"]["conformTailUnpaintedFrames"]), (1, 0), out)
+        self.assertTrue(out["v"]["pass"], out)
+        with self.subTest(case="forced_paints_before=1 is not credited"):
+            self.assert_no_credit(self.metrics(self.HELD, app=self.app_json(self.play(0, kind="play_first_unbound", forced_paints_before=1)), criteria=self.BOTH), 1)
+        with self.subTest(case="file play-first-unbound-1.png on index 0"):
+            out = self.metrics(self.HELD, app=self.app_json(self.play(0, kind="play_first_unbound", file="play-first-unbound-1.png")), criteria=self.BOTH)
+            self.assert_no_credit(out, 1)
+            self.assertIn("TAIL_VISUAL_FILE_AMBIGUOUS", out["m"]["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="a duplicate kind|index is refused"):
+            out = self.metrics(app=self.app_json(self.play(0, kind="play_first_unbound", display_frame=478, serial=483, painted_serial=483),
+                                                 self.play(0, kind="play_first_unbound")), criteria=self.BOTH)
+            self.assertFalse(out["haveVisual"], out)
+            self.assert_no_credit(out, 2)
+        with self.subTest(case="a missing source_id is not credited"):
+            self.assert_no_credit(self.metrics(self.HELD, app=self.app_json(self.play(0, kind="play_first_unbound", source_id=None)), criteria=self.BOTH), 1)
+        with self.subTest(case="a locked play-first-unbound PNG is TAIL_VISUAL_UNREADABLE"):
+            app = json.dumps(self.app_json(self.play(0, kind="play_first_unbound"))).encode("utf-8")
+            png = self.png_bytes(0)
+            proc, res = run_pwsh_json(
+                "$d = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N')); $v = Join-Path $d 'visual'; [void](New-Item -ItemType Directory -Path $v)\n"
+                "$p = Join-Path $v ($env:DVE_LEG + '-play-first-unbound-0.png')\n"
+                "$png = [Convert]::FromBase64String($env:DVE_PNG); [IO.File]::WriteAllBytes($p, $png)\n"
+                "$json = [Convert]::FromBase64String($env:DVE_APP); [IO.File]::WriteAllBytes((Join-Path $v 'app-visual.json'), $json)\n"
+                "$rec = @([pscustomobject]@{ kind = 'play_first_unbound'; index = 0; sha256 = (Get-DvSha256OfBytes $png) })\n"
+                "$hold = [IO.File]::Open($p, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)\n"
+                "try { $vis = Get-DvTailVisualEvidence -EvidenceDir $d -LegId $env:DVE_LEG -ExpectedSha256 (Get-DvSha256OfBytes $json) -RecordedFrames $rec } finally { $hold.Dispose() }\n"
+                "Remove-Item -LiteralPath $d -Recurse -Force\n"
+                "[ordered]@{ isNull = ($null -eq $vis); refused = [string]$vis.refused; path = [string]$vis.unreadablePath } | ConvertTo-Json -Compress",
+                DVE_PNG=__import__("base64").b64encode(png).decode(), DVE_APP=__import__("base64").b64encode(app).decode(), DVE_LEG=self.LEG)
+            self.assertIsNotNone(res, proc.stdout + proc.stderr)
+            self.assertFalse(res["isNull"], res)
+            self.assertIn("TAIL_VISUAL_UNREADABLE", res["refused"], res)
+            self.assertTrue(res["path"].endswith(f"{self.LEG}-play-first-unbound-0.png"), res)
 
 
 class DriftLegSpecTests(unittest.TestCase):

@@ -14,6 +14,11 @@ read perfect while the display is frozen. So the capture runs after the measured
    REACHED its own stop condition: `finishPlaybackSmokeTelemetry("visual-capture")` closes the measured session (the
    `playback_smoke.summary` / `gate` lines, and every oracle number, are written there), while the SAME Play keeps running -- no
    new Play, no restart, no loop (the clip-length gate's stop-site pin counts this one pause). Then, untimed:
+   * a short unforced burst, `play-first-unbound-<n>.png` (kind `play_first_unbound`, at most 4), from the tail's start until the first
+     forced capture's target time: one at once, then one each time the display's own painted serial changes
+     (EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1). These are the only captures no forced paint precedes
+     (`forced_paints_before` = 0), so they are what the in-flight tail credit below can use. The frozen check never judges them
+     (it judges `play_unbound`, else `play`), and they are not input to `source_difference`;
    * 6 forced, bound play captures, `play-<k>.png`, across the FIRST half of a ~3 s tail (the centres of six equal slices of it);
    * then 6 unforced play captures, `play-unbound-<k>.png`, across the SECOND half (the centres of six equal slices of it): what the
      display itself shows, and what the frozen check judges;
@@ -35,7 +40,9 @@ read perfect while the display is frozen. So the capture runs after the measured
    Each capture is the WHOLE window via `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)` -- the compositor's view of the window,
    GL child windows included, never an in-app readback -- saved at most 1920 wide after Play has stopped, with the video
    viewport rectangle (in the saved image's pixels) and the frame the app says it showed in `visual.json`. A capture failure is
-   recorded there and never changes the run's exit code.
+   recorded there and never changes the run's exit code. `visual.json` carries `run_nonce` (top level, a JSON string): the launcher's
+   `MLVAPP_RUN_NONCE` as the app reads it (`automationRunNonce()`: 32 lowercase hex, or `none` when the launcher set none), the same
+   nonce the `playback_smoke.summary` line echoes, so the file is bound to the run that wrote it (R4-RESIDUE-1, r4 pass-5 A8).
 
    **Binding (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1).** PrintWindow reads the LAST PAINTED surface, but the CPU route paints a
    presented frame later (the pixmap item's or GL viewport's `update()`), while its label (`display_frame`, `serial`) is stamped
@@ -182,7 +189,8 @@ after the scan -- cannot make a static clip read "known to differ", and no byte 
 differently: the DHT class/id byte liblj92 zeroes in place, and a table symbol the bitstream never selects.)
 
 * `frames[].source_id` (play entries only, both the forced `play` and the unforced `play_unbound` captures -- the frozen check is
-  judged on the unforced ones whenever they exist): that hash as 16 lowercase hex digits. Absent when it could not be read.
+  judged on the unforced ones whenever they exist -- and the `play_first_unbound` burst, which the in-flight tail credit needs; the
+  burst is never `source_difference` input): that hash as 16 lowercase hex digits. Absent when it could not be read.
 * `source_difference` (top level), a JSON string, exactly one of:
   * `"differ"`: at least two play frames' source ids differ;
   * `"identical"`: every play frame has a source id, they span at least two distinct `display_frame` values, and all are equal;
@@ -207,19 +215,24 @@ line is `INVALID` (`LOOK_ASSIST_NOT_HONOURED`), and the receipt's `lookAssist` b
 
 **In-flight tail credit (EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r4, `Get-DvTailInFlightCredit`).** An every-frame conform reading
 credits an engine target that was still in flight at the measured close only from a capture that proves the app painted it, never
-the observer. A capture counts only when ALL hold: it is unforced (`play_unbound`) and taken before any forced repaint
-(`forced_paints_before` = 0), saved, label-bound, carries a `source_id` (bound to the clip), names its own file
-(`play-unbound-<index>.png`), has its recorded, decodable PNG, and shows Play active. The qualifying captures must be in paint
-order (by `tail_elapsed_ms`, display frame and serial never decrease). The visual record is bound to this run: the hashed run log's
+the observer. A capture counts only when ALL hold: it is unforced (`play_unbound` or `play_first_unbound`) and taken before any
+forced repaint (`forced_paints_before` = JSON integer 0), saved, label-bound, carries a `source_id` (bound to the clip), names its own
+file (`play-unbound-<index>.png` / `play-first-unbound-<index>.png`), has its recorded, decodable PNG, and shows Play active. The
+qualifying captures must be in paint order (by `tail_elapsed_ms`, display frame and serial never decrease). The visual record is bound
+to this run: visual.json's `run_nonce` must be 32 lowercase hex (`TAIL_VISUAL_NONCE_ABSENT` otherwise: absent, `none`, upper case,
+another length, a trailing newline, or not a JSON string) and ordinal-equal to BOTH the launcher's nonce (result.json, `expectedRunNonce`)
+and the nonce the app echoed on its summary line (`observedRunNonce`) (`TAIL_VISUAL_NONCE_MISMATCH` otherwise: two runs can share a
+session number and a millisecond `tail_begin_utc`); the hashed run log's
 one `gui_smoke.visual_capture.begin` record must carry the measured session and the same `tail_begin_utc` as visual.json, and the
 log carries no `gui_smoke.visual_capture.clip_changed` record. Any dropped or replaced prepared result (`prep_stale_drops`,
 `prep_generation_drops`, `prep_replaced_*` non-zero, or a `playback_prep.invalidate_generation` drop logged after the begin record)
 or a non-zero or absent `paint_wait_escapes` refuses the credit. Typed
-refusals: `TAIL_CREDIT_PREP_DROPPED`, `TAIL_CREDIT_PAINT_WAIT_ESCAPES`, `TAIL_VISUAL_NOT_THIS_RUN`, `TAIL_VISUAL_FILE_AMBIGUOUS`,
-`TAIL_CREDIT_PAINT_ORDER`, `TAIL_VISUAL_UNREADABLE` (the validator re-throws it as `DVE_EVIDENCE_VALIDATION_IO`). A credit the
-criteria were judged with must appear in the receipt's `outcomeDetail` (`OUTCOME_DETAIL_TAIL_CREDIT_ABSENT` otherwise). The
-current app takes its K forced `play` captures before the unforced ones, so it supplies no qualifying capture yet: an unforced
-capture before the first forced paint is a C++ follow-up.
+refusals: `TAIL_CREDIT_PREP_DROPPED`, `TAIL_CREDIT_PAINT_WAIT_ESCAPES`, `TAIL_VISUAL_NONCE_ABSENT`, `TAIL_VISUAL_NONCE_MISMATCH`,
+`TAIL_VISUAL_NOT_THIS_RUN`, `TAIL_VISUAL_FILE_AMBIGUOUS`, `TAIL_CREDIT_PAINT_ORDER`, `TAIL_VISUAL_UNREADABLE` (the validator re-throws
+it as `DVE_EVIDENCE_VALIDATION_IO`). A credit the criteria were judged with must appear in the receipt's `outcomeDetail`
+(`OUTCOME_DETAIL_TAIL_CREDIT_ABSENT` otherwise). The app's `play_first_unbound` burst (R4-RESIDUE-1) is the capture that can
+qualify: every `play_unbound` capture follows the six forced `play` paints. A Play start that drops one prepared result
+(`prep_stale_drops=1`) still refuses the credit (`TAIL_CREDIT_PREP_DROPPED`) until each target carries a drop/reissue identity.
 
 ## Opting out
 

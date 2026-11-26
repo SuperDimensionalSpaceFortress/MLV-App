@@ -2996,7 +2996,7 @@ function Publish-AttrCudaVisualCaptures {
     [void](New-AttrCudaDirectory -Path $pubDir)
     [void](Publish-AttrCudaText -Path (Join-Path $pubDir 'visual-capture-request.json') -Value ($Record | ConvertTo-Json -Depth 4))
     if ($Record['forwarded'] -and $SourceDir -and (Test-Path -LiteralPath $SourceDir -PathType Container)) {
-        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
+        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
             [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination (Join-Path $pubDir $_.Name))
         }
     }
