@@ -696,9 +696,10 @@ try {
     $receipt.venue.driverVersion = $probe.driverVersion
     $receipt.venue.displayDevice = $probe.displayDevice
     $receipt.venue.instrumentDigests.presentmon = $probe.presentmonSha256
-    # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2: the ONE display-path block, copied by its one writer from the probe fields above (no new venue read, no
-    # clock, no wait). A probe the writer cannot copy writes no block, so the receipt reads NO_SIGNAL (Read-DvReceiptDisplayPath, the one reader).
-    $displayPathBlock = New-DvDisplayPathBlock -Probe $probe
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2: the ONE display-path block, copied by its one writer from the probe's own DVE_PROBE line (the same line,
+    # read with System.Text.Json; no new venue read, no clock, no wait). A probe the writer cannot copy as reported writes no block, so the receipt reads
+    # NO_SIGNAL (Read-DvReceiptDisplayPath, the one reader).
+    $displayPathBlock = New-DvDisplayPathBlock -ProbeStdout ([string]$probeRun.result.stdout)
     if ($null -ne $displayPathBlock) { $receipt.venue['displayPath'] = $displayPathBlock }
 
     # P6: one source of truth for which venue a host is.

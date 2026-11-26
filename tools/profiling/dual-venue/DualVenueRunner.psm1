@@ -6419,6 +6419,8 @@ function Test-DvReceiptValid {
     # Claims the receipt makes that NO hashed artifact carries (fable r1 B1 / sol r1 B3). They are recorded, typed, and never used as a verdict input.
     $unbound = @('CLIP_CONTENT_UNBOUND: subject.clipContentSha256 is computed by the local generator and written to no artifact the venue returns; it is recorded, never trusted',
                  'LEG_IDENTITY_UNBOUND: legId / legSpecSha256 name a committed spec, but no hashed artifact carries them; only the leg TYPE (summary.lookLeg), look flavor, backend, venue, clip and build are bound')
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2 (r1 adversary pass-3 A5): the display-path block copies the health probe's own report, which no hashed artifact carries
+    if (Test-DvReceiptCarriesDisplayPath $Receipt) { $unbound += 'DISPLAY_PATH_UNBOUND: venue.displayPath copies the health probe''s own report and is written to no hashed artifact; it is recorded, never a verdict input' }
 
     $subject = Get-DvProp $Receipt 'subject'
     $clipId = [string](Get-DvProp $subject 'clipId')
@@ -7643,6 +7645,42 @@ function Get-DvJsonMembersNamed {
     $hits.ToArray()   # unrolled to the caller, which collects it with @(): zero, one or more JsonProperty values
 }
 
+function Test-DvJsonTextReadable {
+    # r1 adversary pass-3 A4: every member name and string value under a System.Text.Json element can be read back (an escaped lone surrogate cannot).
+    # Iterative (a work stack), so the document's own depth bound is the only bound.
+    param([System.Text.Json.JsonElement]$Element)
+    $stack = [System.Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
+    $stack.Push($Element)
+    try {
+        while ($stack.Count -gt 0) {
+            $e = $stack.Pop()
+            if ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                foreach ($p in $e.EnumerateObject()) {
+                    if ($null -eq $p.Name) { return $false }
+                    $stack.Push($p.Value)
+                }
+            } elseif ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                foreach ($x in $e.EnumerateArray()) { $stack.Push($x) }
+            } elseif ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                if ($null -eq $e.GetString()) { return $false }
+            }
+        }
+    } catch { return $false }
+    $true
+}
+
+function Test-DvReceiptCarriesDisplayPath {
+    # r1 adversary pass-3 A5: does the receipt's venue carry a displayPath member (any letter case)? Presence only, for the validator's UNBOUND list;
+    # the block's content is read by Read-DvReceiptDisplayPath alone.
+    param($Receipt)
+    $venue = Get-DvProp $Receipt 'venue'
+    if ($null -eq $venue) { return $false }
+    if ($venue -is [System.Collections.IDictionary]) {
+        return (@($venue.Keys | Where-Object { [string]::Equals([string]$_, 'displayPath', [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
+    }
+    $null -ne $venue.PSObject.Properties['displayPath']
+}
+
 function Read-DvReceiptDisplayPath {
     <#
     .SYNOPSIS
@@ -7666,6 +7704,7 @@ function Read-DvReceiptDisplayPath {
         $object = [System.Text.Json.JsonValueKind]::Object
         $root = $doc.RootElement
         if ($root.ValueKind -ne $object) { $why = 'the receipt root is not an object' }
+        elseif (-not (Test-DvJsonTextReadable -Element $root)) { $why = 'the receipt text holds a name or string that cannot be read back' }
         else {
             $venues = @(Get-DvJsonMembersNamed -Element $root -Name 'venue')
             if ($venues.Count -eq 0) { return [pscustomobject]@{ state = 'NO_SIGNAL'; block = $null; reason = $null } }
@@ -7695,16 +7734,17 @@ function Read-DvReceiptDisplayPath {
                         $string = [System.Text.Json.JsonValueKind]::String
                         $null_ = [System.Text.Json.JsonValueKind]::Null
                         $adapters = $fields['adapters']
-                        # r1 adversary pass-1 A3: U+FFFD is the mark of a text that was not read back as it was reported (the probe-line parse turns the
-                        # probe's escaped lone surrogate into it, and so does a UTF-8 write of one), so a block string carrying it is malformed, never present evidence.
-                        $replacement = [char]0xFFFD
+                        # r1 adversary pass-1 A3 / pass-3 A1: U+FFFD and '?' are the marks of a text that was not carried as it was reported (a decoder
+                        # turns an escaped lone surrogate into U+FFFD; a venue agent that writes its result as ASCII turns a non-ASCII letter into '?'). No
+                        # adapter name, driver version or display device name holds either, so a block string carrying one is malformed, never present evidence.
+                        $lossy = [char[]]@([char]0xFFFD, [char]0x3F)
                         $nullable = @{}
                         foreach ($f in @('firstAdapterDriverVersion', 'primaryDisplayDevice')) {
                             $v = $fields[$f]
                             if ($v.ValueKind -eq $null_) { $nullable[$f] = $null }
                             elseif ($v.ValueKind -eq $string) {
                                 $s = [string]$v.GetString()
-                                if ($s.IndexOf($replacement) -ge 0) { $why = "$f carries U+FFFD"; break }
+                                if ($s.IndexOfAny($lossy) -ge 0) { $why = "$f carries U+FFFD or '?'"; break }
                                 $nullable[$f] = $s
                             }
                             else { $why = "$f is neither a string nor null"; break }
@@ -7714,12 +7754,15 @@ function Read-DvReceiptDisplayPath {
                         elseif ($fields['source'].ValueKind -ne $string -or -not (Test-DvOrdinalEqual $fields['source'].GetString() $script:DisplayPathSource)) { $why = "source is not $($script:DisplayPathSource)" }
                         elseif ($adapters.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { $why = 'adapters is not a list' }
                         elseif ($adapters.GetArrayLength() -gt $script:DisplayPathMaxAdapters) { $why = "adapters lists more than $($script:DisplayPathMaxAdapters)" }
+                        # r1 adversary pass-3 A3: every Windows host has a video controller (Microsoft Basic Display Adapter at least), so a sample with none is a
+                        # failed controller read, never a venue state: an empty list is malformed.
+                        elseif ($adapters.GetArrayLength() -lt 1) { $why = 'adapters is empty (a sample with no video controller is a failed read)' }
                         else {
                             $names = [System.Collections.Generic.List[string]]::new()
                             foreach ($e in $adapters.EnumerateArray()) {
                                 if ($e.ValueKind -ne $string) { $why = 'an adapter is not a string'; break }
                                 $s = [string]$e.GetString()
-                                if ($s.IndexOf($replacement) -ge 0) { $why = 'an adapter carries U+FFFD'; break }
+                                if ($s.IndexOfAny($lossy) -ge 0) { $why = "an adapter carries U+FFFD or '?'"; break }
                                 $names.Add($s)
                             }
                             if ($null -eq $why) {
@@ -7747,23 +7790,52 @@ function New-DvDisplayPathBlock {
     .SYNOPSIS
     VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2: the ONE writer of a leg receipt's `venue.displayPath` block. It copies three fields the health probe ALREADY
     reported (gpuNames from its Win32_VideoController read, driverVersion, displayDevice = Screen.PrimaryScreen.DeviceName) into the block; it reads nothing
-    on the venue, waits on nothing and reads no clock. Returns the block the ONE reader (Read-DvReceiptDisplayPath) gives back for it, or $null when a probe
-    field is not of its type (gpuNames missing or not a list, an element that is not a [string], a driver or device that is neither $null nor a [string],
-    e.g. a time-looking text ConvertFrom-Json made a [datetime]): the caller then writes no block and the receipt reads NO_SIGNAL. Never throws.
+    on the venue, waits on nothing and reads no clock. r1 adversary pass-3 A2: it takes the probe job's stdout TEXT and reads the same `DVE_PROBE=` line
+    ConvertFrom-DvProbeStdout reads (the first one) with System.Text.Json, strict default options, so a key that appears twice or in another letter case,
+    an array root, a comment or a time-looking text is never read the way ConvertFrom-Json reads it. Returns the block the ONE reader
+    (Read-DvReceiptDisplayPath) gives back for it, or $null -- the caller then writes no block and the receipt reads NO_SIGNAL -- when there is no such line,
+    it is not a strict JSON object, gpuNames / driverVersion / displayDevice is missing, doubled or misspelled in case, gpuNames is not a list of strings,
+    a driver or device is neither a string nor null, a string cannot be read back, or the reader does not type the block present. Never throws.
     #>
-    param([AllowNull()]$Probe)
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ProbeStdout)
     try {
-        $names = Get-DvProp $Probe 'gpuNames'
-        if ($names -isnot [array] -or $names.Rank -ne 1) { return $null }   # r1 adversary pass-1 A4: a rank-two array is not a list of names
-        foreach ($n in $names) { if ($n -isnot [string]) { return $null } }
-        $driver = Get-DvProp $Probe 'driverVersion'
-        if ($null -ne $driver -and $driver -isnot [string]) { return $null }
-        $device = Get-DvProp $Probe 'displayDevice'
-        if ($null -ne $device -and $device -isnot [string]) { return $null }
+        $json = $null
+        foreach ($line in ($ProbeStdout -split "`r?`n")) {
+            if ($line.StartsWith('DVE_PROBE=')) { $json = $line.Substring('DVE_PROBE='.Length); break }   # the line ConvertFrom-DvProbeStdout reads
+        }
+        if ($null -eq $json) { return $null }
+        $doc = [System.Text.Json.JsonDocument]::Parse($json, [System.Text.Json.JsonDocumentOptions]::new())
+        try {
+            $root = $doc.RootElement
+            if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
+            $got = @{}
+            foreach ($name in @('gpuNames', 'driverVersion', 'displayDevice')) {
+                $hits = @(Get-DvJsonMembersNamed -Element $root -Name $name)
+                if ($hits.Count -ne 1 -or -not (Test-DvOrdinalEqual $hits[0].Name $name)) { return $null }
+                $got[$name] = $hits[0].Value
+            }
+            if ($got['gpuNames'].ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { return $null }
+            $list = [System.Collections.Generic.List[string]]::new()
+            foreach ($e in $got['gpuNames'].EnumerateArray()) {
+                if ($e.ValueKind -ne [System.Text.Json.JsonValueKind]::String) { return $null }
+                $list.Add([string]$e.GetString())
+            }
+            $names = $list.ToArray()
+            $text = @{}
+            foreach ($name in @('driverVersion', 'displayDevice')) {
+                $v = $got[$name]
+                if ($v.ValueKind -eq [System.Text.Json.JsonValueKind]::Null) { $text[$name] = $null }
+                elseif ($v.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $text[$name] = [string]$v.GetString() }
+                else { return $null }
+            }
+            $driver = $text['driverVersion']
+            $device = $text['displayDevice']
+        } finally { $doc.Dispose() }
         $block = [ordered]@{
             schema = $script:DisplayPathSchema
             source = $script:DisplayPathSource
-            adapters = [string[]]@($names)
+            adapters = [string[]]$names
             firstAdapterDriverVersion = $driver
             primaryDisplayDevice = $device
         }

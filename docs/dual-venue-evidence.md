@@ -725,20 +725,25 @@ different adapter (Bachelor's 59.56 -> 38.78 fps control, BACHELOR-1457-NATIVE-G
 block, written by ONE writer and read by ONE reader. It replaces the closed PR #904 (VENUE-LEG-DISPLAY-PATH-RECEIPT-1), whose wider collector and
 timing work were not carried over: this block adds no venue read, no CIM query, no clock and no wait.
 
-**Writer.** `New-DvDisplayPathBlock -Probe <probe>` (`DualVenueRunner.psm1`), called once by `Invoke-VenueLeg.ps1` right after the health probe's
-fields are copied, so an unhealthy or host-mismatched leg carries the block too. It copies three fields the probe already reports:
+**Writer.** `New-DvDisplayPathBlock -ProbeStdout <the health probe job's stdout>` (`DualVenueRunner.psm1`), called once by `Invoke-VenueLeg.ps1`
+right after the health probe's fields are copied, so an unhealthy or host-mismatched leg carries the block too. It reads the same `DVE_PROBE=` line
+`ConvertFrom-DvProbeStdout` reads (the first one), but with `System.Text.Json` and strict options, and copies three fields the probe already reports:
 
 | Field | Type | Value |
 |---|---|---|
 | `schema` | string | exactly `mlv-app/venue-display-path/v2` (`v1` was the closed #904 shape; it reads malformed) |
 | `source` | string | exactly `health-probe`: the probe's sample, taken before the measurement job is submitted, never re-read during the run |
-| `adapters` | list of strings | the probe's `gpuNames` (every `Win32_VideoController` name, in probe order), at most 64 |
+| `adapters` | list of strings | the probe's `gpuNames` (every `Win32_VideoController` name, in probe order), 1 to 64 of them |
 | `firstAdapterDriverVersion` | string or null | the probe's `driverVersion` (the first video controller's driver) |
 | `primaryDisplayDevice` | string or null | the probe's `displayDevice` (`Screen.PrimaryScreen.DeviceName`, e.g. `\\.\DISPLAY1`) |
 
-A probe field of the wrong type (no `gpuNames` list, a name that is not a string, a time-looking text the probe parse turned into a `[datetime]`)
-makes the writer write **no** block, never a malformed one and never a throw; that receipt reads `NO_SIGNAL`. The writer hands back only a block
-its reader types `present`. The block names the adapters and the primary display device; it does not say which adapter drives that display.
+The writer writes **no** block, never a malformed one and never a throw, when the line is missing or not a strict JSON object, or when a field
+is missing, appears twice, appears in another letter case or has the wrong type. The same goes for a string that cannot be read back, and for
+any block its reader would not type `present` (for example an empty adapter list or a name that lost a letter on the way). That receipt reads
+`NO_SIGNAL`. Since the line is read with `System.Text.Json`, a time-looking device name is copied as the text the probe printed. The block names the
+adapters and the primary display device. It does not say which adapter drives that display.
+Because the block copies the probe's own report and no hashed artifact carries it, `Test-DvReceiptValid` lists `DISPLAY_PATH_UNBOUND` among the
+`unbound` claims of a PASS / FAIL receipt that carries it, and a sheet-pair record lists `venue.displayPath` as unbound. It is never a verdict input.
 
 **Reader.** `Read-DvReceiptDisplayPath -ReceiptText <the receipt file's text>` reads with `System.Text.Json` and its strict default options
 (no comments, no trailing commas, double-quoted names and strings only, depth 64), every string exactly as written. There is no second reader,
@@ -749,10 +754,12 @@ no `ConvertFrom-Json` fallback and no recovery rewrite. It returns `{ state; blo
   receipt reads as it did on fork/master. `Test-DvReceiptValid` does not read the block, and its status for every receipt is unchanged.
 * `malformed`: any parse failure of the block. That covers a text that is not strict JSON, a root that is not an object, `venue` or `displayPath`
   twice in any letter case, a `venue` that is not an object, a block member not spelled `displayPath`, a block that is not an object (JSON
-  `null` included), and a missing, unknown, doubled or wrongly typed field. So are a `schema`/`source` that is not the exact string, more than 64
-  adapters, a name or string that cannot be read back (an escaped lone surrogate), and a block string that carries U+FFFD (the mark of a text
-  that was not read back as reported: the probe-line parse turns a lone surrogate into it, so the writer then writes no block). Every name and
-  string comparison is ordinal: PowerShell's `-ceq` / `-cne` / `-cnotcontains` compare by culture and ignore a NUL or a soft hyphen inside a text.
+  `null` included), and a missing, unknown, doubled or wrongly typed field. So are a `schema`/`source` that is not the exact string, an empty
+  adapter list (every Windows host has a video controller, so none is a failed read) or more than 64 adapters, and a name or string anywhere
+  in the receipt that cannot be read back (an escaped lone surrogate). So is a block string that carries U+FFFD or `?`. Those are the marks
+  of a text that was not carried as reported: a decoder turns a lone surrogate into U+FFFD, and a venue agent that writes its result as ASCII
+  turns a non-ASCII letter into `?`. No adapter, driver or display name holds either. Every name and string comparison is ordinal:
+  PowerShell's `-ceq` / `-cne` / `-cnotcontains` compare by culture and ignore a NUL or a soft hyphen inside a text.
 
 `ConvertFrom-Json` reads several of those texts differently: it keeps the last of two same-name keys, accepts `//` comments, single quotes and
 trailing commas, reads a lone surrogate and turns `2026-11-24T00:00:00Z` into a `[datetime]`. That is why the block is read with one grammar
