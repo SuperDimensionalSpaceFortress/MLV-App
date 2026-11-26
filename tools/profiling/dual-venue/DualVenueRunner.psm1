@@ -4573,7 +4573,8 @@ function Read-DvVisualCaptures {
         if ($exposureNote -and -not ([string]$block.reason).Contains($exposureNote)) { $block.reason = (@($block.reason, $exposureNote) | Where-Object { $_ }) -join '; ' }
         # r2 pass 4 A2: the reason is one line. A note may quote outside text (an exposure band key, say) and Invoke-VenueLeg prints the reason inside its
         # DVE_DETAIL line, so a control character (a line break above all) is written as \uXXXX: no note can forge a second record line.
-        if ($null -ne $block.reason) { $block.reason = [regex]::Replace([string]$block.reason, '\p{Cc}', { param($m) '\u{0:X4}' -f [int][char]$m.Value }) }
+        # (r2 pass 5 A1: and the Unicode line and paragraph separators U+2028 / U+2029, which split a line for Python's splitlines too)
+        if ($null -ne $block.reason) { $block.reason = [regex]::Replace([string]$block.reason, '[\p{Cc}\p{Zl}\p{Zp}]', { param($m) '\u{0:X4}' -f [int][char]$m.Value }) }
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -4728,9 +4729,11 @@ function Read-DvVisualCaptures {
         if ($bandInfo.note) { $exposureNote = $bandInfo.note }
     }
     # r2 (r1 adversary pass 3 A1): only when the judged frames carry two or more display frame numbers: one held number explains one picture by itself.
-    # r2 pass 4 A1: and never over judged frames whose own source ids are identical: a static source explains one picture by itself (the waiver says so)
+    # r2 pass 4 A1: and never over judged frames whose own source ids are identical: a static source explains one picture by itself (the waiver says so).
+    # r2 pass 5 A2: only over judged frames whose own source ids are KNOWN to differ: over an unknown source one picture may be the source's own, so the
+    # captures support no masking claim
     if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1 -and [int]$block.appDistinctDisplayFrames -ge 2 -and
-        $block.sourceDifference -cne 'known-identical') {
+        $block.sourceDifference -ceq 'known-differ') {
         $maskNote = "the forced play captures show $($block.forcedPlayDistinctContentHashes) distinct pictures where the unforced ones show one: the force-paint would have masked this"
         if (-not $block.reason) { $block.reason = $maskNote }
     }

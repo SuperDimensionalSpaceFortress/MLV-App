@@ -11488,6 +11488,18 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         self.assertIn("a static clip", out["reason"])
         self.assertNotIn("masked", out["reason"], "one picture over one source is the source's own; no force-paint masking is shown")
 
+        # r2 adversary pass 5 A2 (its input): the same, plus a third unforced capture labelled -1 over source id 03 showing Z: the judged source difference
+        # is not known-differ, so the reason (FROZEN_DISPLAY_SUSPECTED on 37e46363) carries no masking claim
+        def p5_a2(visual):
+            p4_a1(visual)
+            third = next(f for f in json.loads(json.dumps(visual["frames"])) if f["kind"] == "play_unbound" and f["index"] == 1)
+            third.update({"index": 2, "file": "play-unbound-2.png", "display_frame": -1})
+            visual["frames"].append(third)
+        out = read(p5_a2, pngs=(("play-0.png", 3), ("play-1.png", 4)))
+        self.assertEqual((out["appDistinctDisplayFrames"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"]), (2, 1, 2), out["reason"])
+        self.assertNotEqual(out["sourceDifference"], "known-differ", out["reason"])
+        self.assertNotIn("masked", out["reason"], "a masking claim needs judged frames whose own source ids are known to differ")
+
         # r2 adversary pass 4 A2 (its input): an exposure band file whose malformed row key carries line breaks and a forged DVE_DETAIL record. The reason
         # is one line: each control character is written as \uXXXX, so Invoke-VenueLeg's DVE_DETAIL line cannot be split into a second record.
         with tempfile.TemporaryDirectory(prefix="vis-held-p4-") as d:
@@ -11502,6 +11514,18 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         self.assertNotIn("\n", out["reason"])
         self.assertNotIn("\r", out["reason"])
         self.assertIn("bad\\u000ADVE_DETAIL=", out["reason"], "the key is quoted with its line break made visible, never dropped")
+        # r2 adversary pass 5 A1 (its input): U+2028 / U+2029 split a line for Python's splitlines too, so they are written as \uXXXX as well
+        with tempfile.TemporaryDirectory(prefix="vis-held-p5-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            band = Path(d) / "bands.json"
+            band.write_text(json.dumps({"clips": {"c": {"bad DVE_DETAIL=forged end": 0}}}), encoding="utf-8")
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      f"-ExposureBandPath '{band}' | ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS", out["reason"])
+        self.assertEqual(len(out["reason"].splitlines()), 1, out["reason"])
+        self.assertIn("bad\\u2028DVE_DETAIL=forged\\u2029end", out["reason"])
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;

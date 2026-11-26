@@ -81,7 +81,9 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   from THEM: the frozen check never judges a force-painted set), else `play`. Beside it, `forcedPlayDistinctContentHashes`; a
   forced set that moved over an unforced one that did not is said in the reason ("the force-paint would have masked this") only when
   the judged unforced frames carry two or more display frame numbers, and never beside `NOT_A_MOTION_WITNESS`: over one held display
-  frame the hold, not a force-paint, explains the one unforced picture (UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2). (r5:
+  frame the hold, not a force-paint, explains the one unforced picture (UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2). It also needs the judged
+  frames' own source ids to be KNOWN to differ (`sourceDifference` `known-differ`): over identical or unknown source frames one picture
+  may be the source's own. The visual `reason` is one line: control characters and U+2028 / U+2029 are written as `\uXXXX`. (r5:
   no forced-k vs unforced-k pairing is reported; under the r3 order such a pair compares two moments half a tail apart.)
 * `observerPaintedPlayFrames`: unforced play captures not judged because they record another `forced_paints_before` than the
   first (or none: an r2 build); `stopUnboundObserverClean`: whether `stop-unbound.png` also follows them with no forced paint;
