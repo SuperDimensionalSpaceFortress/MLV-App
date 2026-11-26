@@ -315,7 +315,8 @@ $script:SpecDigestKeyDelayMs = @{}
 if ($SpecDigestKeyDelay) {
     if ($umRunIsReal) { Stop-Usage '-SpecDigestKeyDelay is an offline test seam: with the real um-run.ps1 the spec digest key is looked up as it is' }
     foreach ($pair in ($SpecDigestKeyDelay -split ',')) {
-        if ($pair.Trim() -cnotmatch '^([0-9]{1,4}):([0-9]{1,6})\z') { Stop-Usage "-SpecDigestKeyDelay '$SpecDigestKeyDelay' is not <n>:<ms>[,<n>:<ms>...]" }
+        # (the ordinal counts from 1; adversary pass 2 A9: a 0 named a lookup that never exists)
+        if ($pair.Trim() -cnotmatch '^([1-9][0-9]{0,3}):([0-9]{1,6})\z') { Stop-Usage "-SpecDigestKeyDelay '$SpecDigestKeyDelay' is not <n>:<ms>[,<n>:<ms>...]" }
         $script:SpecDigestKeyDelayMs[[int]$Matches[1]] = [int]$Matches[2]
     }
 }
@@ -1463,17 +1464,25 @@ function Get-SpecDigestKey([string]$Path) {
     if ($script:SpecDigestKeyMemo.ContainsKey($digestFull)) { return [string]$script:SpecDigestKeyMemo[$digestFull] }
     if (-not ('VenueLeaseBatchFinalPath' -as [type])) { try { $null = Get-PhysicalPath $PSScriptRoot } catch { } }
     if (-not ('VenueLeaseBatchFinalPath' -as [type])) { return $digestFull }
-    $script:SpecDigestKeyCalls++
-    $keyDelayMs = $(if ($script:SpecDigestKeyDelayMs.ContainsKey([int]$script:SpecDigestKeyCalls)) { [int]$script:SpecDigestKeyDelayMs[[int]$script:SpecDigestKeyCalls] } else { 0 })   # offline seam (-SpecDigestKeyDelay); 0 in production
     # R10 pass 1 A2 (on 5a73d8e8): the wait is bounded by what is left before -DeadlineUtc too (the read bound's own room, less its 2 s reserve), under the 1 s: a lookup that started with 250 ms left held
-    # the typed refusal 750 ms past the deadline. No room is a wait of 0 (no answer at once), and the read right after it is then the typed SPEC_READ_TIMEOUT before the deadline.
-    $waitMs = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(1.0, [double](Get-SpecReadBoundSec))) * 1000.0)
-    $ph = $null; $ik = $null
-    $located = try { [VenueLeaseBatchFinalPath]::LocateWithin($digestFull, $keyDelayMs, $waitMs, [ref]$ph, [ref]$ik) } catch { $false }
-    $key = $(if ($located -and $ph) { [string]$ph } else { $digestFull })
-    # R10 pass 1 A1 (on 5a73d8e8): a spelling that fell back keeps its fallback for the run, but is recorded: it was not folded with its twin spellings (a twin that resolved has the final path as its key), so
+    # the typed refusal 750 ms past the deadline. R10 pass 2 A3 (on 0cffc10b): no room is NO lookup (a zero wait still handed the pool a task that opened the file after the caller gave up), and the
+    # read right after it is then the typed SPEC_READ_TIMEOUT before the deadline. R10 pass 2 A4: the deadline is read as the script's own variable, never through the variable-lookup cmdlet (a caller's
+    # $PSDefaultParameterValues default for its Scope parameter made that call answer nothing, and the room fell back to the 120 s cap).
+    $room = $(if ($script:deadline -is [datetime]) { ($script:deadline - [DateTime]::UtcNow).TotalSeconds - 2.0 } else { 120.0 })
+    $waitMs = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(1.0, $room)) * 1000.0)
+    $located = $false; $ph = $null; $ik = $null
+    if ($waitMs -gt 0) {
+        $script:SpecDigestKeyCalls++
+        $keyDelayMs = $(if ($script:SpecDigestKeyDelayMs.ContainsKey([int]$script:SpecDigestKeyCalls)) { [int]$script:SpecDigestKeyDelayMs[[int]$script:SpecDigestKeyCalls] } else { 0 })   # offline seam (-SpecDigestKeyDelay); 0 in production
+        $located = try { [VenueLeaseBatchFinalPath]::LocateWithin($digestFull, $keyDelayMs, $waitMs, [ref]$ph, [ref]$ik) } catch { $false }
+    }
+    # R10 pass 2 A1 (on 0cffc10b): the key is the file's IDENTITY (volume serial + file index, the second answer LocateWithin gives), not its final path: two hard links of one file have two final paths and one
+    # identity, so the second read overwrites the first's digest and the first entry is refused before any claim, as a case twin or a junction spelling is; two distinct files stay two. (An identity
+    # cannot collide with the spelled-path fallback: it has no path separator.)
+    $key = $(if ($located -and $ik) { [string]$ik } else { $digestFull })
+    # R10 pass 1 A1 (on 5a73d8e8): a spelling that fell back keeps its fallback for the run, but is recorded: it was not folded with its twin spellings (a twin that resolved has the identity as its key), so
     # Get-UnresolvedSpecKeyRefusal ends the run before any claim instead of leaving the swap of one twin's bytes to the content guard after the claim
-    if (-not ($located -and $ph)) { $script:SpecDigestKeyFallback[$digestFull] = $true }
+    if (-not ($located -and $ik)) { $script:SpecDigestKeyFallback[$digestFull] = $true }
     $script:SpecDigestKeyMemo[$digestFull] = $key
     $key
 }
