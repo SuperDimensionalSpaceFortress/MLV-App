@@ -492,11 +492,20 @@ class GitCallsAreBoundedTests(unittest.TestCase):
 
     def read_child_probe(self, out: str) -> tuple[str, str]:
         """(in-job, alive) as the cleanup gate saw them, after proving IsProcessInJob itself answered: a failed call is reported with its Win32 error."""
-        seen = re.search(r"SEEN pid=(\d{2,}) ok=(\w+) win32=(\d+) injob=(\w+) alive=(\w+)", out)
+        # EXPORT-KILL-DESCENDANT-CONFIRM-1-R8-CI-RESIDUE-1: a positive pid of any width (hosted run 45712709620 read `SEEN pid=8 ok=True ...`, which `\d{2,}` refused as "never saw a child")
+        seen = re.search(r"SEEN pid=([1-9]\d*) ok=(\w+) win32=(\d+) injob=(\w+) alive=(\w+)", out)
         self.assertIsNotNone(seen, f"the cleanup gate never saw a created child: {out}")
         self.assertEqual(seen.group(2), "True", f"IsProcessInJob failed (GetLastError={seen.group(3)}), so its membership answer was never given: {out}")
         self.assertIn(seen.group(4), ("True", "False"), f"IsProcessInJob returned no 0/1 membership answer: {out}")
         return seen.group(4), seen.group(5)
+
+    def test_the_child_probe_reader_accepts_a_one_digit_pid_and_refuses_a_zero_or_missing_one(self) -> None:
+        # The reader parses the probe line the gate prints; a recycled one-digit pid is still a created child (the hosted shard-6 failure), a pid of 0 or none is not.
+        self.assertEqual(self.read_child_probe("SEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True"), ("False", "True"))
+        self.assertEqual(self.read_child_probe("SEEN pid=12044 ok=True win32=0 injob=True alive=True"), ("True", "True"))
+        for line in ("SEEN pid=0 ok=True win32=0 injob=False alive=True", "SEEN pid= ok=True win32=0 injob=False alive=True"):
+            with self.assertRaises(AssertionError):
+                self.read_child_probe(line)
 
     def assert_child_was_unassigned_alive_then_gone(self, out: str) -> None:
         in_job, alive = self.read_child_probe(out)

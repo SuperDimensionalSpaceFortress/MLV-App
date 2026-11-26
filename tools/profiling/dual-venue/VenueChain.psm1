@@ -2064,7 +2064,7 @@ function Invoke-VenueBoundedProcess {
         # (r6, adversary pass 7 A2 sibling: the whole seconds left are read at the moment the scan's timeout is granted, not from a value taken earlier, and under the 1 s floor no scan starts)
         if ($cleanup.Elapsed.TotalMilliseconds -ge $CleanupWaitMs) { $tree = $null }
         try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
-        $treeGone = $(if ($null -eq $tree) { $false } else { [bool](Wait-AttrCudaProcessTreeGone -Snapshot $tree -WaitMs ([int][Math]::Floor([Math]::Max(0, $CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds)))).confirmed })
+        $treeGone = $(if ($null -eq $tree) { $false } else { [bool](Wait-AttrCudaProcessTreeGone -Snapshot $tree -WaitMs ([int][Math]::Floor([Math]::Max(0.0, $CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds)))).confirmed })
         # r7b (adversary A3 on 1413e30f): the wait's own clock starts after its -WaitMs was read from this one, so its bound can end past this allowance; a confirmation
         # that returns past the one cleanup allowance is late evidence and confirms nothing.
         if ($cleanup.Elapsed.TotalMilliseconds -gt $CleanupWaitMs) { $treeGone = $false }
