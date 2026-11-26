@@ -11245,7 +11245,7 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
                 reason = out["reason"] or ""
                 self.assertNotIn("2 distinct frames", reason)
-                self.assertNotIn("a static clip", reason)
+                self.assertNotIn("the app records the source frames as identical", reason)   # the waiver's own words ("a static clip" is also the SUSPECTED boilerplate)
                 if verdict != "OK":
                     self.assertIn("a distinct-frame count that cannot be true for them and is not quoted", reason)
         # a tuple that fits is still quoted
