@@ -562,9 +562,15 @@ foreach ($leg in $plan) {
             $lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256)
             if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
             L "LEG $($leg.name) RUN verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })"
-            & $pwshExe @lArgs *> $out
+            # DV-PLANNED-SPEC-HASH-BIND-R9-RESIDUE-1 r1 (sol r9): this child's output is CAPTURED (both streams, in arrival order) and everything below is read from that capture, never
+            # from <RunDir>\leg-<name>.out.txt read back from disk: a second run sharing the RunDir and the leg name may have written that transcript, and a refusal record found in it
+            # would be published as THIS child's observed spec hash. The file is only the operator's copy of the capture. The typed refusal is classified from the child's STDOUT only,
+            # as the supplementary route does (a whole line on stderr is not the child's refusal record).
+            $legCaptured = @(& $pwshExe @lArgs 2>&1)
             $legCode = $LASTEXITCODE
-            $legLines = @(if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out })
+            $legLines = @($legCaptured | ForEach-Object { [string]$_ })
+            $legStdoutLines = @($legCaptured | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
+            $legLines | Out-File -LiteralPath $out
             $o = $legLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
             $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
             $p = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
@@ -581,7 +587,7 @@ foreach ($leg in $plan) {
                 # streams (*>), so the record is read only from a leg that wrote no receipt line, as a whole anchored line naming this leg's planned hash.
                 # (r2, adversary A5: the exit code is set BEFORE the label, and the label's log write may fail without costing the result, CHAIN_RESULT or the next leg)
                 if ($exitCode -eq 0) { $exitCode = 7 }
-                $specRefusal = $(if (-not $receipt) { Get-LegSpecRefusalLine $legLines $leg } else { '' })
+                $specRefusal = $(if (-not $receipt) { Get-LegSpecRefusalLine $legStdoutLines $leg } else { '' })
                 if ($specRefusal) {
                     $results[$results.Count - 1] | Add-Member -NotePropertyName specRefusal -NotePropertyValue (($specRefusal -split ' ', 2)[0]) -Force
                     try { L "$specRefusal (the spec bytes are not the planned ones; the leg was refused before anything ran and is no measurement)" }

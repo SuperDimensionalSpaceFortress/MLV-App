@@ -1698,7 +1698,9 @@ if ($legPlanMode) {
         }
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$($e.specPath)' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal ([string]$e.specPath)   # r8 (adversary r7 A3): before the lease, as -LegPlan does
-        if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
+        # DV-PLANNED-SPEC-HASH-BIND-R9-RESIDUE-1 r1 (sol r9): bytes replaced AFTER the shape read and BEFORE the budget read are refused by the budget read itself, whose message knows no
+        # planner. In this -LegSet loop that refusal names the planner's hash like every other spec-changed refusal here.
+        if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])$(if ($budgetRefusal[0] -ceq 'SPEC_CHANGED_AFTER_PREFLIGHT') { " (planned_sha256=$($e.specSha256))" })" }
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 (sol r6 INV-3 sibling): the set planner judged THESE bytes (legId, twin, the name it reached; Get-DvLegSetPlan's specSha256), and the
         # shape and budget reads above are later reads of the same path. The bytes they judged (and every later read, the leg's own -ExpectSpecSha256 included, is bound to) must
         # be the planner's, or bytes swapped in after planning (a committed visual twin's) would pass both checks and run in the planned speed slot. Refused before any claim or lease.
