@@ -5130,9 +5130,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         # sol r2 A4 on b428e461: one call clock; the census needs 5 s granted and the wait is what that clock leaves after listing, launch and stream setup
         self.assertIn("$TimeoutSec -ge 5 -and", body)
         self.assertIn("-BaselineOnly -OperationTimeoutSec 1 }", body)
-        self.assertIn("$p.WaitForExit([int][Math]::Max(1.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds)))", body)
+        self.assertIn("$p.WaitForExit([int][Math]::Max(0.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds)))", body)   # R2-RESIDUE r1 (sol A2): was Max(1.0, ...)
         self.assertLess(body.index("$censusClock = [Diagnostics.Stopwatch]::StartNew()"), body.index("Get-AttrCudaProcessTreeSnapshot -BaselineOnly"))
-        self.assertLess(body.index("[Diagnostics.Process]::Start($psi)"), body.index("$p.WaitForExit([int][Math]::Max(1.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds)))"))
+        self.assertLess(body.index("[Diagnostics.Process]::Start($psi)"), body.index("$p.WaitForExit([int][Math]::Max(0.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds)))"))
         self.assertNotIn("$censusMs", body, "the wait is not reduced by the census alone")
         src = ARTIFACTS_MODULE.read_text(encoding="utf-8")
         wait = src[src.index("function Wait-AttrCudaProcessTreeGone"):src.index("function Get-AttrCudaProcessCpuSnapshot")]
