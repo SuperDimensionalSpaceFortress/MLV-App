@@ -1479,8 +1479,8 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
     # temporary file and, when this call created it, the empty folder; the report that was there before is left exactly as it was.
     # R2-RESIDUE-1 r1 (adversary-3be19c39.json A3 and A4): on Windows each report folder level this call makes and the temporary report file are HELD by a handle from the moment they are created (see
     # Initialize-SmokeOwnedFs) and acted on only through it; elsewhere the older path-based steps stand ($ownedFs false). Each $createdDirs entry carries its handle (Windows) or its creation time (elsewhere).
-    $ownedFs = Initialize-SmokeOwnedFs
     $createdDirs = [System.Collections.Generic.List[object]]::new()
+    $ownedFs = Initialize-SmokeOwnedFs   # (inside the write block proper: the block is what the tests extract and run, so the route it takes is decided by its own text)
     $inputHolds = [System.Collections.Generic.List[IO.FileStream]]::new()
     $tempOutput = $null
     $tempStream = $null

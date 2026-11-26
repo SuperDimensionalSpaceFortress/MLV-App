@@ -4329,17 +4329,24 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             out = Path(tmp) / "out"
             out.mkdir()
             new = out / "new"
+            # R2-RESIDUE-1 r2 (adversary-3be19c39.json A3): on Windows the folder level is created through a handle (NtCreateFile), not New-Item, so the swap is no longer triggered by a New-Item mock: it
+            # fires at the first report-path existence probe once the folder exists (the same point as before), and the rename-aside is then attempted. A held folder (no delete sharing) refuses that
+            # rename: SWAP=blocked, and the folder this call made is removed by its handle. If the rename ever succeeds (SWAP=yes) the other process's folder under the name must survive.
             pre = (
-                "$script:swapped = $false; $script:madeDir = $null\n"
-                "function New-Item { $r = Microsoft.PowerShell.Management\\New-Item @args; if ($null -eq $script:madeDir) { $script:madeDir = $r.FullName }; $r }\n"
-                # the swap happens at the first existence probe AFTER the call made (and recorded) its folder: the report path's own Test-Path
-                "function Test-Path { param([string]$LiteralPath, [string]$PathType) if ($null -ne $script:madeDir -and -not $script:swapped -and $PathType -eq 'Leaf') { $script:swapped = $true; Start-Sleep -Milliseconds 50; "
-                "Rename-Item -LiteralPath $script:madeDir -NewName 'new-moved'; Microsoft.PowerShell.Management\\New-Item -ItemType Directory -Path $script:madeDir | Out-Null }; Microsoft.PowerShell.Management\\Test-Path @PSBoundParameters }\n"
+                "$script:swapped = $false\n"
+                f"$script:madeDir = '{new}'\n"
+                "function Test-Path { param([string]$LiteralPath, [string]$PathType) if (-not $script:swapped -and $PathType -eq 'Leaf' -and (Microsoft.PowerShell.Management\\Test-Path -LiteralPath $script:madeDir -PathType Container)) { $script:swapped = $true; Start-Sleep -Milliseconds 50; "
+                "try { Rename-Item -LiteralPath $script:madeDir -NewName 'new-moved' -ErrorAction Stop; Microsoft.PowerShell.Management\\New-Item -ItemType Directory -Path $script:madeDir | Out-Null; [Console]::Out.WriteLine('SWAP=yes') } catch { [Console]::Out.WriteLine('SWAP=blocked') } }; Microsoft.PowerShell.Management\\Test-Path @PSBoundParameters }\n"
                 f"Remove-Item -LiteralPath '{before}'\n")
             proc = _run_ps_file(_report_write_probe(tmp, before, after, new / "report.json", new, pre_block=pre))
             self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
-            self.assertTrue(new.is_dir(), "the folder the other process made under the name is not this call's to remove\n" + proc.stdout + proc.stderr)
-            self.assertTrue((out / "new-moved").is_dir())
+            if "SWAP=yes" in proc.stdout:
+                self.assertTrue(new.is_dir(), "the folder the other process made under the name is not this call's to remove\n" + proc.stdout + proc.stderr)
+                self.assertTrue((out / "new-moved").is_dir())
+            else:
+                self.assertIn("SWAP=blocked", proc.stdout, "the swap probe must have run\n" + proc.stdout + proc.stderr)
+                self.assertFalse(new.exists(), "nothing replaced the folder this call made, so it is removed\n" + proc.stdout + proc.stderr)
+                self.assertFalse((out / "new-moved").exists())
 
     @requires_windows_pwsh
     def test_r2res_a3_the_cleanup_acts_on_the_folder_it_made_never_on_one_swapped_in_after_its_check(self) -> None:
