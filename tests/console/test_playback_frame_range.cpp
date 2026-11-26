@@ -5049,7 +5049,31 @@ TEST( PlaybackFrameRangeArgOverflow, MainRefusesSecondsOutOfRangeFirst )
     ASSERT_TRUE( range < positive );                                   // RED on d9c1e61b: the range check came after
     ASSERT_TRUE( positive < convert );
     ASSERT_EQ( 1, source.count( QStringLiteral( "smokeSecondsFitDurationMs(" ) ) );
-    const QString refusal = source.mid( range, source.indexOf( QStringLiteral( "return 2;" ), range ) - range );
+    // GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r1: the refusal is the brace-matched `if` block itself, not the text up to the
+    // next `return 2;` (a mutated `return 0;` there let the later "> 0" branch's `return 2;` end the slice and stay green).
+    const int condEnd = source.indexOf( QStringLiteral( "))" ), range ) + 2;           // the `if (!...(seconds))` condition
+    ASSERT_TRUE( condEnd > range );
+    int open = condEnd;
+    while( open < source.size() && source.at( open ).isSpace() )
+        ++open;
+    ASSERT_TRUE( open < source.size() && source.at( open ) == QLatin1Char( '{' ) );   // the block opens right after the condition
+    int depth = 0;
+    int close = -1;
+    for( int i = open; i < source.size(); ++i )
+    {
+        if( source.at( i ) == QLatin1Char( '{' ) )
+            ++depth;
+        else if( source.at( i ) == QLatin1Char( '}' ) && --depth == 0 )
+        {
+            close = i;
+            break;
+        }
+    }
+    ASSERT_TRUE( close > open && close < positive );                  // closed, and before the "> 0" refusal
+    const QString refusal = source.mid( range, close + 1 - range );
+    ASSERT_EQ( 1, refusal.count( QStringLiteral( "return " ) ) );     // one exit in the block ...
+    ASSERT_EQ( 1, refusal.count( QStringLiteral( "return 2;" ) ) );   // ... and it is exit code 2
+    ASSERT_TRUE( refusal.indexOf( QStringLiteral( "SECONDS_OUT_OF_RANGE" ) ) < refusal.indexOf( QStringLiteral( "return 2;" ) ) );
     ASSERT_TRUE( refusal.contains( QStringLiteral( "SECONDS_OUT_OF_RANGE" ) ) );
     ASSERT_TRUE( refusal.contains( QStringLiteral( "parser.value(secondsOpt).trimmed()" ) ) );       // RED: raw token
     ASSERT_TRUE( refusal.contains( QStringLiteral( "at most 2147483647" ) ) );                       // RED: 2147483.647
