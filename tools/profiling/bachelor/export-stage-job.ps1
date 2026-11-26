@@ -332,6 +332,9 @@ try {
         $psi.Environment['MLVAPP_STAGE_TIMING_FILE'] = $stageLog
     }
     Write-JobTrace "step export start format=$Format maxFrames=$MaxFrames timeoutSec=$ExportTimeoutSec"
+    # A1-CLOCK-FREE-ANCESTRY-1 r1: the identities (pid + creation stamp) of every process alive BEFORE the export root starts. The kill confirmation below calls only those, and what they
+    # started directly, outsiders: no clock ordering decides ancestry. No listing ($null) is an unknown tree: an unconfirmed kill, never a confirmed one.
+    $exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 10
     $exportWatch = [Diagnostics.Stopwatch]::StartNew()
     $app = [Diagnostics.Process]::Start($psi)
     $timedOut = -not $app.WaitForExit([int]($ExportTimeoutSec * 1000))
@@ -343,7 +346,7 @@ try {
     # after the root's wait. A survivor, or a tree that could not be read, leaves the kill unconfirmed (EXPORT_KILL_UNCONFIRMED, exit 48) and the survivors are traced.
     $killConfirmed = $true
     if ($timedOut) {
-        $exportTree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id
+        $exportTree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline
         try { $app.Kill($true) } catch { $killConfirmed = $false; Write-JobTrace "step export kill tree error=$([string]$_.CategoryInfo.Reason)"; try { $app.Kill() } catch { Write-JobTrace "step export kill root error=$([string]$_.CategoryInfo.Reason)" } }
         if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }
         $exportTreeGone = Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000

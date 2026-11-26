@@ -5061,17 +5061,38 @@ function Get-AttrCudaProcessTreeSnapshot {
     [pscustomobject]@{ ok; rootProcessId; rootCreationTicks; members; error }. ok is $false -- the tree is NOT known and no caller may confirm it dead -- when the
     scan throws, the root is not in it, or a row whose parent is a member has no readable pid or creation time. Never throws.
     -Processes is the test seam: the rows of the scan (ProcessId, ParentProcessId, CreationDate).
+    A1-CLOCK-FREE-ANCESTRY-1 r1: ancestry is proved WITHOUT any clock. -BaselineOnly returns the identities (pid -> creation ticks, a hashtable; $null when the listing could not be
+    read) of every process alive BEFORE the root starts; a caller takes it ahead of the root's start and passes it back as -Baseline. A process whose pid AND creation stamp are
+    in that listing was alive, under that pid, since before the root existed, so it can never be a descendant (equality of two stamps of ONE process; no ordering of two stamps,
+    so a clock stepped back and a recycled parent number prove nothing). An OUTSIDER is only a row that is such a baseline process, or whose direct parent is one (a baseline
+    process holds its pid continuously, so the child's ParentProcessId can only have been that process). Anything else the walk did not reach is a MEMBER (unproven: the kill
+    is then unconfirmed): a recycled parent number or a grandchild of a process started after the root is never believed an outsider. No usable baseline is an unknown tree.
     #>
-    param([Parameter(Mandatory = $true)][int]$RootProcessId, [object[]]$Processes, [ValidateRange(1, 120)][int]$OperationTimeoutSec = 20, [int64]$NowTicks)
+    [CmdletBinding(DefaultParameterSetName = 'Tree')]
+    param([Parameter(ParameterSetName = 'Tree', Mandatory = $true)][int]$RootProcessId, [Parameter(ParameterSetName = 'Baseline', Mandatory = $true)][switch]$BaselineOnly,
+          [Parameter(ParameterSetName = 'Tree')][AllowNull()][hashtable]$Baseline, [object[]]$Processes, [ValidateRange(1, 120)][int]$OperationTimeoutSec = 20, [int64]$NowTicks)
+    if ($BaselineOnly) {
+        try {
+            $baseRows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, CreationDate -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
+            $baseTable = @{}
+            foreach ($baseRow in $baseRows) { if ($null -ne $baseRow -and $null -ne $baseRow.ProcessId -and $null -ne $baseRow.CreationDate) { $baseTable[[int64]$baseRow.ProcessId] = ([datetime]$baseRow.CreationDate).ToUniversalTime().Ticks } }
+            if ($baseTable.Count -eq 0) { return $null }
+            return $baseTable
+        } catch { return $null }
+    }
     $unknown = { param([string]$Why) [pscustomobject]@{ ok = $false; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $null; members = @(); error = $Why } }
     try {
+        $baseTable = @{}
+        if ($null -ne $Baseline) { foreach ($bk in @($Baseline.Keys)) { if ($null -ne $Baseline[$bk]) { $baseTable[[int64]$bk] = [int64]$Baseline[$bk] } } }
+        if ($baseTable.Count -eq 0) { return (& $unknown 'baseline-unknown') }
+        $inBase = { param($BasePid, $BaseTicks) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid] -eq [int64]$BaseTicks) }
         $rows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
         # r5b fix (adversary A1 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started, so the
         # creation-time ordering the orphan classification below relies on is untrustworthy: the tree is unknown (fail closed), never classified by a rolled-back clock.
         # -NowTicks is the test seam; the check is inline because VenueChain and DualVenueRunner embed this function alone, by name.
         $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [DateTime]::UtcNow.Ticks })
-        # r2 (sol r1 A1, hub ruling 2026-11-26): ONE clock-ambiguity band, $skewTicks (2 s), serves the future-row check, the climb's parent hop and the outsider test. A
-        # rollback inside the band cannot be seen as a step, so two stamps inside it are never ordered: anything the walk cannot PROVE an outsider counts as a member.
+        # A1-CLOCK-FREE-ANCESTRY-1 r1: $skewTicks (2 s) now serves ONLY the future-row check above (a stamp ahead of the clock makes the tree unknown). It decides no ancestry: that is
+        # proved by the listing taken before the root started (see .DESCRIPTION), so an unbounded rollback cannot make a live orphan look like an outsider.
         $skewTicks = 20000000L
         foreach ($row in $rows) {
             if ($null -ne $row -and $null -ne $row.CreationDate -and ([datetime]$row.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + $skewTicks)) { return (& $unknown "clock-stepped-back pid=$($row.ProcessId)") }
@@ -5090,6 +5111,8 @@ function Get-AttrCudaProcessTreeSnapshot {
             $byParent[$parentKey].Add($row)
         }
         if ($null -eq $rootTicks) { return (& $unknown "root-not-in-scan pid=$RootProcessId") }
+        # a root that is itself in the baseline was NOT started after it: the listing proves nothing about this tree (fail closed)
+        if (& $inBase $RootProcessId $rootTicks) { return (& $unknown "root-in-baseline pid=$RootProcessId") }
         $members = [System.Collections.Generic.List[object]]::new()
         $seen = [System.Collections.Generic.HashSet[int64]]::new()
         [void]$seen.Add([int64]$RootProcessId)
@@ -5102,6 +5125,8 @@ function Get-AttrCudaProcessTreeSnapshot {
                 if ($null -eq $child.ProcessId -or $null -eq $child.CreationDate) { return (& $unknown "descendant-unreadable parent=$($parent.processId)") }
                 $childPid = [int64]$child.ProcessId
                 $childTicks = ([datetime]$child.CreationDate).ToUniversalTime().Ticks
+                # a baseline process (same pid AND stamp) was alive before the root started: a holder of a member's number that is one is no descendant, and neither is anything it started
+                if (& $inBase $childPid $childTicks) { continue }
                 if ($seen.Contains($childPid)) { continue }
                 [void]$seen.Add($childPid)
                 $member = [pscustomobject]@{ processId = $childPid; creationTicks = $childTicks }
@@ -5109,12 +5134,8 @@ function Get-AttrCudaProcessTreeSnapshot {
                 $queue.Enqueue($member)
             }
         }
-        # r3 fix 2 (adversary A1 on 4d69f211 and on 6b788356): a row the walk did not reach climbs ParentProcessId while the parent is in this scan and no younger than
-        # the child. A climb that stops at a process created AFTER the root (its parent gone, younger or unreadable) cannot be proved outside the tree: its rows are
-        # members. Every other row is recorded in .others by identity (pid -> creation ticks): the processes known to exist outside the tree BEFORE the kill. The wait
-        # then needs no clock to judge a later orphan: one that is not a known outsider is unproven, whatever its creation time reads.
-        # r7 (sol r6d B1): an EQUAL creation time proves nothing. A climb top at the root's own time is a member (only a strictly older top is outside the tree), and the
-        # climb follows only a STRICTLY older parent: a real parent is created before its child, so a holder of the parent's number with the same time is a reuse.
+        # r3 fix 2 (adversary A1 on 4d69f211 and on 6b788356): every proven outsider is recorded in .others by identity (pid -> creation ticks): the processes known to exist outside
+        # the tree BEFORE the kill. The wait then needs no clock to judge a later orphan: one that is not a known outsider is unproven, whatever its creation time reads.
         $memberIds = @{}
         $memberIds[[int64]$RootProcessId] = $rootTicks
         foreach ($m in $members) { $memberIds[$m.processId] = $m.creationTicks }
@@ -5126,31 +5147,23 @@ function Get-AttrCudaProcessTreeSnapshot {
             $rowTicks[$rp] = $(if ($null -eq $row.CreationDate) { $null } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
             $rowParent[$rp] = $(if ($null -eq $row.ParentProcessId) { $null } else { [int64]$row.ParentProcessId })
         }
+        # A1-CLOCK-FREE-ANCESTRY-1 r1: no climb and no stamp ordering. A row the walk did not reach is an OUTSIDER only when it is a baseline process (same pid and stamp, alive before the
+        # root started) or its DIRECT parent is one; every other row is a member (unproven).
         $late = @{}
         foreach ($start in @($rowTicks.Keys)) {
-            if ($memberIds.ContainsKey([int64]$start) -or $late.ContainsKey([int64]$start)) { continue }
-            $climb = [System.Collections.Generic.List[int64]]::new()
-            $cur = [int64]$start
-            $verdict = $false
-            while ($true) {
-                if ($late.ContainsKey($cur)) { $verdict = $late[$cur]; break }
-                if ($memberIds.ContainsKey($cur)) { $verdict = $true; break }
-                $climb.Add($cur)
-                $curTicks = $rowTicks[$cur]
-                $up = $rowParent[$cur]
-                # r2: a parent is followed only when it is older than the child by MORE than the band (a recycled number whose stamp reads older through a small rollback is no parent);
-                # the top is an outsider only when its stamp is older than the root's by MORE than the band. Equal, inside-the-band, newer or missing: a member (fail closed).
-                if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -lt ([int64]$curTicks - $skewTicks)) { $cur = $up; continue }
-                $verdict = -not (($null -ne $curTicks) -and ([int64]$curTicks -lt ([int64]$rootTicks - $skewTicks)))
-                break
+            if ($memberIds.ContainsKey([int64]$start)) { continue }
+            $outsider = [bool](& $inBase $start $rowTicks[$start])
+            if (-not $outsider) {
+                $up = $rowParent[$start]
+                if ($null -ne $up -and [int64]$up -ne [int64]$start -and $rowTicks.ContainsKey([int64]$up) -and (& $inBase $up $rowTicks[[int64]$up])) { $outsider = $true }
             }
-            foreach ($q in $climb) { $late[$q] = $verdict }
+            $late[[int64]$start] = -not $outsider
         }
         $others = @{}
         foreach ($q in @($late.Keys)) {
             if ($late[$q]) { $members.Add([pscustomobject]@{ processId = [int64]$q; creationTicks = $rowTicks[$q] }) } else { $others[[int64]$q] = $rowTicks[$q] }
         }
-        [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $rootTicks; members = @($members); others = $others; error = $null }
+        [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $rootTicks; members = @($members); others = $others; baseline = $baseTable; error = $null }
     } catch { & $unknown "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
 }
 
@@ -5161,10 +5174,10 @@ function Wait-AttrCudaProcessTreeGone {
     .DESCRIPTION
     A SURVIVOR, in one scan, is (a) a recorded member (or the root) whose pid shows with its recorded creation time, or with no readable creation time (a reuse
     cannot be told apart then), or (b) r1 fix iteration (adversary A1 on 2223cc4d): any live process whose ParentProcessId chain reaches the root or a recorded
-    member, so a child started after the snapshot by a member that then exited is still found, or (c) r3 (adversary A1 on 4d69f211): any live process whose
-    ancestry cannot be proved -- climbing ParentProcessId while the parent is in the scan and no younger than the child, the climb stops at a process (its parent gone,
-    younger, or unreadable) that is not an outsider the snapshot recorded in .others by pid and creation time (r3 fix 2: no clock comparison, so a clock stepped back
-    proves nothing) -- so a grandchild whose parents both exited is never confirmed gone. The same
+    member, so a child started after the snapshot by a member that then exited is still found, or (c) r3 (adversary A1 on 4d69f211; A1-CLOCK-FREE-ANCESTRY-1 r1): any live
+    process whose ancestry cannot be proved. An outsider is only a process the snapshot recorded in .others by pid and creation stamp, or a baseline process (same pid AND
+    stamp in .baseline, the listing taken before the root started), or a direct child of one; there is no climb and no ordering of two stamps, so a clock stepped back by any
+    amount, and a recycled parent number, prove nothing -- a grandchild whose parents both exited is never confirmed gone. The same
     pid with ANOTHER creation time is a reused number, not a survivor by (a); it is still adopted by (b) or (c) on its own row (r3, adversary A2 on 4d69f211: identity
     is pid and creation time, a recorded number never hides a new process), which can only leave the kill unconfirmed. A survivor (b) or (c) finds stays recorded for
     every later scan. Budget (adversary A3 on 2223cc4d, A2 on 348c4357): a scan starts only while CIM's 1 s floor is left, under a timeout no longer than what is left; a scan
@@ -5187,6 +5200,8 @@ function Wait-AttrCudaProcessTreeGone {
     # r1 fix 2 (adversary A3 advisory on 348c4357): a snapshot whose identities do not convert is an unknown tree, never a throw.
     $recorded = @{}
     $known = @{}
+    $baseTable = @{}
+    $inBase = { param($BasePid, $BaseTicks) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid] -eq [int64]$BaseTicks) }
     $skewTicks = 20000000L
     try {
         $recorded[[int64]$Snapshot.rootProcessId] = [int64]$Snapshot.rootCreationTicks
@@ -5196,6 +5211,9 @@ function Wait-AttrCudaProcessTreeGone {
         # r3 fix 2 (adversary A1 on 6b788356): the outsiders the snapshot saw (pid -> creation ticks). A snapshot without them knows no outsider: every orphan is unproven.
         $othersRaw = $(if ($null -ne $snapProps['others']) { $snapProps['others'].Value } else { $null })
         if ($othersRaw -is [hashtable]) { foreach ($k in @($othersRaw.Keys)) { $known[[int64]$k] = $(if ($null -eq $othersRaw[$k]) { $null } else { [int64]$othersRaw[$k] }) } }
+        # A1-CLOCK-FREE-ANCESTRY-1 r1: the listing taken before the root started (pid -> creation ticks). A snapshot without it proves no baseline process.
+        $baseRaw = $(if ($null -ne $snapProps['baseline']) { $snapProps['baseline'].Value } else { $null })
+        if ($baseRaw -is [hashtable]) { foreach ($k in @($baseRaw.Keys)) { if ($null -ne $baseRaw[$k]) { $baseTable[[int64]$k] = [int64]$baseRaw[$k] } } }
     } catch { return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: unreadable snapshot identity" } }
     # r1 fix 2 (adversary A2 on 348c4357): a scan is STARTED only while at least $scanFloorMs (CIM's own 1 s OperationTimeoutSec floor) is left, under a timeout no
     # longer than what is left, and no sleep runs into that floor; so no scan is granted past the bound. A bound under 1 s is no time to confirm.
@@ -5261,6 +5279,8 @@ function Wait-AttrCudaProcessTreeGone {
                 $parentPid = $queue.Dequeue()
                 if (-not $byParent.ContainsKey($parentPid)) { continue }
                 foreach ($childPid in $byParent[$parentPid]) {
+                    # a baseline process (same pid AND stamp, alive before the root started) holding a member's number is no descendant, and neither is anything it started
+                    if (& $inBase $childPid $rowTicks[$childPid]) { continue }
                     if ($adopted.Add($childPid)) { $found.Add($childPid); $discovered.Add($childPid) }
                     if ($expanded.Add($childPid)) { $queue.Enqueue($childPid) }
                 }
@@ -5271,26 +5291,19 @@ function Wait-AttrCudaProcessTreeGone {
             # readable), ancestry is unproven and every row on the climb is a survivor (fail closed), recorded from then on. r3 fix 2 (adversary A1 on 6b788356): no
             # wall-clock comparison decides this, so a clock stepped back cannot make a late orphan read as older than the tree. r7 (sol r6d B1 sibling): the climb follows
             # only a STRICTLY older parent; one with the child's own creation time is a reused number, so a late orphan never climbs to a known outsider through it.
+            # A1-CLOCK-FREE-ANCESTRY-1 r1: no climb and no stamp ordering. A live row the walk did not reach is an OUTSIDER only when the snapshot PROVED it one (same pid and stamp in
+            # .others), or it is a baseline process (same pid and stamp in .baseline: alive before the root started), or its DIRECT parent is such a baseline process. Anything else,
+            # a recycled parent number reading older included, is unproven: a survivor.
             $unproven = @{}
             foreach ($start in @($rowTicks.Keys)) {
-                if ($adopted.Contains([int64]$start) -or $unproven.ContainsKey([int64]$start)) { continue }
-                $climb = [System.Collections.Generic.List[int64]]::new()
-                $cur = [int64]$start
-                $verdict = $false
-                while ($true) {
-                    if ($unproven.ContainsKey($cur)) { $verdict = $unproven[$cur]; break }
-                    if ($adopted.Contains($cur)) { $verdict = $true; break }
-                    $climb.Add($cur)
-                    $curTicks = $rowTicks[$cur]
-                    $up = $rowParent[$cur]
-                    if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -lt ([int64]$curTicks - $skewTicks)) { $cur = $up; continue }
-                    # r2 (sol r1 A1): the hop needs a parent older by MORE than the clock-ambiguity band, and the top is an outsider only when the snapshot PROVED it one (same pid and
-                    # stamp in .others, which the snapshot admits only when older than the root by more than the band). Anything else, a recycled number with an older-reading stamp
-                    # included, is unproven: a survivor.
-                    $verdict = -not (($null -ne $curTicks) -and $known.ContainsKey($cur) -and ($null -ne $known[$cur]) -and ([int64]$known[$cur] -eq [int64]$curTicks))
-                    break
+                if ($adopted.Contains([int64]$start)) { continue }
+                $startTicks = $rowTicks[$start]
+                $outsider = [bool](& $inBase $start $startTicks) -or (($null -ne $startTicks) -and $known.ContainsKey([int64]$start) -and ($null -ne $known[[int64]$start]) -and ([int64]$known[[int64]$start] -eq [int64]$startTicks))
+                if (-not $outsider) {
+                    $up = $rowParent[$start]
+                    if ($null -ne $up -and [int64]$up -ne [int64]$start -and $rowTicks.ContainsKey([int64]$up) -and (& $inBase $up $rowTicks[[int64]$up])) { $outsider = $true }
                 }
-                foreach ($q in $climb) { $unproven[$q] = $verdict }
+                if (-not $outsider) { $unproven[[int64]$start] = $true }
             }
             foreach ($q in @($unproven.Keys)) { if ($unproven[$q] -and $adopted.Add([int64]$q)) { $found.Add([int64]$q); $discovered.Add([int64]$q) } }
             # r1 fix 2 (adversary A1 on 348c4357): a descendant the walk found is recorded from then on, so a later scan still sees it after its parent exits.

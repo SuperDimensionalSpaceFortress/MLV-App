@@ -2027,6 +2027,8 @@ function Get-VenueProcessTreeHelperSource {
 # its child starts (that delayed a start its caller timed against an absolute deadline) and not after the timeout (that spent the cleanup allowance before the kill,
 # sol r6d B2). They stay module-private (Export-ModuleMember names neither). A source that will not load leaves every timed-out tree unknown: an unconfirmed kill.
 $script:VenueProcessTreeHelpersLoaded = $false
+$script:VenueBaseline = $null
+$script:VenueBaselineClock = $null
 try { . ([scriptblock]::Create((Get-VenueProcessTreeHelperSource))); $script:VenueProcessTreeHelpersLoaded = $true } catch { $script:VenueProcessTreeHelpersLoaded = $false }
 
 function Invoke-VenueBoundedProcess {
@@ -2044,6 +2046,14 @@ function Invoke-VenueBoundedProcess {
     $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
     foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    # A1-CLOCK-FREE-ANCESTRY-1 r1: ancestry is proved from a listing of the identities (pid + creation stamp) taken BEFORE the root starts, never from comparing creation stamps. One listing is
+    # reused for 30 s (a process in it was alive before ANY later root started, so reuse stays sound; a process started since is simply not an outsider: an unconfirmed kill, never a
+    # false confirmation), so a quick child pays no scan. A listing that cannot be read is cached as unknown for the same 30 s: the tree is then unknown.
+    if ($script:VenueProcessTreeHelpersLoaded -and ($null -eq $script:VenueBaselineClock -or $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30)) {
+        $script:VenueBaseline = $null
+        try { $script:VenueBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 5 } catch { $script:VenueBaseline = $null }
+        $script:VenueBaselineClock = [Diagnostics.Stopwatch]::StartNew()
+    }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
@@ -2060,7 +2070,7 @@ function Invoke-VenueBoundedProcess {
         # (r3, adversary A3 on 4d69f211: the budget is re-read from the one $cleanup stopwatch, and the scan gets only the whole seconds still left; when less than the
         # 1 s floor is left no scan starts and the tree is unknown. r7b: the helpers were defined when this module loaded, above; the clock is read to the fraction of
         # a millisecond (adversary A3 on 1413e30f: a truncated 500.6 ms granted a 1 s scan with 999.4 ms left))
-        if ($script:VenueProcessTreeHelpersLoaded -and $CleanupWaitMs -ge 1000) { try { $grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0); if ($grantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -OperationTimeoutSec ([int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0)) } } catch { $tree = $null } }
+        if ($script:VenueProcessTreeHelpersLoaded -and $CleanupWaitMs -ge 1000) { try { $grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0); if ($grantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -Baseline $script:VenueBaseline -OperationTimeoutSec ([int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0)) } } catch { $tree = $null } }
         # (r6, adversary pass 7 A2 sibling: the whole seconds left are read at the moment the scan's timeout is granted, not from a value taken earlier, and under the 1 s floor no scan starts)
         if ($cleanup.Elapsed.TotalMilliseconds -ge $CleanupWaitMs) { $tree = $null }
         # r2 (sol r1 A2): every grant below is the whole milliseconds of the exact remaining time (a double); a truncated ElapsedMilliseconds read granted up to a millisecond too much.

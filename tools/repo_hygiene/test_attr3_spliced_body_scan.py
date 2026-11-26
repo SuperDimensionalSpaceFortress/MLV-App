@@ -352,10 +352,13 @@ _allow("Find-AttrCudaFailedSmokeDisplayLog", _IN_MEMORY, ("R1", "New-Object Syst
 _allow("Get-AttrCudaEligibilityVerdict", _LOCAL_BLOCK, ("R3", "& $read", 8))
 # EXPORT-KILL-DESCENDANT-CONFIRM-1 r2: $unknown is the body's own `{ param([string]$Why) [pscustomobject]@{ ... } }` (defined on its first line, a pure object builder).
 # r6b: 5 calls; r5b (e75704ae) added the fifth, the clock-stepped-back return (a row created ahead of the clock).
-_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 5))
+# A1-CLOCK-FREE-ANCESTRY-1 r1: 7 calls (two more returns: baseline-unknown, root-in-baseline). $inBase is the body's own pure comparison block, defined near the top of the body:
+# `{ param($BasePid, $BaseTicks) ... $baseTable.ContainsKey(...) -and ([int64]$baseTable[...] -eq [int64]$BaseTicks) }` (an identity test against the listing taken before the root started).
+_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 7), ("R3", "& $inBase", 4))
 _allow("Wait-AttrCudaProcessTreeGone",
        "test-only seam: runs the caller's -Scan block (a stand-in for the Win32_Process scan) only when a test passed one; production passes none and reads Get-CimInstance, a read-only query",
        ("R3", "& $Scan", 1))
+_allow("Wait-AttrCudaProcessTreeGone", _LOCAL_BLOCK, ("R3", "& $inBase", 3))
 _allow("Get-AttrCudaPresentMonDisplayReport", _LOCAL_BLOCK, ("R3", "& $buildWindow", 2), ("R3", "& $unavailable", 7))
 _allow("Get-AttrCudaSelfHealMetrics", _LOCAL_BLOCK,
        ("R3", "& $count", 4), ("R3", "& $field", 2), ("R3", "& $fps", 2), ("R3", "& $iniFlag", 2), ("R3", "& $readJson", 3),

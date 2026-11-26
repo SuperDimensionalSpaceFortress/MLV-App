@@ -4359,7 +4359,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
     def export_kill_block(self, survivor: bool) -> dict:
         """Run the job's own export-wait-through-classification block (sliced from the generator's template) on a real two-process tree that times out."""
         src = EXPORT_JOB.read_text(encoding="utf-8")
-        start = src.index("    $exportWatch = [Diagnostics.Stopwatch]::StartNew()\n")
+        # A1-CLOCK-FREE-ANCESTRY-1 r1: the block starts at the listing of the processes alive BEFORE the root starts (it sits just ahead of the export stopwatch, so the scan is never timed)
+        start = src.index("    $exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly")
+        self.assertLess(start, src.index("    $exportWatch = [Diagnostics.Stopwatch]::StartNew()\n"))
         end_anchor = src.index("    $exitFor = @{", start)
         end = src.index("\n", end_anchor) + 1
         block = src[start:end]
@@ -4422,7 +4424,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
 
     def test_the_job_records_the_tree_before_the_kill_and_confirms_it_after_the_root_wait(self) -> None:
         text = EXPORT_JOB.read_text(encoding="utf-8")
-        snap = text.index("$exportTree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id")
+        snap = text.index("$exportTree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline")
+        self.assertLess(text.index("$exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly"), text.index("$app = [Diagnostics.Process]::Start($psi)"),
+                        "the listing of the processes alive before the root is taken BEFORE the root starts")
         kill = text.index("try { $app.Kill($true) }")
         root_wait = text.index("if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }")
         tree_wait = text.index("$exportTreeGone = Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000")
@@ -4434,17 +4438,31 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
     def snapshot_and_wait(self, body: str) -> dict:
         proc = run_pwsh(["-Command", f"$ErrorActionPreference = 'Stop'; Import-Module '{ARTIFACTS_MODULE}' -Force -DisableNameChecking\n"
                          "$t = [datetime]::new(2026, 11, 19, 12, 0, 0, [DateTimeKind]::Utc)\n"
-                         "function Row($p, $pp, $c) { [pscustomobject]@{ ProcessId = $p; ParentProcessId = $pp; CreationDate = $c } }\n" + body])
+                         "function Row($p, $pp, $c) { [pscustomobject]@{ ProcessId = $p; ParentProcessId = $pp; CreationDate = $c } }\n"
+                         + self.BASELINE_FIXTURE_PROXY + body])
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout.strip().splitlines()[-1])
+
+    # A1-CLOCK-FREE-ANCESTRY-1 r1: ancestry is proved from the listing taken before the root starts, and the fixtures here describe a tree whose root was created at $t. This proxy hands the
+    # real snapshot, as that listing, every row of its -Processes created strictly BEFORE $t (a fixture's own statement of which processes predate the root), unless the test gives its own
+    # -Baseline. The tests of the clock-free proof itself call the real function as & $realSnapshot with an explicit baseline.
+    BASELINE_FIXTURE_PROXY = (
+        "$realSnapshot = 'AttrCudaArtifacts\\Get-AttrCudaProcessTreeSnapshot'\n"
+        "function Get-AttrCudaProcessTreeSnapshot {\n"
+        "    $names = @($args | ForEach-Object { [string]$_ }); $pi = [array]::IndexOf($names, '-Processes')\n"
+        "    if ($names -contains '-Baseline' -or $names -contains '-BaselineOnly' -or $pi -lt 0) { return (& $realSnapshot @args) }\n"
+        "    $b = @{}; foreach ($r in @($args[$pi + 1])) { if ($null -ne $r -and $null -ne $r.ProcessId -and $null -ne $r.CreationDate -and ([datetime]$r.CreationDate).ToUniversalTime().Ticks -lt $t.Ticks) { $b[[int64]$r.ProcessId] = ([datetime]$r.CreationDate).ToUniversalTime().Ticks } }\n"
+        "    & $realSnapshot @args -Baseline $b\n"
+        "}\n")
 
     def test_the_snapshot_walks_the_tree_skips_a_reused_parent_pid_and_fails_closed_on_an_unreadable_tree(self) -> None:
         got = self.snapshot_and_wait(
             # r3 fix 2: a real scan always holds pid 4 (System, older than everything); without it 400 would be an orphan created after the root, i.e. a member
             "$rows = @((Row 4 0 $t.AddDays(-1)), (Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 202 201 $t.AddSeconds(2)), (Row 300 100 $t.AddHours(-3)), (Row 400 4 $t.AddSeconds(3)))\n"
-            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows\n"
-            "$bad = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($rows + @(Row 203 201 $null))\n"
-            "$gone = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 201 100 $t))\n"
+            # A1-CLOCK-FREE-ANCESTRY-1 r1: 300 reads three hours older than the root (a clock stepped back) but is NOT in the listing taken before the root started: only 4 is
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes $rows -Baseline @{ 4 = $t.AddDays(-1).Ticks }\n"
+            "$bad =Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($rows + @(Row 203 201 $null))\n"
+            "$gone = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @((Row 201 100 $t)) -Baseline @{ 4 = $t.AddDays(-1).Ticks }\n"
             "[ordered]@{ ok = $s.ok; members = @($s.members | ForEach-Object { $_.processId }); bad = $bad.ok; badWhy = $bad.error; rootGone = $gone.ok; rootGoneWhy = $gone.error } | ConvertTo-Json -Compress")
         self.assertTrue(got["ok"], got)
         # r1 fix iteration (adversary A2 on 2223cc4d): a child that reads three hours older than its parent (a clock stepped back) is still a member; creation times
@@ -4694,7 +4712,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         after the helper source loaded. Here the source takes 1600 ms to load under a 1500 ms budget: no scan may start, and the kill is unconfirmed. With 5000 ms
         and a 1200 ms load, the scan gets at most the remaining whole seconds (3), never the original 5."""
         module = DV / "VenueChain.psm1"
-        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec) $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
+        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, [switch]$BaselineOnly) if ($BaselineOnly) { return @{ ([int64]4) = [int64]1 } }; $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
                 "[pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } }\n"
                 "function Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }")
         got = json.loads(run_pwsh(["-Command",
@@ -4776,7 +4794,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         child starts. Behavior: a 1600 ms load under 1500 ms still gets its snapshot scan and the kill. A load that throws leaves the tree unknown (unconfirmed)
         and the child is still killed inside the bound. Source: the load precedes Process.Start, and nothing reads the source after the timeout."""
         module = DV / "VenueChain.psm1"
-        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec) $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
+        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, [switch]$BaselineOnly) if ($BaselineOnly) { return @{ ([int64]4) = [int64]1 } }; $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
                 "[pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } }\n"
                 "function Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }")
         # r7b (adversary A2 on 1413e30f): r7 loaded the source before Process.Start, which delayed a start its caller had timed against an absolute deadline. The
@@ -4864,49 +4882,104 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertEqual(got["inBlock"], 1, got)
         self.assertEqual(got["invoked"], 0, f"the script block is never invoked: {got}")
 
-    def test_r2_a1_a_clock_ambiguity_never_turns_a_live_orphan_into_a_proven_outsider(self) -> None:
-        """r2, sol r1 A1 on 76dd1e12 (hub ruling: any process the walk cannot PROVE an outsider counts as NOT confirmed gone). One clock-ambiguity band (2 s) serves the
-        parent hop and the outsider test, in the snapshot and the wait. Rows: (a) a one-second rollback leaves a live orphan reading 500 ms OLDER than the root: a
-        member, and the wait names it; (b) an orphan whose dead parent's number is held by a recycled process reading older by less than the band: no hop, a member;
-        (c) the same in the wait with the clock a fraction behind the new rows: a survivor; (d) an equal-time and a missing stamp stay members. Controls: an orphan older
-        than the root by MORE than the band is an outsider, and a legitimate new outsider tree under an old outsider (older by more than the band at every hop) is no survivor."""
+    # A1-CLOCK-FREE-ANCESTRY-1 r1: the scenarios below call the REAL snapshot (never the fixture proxy) with an explicit listing taken before the root started. On a head without the
+    # -Baseline parameter they call it without one, so the same scenarios run there and show the stamp-based verdicts the adversary's A1 found.
+    CLOCK_FREE_PREAMBLE = (
+        "$realSnapshot = 'AttrCudaArtifacts\\Get-AttrCudaProcessTreeSnapshot'\n"
+        "$hasBaseline = (Get-Command $realSnapshot).Parameters.ContainsKey('Baseline')\n"
+        "function Snap($rows, $bl) { if ($hasBaseline) { & $realSnapshot -RootProcessId 100 -Processes $rows -Baseline $bl } else { & $realSnapshot -RootProcessId 100 -Processes $rows } }\n"
+        # what was alive BEFORE root 100 started: System (4), the idle row (0) and an old service (600, parent gone)
+        "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 600 999 $t.AddHours(-1)))\n"
+        "$bl = @{ 0 = $t.AddDays(-1).Ticks; 4 = $t.AddDays(-1).Ticks; 600 = $t.AddHours(-1).Ticks }\n"
+        "$tree = @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n")
+
+    def test_a1_clock_free_a_rolled_back_live_orphan_is_never_a_proven_outsider(self) -> None:
+        """A1-CLOCK-FREE-ANCESTRY-1 r1 (adversary A1, introduced, on 141a7bd4 and d3e7d6d5). The wall clock was stepped back by 10 s (more than the 2 s band) with no stamp ahead of
+        it. A live orphan 203 (its parent 202, a member, exited) reads 10 s OLDER than the root although it started after it; and a process that recycled the dead parent's number
+        reads older still, under an old outsider. Stamps cannot prove ancestry then: only the listing taken before the root started can. 203 is in no such listing, so it is a
+        member, the wait names it a survivor and the kill is NOT confirmed. Controls: a process the listing holds, and a new direct child of one, are outsiders and the wait
+        confirms the kill with them alive."""
         got = self.snapshot_and_wait(
-            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
-            "$base = @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1))))\n"
-            # (a) rollback: the orphan reads 500 ms older than the root
-            "$a = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($base + @((Row 208 204 $t.AddMilliseconds(-500))))\n"
-            "$aWait = Wait-AttrCudaProcessTreeGone -Snapshot $a -WaitMs 1200 -Scan { @($sys + @((Row 208 204 $t.AddMilliseconds(-500)))) }\n"
-            # the band edge: 1.999 s older is a member, 3 s older is an outsider (control)
-            "$edge = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($base + @((Row 209 204 $t.AddMilliseconds(-1999)), (Row 210 204 $t.AddSeconds(-3))))\n"
-            "$edgeWait = Wait-AttrCudaProcessTreeGone -Snapshot $edge -WaitMs 1200 -Scan { @($sys + @((Row 209 204 $t.AddMilliseconds(-1999)), (Row 210 204 $t.AddSeconds(-3)))) }\n"
-            # (b) snapshot side, recycled parent number reading 500 ms older than its child
-            "$b = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($base + @((Row 204 4 $t.AddMilliseconds(-200)), (Row 208 204 $t.AddMilliseconds(300))))\n"
-            # (c) wait side: member 201 recorded; its child 204 created after the snapshot exited; a recycled 204 (parent 4) and the orphan 208 read 700 ms apart, the clock behind both
-            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($base)\n"
-            "$c = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 204 4 $t.AddSeconds(899.6)), (Row 208 204 $t.AddSeconds(900.3)))) } -NowTicks $t.AddSeconds(899.8).Ticks\n"
-            # (d) equal-time and missing stamp
-            "$d = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 211 212 $t), (Row 213 4 $null))) }\n"
-            # control: a new outsider tree under an old outsider (older by more than the band at every hop) is not the tree
-            "$ctl = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 204 4 $t.AddSeconds(897)), (Row 208 204 $t.AddSeconds(900.3)))) } -NowTicks $t.AddSeconds(901).Ticks\n"
-            "[ordered]@{ aMembers = @($a.members | ForEach-Object { $_.processId }); aOthers = @($a.others.Keys | Sort-Object); aWait = $aWait.confirmed; aSurvivors = @($aWait.survivors);\n"
-            "            edgeMembers = @($edge.members | ForEach-Object { $_.processId }); edgeOthers = @($edge.others.Keys | Sort-Object); edgeWait = $edgeWait.confirmed; edgeSurvivors = @($edgeWait.survivors);\n"
-            "            bMembers = @($b.members | ForEach-Object { $_.processId }); bOthers = @($b.others.Keys | Sort-Object);\n"
-            "            c = $c.confirmed; cSurvivors = @($c.survivors); d = $d.confirmed; dSurvivors = @($d.survivors); ctl = $ctl.confirmed; ctlSurvivors = @($ctl.survivors) } | ConvertTo-Json -Compress")
-        self.assertEqual(sorted(got["aMembers"]), [201, 208], f"a rollback never makes a live orphan an outsider: {got}")
-        self.assertNotIn(208, got["aOthers"], got)
-        self.assertFalse(got["aWait"], got)
-        self.assertEqual(got["aSurvivors"], [208], got)
-        self.assertEqual(sorted(got["edgeMembers"]), [201, 209], f"a stamp inside the band is a member: {got}")
-        self.assertEqual(sorted(got["edgeOthers"]), [0, 4, 210], f"control: an orphan older than the root by more than the band is an outsider: {got}")
-        self.assertFalse(got["edgeWait"], got)
-        self.assertEqual(got["edgeSurvivors"], [209], got)
-        self.assertIn(208, got["bMembers"], f"a recycled parent number reading older inside the band is no proof of ancestry: {got}")
-        self.assertNotIn(208, got["bOthers"], got)
-        self.assertFalse(got["c"], f"a reused pid inside the band is never followed into a known outsider: {got}")
-        self.assertIn(208, got["cSurvivors"], got)
-        self.assertFalse(got["d"], got)
-        self.assertEqual(sorted(got["dSurvivors"]), [211, 213], f"an equal stamp, an unreadable parent and a missing stamp are survivors: {got}")
-        self.assertTrue(got["ctl"], f"control: a new tree under an old outsider (older at every hop by more than the band) is not a survivor: {got}")
+            self.CLOCK_FREE_PREAMBLE +
+            # (1) rollback beyond the band: orphan 203 (parent 202 gone) reads 10 s older than the root
+            "$a = Snap @($sys + $tree + @((Row 203 202 $t.AddSeconds(-10)))) $bl\n"
+            "$aWait = Wait-AttrCudaProcessTreeGone -Snapshot $a -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(-10)))) }\n"
+            # (2) recycled parent number: 202 is now a process with parent 4 reading older than 203, so a stamp climb 203 -> 202 -> 4 would end at an outsider
+            "$b = Snap @($sys + $tree + @((Row 202 4 $t.AddSeconds(-20)), (Row 203 202 $t.AddSeconds(-10)))) $bl\n"
+            "$bWait = Wait-AttrCudaProcessTreeGone -Snapshot $b -WaitMs 1200 -Scan { @($sys + @((Row 202 4 $t.AddSeconds(-20)), (Row 203 202 $t.AddSeconds(-10)))) }\n"
+            # controls: a baseline process, and a new direct child of one (stamp after the root), are outsiders
+            "$c = Snap @($sys + $tree + @((Row 700 4 $t.AddSeconds(5)))) $bl\n"
+            "$cWait = Wait-AttrCudaProcessTreeGone -Snapshot $c -WaitMs 1200 -Scan { @($sys + @((Row 700 4 $t.AddSeconds(5)), (Row 701 700 $t.AddSeconds(6)))) }\n"
+            "$c2Wait = Wait-AttrCudaProcessTreeGone -Snapshot $c -WaitMs 1200 -Scan { @($sys + @((Row 700 4 $t.AddSeconds(5)), (Row 702 600 $t.AddSeconds(6)))) }\n"
+            "[ordered]@{ c2 = $c2Wait.confirmed; aMembers = @($a.members | ForEach-Object { $_.processId }); aOthers = @($a.others.Keys | Sort-Object); aWait = $aWait.confirmed; aSurvivors = @($aWait.survivors);\n"
+            "            bMembers = @($b.members | ForEach-Object { $_.processId }); bOthers = @($b.others.Keys | Sort-Object); bWait = $bWait.confirmed; bSurvivors = @($bWait.survivors);\n"
+            "            cMembers = @($c.members | ForEach-Object { $_.processId }); cOthers = @($c.others.Keys | Sort-Object); cWait = $cWait.confirmed; cSurvivors = @($cWait.survivors) } | ConvertTo-Json -Compress")
+        self.assertIn(203, got["aMembers"], f"a rolled-back live orphan is a member: {got}")
+        self.assertNotIn(203, got["aOthers"], got)
+        self.assertFalse(got["aWait"], f"a live orphan reading older after a clock rollback must never confirm the kill: {got}")
+        self.assertEqual(got["aSurvivors"], [203], got)
+        self.assertIn(203, got["bMembers"], f"a recycled parent number reading older is no proof of ancestry: {got}")
+        self.assertNotIn(203, got["bOthers"], got)
+        self.assertIn(202, got["bOthers"], f"the recycled holder is a direct child of a baseline process: an outsider itself: {got}")
+        self.assertFalse(got["bWait"], got)
+        self.assertEqual(got["bSurvivors"], [203], got)
+        self.assertEqual(sorted(got["cOthers"]), [0, 4, 600, 700], f"control: baseline processes and their new direct children are outsiders: {got}")
+        self.assertEqual(got["cMembers"], [201], got)
+        self.assertEqual(got["cSurvivors"], [701], f"a grandchild started AFTER the root by a non-baseline process is unproven (fail closed): {got}")
+        self.assertFalse(got["cWait"], got)
+        self.assertTrue(got["c2"], f"control: a new direct child of a baseline process alive in the wait is not a survivor: {got}")
+
+    def test_a1_clock_free_the_baseline_is_the_only_proof_and_a_missing_one_is_an_unknown_tree(self) -> None:
+        """A1-CLOCK-FREE-ANCESTRY-1 r1. -BaselineOnly lists pid -> creation ticks (null when nothing could be read). A snapshot with no usable listing is an UNKNOWN tree (never
+        an empty one), and a root that is itself in the listing proves nothing. A baseline row never becomes a member by holding a member's pid number, and a baseline pid
+        with ANOTHER stamp is not that process. A tree whose wait scan shows only baseline rows is confirmed gone, with no stamp compared with the root's."""
+        got = self.snapshot_and_wait(
+            "$realSnapshot = 'AttrCudaArtifacts\\Get-AttrCudaProcessTreeSnapshot'\n"
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 600 999 $t.AddHours(-1)))\n"
+            "$tree = @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$bl = & $realSnapshot -BaselineOnly -Processes @($sys + @((Row 9 4 $null)))\n"
+            "$none = & $realSnapshot -BaselineOnly -Processes @()\n"
+            "$noBase = & $realSnapshot -RootProcessId 100 -Processes @($sys + $tree) -Baseline $null\n"
+            "$emptyBase = & $realSnapshot -RootProcessId 100 -Processes @($sys + $tree) -Baseline @{}\n"
+            "$rootIn = & $realSnapshot -RootProcessId 100 -Processes @($sys + $tree) -Baseline @{ 100 = $t.Ticks; 4 = $t.AddDays(-1).Ticks }\n"
+            # baseline process 600 holds member 201's number is impossible; here baseline 500 has parent 201 (a reused number): not adopted, an outsider
+            "$s = & $realSnapshot -RootProcessId 100 -Processes @($sys + $tree + @((Row 500 201 $t.AddHours(-2)))) -Baseline @{ 0 = $t.AddDays(-1).Ticks; 4 = $t.AddDays(-1).Ticks; 600 = $t.AddHours(-1).Ticks; 500 = $t.AddHours(-2).Ticks }\n"
+            "$sWait = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 500 201 $t.AddHours(-2)))) }\n"
+            # a baseline pid holding ANOTHER stamp is a new process: under member 201 it is a survivor
+            "$diff = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 500 201 $t.AddHours(-1)))) }\n"
+            "[ordered]@{ blKeys = @($bl.Keys | Sort-Object); blTicks = $bl[[int64]600]; blWant = $t.AddHours(-1).Ticks; none = ($null -eq $none); noBase = $noBase.ok; noBaseWhy = $noBase.error; emptyBase = $emptyBase.ok;\n"
+            "            rootIn = $rootIn.ok; rootInWhy = $rootIn.error; sOk = $s.ok; sMembers = @($s.members | ForEach-Object { $_.processId }); sOthers = @($s.others.Keys | Sort-Object);\n"
+            "            sWait = $sWait.confirmed; diff = $diff.confirmed; diffSurvivors = @($diff.survivors) } | ConvertTo-Json -Compress")
+        self.assertEqual(sorted(got["blKeys"]), [0, 4, 600], f"a row with no readable stamp is not in the listing: {got}")
+        self.assertEqual(got["blTicks"], got["blWant"], got)
+        self.assertTrue(got["none"], got)
+        self.assertFalse(got["noBase"], got)
+        self.assertEqual(got["noBaseWhy"], "baseline-unknown", got)
+        self.assertFalse(got["emptyBase"], got)
+        self.assertFalse(got["rootIn"], got)
+        self.assertIn("root-in-baseline", got["rootInWhy"], got)
+        self.assertTrue(got["sOk"], got)
+        self.assertEqual(got["sMembers"], [201], f"a baseline process under a member's number is no descendant: {got}")
+        self.assertIn(500, got["sOthers"], got)
+        self.assertTrue(got["sWait"], f"a tree whose scan shows only baseline processes is confirmed gone: {got}")
+        self.assertFalse(got["diff"], f"a baseline number with another stamp under a member is a new process: {got}")
+        self.assertEqual(got["diffSurvivors"], [500], got)
+
+    def test_a1_clock_free_both_launch_sites_take_the_listing_before_the_root_starts_and_no_stamp_ordering_remains(self) -> None:
+        """A1-CLOCK-FREE-ANCESTRY-1 r1, source. Invoke-VenueBoundedProcess lists the processes before Process.Start and passes the listing to the snapshot; the snapshot and the wait
+        classify an outsider with no `-lt`/`-gt` between two creation stamps (only the future-row check compares a stamp with the clock, and it can only make a kill unconfirmed)."""
+        venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = venue[venue.index("function Invoke-VenueBoundedProcess"):venue.index("function Get-VenueDriverScriptMissing")]
+        self.assertLess(body.index("Get-AttrCudaProcessTreeSnapshot -BaselineOnly"), body.index("[Diagnostics.Process]::Start($psi)"), "the listing precedes the root's start")
+        self.assertIn("Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -Baseline $script:VenueBaseline", body)
+        src = ARTIFACTS_MODULE.read_text(encoding="utf-8")
+        snap = src[src.index("function Get-AttrCudaProcessTreeSnapshot"):src.index("function Wait-AttrCudaProcessTreeGone")]
+        wait = src[src.index("function Wait-AttrCudaProcessTreeGone"):src.index("function Get-AttrCudaProcessCpuSnapshot")]
+        cut = snap[snap.index("$late = @{}"):snap.index("$others = @{}")]
+        self.assertNotRegex(cut, r"-(lt|gt|le|ge)\b", "no ordering of two stamps decides ancestry in the snapshot")
+        unproven = wait[wait.index("$unproven = @{}"):wait.index("$adopted.Add([int64]$q)")]
+        self.assertNotRegex(unproven, r"-(lt|gt|le|ge)\b", "no ordering of two stamps decides ancestry in the wait")
+        self.assertNotIn("$climb", cut + unproven, "no ParentProcessId climb through processes the listing does not hold")
 
     def test_r2_a2_no_scan_starts_without_its_floor_plus_margin_left_and_the_grants_are_floored_doubles(self) -> None:
         """r2, sol r1 A2 on 76dd1e12 (margin 50 -> 100 ms and the timeout re-read inside the call's argument: sol r2 A3 on 8cf9cae3). A scan needs CIM's 1 s floor plus the
