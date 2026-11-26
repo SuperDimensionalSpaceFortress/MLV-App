@@ -205,6 +205,21 @@ independent paint-path record; an acceptance that counts `label_bound` there mus
 counts only when the app's own last `gui_smoke.visual_state` line says `look_assist_enabled=1`; `0`, a missing field or a missing
 line is `INVALID` (`LOOK_ASSIST_NOT_HONOURED`), and the receipt's `lookAssist` block records what the app reported.
 
+**In-flight tail credit (EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r4, `Get-DvTailInFlightCredit`).** An every-frame conform reading
+credits an engine target that was still in flight at the measured close only from a capture that proves the app painted it, never
+the observer. A capture counts only when ALL hold: it is unforced (`play_unbound`) and taken before any forced repaint
+(`forced_paints_before` = 0), saved, label-bound, carries a `source_id` (bound to the clip), names its own file
+(`play-unbound-<index>.png`), has its recorded, decodable PNG, and shows Play active. The qualifying captures must be in paint
+order (by `tail_elapsed_ms`, display frame and serial never decrease). The visual record is bound to this run: the hashed run log's
+one `gui_smoke.visual_capture.begin` record must carry the measured session and the same `tail_begin_utc` as visual.json, and the
+log carries no `gui_smoke.visual_capture.clip_changed` record. Any dropped or replaced prepared result (`prep_stale_drops`,
+`prep_generation_drops`, `prep_replaced_*` non-zero) or a non-zero or absent `paint_wait_escapes` refuses the credit. Typed
+refusals: `TAIL_CREDIT_PREP_DROPPED`, `TAIL_CREDIT_PAINT_WAIT_ESCAPES`, `TAIL_VISUAL_NOT_THIS_RUN`, `TAIL_VISUAL_FILE_AMBIGUOUS`,
+`TAIL_CREDIT_PAINT_ORDER`, `TAIL_VISUAL_UNREADABLE` (the validator re-throws it as `DVE_EVIDENCE_VALIDATION_IO`). A credit the
+criteria were judged with must appear in the receipt's `outcomeDetail` (`OUTCOME_DETAIL_TAIL_CREDIT_ABSENT` otherwise). The
+current app takes its K forced `play` captures before the unforced ones, so it supplies no qualifying capture yet: an unforced
+capture before the first forced paint is a C++ follow-up.
+
 ## Opting out
 
 Absent means on for every speed leg. A spec opts out with `"visualCapture": false` AND a `"visualCaptureOptOutReason"` (at least

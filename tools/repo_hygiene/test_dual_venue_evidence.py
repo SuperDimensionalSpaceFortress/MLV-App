@@ -19804,7 +19804,10 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         # one assignment, so a call site that judges anything but the criteria metrics still fails here
         hoisted = re.findall(r"^\s*\$criteriaMetrics = ([^\r\n]+)", leg, re.MULTILINE)
         self.assertEqual(len(hoisted), 1, hoisted)
-        calls = [hoisted[0] if c == "$criteriaMetrics" else c for c in calls]
+        # r4 (adversary A7/A8 on eabccd6c) hoisted the validator's argument into $validatorCriteriaMetrics (the tail-credit suffix check reads it too): followed the same way
+        hoisted_mod = re.findall(r"^\s*\$validatorCriteriaMetrics = ([^\r\n]+)", mod, re.MULTILINE)
+        self.assertEqual(len(hoisted_mod), 1, hoisted_mod)
+        calls = [hoisted[0] if c == "$criteriaMetrics" else ("(" + hoisted_mod[0]) if c == "$validatorCriteriaMetrics" else c for c in calls]
         self.assertEqual([c.split(" -Visual ")[0] for c in calls], ["(Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback",
                                                                   "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived"], calls)   # + -Visual (Get-DvTailVisualEvidence ...): EveryFrameTailInFlightVsNeverPaintedTests
 
@@ -20351,23 +20354,33 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
 
     # The playback block 231ea06e carries (receipt playback.*), plus the summary's prep counters the credit reads (smoke-run.log:77 prep_stale_drops=1
     # prep_generation_drops=1 prep_replaced_before=0 prep_replaced_after=0). conformMaxJump=1 is the APP's own line.
+    # r4 (adversary A2, A6, A9 on eabccd6c): the credit now also needs no dropped prepared result at all (231ea06e itself had prep_stale_drops=1
+    # prep_generation_drops=1, so 231ea06e is no longer credited), a conform line with paint_wait_escapes=0, and the hashed run log's visual-capture begin record
+    # (the run binding: session and tail_begin_utc, no clip_changed record), so the credited fixture carries all three.
+    BEGIN_UTC = "2026-11-25T18:00:00.000Z"
     PB = {"conformLinePresent": True, "summarySession": "1", "conformSession": "1", "conformSourceFps": 11.906, "conformMaxJump": 1, "conformAudioSyncRequests": 0,
           "conformRepeats": 0, "conformPresented": 477, "sourceAdvanced": 480, "conformSourceAdvanced": 476, "conformFirstFrame": 1, "conformLastFrame": 477,
-          "conformEngineTarget": 479, "conformBackward": 0, "prepReplacedBefore": 0, "prepReplacedAfter": 0, "prepStaleDrops": 1, "prepGenerationDrops": 1}
+          "conformEngineTarget": 479, "conformBackward": 0, "prepReplacedBefore": 0, "prepReplacedAfter": 0, "prepStaleDrops": 0, "prepGenerationDrops": 0,
+          "conformPaintWaitEscapes": 0, "visualCaptureBeginSession": "1", "visualCaptureBeginUtc": BEGIN_UTC, "visualCaptureClipChanged": 0}
     LEG = "m16-1243-everyframe-visual-unpaced-fullscreen-s1"
 
     @staticmethod
     def play(index: int = 0, **over) -> dict:
-        """One capture row as the app writes it to visual.json (231ea06e play-0: 126 ms into the tail, display frame 479)."""
-        frame = {"kind": "play", "index": index, "file": f"play-{index}.png", "display_frame": 479, "play_active": True, "tail_elapsed_ms": 126 + 250 * index,
-                 "saved": True, "serial": 484, "painted_serial": 484, "painted_serial_valid": True, "label_bound": True, "forced_paints_before": index}
+        """One capture row as the app writes it to visual.json (231ea06e play-0: 126 ms into the tail, display frame 479). r4 (adversary A1 on eabccd6c): the
+        credited row is UNFORCED (play_unbound) and taken before any forced repaint (forced_paints_before=0), with its clip-bound source_id (A2); a forced
+        `play` row is passed as kind='play', file='play-<i>.png'."""
+        frame = {"kind": "play_unbound", "index": index, "file": f"play-unbound-{index}.png", "display_frame": 479, "play_active": True,
+                 "tail_elapsed_ms": 126 + 250 * index, "saved": True, "serial": 484, "painted_serial": 484, "painted_serial_valid": True, "label_bound": True,
+                 "label_bound_basis": "gl_window_paint", "forced_paints_before": 0, "source_id": "00000000000001df"}
         frame.update(over)
+        if "kind" in over and "file" not in over and isinstance(frame["kind"], str):
+            frame["file"] = f"{frame['kind'].replace('_', '-')}-{index}.png"
         return frame
 
     @classmethod
     def app_json(cls, *frames: dict, **top) -> dict:
         doc = {"schema": "mlv-app/visual-capture/v1", "error": "", "measured_session": 1, "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
-               "frames": list(frames or (cls.play(0), cls.play(1), cls.play(2)))}
+               "tail_begin_utc": cls.BEGIN_UTC, "frames": list(frames or (cls.play(0), cls.play(1), cls.play(2)))}
         doc.update(top)
         return doc
 
@@ -20604,9 +20617,11 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         # r2 (sol r1 finding 6): the collector hashes the bytes it parses (one read)
         self.assertIn("$block.appVisualJsonSha256 = Get-DvSha256OfBytes $appBytes", mod)
         calls = re.findall(r"Get-DvCriteriaMetrics -Metrics (\$\w+(?:\.\w+)?) -Playback (\$\w+(?:\.\w+)?) -Visual \((Get-DvTailVisualEvidence [^\r\n]+)", leg + "\n" + mod)
-        self.assertEqual([c[:2] for c in calls], [("$receipt.metrics", "$receipt.playback"), ("$metrics", "$derived")], calls)
+        self.assertEqual([c[:2] for c in calls], [("$receipt.metrics", "$receipt.playback")], calls)
         self.assertIn("-EvidenceDir $evidenceDir -LegId ([string]$spec.legId) -ExpectedSha256 ([string](Get-DvProp $receipt.visual 'appVisualJsonSha256'))", calls[0][2])
-        self.assertIn("-EvidenceDir $ev.dir -LegId ([string]$spec.legId) -ExpectedSha256 ([string](Get-DvProp (Get-DvProp $Receipt 'visual') 'appVisualJsonSha256'))", calls[1][2])
+        # r4 (adversary A7 on eabccd6c): the validator reads the tail into $tailVisual first (an unreadable tail file is re-thrown as evidence I/O), then judges with it
+        self.assertIn("$tailVisual = Get-DvTailVisualEvidence -EvidenceDir $ev.dir -LegId ([string]$spec.legId) -ExpectedSha256 ([string](Get-DvProp (Get-DvProp $Receipt 'visual') 'appVisualJsonSha256'))", mod)
+        self.assertIn("$validatorCriteriaMetrics = Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived -Visual $tailVisual", mod)
 
     # ---- r2: the PR #913 r1 keys (sol CHANGES_REQUESTED findings 2-7, fable key3 blocker and H2). Each is RED on c0af7b49. ----
     HELD = {"conformLastFrame": 478, "conformSourceAdvanced": 477, "conformPresented": 478}
@@ -20755,7 +20770,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 "$one = Get-DvTailVisualEvidence -EvidenceDir $d -LegId $env:DVE_LEG -ExpectedSha256 (Get-DvSha256OfBytes $json) -RecordedFrames @($rec[0])\n"
                 "Remove-Item -LiteralPath $d -Recurse -Force\n"
                 "[ordered]@{ twice = $vis.frames[0].pngSha256; once = $one.frames[0].pngSha256 } | ConvertTo-Json -Compress",
-                DVE_PNG=__import__("base64").b64encode(self.png_bytes(0)).decode(), DVE_LEG=self.LEG, DVE_APP=json.dumps(self.app_json(self.play(0))))
+                DVE_PNG=__import__("base64").b64encode(self.png_bytes(0)).decode(), DVE_LEG=self.LEG, DVE_APP=json.dumps(self.app_json(self.play(0, kind="play"))))
             self.assertIsNotNone(res, proc.stdout + proc.stderr)
             self.assertIsNone(res["twice"], res)
             self.assertEqual(res["once"], hashlib.sha256(self.png_bytes(0)).hexdigest(), res)
@@ -20800,6 +20815,185 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         proc, res = run_pwsh_json("[ordered]@{ u16 = ($null -eq (ConvertFrom-DvStrictJsonBytes -Bytes ([byte[]]@(255,254,123,0,34,0,97,0,34,0,58,0,49,0,125,0)))) } | ConvertTo-Json -Compress")
         self.assertIsNotNone(res, proc.stdout + proc.stderr)
         self.assertTrue(res["u16"], res)
+
+    # ---- r4 (adversary pass on eabccd6c: A1, A2, A3, A5, A6, A7, A8, A9 introduced majors; hub ruling 2026-11-26T01:26:39Z). Each is RED on eabccd6c. ----
+    def test_r4_a1_a_capture_after_or_by_a_forced_repaint_is_never_credited(self) -> None:
+        """A1, its input: one target in flight (last 478, target 479); the first FORCED play capture repaints 479 and saves the bound row
+        (label_bound_basis=pixmap_item_by_construction), and the later unforced rows all show 479 after that forced paint. eabccd6c credited 479 (tail 0, PASS):
+        the observer supplied the paint it credited. Only an unforced capture taken before any forced repaint counts."""
+        forced = self.play(0, kind="play", label_bound_basis="pixmap_item_by_construction", forced_paints_before=0)
+        after = [self.play(i, forced_paints_before=1, tail_elapsed_ms=1625 + 250 * i) for i in range(2)]
+        cases = {"the forced play capture with unforced captures after it": self.app_json(forced, *after),
+                 "the forced play capture alone": self.app_json(forced),
+                 "unforced captures after one forced paint": self.app_json(*after),
+                 "forced_paints_before absent": self.app_json(self.play(0, forced_paints_before=None)),
+                 "forced_paints_before a string": self.app_json(self.play(0, forced_paints_before="0"))}
+        for name, app in cases.items():
+            with self.subTest(case=name):
+                out = self.metrics(self.HELD, app=app, criteria=self.BOTH)
+                self.assert_no_credit(out, 1)
+                self.assertIn("before any forced repaint", out["m"]["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="an unforced capture before any forced repaint still credits"):
+            out = self.metrics(self.HELD, app=self.app_json(self.play(0)), criteria=self.BOTH)
+            self.assertEqual(out["m"]["conformTailInFlightCreditedFrames"], 1, out)
+            self.assertTrue(out["v"]["pass"], out)
+
+    def test_r4_a2_a_tail_not_bound_to_this_run_session_or_clip_is_never_credited(self) -> None:
+        """A2, its input: run A's hashed log records tail_begin_utc=2026-11-25T18:00:00.000Z; run B's genuine session-1 visual.json (tail_begin_utc
+        2026-11-25T17:00:00.000Z) and its frame-479 PNG are re-digested into A's receipt. Same-run variant: a FileOpen during the tail (a clip_changed record,
+        and the app omits source_id). eabccd6c credited 479 for A in each. Missing binding is no credit."""
+        cases = {"another run's visual.json": ({}, self.app_json(self.play(0), tail_begin_utc="2026-11-25T17:00:00.000Z"), "TAIL_VISUAL_NOT_THIS_RUN"),
+                 "visual.json carries no tail_begin_utc": ({}, {k: v for k, v in self.app_json(self.play(0)).items() if k != "tail_begin_utc"}, "TAIL_VISUAL_NOT_THIS_RUN"),
+                 "the log has no begin record": ({"visualCaptureBeginUtc": None, "visualCaptureBeginSession": None}, self.app_json(self.play(0)), "TAIL_VISUAL_NOT_THIS_RUN"),
+                 "the log's begin record is another session's": ({"visualCaptureBeginSession": "2"}, self.app_json(self.play(0)), "TAIL_VISUAL_NOT_THIS_RUN"),
+                 "the clip changed during the tail": ({"visualCaptureClipChanged": 1}, self.app_json(self.play(0)), "TAIL_VISUAL_NOT_THIS_RUN"),
+                 "the clip-changed count is unreadable": ({"visualCaptureClipChanged": None}, self.app_json(self.play(0)), "TAIL_VISUAL_NOT_THIS_RUN"),
+                 "the capture carries no source_id": ({}, self.app_json(self.play(0, source_id=None)), "no play capture"),
+                 "the source_id is not the app's 16-hex form": ({}, self.app_json(self.play(0, source_id="1DF")), "no play capture")}
+        for name, (pb, app, why) in cases.items():
+            with self.subTest(case=name):
+                out = self.metrics({**self.HELD, **pb}, app=app, criteria=self.BOTH)
+                self.assert_no_credit(out, 1)
+                self.assertIn(why, out["m"]["conformTailInFlightCreditNote"], out)
+
+    def test_r4_a2_a9_the_begin_record_and_paint_wait_escapes_are_read_from_the_hashed_log(self) -> None:
+        """Get-DvPlaybackEvidence re-derives the run binding from the log's ONE gui_smoke.visual_capture.begin record (two are ambiguous: no binding), counts
+        clip_changed records, and reads the measured conform line's paint_wait_escapes."""
+        summary = conformed_summary_line()
+        conform = ("playback_smoke.conform session=3 clip_fps=23.976 playback_fps=23.976 conform_active=0 conform_enabled=1 conform_env_override=0 "
+                   "audio_sync_requests=0 paint_wait_escapes=2")
+        begin = "gui_smoke.visual_capture.begin measured_session=3 tail_ms=3000 play_frames=6 tail_begin_utc=2026-11-25T18:00:00.000Z"
+        clip = "gui_smoke.visual_capture.clip_changed refused_play_captures=1 capture_generation=4"
+
+        def derive(lines: list[str]) -> dict:
+            log = "\n".join(lines) + "\n"
+            sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+            proc, out = run_pwsh_json(
+                "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false; clipId = $env:DVE_CLIP }\n"
+                "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
+                "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
+                "$pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $env:DVE_LOG -LogSha256 $env:DVE_SHA -ExpectedClipId $env:DVE_CLIP\n"
+                "[ordered]@{ s = $pb.visualCaptureBeginSession; u = $pb.visualCaptureBeginUtc; c = $pb.visualCaptureClipChanged; e = $pb.conformPaintWaitEscapes } | ConvertTo-Json -Compress",
+                DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP="M16-1243")
+            self.assertIsNotNone(out, proc.stdout + proc.stderr)
+            return out
+
+        self.assertEqual(derive(["playback_smoke.measured_session id=3", conform, summary, begin]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 0, "e": 2})
+        self.assertEqual(derive(["playback_smoke.measured_session id=3", conform, summary, begin, clip]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 1, "e": 2})
+        two = derive(["playback_smoke.measured_session id=3", conform, summary, begin, begin.replace("18:00", "17:00")])
+        self.assertEqual((two["s"], two["u"]), (None, None), two)
+        none = derive(["playback_smoke.measured_session id=3", conform.replace(" paint_wait_escapes=2", ""), summary])
+        self.assertEqual(none, {"s": None, "u": None, "c": 0, "e": None})
+
+    def test_r4_a3_two_rows_naming_one_file_refuse_the_tail(self) -> None:
+        """A3, its input: two rows with distinct indices, row 0 frame 478 at 126 ms serial 483 file=play-1.png, row 1 frame 479 at 376 ms serial 484
+        file=play-1.png, source_id omitted on both. eabccd6c credited both from one image. A row whose file= is not its own kind-index name, or a file two rows
+        name, refuses the whole tail (typed)."""
+        shared = "play-unbound-1.png"
+        for name, rows in (("two rows name one file", (self.play(0, display_frame=478, serial=483, painted_serial=483, file=shared), self.play(1, file=shared))),
+                           ("a row names another row's file", (self.play(0, display_frame=478, file=shared),)),
+                           ("the forced kind, the adversary's literal names", (self.play(0, kind="play", display_frame=478, file="play-1.png", source_id=None),
+                                                                              self.play(1, kind="play", file="play-1.png", source_id=None)))):
+            with self.subTest(case=name):
+                out = self.metrics(app=self.app_json(*rows), criteria=self.BOTH)
+                self.assert_no_credit(out, 2)
+                self.assertIn("TAIL_VISUAL_FILE_AMBIGUOUS", out["m"]["conformTailInFlightCreditNote"], out)
+        # the sibling (:4690): the collector copies a row's PNG only when the row names the app's own file for its kind and index
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        collector = mod[mod.index("foreach ($f in @($appFrames)) {"):mod.index("$src = Join-Path $share $file")]
+        self.assertIn("if (-not [string]::Equals($file, $ownFile, [StringComparison]::Ordinal)) { continue }", collector)
+
+    def test_r4_a5_captures_out_of_paint_order_are_never_credited(self) -> None:
+        """A5, its input: two in flight (last 477, target 479); index 0 shows 479 at 126 ms serial 484, index 1 shows 478 at 376 ms serial 485 (a backward
+        paint after the close). eabccd6c credited both (tail 0, PASS). Siblings: a serial that goes back, two captures at the same instant."""
+        cases = {"display frame goes back": (self.play(0, display_frame=479, serial=484, painted_serial=484), self.play(1, display_frame=478, serial=485, painted_serial=485)),
+                 "serial goes back": (self.play(0, display_frame=478, serial=485, painted_serial=485), self.play(1, display_frame=479, serial=484, painted_serial=484)),
+                 "same instant": (self.play(0, display_frame=478, serial=483, painted_serial=483), self.play(1, display_frame=479, tail_elapsed_ms=126))}
+        for name, rows in cases.items():
+            with self.subTest(case=name):
+                out = self.metrics(app=self.app_json(*rows), criteria=self.BOTH)
+                self.assert_no_credit(out, 2)
+                self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="in paint order both still credit"):
+            out = self.metrics(app=self.app_json(self.play(0, display_frame=478, serial=483, painted_serial=483), self.play(1)), criteria=self.BOTH)
+            self.assertEqual((out["m"]["conformTailInFlightCreditedFrames"], out["m"]["conformTailUnpaintedFrames"]), (2, 0), out)
+
+    def test_r4_a6_any_dropped_prepared_result_refuses_the_credit(self) -> None:
+        """A6, its input: a resize dropped the queued target 479 before the close (playback_prep.invalidate_generation reason=resize-keep-playing
+        dropped_pending=1), counters replaced 0/0, stale=1, generation=1, and the reissued 479 is captured after the close. eabccd6c credited it: equal counters
+        read as Play's own start. Any dropped prepared result is no credit."""
+        for name, pb in (("stale 1 generation 1 (a resize or Play start)", {"prepStaleDrops": 1, "prepGenerationDrops": 1}),
+                         ("stale 3 generation 3", {"prepStaleDrops": 3, "prepGenerationDrops": 3})):
+            with self.subTest(case=name):
+                out = self.metrics({**self.HELD, **pb}, criteria=self.BOTH)
+                self.assert_no_credit(out, 1)
+                self.assertIn("TAIL_CREDIT_PREP_DROPPED", out["m"]["conformTailInFlightCreditNote"], out)
+
+    def test_r4_a9_a_conform_leg_with_paint_wait_escapes_is_never_credited(self) -> None:
+        """A9, its input (m16-1457-conform-fullscreen-s1 shape): summary source_advanced=1200; conform presented=1197 source_advanced=1196 max_jump=1 wraps=0
+        backward=0 repeats=0 first_frame=1 last_frame=1197 engine_target=1199 paint_wait_escapes=1; bound captures of 1198 and 1199. eabccd6c credited both and
+        conformMaxJump read 1 (PASS). An escaped paint wait (or no readable count) refuses the credit, so the measured jump gate stands."""
+        conform = {"sourceAdvanced": 1200, "conformPresented": 1197, "conformSourceAdvanced": 1196, "conformFirstFrame": 1, "conformLastFrame": 1197,
+                   "conformEngineTarget": 1199}
+        crit = [{"metric": "conformMaxJump", "op": "eq", "value": 1}]
+        app = self.app_json(self.play(0, display_frame=1198, serial=1203, painted_serial=1203), self.play(1, display_frame=1199, serial=1204, painted_serial=1204))
+        for name, esc in (("paint_wait_escapes=1", 1), ("paint_wait_escapes absent", None), ("paint_wait_escapes negative", -1)):
+            with self.subTest(case=name):
+                out = self.metrics({**conform, "conformPaintWaitEscapes": esc}, app=app, criteria=crit)
+                self.assertNotIn("conformTailInFlightCreditedFrames", out["m"], out)
+                self.assertGreaterEqual(out["m"]["conformMaxJump"], 2, out)
+                self.assertFalse(out["v"]["pass"], out)
+                self.assertIn("TAIL_CREDIT_PAINT_WAIT_ESCAPES", out["m"]["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="paint_wait_escapes=0 credits both"):
+            out = self.metrics(conform, app=app, criteria=crit)
+            self.assertEqual(out["m"]["conformTailInFlightCreditedFrames"], 2, out)
+
+    def test_r4_a7_a_locked_tail_file_is_a_typed_unreadable_refusal(self) -> None:
+        """A7, its input: app-visual.json (or the qualifying PNG) held with FileShare.None at revalidation. eabccd6c's reader returned $null (the I/O cause erased,
+        so the writer saw an outcome mismatch, INVALID), and the collector's read sat outside its guarded parse (RUNNER_ERROR). The reader now returns a typed
+        TAIL_VISUAL_UNREADABLE refusal naming the path; the validator re-throws it (Write-DvReceipt tags DVE_EVIDENCE_VALIDATION_IO); the collector's read is
+        guarded (VISUAL_EVIDENCE_UNREADABLE)."""
+        app = json.dumps(self.app_json(self.play(0))).encode("utf-8")
+        png = self.png_bytes(0)
+        for target in ("app-visual.json", f"{self.LEG}-play-unbound-0.png"):
+            with self.subTest(locked=target):
+                proc, res = run_pwsh_json(
+                    "$d = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N')); $v = Join-Path $d 'visual'; [void](New-Item -ItemType Directory -Path $v)\n"
+                    "$png = [Convert]::FromBase64String($env:DVE_PNG); [IO.File]::WriteAllBytes((Join-Path $v ($env:DVE_LEG + '-play-unbound-0.png')), $png)\n"
+                    "$json = [Convert]::FromBase64String($env:DVE_APP); [IO.File]::WriteAllBytes((Join-Path $v 'app-visual.json'), $json)\n"
+                    "$rec = @([pscustomobject]@{ kind = 'play_unbound'; index = 0; sha256 = (Get-DvSha256OfBytes $png) })\n"
+                    "$hold = [IO.File]::Open((Join-Path $v $env:DVE_LOCK), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)\n"
+                    "try { $vis = Get-DvTailVisualEvidence -EvidenceDir $d -LegId $env:DVE_LEG -ExpectedSha256 (Get-DvSha256OfBytes $json) -RecordedFrames $rec } finally { $hold.Dispose() }\n"
+                    "Remove-Item -LiteralPath $d -Recurse -Force\n"
+                    "[ordered]@{ isNull = ($null -eq $vis); refused = [string]$vis.refused; path = [string]$vis.unreadablePath } | ConvertTo-Json -Compress",
+                    DVE_PNG=__import__("base64").b64encode(png).decode(), DVE_APP=__import__("base64").b64encode(app).decode(), DVE_LEG=self.LEG, DVE_LOCK=target)
+                self.assertIsNotNone(res, proc.stdout + proc.stderr)
+                self.assertFalse(res["isNull"], res)
+                self.assertIn("TAIL_VISUAL_UNREADABLE", res["refused"], res)
+                self.assertTrue(res["path"].endswith(target), res)
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        validator = mod[mod.index("$tailVisual = Get-DvTailVisualEvidence"):mod.index("$validatorCriteriaMetrics = Get-DvCriteriaMetrics")]
+        self.assertIn("throw \"DVE_TAIL_VISUAL_UNREADABLE the post-close tail evidence '$tailUnreadable' could not be re-read", validator)
+        collector = mod[mod.index("Copy-Item -LiteralPath $appJsonShare -Destination"):mod.index("$block.method = [string](Get-DvProp $app 'method')")]
+        self.assertIn("try { $appBytes = [IO.File]::ReadAllBytes((Join-Path $dir 'app-visual.json')) }", collector)
+        self.assertIn("VISUAL_EVIDENCE_UNREADABLE", collector)
+        # the writer's catch carries the path the throw quotes into DVE_EVIDENCE_VALIDATION_IO|<path>|<reason>
+        self.assertIn("throw [System.Management.Automation.RuntimeException]::new(\"DVE_EVIDENCE_VALIDATION_IO|$where|$reason\")", mod)
+
+    def test_r4_a8_the_validator_requires_the_tail_credit_suffix_in_the_stored_detail(self) -> None:
+        """A8, its input: a one-target control with the default qualifying capture, stored outcome PASS and outcomeDetail the old literal 'CAPTURED; every
+        criterion for this role/backend held'. eabccd6c checked PASS/FAIL only. The validator derives the credit suffix from the metrics it judged with and
+        refuses a stored detail that does not contain it (the writer may only prefix ADVISORY, and a clamp note may follow it)."""
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        block = mod[mod.index("$validatorCriteriaMetrics = Get-DvCriteriaMetrics"):mod.index("$sheetOk = $true", mod.index("$validatorCriteriaMetrics = Get-DvCriteriaMetrics"))]
+        self.assertIn("$verdict = Test-DvCriteria -Criteria $criteria -Metrics $validatorCriteriaMetrics", block)
+        self.assertIn("$tailCreditSuffix = Get-DvTailCreditDetail -CriteriaMetrics $validatorCriteriaMetrics", block)
+        self.assertIn("-not ([string](Get-DvProp $Receipt 'outcomeDetail')).Contains($tailCreditSuffix)", block)
+        self.assertIn("OUTCOME_DETAIL_TAIL_CREDIT_ABSENT", block)
+        # the suffix the validator expects is exactly what the leg runner appends for the same metrics (one function, Get-DvTailCreditDetail)
+        out = self.metrics(self.HELD, criteria=self.BOTH)
+        self.assertTrue(out["detail"].startswith("; tail in-flight credit: 1 of 1 target(s)"), out)
+        self.assertNotIn(out["detail"], "CAPTURED; every criterion for this role/backend held")
 
 
 class DriftLegSpecTests(unittest.TestCase):
