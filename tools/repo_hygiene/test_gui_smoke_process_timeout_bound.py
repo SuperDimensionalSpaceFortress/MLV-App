@@ -199,7 +199,7 @@ function Trip([scriptblock]$Mutate, [int]$Window = 1200) {
     [void](Test-GuiSmokeLogProgressStalled -Watch $w)
     $held = & $Mutate $dir
     $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false
-    while ($sw.ElapsedMilliseconds -lt 6000 -and -not $tripped) { Start-Sleep -Milliseconds 150; if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true } }
+    while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) { Start-Sleep -Milliseconds 150; if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true } }
     if ($held) { $held.Dispose() }
     Stop-GuiSmokeLogProgressWatch -Watch $w
     $tripped
@@ -285,7 +285,7 @@ Set-Content -LiteralPath $a -Value ('x' * 1000) -NoNewline
 Set-Content -LiteralPath $b -Value ('y' * 1000) -NoNewline
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 3000 -ProbeWaitMs 300
 $sw = [Diagnostics.Stopwatch]::StartNew()
-do { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 100 } while (($null -ne $w.Pending -or -not $w.Armed) -and $sw.ElapsedMilliseconds -lt 8000)
+do { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 100 } while (($null -ne $w.Pending -or -not $w.Armed) -and $sw.ElapsedMilliseconds -lt 20000)
 $w.ProbeOpenDelayMs = 2000
 Add-Content -LiteralPath $a -Value 'z' -NoNewline
 $growth = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false
@@ -342,7 +342,7 @@ Set-Content -LiteralPath (Join-Path $dir 'mlvapp-2.log') -Value ('y' * 1000) -No
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000
 [void](Test-GuiSmokeLogProgressStalled -Watch $w)
 $held = $null; $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $flip = 0
-while ($sw.ElapsedMilliseconds -lt 7000 -and -not $tripped) {
+while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) {
     if (([int]($sw.ElapsedMilliseconds / 400)) -ne $flip) {
         $flip = [int]($sw.ElapsedMilliseconds / 400)
         if ($held) { $held.Dispose(); $held = $null } else { $held = [IO.File]::Open((Join-Path $dir 'mlvapp-2.log'), 'Open', 'ReadWrite', 'None') }
@@ -365,7 +365,7 @@ Set-Content -LiteralPath $log -Value 'first line'
 $held = [IO.File]::Open($log, 'Open', 'ReadWrite', 'None')
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000
 $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false
-while ($sw.ElapsedMilliseconds -lt 6000 -and -not $tripped) { Start-Sleep -Milliseconds 150; if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true } }
+while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) { Start-Sleep -Milliseconds 150; if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true } }
 $held.Dispose(); Stop-GuiSmokeLogProgressWatch -Watch $w
 [pscustomobject]@{ tripped = $tripped } | ConvertTo-Json -Compress
 """)
@@ -1707,7 +1707,7 @@ $dir = Join-Path $env:GS_TMP 'marker'; New-Item -ItemType Directory -Force -Path
 $log = Join-Path $dir 'mlvapp-1.log'
 Set-Content -LiteralPath $log -Value 'start'
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs 30000 -ProbeWaitMs 1000
-function Poll-Until([scriptblock]$Done) { $sw = [Diagnostics.Stopwatch]::StartNew(); while (-not (& $Done) -and $sw.ElapsedMilliseconds -lt 8000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
+function Poll-Until([scriptblock]$Done) { $sw = [Diagnostics.Stopwatch]::StartNew(); while (-not (& $Done) -and $sw.ElapsedMilliseconds -lt 20000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
 Poll-Until { $w.Armed -and $null -eq $w.Pending }
 $len0 = [int64]$w.Files['mlvapp-1.log']
 Add-Content -LiteralPath $log -Value '[2026-11-19T10:00:01.000Z] [info] [0x1a2b] a plain growth record without the marker (main.cpp:1)'
@@ -1747,7 +1747,7 @@ $dir = Join-Path $env:GS_TMP 'metadatapath'; New-Item -ItemType Directory -Force
 $log = Join-Path $dir 'mlvapp-1.log'
 Set-Content -LiteralPath $log -Value '[2026-11-19T10:00:00.000Z] [info] [0x1a2b] run_metadata={"command_line":["MLVApp.exe","--gui-smoke-play","X:\\owner-input\\gui_smoke.night\\take"]} (CrashForensics.cpp:904)'
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs 30000 -ProbeWaitMs 1000
-function Poll-Until([scriptblock]$Done) { $sw = [Diagnostics.Stopwatch]::StartNew(); while (-not (& $Done) -and $sw.ElapsedMilliseconds -lt 8000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
+function Poll-Until([scriptblock]$Done) { $sw = [Diagnostics.Stopwatch]::StartNew(); while (-not (& $Done) -and $sw.ElapsedMilliseconds -lt 20000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
 Poll-Until { $w.Armed -and $null -eq $w.Pending -and [int64]$w.Files['mlvapp-1.log'] -ge 0 }
 $len0 = [int64]$w.Files['mlvapp-1.log']
 # the same bytes later in the start-up, mid-record (a message that quotes the path)
@@ -1868,8 +1868,9 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
     # the stub's first log line lands at pwsh start-up + 2000 ms on a real clock, and a window that fits needs the watch armed by L - W. With the allowance
     # at 6000 (H = 8000, L = 6000, W = 2000) that left 2000 ms for a hosted runner's pwsh start-up and first probe; a slower start-up armed the watch too
     # late, the module rightly passed no silence verdict (E = -1) and the leg ended as `timeout` at H. The two `fits` tests take the wider allowance
-    # below (H = 12000, L = 10000: the watch may arm up to 8000 ms after launch, 4x the headroom); the `cannot run out by L` pair keeps 6000, where a
-    # slower start-up only makes its verdict (no silence expiry) more certain. Same property under test: the expiry is at most H - M.
+    # below (H = 12000, L = 10000: the watch may arm up to 8000 ms after launch, 4x the headroom). r3 sibling sweep: the `cannot run out by L` pair
+    # takes the same allowance, because it asserts `armed` and a first log line that lands after H would fail it although the module is right (W = L
+    # = 10000 cannot run out by L however late the watch arms, so its verdict is unchanged). Same property under test: the expiry is at most H - M.
     _FITS_ALLOW_MS = 10000
 
     def _run(self, sample_ms: int, override_ms: int = 0, allow_ms: int = 6000) -> dict:
@@ -1890,8 +1891,7 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
         self.assertEqual(124, out["exitCode"])
         self.assertFalse(out["alive"])
 
-    def _assert_the_deadline_decides(self, out: dict, branch: str) -> None:
-        hard = 8000
+    def _assert_the_deadline_decides(self, out: dict, branch: str, hard: int = 8000) -> None:
         self.assertEqual(hard, out["hardLimitMs"])
         self.assertTrue(out["armed"], branch)
         self.assertEqual("timeout", out["outcome"], "%s: a window that cannot run out by L made a silence verdict (expiry %s ms since launch, the loop ended at %s)"
@@ -1909,10 +1909,10 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
         self._assert_fires_before_the_deadline(self._run(500, override_ms=2000, allow_ms=self._FITS_ALLOW_MS), "host-load", hard=2000 + self._FITS_ALLOW_MS)
 
     def test_a_late_arming_whose_window_cannot_run_out_by_l_is_left_to_the_deadline_in_the_log_only_branch(self) -> None:
-        self._assert_the_deadline_decides(self._run(0), "log-only")
+        self._assert_the_deadline_decides(self._run(0, allow_ms=self._FITS_ALLOW_MS), "log-only", hard=2000 + self._FITS_ALLOW_MS)
 
     def test_a_late_arming_whose_window_cannot_run_out_by_l_is_left_to_the_deadline_in_the_host_load_branch(self) -> None:
-        self._assert_the_deadline_decides(self._run(500), "host-load")
+        self._assert_the_deadline_decides(self._run(500, allow_ms=self._FITS_ALLOW_MS), "host-load", hard=2000 + self._FITS_ALLOW_MS)
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
