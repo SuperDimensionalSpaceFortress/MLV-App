@@ -740,11 +740,10 @@ right after the health probe's fields are copied, so an unhealthy or host-mismat
 The writer writes **no** block, never a malformed one and never a throw, when the line is missing or not a strict JSON object, or when a field
 is missing, appears twice, appears in another letter case or has the wrong type. The same goes for a member name at the root of the probe line
 that cannot be read back, for an unreadable string among the three copied values (each `gpuNames` element, `driverVersion`, `displayDevice`), and for
-any block its reader would not type `present` (for example an empty adapter list or a name that lost a letter on the way). The writer validates
-exactly those three copied fields and the member names at the root of the line; it does **not** validate any other probe string (for example
-`hostName`), so a probe whose `hostName` is an unreadable escape such as `"\ud800"` still yields a present block, and the block never carries that
-string. That receipt reads
-`NO_SIGNAL`. Since the line is read with `System.Text.Json`, a time-looking device name is copied as the text the probe printed. The block names the
+any block its reader would not type `present` (for example an empty adapter list or a name that lost a letter on the way). A receipt written
+without a block reads `NO_SIGNAL`. The writer validates exactly those three copied fields and the member names at the root of the line, and no other
+probe string: a probe whose `hostName` (not a copied field) is an unreadable escape such as `"\ud800"` still yields a present block, which never
+carries that string, so that receipt does not read `NO_SIGNAL`. Since the line is read with `System.Text.Json`, a time-looking device name is copied as the text the probe printed. The block names the
 adapters and the primary display device. It does not say which adapter drives that display.
 Because the block copies the probe's own report and no hashed artifact carries it, `Test-DvReceiptValid` lists `DISPLAY_PATH_UNBOUND` among the
 `unbound` claims of a PASS / FAIL receipt that carries it, and a sheet-pair record lists `venue.displayPath` as unbound. It is never a verdict input.

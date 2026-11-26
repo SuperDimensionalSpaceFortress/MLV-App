@@ -587,9 +587,10 @@ class SolR1KeysShadowTests(unittest.TestCase):
             with self.subTest(label):
                 self.assertIsNone(g["threw"], g["threw"])
                 self.assertEqual(g["wrote"], wrote, f"{label}: wrote={g['wrote']} block={g['block']}")
-        text = DOC.read_text(encoding="utf-8")
-        self.assertIn("it does **not** validate any other probe string", text)
+        text = " ".join(DOC.read_text(encoding="utf-8").split())   # the doc wraps lines
+        self.assertIn("and no other probe string", text)
         self.assertIn("member names at the root of the line", text)
+        self.assertIn("so that receipt does not read `NO_SIGNAL`", text)   # r2 adversary pass A1: the NO_SIGNAL sentence must not read as the hostName case's outcome
 
     def test_b1_no_dictionary_keys_property_read_is_left_in_the_receipt_key_readers(self) -> None:
         text = MODULE.read_text(encoding="utf-8")
