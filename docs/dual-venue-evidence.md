@@ -755,14 +755,16 @@ Because the block copies the probe's own report and no hashed artifact carries i
 receipt cannot show a first `venue` block that the strict reader types `malformed`. `Test-DvReceiptValid -ReceiptText <the text the receipt was
 parsed from>` therefore reads the text too (`Get-DvReceiptTextDisplayPathFacts`, `System.Text.Json`, the same name rule as the reader). The two
 file readers that pair receipts (`New-VenueSheetPair.ps1`, `New-VenueFlavorPair.ps1`), `Invoke-VenueBaseline.ps1` and `Write-DvReceipt` pass it.
-With the text: a PASS / FAIL receipt that names `venue` more than once, or one `venue` that names `displayPath` more than once, in any letter
-case, is `INVALID` with `DISPLAY_PATH_DUPLICATE_MEMBER` (it fails closed); and, for text the strict `System.Text.Json` reader can inspect,
-`DISPLAY_PATH_UNBOUND` is owed when ANY `venue` occurrence in the text holds a `displayPath` member. That rule looks only at the `venue` and
-`displayPath` member names, so a lone-surrogate string or member name elsewhere in the receipt owes no marker. The "any occurrence" guarantee does NOT
-extend to PASS / FAIL text the strict reader cannot inspect (the `DISPLAY_PATH_TEXT_UNREADABLE` case below: a comment, a trailing comma, nesting past
-its depth limit, a root that is not an object, a lone surrogate): that receipt is `INVALID` whatever the marker says, and there the
-`DISPLAY_PATH_UNBOUND` marker follows the parsed object alone (`ConvertFrom-Json` keeps the last of two same-name members), so it is not guaranteed
-when only an earlier duplicate `venue` holds the block. No consumer branches on the marker (status alone gates a receipt), so the receipt is refused either way. A text that was supplied and that the strict reader cannot inspect
+With the text, the `DISPLAY_PATH_UNBOUND` marker and the duplicate finding come from one of two sources, which are these two cases:
+(a) The member scan completes: the text is strict JSON for `System.Text.Json` default options, has an object root and stays within its depth limit.
+A lone-surrogate string or member name elsewhere does not stop the scan, which looks only at the `venue` and `displayPath` member names, and it owes no marker
+of its own. The marker is owed when ANY `venue` occurrence in the text holds a `displayPath` member, and a PASS / FAIL receipt that names `venue` more than
+once, or one `venue` that names `displayPath` more than once, in any letter case, is `INVALID` with `DISPLAY_PATH_DUPLICATE_MEMBER` (it fails closed). The scan keeps
+its marker and its duplicate finding even when the readability check then finds a lone surrogate.
+(b) The scan yields no facts (a comment, a trailing comma, nesting past its depth limit, a root that is not an object, or a scan that threw): nothing comes from the text,
+and the marker follows the parsed object alone (`ConvertFrom-Json` keeps the last of two same-name members), so it is not guaranteed when only an earlier duplicate
+`venue` holds the block.
+In every case the strict reader cannot inspect (those in (b), and a lone surrogate in (a)) a PASS / FAIL receipt is `INVALID` with `DISPLAY_PATH_TEXT_UNREADABLE`, whatever the marker says. A text that was supplied and that the strict reader cannot inspect
 (not strict JSON for `System.Text.Json` default options: a comment, a trailing comma, nesting deeper than 64, which `ConvertFrom-Json` reads up to 1024;
 or a root that is not an object, or any name or string that cannot be read back, an escaped lone surrogate) cannot be ruled free of a duplicate member, so a PASS / FAIL receipt carrying it is `INVALID` with
 `DISPLAY_PATH_TEXT_UNREADABLE`; the parsed object's own status is never the answer for it. The depth limit is not raised: the strict reader's grammar is
