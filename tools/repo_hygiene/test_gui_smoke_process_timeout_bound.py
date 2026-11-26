@@ -1856,10 +1856,10 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
 class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCase):
     """VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-2 r1 (adversary r16 A3, major): r16 anchored the quiet clock at the FIRST observation of the log, so a window of
     H - 1000 armed at 4 s expired at about H + 3000 (owner leg 3603000 ms of 3600000; fixture 136000 ms of 133000): the whole budget always ran out first.
-    The r16 test compared durations; these compare TIMES SINCE LAUNCH. The runner's own derivation and wait region run as written, with H = 8000
-    (leg 2000 + allowance 6000), M = 2000, L = 6000, and the app's first log line written at about 2 s.
+    The r16 test compared durations; these compare TIMES SINCE LAUNCH. The runner's own derivation and wait region run as written, with H = 12000
+    (leg 2000 + allowance 10000, CI-FLAKE r2/r3: was 8000 and 6000), M = 2000, L = 10000, and the app's first log line written at about 2 s.
 
-    Adversary 81e7f8b2 A2 re-specified the derived case: there W = L = 6000, so a watch armed at about 2 s cannot see a whole window of silence by L, and
+    Adversary 81e7f8b2 A2 re-specified the derived case: there W = L = 10000, so a watch armed at about 2 s cannot see a whole window of silence by L, and
     capping E at L would claim one. No silence verdict is passed (E = -1) and the hard deadline ends the leg as a timeout. A window that fits after the
     late arming (an explicit -NoProgressTimeoutMs of 2000 ms) still fires by L."""
 
@@ -1874,7 +1874,9 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
     _FITS_ALLOW_MS = 10000
 
     def _run(self, sample_ms: int, override_ms: int = 0, allow_ms: int = 6000) -> dict:
-        extra = {"GS_OVERRIDE_MS": str(override_ms)} if override_ms else {}
+        # r3 (adversary 77606b95 A2): the override is always set ("0" is no override: the harness reads it as [int]0), so a GS_OVERRIDE_MS inherited from
+        # the caller's environment cannot turn a derived-window case into an explicit-window one
+        extra = {"GS_OVERRIDE_MS": str(override_ms)}
         return run_ps(_RUNNER_HARNESS, GS_STUB=self._DELAYED_ARMING, GS_SAMPLE_MS=str(sample_ms), GS_ALLOW_MS=str(allow_ms),
                       GS_DERIVE=_runner_snippet(*_DERIVE_REGION), GS_WAIT=_runner_snippet(*_WAIT_REGION), **extra)
 
