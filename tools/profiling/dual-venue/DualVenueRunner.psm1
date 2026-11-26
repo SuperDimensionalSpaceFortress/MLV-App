@@ -4367,7 +4367,11 @@ function Get-DvVisualVerdict {
         $pictureText = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { " ($DistinctContentHashes distinct picture(s) among them)" } else { '' })
         # pass 2 A2: "none carries a valid number" needs the rest of the tuple to agree: a sole frame number or a labelled count beside -AppDistinctDisplayFrames 0
         # (also what an OMITTED -AppDistinctDisplayFrames binds to) contradicts it, so that reason abstains too
-        $contradicted = ($AppDistinctDisplayFrames -eq 0 -and ($null -ne $sole -or $null -ne $labelled))
+        # R1C-REASON-RESIDUE-1 (sol r1c A2): the same for the rest of the tuple. A known source difference (either value: the app's rule needs a valid label on
+        # every judged frame and two distinct ones) and a repeat (a pair with two distinct valid labels) both need two distinct display frame numbers, so
+        # either beside fewer than two disagrees with the count, and the reason claims neither "none" nor "all one number" (Get-DvVisualSourceDifference, Read-DvVisualCaptures)
+        $needsTwoLabels = ($SourceDifference -ne 'unknown' -or $RepeatedPlayFrames -ge 1)   # -ne: the binder accepts any case of the enum (sol r1c A4 is open, not mine)
+        $contradicted = (($AppDistinctDisplayFrames -eq 0 -and ($null -ne $sole -or $null -ne $labelled)) -or ($AppDistinctDisplayFrames -ge 0 -and $needsTwoLabels))
         $position = $(if ($AppDistinctDisplayFrames -lt 0) { "the $PlayFrames judged play frames do not establish two distinct display frame numbers" }
                       elseif ($contradicted) { "the $PlayFrames judged play frames do not establish two distinct display frame numbers (the counts supplied disagree on how many carry a valid one)" }
                       elseif ($AppDistinctDisplayFrames -eq 0) { "none of the $PlayFrames judged play frames carries a valid display frame number" }
@@ -4389,9 +4393,12 @@ function Get-DvVisualVerdict {
         $repeatMax = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { $PlayFrames - $DistinctContentHashes } else { $PlayFrames - 1 })
         # pass 2 A1: when the supplied count is over that bound, "two or more of them repeat" is the same impossible claim in words (N = D = 2 holds no repeat at
         # all), so the reason says the count cannot be true and speaks of what was SUPPLIED, never of what the judged frames show
-        $repeatLead = $(if ($RepeatedPlayFrames -le $repeatMax) { "$RepeatedPlayFrames of the $PlayFrames judged play frames repeat the picture before them" }
-                        else { "the repeat count supplied for the $PlayFrames judged play frames cannot be true for them and is not quoted; as supplied, they repeat the picture before them" })
-        return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "$repeatLead while the app's label advanced and the source frames are known to differ: the display's own paint stopped landing for part of the tail" }
+        # R1C-REASON-RESIDUE-1 (sol r1c A1): and an impossible count supports neither an observed repeat ("as supplied, they repeat") nor the freeze
+        # diagnosis ("the display's own paint stopped landing"): the verdict is what it was, the reason names the impossible input and claims nothing
+        if ($RepeatedPlayFrames -gt $repeatMax) {
+            return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "the repeat count supplied for the $PlayFrames judged play frames cannot be true for them and is not quoted: it establishes no repeat and no cause, so the judged frames are not described as repeating (the verdict follows the count supplied, not an observation)" }
+        }
+        return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "$RepeatedPlayFrames of the $PlayFrames judged play frames repeat the picture before them while the app's label advanced and the source frames are known to differ: the display's own paint stopped landing for part of the tail" }
     }
     if (($null -ne $LabelBound -or $null -ne $PausedLabelBound) -and -not ($LabelBound -eq $true -and $PausedLabelBound -eq $true)) {
         $unbound = @(if ($LabelBound -ne $true) { "the paused-instant capture (label_bound $(if ($null -eq $LabelBound) { 'missing' } else { 'false' }))" }

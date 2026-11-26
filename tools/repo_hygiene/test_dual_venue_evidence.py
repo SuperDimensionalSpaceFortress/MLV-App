@@ -11047,14 +11047,22 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertEqual((out["verdict"], out["counted"]), (verdict, verdict != "FROZEN_DISPLAY"), out["reason"])
                 if verdict == "NOT_A_MOTION_WITNESS":
                     self.assertIn(f"({distinct} distinct picture(s) among them), so they cannot witness motion during playback", out["reason"])
-                    self.assertIn("none of the 6 judged play frames carries a valid display frame number" if app == 0
-                                  else "the valid display frame numbers among the 6 judged play frames are all one display frame number: one display frame number "
-                                       "across them at most", out["reason"])
+                    if src in ("known-differ", "known-identical"):
+                        # R1C-REASON-RESIDUE-1 (sol r1c A2): a known source difference needs two distinct display frame numbers, so beside fewer than two the
+                        # tuple disagrees and the reason claims neither "none" nor "all one number"
+                        self.assertTrue(out["reason"].startswith("the 6 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                                 "on how many carry a valid one)"), out["reason"])
+                        self.assertNotIn("none of the", out["reason"])
+                        self.assertNotIn("are all", out["reason"])
+                    else:
+                        self.assertIn("none of the 6 judged play frames carries a valid display frame number" if app == 0
+                                      else "the valid display frame numbers among the 6 judged play frames are all one display frame number: one display frame number "
+                                           "across them at most", out["reason"])
                     self.assertNotIn("the strip shows", out["reason"], "r1 adversary A1: the reason speaks of the judged frames, never of the whole strip")
                     self.assertNotIn("they show", out["reason"], "r1 adversary pass 2 A1: the labels carry a number; the pictures are not claimed to show one")
                     self.assertNotIn("timeline position", out["reason"], "r1 adversary pass 3 A2: one number is not one timeline position (no clip token)")
         # the reason quotes the one frame when the caller names it (the reader does); a value that is not a frame number is not quoted
-        out = self.visual_verdict("known-identical", 6, 0, 2, app=1, extra="-SoleDisplayFrame 479 ")
+        out = self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 479 ")
         self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS")
         self.assertIn("the valid display frame numbers among the 6 judged play frames are all display frame number 479: one display frame number across them at most "
                       "(2 distinct picture(s) among them)", out["reason"])
@@ -11078,7 +11086,7 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                                          "frame number across them at most"), out["reason"])
                 self.assertNotIn(" of the 2", out["reason"])
 
-    IMPOSSIBLE_REPEAT_LEAD = "the repeat count supplied for the 6 judged play frames cannot be true for them and is not quoted; as supplied, they repeat the picture before them"
+    IMPOSSIBLE_REPEAT_LEAD = "the repeat count supplied for the 6 judged play frames cannot be true for them and is not quoted: it establishes no repeat and no cause"
 
     def test_the_visual_gate_never_quotes_a_count_that_cannot_be_true_as_observed_evidence(self) -> None:
         """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R3-KEY-RESIDUE-1 (sol r3 blocker; opus VISUAL-GATE-DISTINCT-HASHES-RANGE-1): Get-DvVisualVerdict is exported, so a
@@ -11134,8 +11142,42 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         # words; the reason says the supplied count cannot be true and speaks of what was SUPPLIED
         out = self.visual_verdict("known-differ", 2, 0, 2, app=2, repeats=2)
         self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
-        self.assertTrue(out["reason"].startswith("the repeat count supplied for the 2 judged play frames cannot be true for them and is not quoted; as supplied, they repeat"), out["reason"])
+        self.assertTrue(out["reason"].startswith("the repeat count supplied for the 2 judged play frames cannot be true for them and is not quoted: it establishes no repeat"), out["reason"])
         self.assertNotIn("two or more", out["reason"])
+        # R1C-REASON-RESIDUE-1 (sol r1c A1, its input verbatim): the impossible count supports neither an observed repeat nor the freeze diagnosis; the verdict
+        # and counted stay. Red on cda3ba8d: "as supplied, they repeat the picture before them ... the display's own paint stopped landing for part of the tail"
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 2 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -FlatPlayFrames 0 "
+                                  "-SourceDifference known-differ -RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+        self.assertIn("cannot be true for them", out["reason"])
+        for claim in ("as supplied", "they repeat", "stopped landing", "label advanced", "paint"):
+            self.assertNotIn(claim, out["reason"], out["reason"])
+        # every impossible repeat count says nothing about repeats or a cause; a possible one still does
+        for distinct, repeats in ((3, 4), (3, 6), (6, 2), (2, 5), (9, 6), (0, 6)):
+            out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+            self.assertNotIn("stopped landing", out["reason"], out["reason"])
+            self.assertNotIn("as supplied", out["reason"], out["reason"])
+            self.assertNotIn("repeat the picture", out["reason"], out["reason"])
+        self.assertIn("the display's own paint stopped landing for part of the tail", self.visual_verdict("known-differ", 6, 0, 3, repeats=3)["reason"])
+        # R1C-REASON-RESIDUE-1 (sol r1c A2, its inputs verbatim): AppDistinctDisplayFrames 0 (or omitted) beside a known source difference (either value) or a
+        # repeat count disagrees with itself: the verdict stays, the reason never says "none of the 2 judged play frames carries a valid display frame number"
+        for label, args in (("known-differ", "-AppDistinctDisplayFrames 0 -SourceDifference known-differ"),
+                            ("known-identical", "-AppDistinctDisplayFrames 0 -SourceDifference known-identical"),
+                            ("omitted app", "-SourceDifference known-differ"),
+                            ("unknown+repeat", "-AppDistinctDisplayFrames 0 -SourceDifference unknown -RepeatedPlayFrames 1"),
+                            ("app 1 known-differ", "-AppDistinctDisplayFrames 1 -SourceDifference known-differ"),
+                            ("app 1 repeat", "-AppDistinctDisplayFrames 1 -RepeatedPlayFrames 1")):
+            with self.subTest(a2=label):
+                proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 2 -DistinctContentHashes 1 -FlatPlayFrames 0 "
+                                          f"{args} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                for claim in ("none of the", "carries a valid display frame number", "are all"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+                self.assertTrue(out["reason"].startswith("the 2 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                         "on how many carry a valid one) (1 distinct picture(s) among them)"), out["reason"])
+        # the consistent unknown-source zero still says none
         # adversary pass 2 A2 (its input verbatim): -AppDistinctDisplayFrames omitted (it binds to 0) or 0 beside a sole frame number / a labelled count: the
         # tuple disagrees with itself, so the reason never says "none of the 6 ... carries a valid display frame number"
         for app_arg in ("", "-AppDistinctDisplayFrames 0 "):
