@@ -640,6 +640,19 @@ $startUtc = [datetime]::UtcNow
 $startTimestamp = [Diagnostics.Stopwatch]::GetTimestamp()
 $s = New-Stub $env:GS_STUB
 $process = $s.p; $stdoutTask = $s.o; $stderrTask = $s.e
+# r6 (adversary df44ab80 A1): the time since launch at which the poll that RETURNED THE STALL VERDICT began, read on the launch stamp just before the
+# module call. The loop's own end is sampled after the verdict, so a host that deschedules the caller there would read as a late verdict.
+$script:verdictPollStartMs = [double]-1
+$guiModule = Get-Module gui-smoke-process-boundary
+function Test-GuiSmokeLogProgressStalled {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object]$Watch, [int64]$DeadlineMs = 0)
+    $began = Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $startTimestamp
+    # the module's own function, looked up in the module's scope (a call by name from here would find this wrapper again)
+    $verdict = & $guiModule { param($w, $d) Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs $d } $Watch $DeadlineMs
+    if ($verdict -and $script:verdictPollStartMs -lt 0) { $script:verdictPollStartMs = $began }
+    return $verdict
+}
 . ([scriptblock]::Create($env:GS_DERIVE))
 $hardLimitMs = [int64]$effectiveProcessTimeoutMs
 # r11: GS_PREWAIT lets a stub finish BEFORE the wait region runs, the state a runner that was descheduled between its remaining-time read and its wait sees
@@ -653,7 +666,8 @@ $alive = -not $process.HasExited
 if ($alive) { $process.Kill($true) }
 [pscustomobject]@{ hardLimitMs = $hardLimitMs; waitedMs = $waitedMs; timedOut = [bool]$processBoundary.timedOut; outcome = [string]$processBoundary.outcome
     timeoutMs = [int]$processBoundary.timeoutMs; exitCode = [int]$processBoundary.exitCode; alive = $alive; samples = $hostLoadDuringSamples.Count
-    loopEndMs = [int]$hostLoadSampleLoopElapsedMs; expiryMs = $noProgressWatch.ExpiryMs; armed = [bool]$noProgressWatch.Armed } | ConvertTo-Json -Compress
+    loopEndMs = [int]$hostLoadSampleLoopElapsedMs; expiryMs = $noProgressWatch.ExpiryMs; armed = [bool]$noProgressWatch.Armed
+    verdictPollStartMs = [double]$script:verdictPollStartMs } | ConvertTo-Json -Compress
 """
 
 _NEVER_EXITS_NO_LOG = "Start-Sleep -Seconds 20"
@@ -1335,8 +1349,9 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         # the watch is Hung, which is the state the old control then burned its four retries in at zero wait. r6 (sol r5 H2): the miss is forced by a 50 ms
         # wait against a 4000 ms listing (3950 ms of margin; 500 ms before), and the control proves the first call really missed
         out = self._budget_left_control(4000, first_wait_ms=50)
-        self.assertFalse(out["first"]["armed"], "the forced miss never happened: the first call armed the watch, so the retry branch was not exercised")
-        self.assertTrue(out["first"]["hung"], "the first call left a probe still running past its wait")
+        # Hung is the module's own record that a bounded wait missed (adversary df44ab80 A2: a caller descheduled for 4 s inside the call may already see the
+        # listing, and arming from what landed is right; the 50 ms wait still missed)
+        self.assertTrue(out["first"]["hung"], "the forced miss never happened: the first call's bounded wait did not miss, so the retry branch was not exercised")
         self._assert_the_budget_left_control(out)
 
     def test_the_budget_left_control_is_not_spent_by_an_arming_that_lands_just_before_its_deadline(self) -> None:
@@ -1863,7 +1878,8 @@ Set-Content -LiteralPath $log -Value 'start'
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs @LIMIT@ -ProbeWaitMs 1000
 $global:Now = [double]100
 & $m { function script:Get-GuiSmokeSinceLaunchMs { param([Nullable[int64]]$LaunchTimestamp = $null) return $global:Now } }
-function Poll-Stage([scriptblock]$Done) { $sw = [Diagnostics.Stopwatch]::StartNew(); while (-not (& $Done) -and $sw.ElapsedMilliseconds -lt 60000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
+$hangBudget = [Diagnostics.Stopwatch]::StartNew()
+function Poll-Stage([scriptblock]$Done) { while (-not (& $Done) -and $hangBudget.ElapsedMilliseconds -lt 60000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
 Poll-Stage { $w.Armed -and $null -eq $w.Pending }
 $len0 = [int64]$w.Files['mlvapp-1.log']
 $global:Now = [double]30100
@@ -1885,12 +1901,15 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
             if len(lines) != 1:
                 found.append("fixture %d: expected one Poll-Until, found %d" % (index, len(lines)))
                 continue
-            if "$launchBudget.ElapsedMilliseconds -lt" not in lines[0]:
-                found.append("fixture %d: Poll-Until is not bounded by the shared $launchBudget" % index)
-            if source.count("$launchBudget = [Diagnostics.Stopwatch]::StartNew()") != 1:
+            # the whole loop line, character for character: a restart, a bypassed condition (`-or $true`) or a second stopwatch changes it
+            expected = ("function Poll-Until([scriptblock]$Done) { while (-not (& $Done) -and $launchBudget.ElapsedMilliseconds -lt 90000) "
+                        "{ [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }")
+            if lines[0] != expected:
+                found.append("fixture %d: Poll-Until is not the pinned loop bounded by the shared $launchBudget: %s" % (index, lines[0]))
+            if len(re.findall(r"\$launchBudget\s*=\s*\[Diagnostics\.Stopwatch\]::StartNew\(\)", source, re.I)) != 1:
                 found.append("fixture %d: the shared stopwatch is not started exactly once" % index)
-            # any member of the shared stopwatch other than the reading restarts, resets or stops it
-            for member in re.findall(r"\$launchBudget\.(?!ElapsedMilliseconds\b)(\w+)", source):
+            # any member of the shared stopwatch other than the reading restarts, resets or stops it (PowerShell variable names ignore case)
+            for member in re.findall(r"\$launchBudget\.(?!ElapsedMilliseconds\b)(\w+)", source, re.I):
                 found.append("fixture %d: $launchBudget.%s changes the shared stopwatch" % (index, member))
             if "StartNew" in lines[0]:
                 found.append("fixture %d: Poll-Until starts a stopwatch of its own" % index)
@@ -1907,10 +1926,15 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         sources = self._marker_fixture_sources()
         self.assertEqual([], self._marker_budget_violations(sources), "the shipped marker fixtures share one budget")
         self.assertEqual(2, len(sources))
-        for member in ("Restart()", "Reset()", "Stop()"):
-            mutated = [s.replace("function Poll-Until([scriptblock]$Done) { while", "function Poll-Until([scriptblock]$Done) { $launchBudget.%s; while" % member) for s in sources]
-            self.assertNotEqual(sources, mutated)
-            self.assertTrue(self._marker_budget_violations(mutated), "a $launchBudget.%s inside Poll-Until passed the guard" % member)
+        # (adversary df44ab80 A3: PowerShell variable names are case-insensitive, and the loop condition itself is pinned, not only a substring of it)
+        for name in ("$launchBudget", "$LaunchBudget", "$LAUNCHBUDGET"):
+            for member in ("Restart()", "Reset()", "Stop()"):
+                mutated = [s.replace("function Poll-Until([scriptblock]$Done) { while", "function Poll-Until([scriptblock]$Done) { %s.%s; while" % (name, member)) for s in sources]
+                self.assertNotEqual(sources, mutated)
+                self.assertTrue(self._marker_budget_violations(mutated), "a %s.%s inside Poll-Until passed the guard" % (name, member))
+        bypassed = [s.replace("-lt 90000)", "-lt 90000 -or $true)") for s in sources]
+        self.assertNotEqual(sources, bypassed)
+        self.assertTrue(self._marker_budget_violations(bypassed), "a loop condition that is always true passed the guard")
 
     def test_gui_smoke_bytes_inside_another_record_do_not_end_the_load_allowance(self) -> None:
         """adversary 81e7f8b2 A1 (major): CrashForensics logs the start-up run_metadata record with the whole command line, so an owner input whose path
@@ -2057,8 +2081,8 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
     # judged against E itself (_VERDICT_LATENCY_MS). The `cannot run out by L` pair runs to H and keeps the r4 allowance (_DERIVED_ALLOW_MS).
     _FITS_ALLOW_MS = 60000
     _DERIVED_ALLOW_MS = 16000
-    # one probe wait (the runner's 1000 ms) after E, plus 1000 ms for the host to schedule the verdict poll; the merge base accepted a verdict no later than
-    # H - 1000 for an E no later than H - 2000, and rejected 2400 ms after an E of 5000
+    # the runner's chunk wait ends at E and the verdict poll starts there; 2000 ms is the host scheduling between the two (the merge base rejected a verdict
+    # 2400 ms after an E of 5000). The probe wait inside the poll is bounded by its own tests (test_probe_wait_is_bounded_by_the_remaining_budget...)
     _VERDICT_LATENCY_MS = 2000
 
     def _run(self, sample_ms: int, override_ms: int = 0, allow_ms: int = 6000, setup_ms: int = 0) -> dict:
@@ -2080,10 +2104,14 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
         self.assertLessEqual(out["expiryMs"], hard - margin, "%s: the expiry, in ms since launch, is later than H - M" % branch)
         # the verdict follows one probe (at most ProbeWaitMs = M - 1000) after E: it lands no later than H - 1000 ...
         self.assertLessEqual(out["loopEndMs"], hard - 1000, "%s: the stall verdict, in ms since launch, is later than H - M + ProbeWaitMs" % branch)
-        # ... and, whatever allowance widened H, no later than one probe wait (plus scheduling) after E itself
-        self.assertLessEqual(out["loopEndMs"] - out["expiryMs"], self._VERDICT_LATENCY_MS,
-                             "%s: the stall verdict came %s ms after the expiry (E = %s ms, the loop ended at %s ms since launch)"
-                             % (branch, out["loopEndMs"] - out["expiryMs"], out["expiryMs"], out["loopEndMs"]))
+        # ... and, whatever allowance widened H, the poll that returned it began no later than _VERDICT_LATENCY_MS after E itself (the loop's chunk wait ends at
+        # E). It is the poll's START that is judged: the loop's end is sampled after the verdict, where a descheduled caller would read as a late verdict
+        self.assertGreaterEqual(out["verdictPollStartMs"], 0, "%s: no poll returned the stall verdict" % branch)
+        self.assertLessEqual(out["verdictPollStartMs"] - out["expiryMs"], self._VERDICT_LATENCY_MS,
+                             "%s: the poll that returned the stall verdict began %s ms after the expiry (E = %s ms, the loop ended at %s ms since launch)"
+                             % (branch, out["verdictPollStartMs"] - out["expiryMs"], out["expiryMs"], out["loopEndMs"]))
+        # (adversary df44ab80 A7) and no verdict is passed before E: the verdict's own reading is at or past it, and the loop ends after that reading
+        self.assertGreaterEqual(out["loopEndMs"], out["expiryMs"] - 1, "%s: the stall verdict came before the expiry" % branch)
         self.assertTrue(out["timedOut"])
         self.assertEqual(124, out["exitCode"])
         self.assertFalse(out["alive"])
@@ -2121,12 +2149,19 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
     def test_a_late_stall_verdict_is_rejected_whatever_allowance_the_fixture_carries(self) -> None:
         # r6 (sol r5 B4): the allowance that makes a late arming fit also widened the old `verdict by H - 1000` bound to 17000 ms, so a verdict 2400 ms
         # after E (7400 against E = 5000), which the merge base rejected (7000), passed. The latency is now measured from E, not from the allowance.
+        # r6 (adversary df44ab80 A1, A7): the latency is the lag of the POLL THAT RETURNED THE VERDICT (when it began, read on the launch stamp just before
+        # the module call), so a host that deschedules the caller after the verdict returned (loopEndMs 7100 for a poll that began at 4600) is no late verdict;
+        # and a verdict before E is no verdict at all
         hard = 2000 + self._FITS_ALLOW_MS
-        base = {"hardLimitMs": hard, "armed": True, "outcome": "process_no_progress", "expiryMs": 5000, "loopEndMs": 5800, "timedOut": True, "exitCode": 124, "alive": False}
+        base = {"hardLimitMs": hard, "armed": True, "outcome": "process_no_progress", "expiryMs": 5000, "verdictPollStartMs": 5010, "loopEndMs": 5800,
+                "timedOut": True, "exitCode": 124, "alive": False}
         self._assert_fires_before_the_deadline(dict(base), "in time", hard=hard)
-        for loop_end in (7400, 9000, hard - 1000):
-            with self.assertRaises(AssertionError, msg="a stall verdict %d ms after E was accepted" % (loop_end - 5000)):
-                self._assert_fires_before_the_deadline(dict(base, loopEndMs=loop_end), "late", hard=hard)
+        self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=4600, loopEndMs=7100), "descheduled after the verdict", hard=hard)
+        for poll_start in (7400, 9000, hard - 1000):
+            with self.assertRaises(AssertionError, msg="a verdict poll that began %d ms after E was accepted" % (poll_start - 5000)):
+                self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=poll_start, loopEndMs=poll_start + 100), "late", hard=hard)
+        with self.assertRaises(AssertionError, msg="a verdict a whole second before E was accepted"):
+            self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=3900, loopEndMs=4000), "early", hard=hard)
 
     def test_a_late_arming_whose_window_cannot_run_out_by_l_is_left_to_the_deadline_in_the_log_only_branch(self) -> None:
         self._assert_the_deadline_decides(self._run(0, allow_ms=self._DERIVED_ALLOW_MS), "log-only", hard=2000 + self._DERIVED_ALLOW_MS)
