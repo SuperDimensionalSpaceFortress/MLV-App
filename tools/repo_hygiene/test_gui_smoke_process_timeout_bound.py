@@ -1283,6 +1283,8 @@ for ($i = 0; $i -lt 5 -and (-not $w.Armed -or $null -ne $w.Pending); $i++) {
     [void](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 3600000)
 }
 if (-not $w.Armed -or $null -ne $w.Pending) { throw 'the arming probe did not finish' }
+# P is pinned to the launch (adversary 2e95fdc8 A2): a parent descheduled during the real arming poll would otherwise credit P late, and E = P + 50 could land past a scripted reading
+$w.LastProgressMs = [int64]0
 # the next probe blocks for the rest of the test: it never answers, as on a stalled share
 $w.ProbeDelayMs = 600000
 $global:ScriptedReadings = [Collections.Generic.Queue[double]]::new()
