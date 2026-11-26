@@ -1104,6 +1104,38 @@ function ConvertTo-DvDouble {
     $null
 }
 
+function ConvertFrom-DvRecordKeyValues {
+    <#
+    .SYNOPSIS
+    EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 B2): the key=value tokens of ONE run-log record (the measured session's playback_smoke.summary
+    or playback_smoke.conform line). Returns @{ fields = each key's value; conflicts = the keys the record carries more than once with DIFFERENT values }.
+    Before r2 both readers kept the LAST occurrence, so `repeats=1 repeats=0`, `last_frame=478 last_frame=479` or `backward=1 backward=0` read clean and
+    passed every criterion. A conflicting key is left out of `fields`, so it reads as absent (every proof field and criterion that reads it fails closed,
+    CouldNotCheck), and is named in `conflicts`. Keys compare case-insensitively (the @{} table every caller indexes), values ordinally: an identical
+    repeat is the same reading and is kept. The app prints each key once (no venue log carries a repeated key).
+    r2 adversary fix 1 (A1 and A2 on 7272acb4): a key STARTS a whitespace-separated token, so `-repeats=0` or `not-repeats=0` supplies no `repeats`
+    (before, the unanchored match read one out of it); and an EMPTY occurrence is a reading too, so `repeats= repeats=0` (either order) conflicts
+    (before, `\S+` skipped the empty one and the other read clean). A key whose only readings are empty is left out, as before (absent).
+    r2 adversary fix 2 (A2 on 7c84e75a, its input `[ repeats=0 ] playback_smoke.conform session=3 ...`): the log prefix's bracket groups before the
+    record marker ($script:DvRecordStart, which the record selectors allow) are no part of the record, so a token inside them is never a field.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Record)
+    $fields = @{}
+    $conflicts = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    if (-not [string]::IsNullOrEmpty($Record)) {
+        $Record = [regex]::Replace($Record, $script:DvRecordStart, '')
+        foreach ($m in [regex]::Matches($Record, '(?<!\S)(?<k>[A-Za-z0-9_]+)=(?<v>\S*)')) {
+            $k = $m.Groups['k'].Value
+            $v = $m.Groups['v'].Value
+            if (-not $fields.ContainsKey($k)) { $fields[$k] = $v }
+            elseif (-not [string]::Equals([string]$fields[$k], $v, [StringComparison]::Ordinal)) { [void]$conflicts.Add($k) }
+        }
+        foreach ($k in $conflicts) { $fields.Remove($k) }
+        foreach ($k in @($fields.Keys)) { if ([string]::IsNullOrEmpty([string]$fields[$k])) { $fields.Remove($k) } }
+    }
+    @{ fields = $fields; conflicts = @($conflicts | Sort-Object) }
+}
+
 function Get-DvSmokeSummaryFields {
     <#
     .SYNOPSIS
@@ -1115,6 +1147,7 @@ function Get-DvSmokeSummaryFields {
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     $fields = @{}
+    $fieldConflicts = @()
     $session = $null
     $sessionUnreadable = $false
     $isolated = $false
@@ -1155,7 +1188,11 @@ function Get-DvSmokeSummaryFields {
             # fps_override=1`): a summary record that lost its tail to the LOCATION_UNREADABLE sentinel ($located false) is refused whole too, as the
             # session readers already refuse it, so a field in the cut tail is never hidden while the fields before it still read
             if ($null -ne $summaryLine -and $summaryLine.IndexOf($script:DvQuotedEqualsMask) -lt 0 -and (& $located $summaryLine)) {
-                foreach ($m in [regex]::Matches($summaryLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $fields[$m.Groups['k'].Value] = $m.Groups['v'].Value }
+                # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 B2 sibling): a key the summary carries twice with different values is
+                # left out (absent, so its proof field is INVALID), never last-value-wins
+                $read = ConvertFrom-DvRecordKeyValues -Record $summaryLine
+                $fields = $read.fields
+                $fieldConflicts = @($read.conflicts)
             }
             foreach ($line in $lines) { if ([regex]::IsMatch($line, ($rs + 'playback_smoke\.conform session=' + [regex]::Escape($session) + '(\s|$)'), $script:DvCi)) { $conformLine = $line } }
         }
@@ -1179,7 +1216,7 @@ function Get-DvSmokeSummaryFields {
         }
         $isolated = ($iso.Count -gt 0) -and (@($iso | Where-Object { -not (& $runScoped $_) }).Count -eq 0)
     }
-    [pscustomobject]@{ session = $session; sessionUnreadable = $sessionUnreadable; fields = $fields; settingsIsolated = $isolated; conformLine = $conformLine }
+    [pscustomobject]@{ session = $session; sessionUnreadable = $sessionUnreadable; fields = $fields; fieldConflicts = $fieldConflicts; settingsIsolated = $isolated; conformLine = $conformLine }
 }
 
 function Get-DvConformPaceProof {
@@ -1316,6 +1353,11 @@ function Get-DvPlaybackProblems {
     $pace = ConvertTo-DvDouble (Get-DvProp $Playback 'paceFps')
     $override = ConvertTo-DvInt64 (Get-DvProp $Playback 'fpsOverride')
     $wrapCount = ConvertTo-DvInt64 (Get-DvProp $Playback 'wrapCount')
+    # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 B2 sibling): a summary line that carries a key twice with different values does not say
+    # which reading the run produced (Get-DvSmokeSummaryFields leaves the key out); the record is refused, never read last-value-wins
+    $summaryConflictsRaw = Get-DvProp $Playback 'summaryConflictingFields'
+    $summaryConflicts = @(@($summaryConflictsRaw) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+    if ($summaryConflicts.Count -gt 0) { $reasons.Add("SUMMARY_FIELD_CONFLICT: the measured session's playback_smoke.summary line carries $($summaryConflicts -join ', ') more than once with different values, so the line is unreadable") }
     if ($null -eq $advanced) { $reasons.Add('RECEIPT_FIELD_ABSENT: source_advanced') }
     if ($null -eq $required) { $reasons.Add('RECEIPT_FIELD_ABSENT: required_source_frames') }
     elseif ($required -lt 20) { $reasons.Add("INVALID_SOURCE_FRAMES: required_source_frames=$required is under the 20-frame floor; the admitted Play was shorter than 20 s of footage") }
@@ -1406,7 +1448,10 @@ function Get-DvPlaybackEvidence {
     # r24 (r24 adversary pass 2 A1 sibling): a conform record that holds a masked `=` or lost its tail to the LOCATION_UNREADABLE sentinel supplies no
     # conform field (refused whole, like the summary record), so the conform proof reads it as absent and is not proven
     $conformReadable = ($null -ne $parsed.conformLine) -and ([string]$parsed.conformLine).IndexOf($script:DvQuotedEqualsMask) -lt 0 -and -not ([string]$parsed.conformLine).EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)
-    if ($conformReadable) { foreach ($m in [regex]::Matches([string]$parsed.conformLine, '(?<k>[A-Za-z0-9_]+)=(?<v>\S+)')) { $conformFields[$m.Groups['k'].Value] = $m.Groups['v'].Value } }
+    # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 B2): a key the conform line carries twice with different values (`repeats=1 repeats=0`,
+    # `last_frame=478 last_frame=479`, `backward=1 backward=0`) is left out, so every criterion that reads it is CouldNotCheck, never last-value-wins
+    $conformConflicts = @()
+    if ($conformReadable) { $conformRead = ConvertFrom-DvRecordKeyValues -Record ([string]$parsed.conformLine); $conformFields = $conformRead.fields; $conformConflicts = @($conformRead.conflicts) }
     $conformPlaybackField = ConvertTo-DvDouble $conformFields['playback_fps']
     $conformClipField = ConvertTo-DvDouble $conformFields['clip_fps']
     $wrappedField = ConvertTo-DvInt64 $f['wrapped']
@@ -1442,6 +1487,16 @@ function Get-DvPlaybackEvidence {
         # r30 (Dot D2 on 71104385): how many times the painted frames stepped backward (a seek back; the conform line's backward). Get-DvCriteriaMetrics
         # judges no frozen tail across one: engine_target is the engine's high-water, not its final target. $null when the line does not carry it.
         conformBackward = (ConvertTo-DvInt64 $conformFields['backward'])
+        # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 (adversary A1 on b56cc731): how many painted frames repeated the frame painted before them (the
+        # conform line's repeats). max_jump counts forward steps only, so a frame painted twice reads max_jump=1. $null when the line does not carry it.
+        conformRepeats = (ConvertTo-DvInt64 $conformFields['repeats'])
+        # r2 adversary fix 2 (A1 on 7c84e75a): how many frames the measured session painted (the conform line's presented); Get-DvCriteriaMetrics checks
+        # the painted steps can cover source_advanced at the line's max_jump. $null when the line does not carry it.
+        conformPresented = (ConvertTo-DvInt64 $conformFields['presented'])
+        # r2 (sol r1 B2): the keys the measured conform line / summary line carry more than once with different values (left out above, so absent);
+        # Get-DvCriteriaMetrics names them in its CouldNotCheck reasons and Get-DvPlaybackProblems refuses a summary that carries one.
+        conformConflictingFields = @($conformConflicts)
+        summaryConflictingFields = @($parsed.fieldConflicts)
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
@@ -3229,6 +3284,43 @@ $script:UmRunSchema = 'mlv-app/dual-venue-um-run/v1'
 # The receipt's playback block fields that must equal what is re-derived from the files (a stored valid / invalidReasons is not one).
 $script:PlaybackComparedFields = @('sourceAdvanced', 'requiredSourceFrames', 'nativeFps', 'paceFps', 'fpsOverride', 'wrapped', 'wrapCount',
     'expectedRunNonce', 'observedRunNonce', 'manifestRunNonce', 'logSha256', 'logShaBound', 'settingsIsolated', 'fixtureRehearsal', 'clipId')
+# EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 adversary fix 2 (A3 on 7c84e75a): the playback fields this card added must equal what the hashed run
+# log re-derives WHENEVER the stored block carries them (a stored conformRepeats=0 over a log that says repeats=1 is PLAYBACK_NOT_FROM_EVIDENCE). A receipt
+# written before a field existed does not carry it and is not re-judged for it. The older conform fields are not compared (OPEN in PR #910).
+$script:PlaybackComparedFieldsWhenStored = @('conformRepeats', 'conformPresented', 'conformConflictingFields', 'summaryConflictingFields')
+
+function Get-DvStoredPlaybackFieldProblems {
+    <#
+    .SYNOPSIS
+    The INVALID reasons of a receipt's stored playback block against the block re-derived from the hashed files (Test-DvReceiptValid runs this).
+    .DESCRIPTION
+    Every PlaybackComparedFields member must equal the re-derived one; every PlaybackComparedFieldsWhenStored member must equal it whenever the
+    stored block carries it. r4 (sol r3 finding 3, opus r3 STORED-PLAYBACK-FIELD-CASE-VARIANT-1): presence was a case-sensitive -ccontains while
+    Get-DvProp reads keys case-insensitively, so a stored "ConformRepeats": 999 read 999 and was never compared. A stored field is now found by any
+    casing (OrdinalIgnoreCase) and its value read by its own stored name, and a stored key that is a case variant of ANY compared field (both
+    lists) is refused outright (PLAYBACK_FIELD_CASE_VARIANT): the writer only ever writes the canonical names.
+    #>
+    param($Stored, $Derived)
+    $problems = [System.Collections.Generic.List[string]]::new()
+    $storedNames = @($(if ($Stored -is [System.Collections.IDictionary]) { @($Stored.Keys) } else { @($Stored.PSObject.Properties.Name) }) | ForEach-Object { [string]$_ })
+    foreach ($f in @($script:PlaybackComparedFields) + @($script:PlaybackComparedFieldsWhenStored)) {
+        foreach ($n in $storedNames) {
+            if ([string]::Equals($n, $f, [StringComparison]::OrdinalIgnoreCase) -and -not [string]::Equals($n, $f, [StringComparison]::Ordinal)) {
+                $problems.Add("PLAYBACK_FIELD_CASE_VARIANT: playback.$n is a case variant of the compared field $f (the writer writes $f only)")
+            }
+        }
+    }
+    foreach ($f in $script:PlaybackComparedFields) {
+        if (-not (Test-DvJsonEquivalent (Get-DvProp $Stored $f) (Get-DvProp $Derived $f))) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+    }
+    foreach ($f in $script:PlaybackComparedFieldsWhenStored) {
+        foreach ($n in @($storedNames | Where-Object { [string]::Equals($_, $f, [StringComparison]::OrdinalIgnoreCase) })) {
+            if (-not (Test-DvJsonEquivalent (Get-DvProp $Stored $n) (Get-DvProp $Derived $f))) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+        }
+    }
+    # one string per problem on the pipeline (callers collect with @(...)); none when the stored block is sound
+    foreach ($p in $problems) { $p }
+}
 
 function Test-DvNumber($Value) {
     ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or $Value -is [decimal] -or $Value -is [single] -or $Value -is [int16] -or $Value -is [byte] -or $Value -is [uint32] -or $Value -is [uint64])
@@ -6608,9 +6700,8 @@ function Test-DvReceiptValid {
         $stored = Get-DvProp $Receipt 'playback'
         if ($null -eq $stored) { $incomplete.Add('RECEIPT_FIELD_ABSENT: the receipt carries no playback block (the source-frame verdict)') }
         else {
-            foreach ($f in $script:PlaybackComparedFields) {
-                if (-not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) { $invalid.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
-            }
+            # r4 (sol r3 finding 3): both field lists, found by any casing, a case-variant key refused (Get-DvStoredPlaybackFieldProblems)
+            foreach ($p in @(Get-DvStoredPlaybackFieldProblems -Stored $stored -Derived $derived)) { $invalid.Add($p) }
         }
         foreach ($p in @($derived.invalidReasons)) { if ($null -ne $p -and [string]$p -ne '') { $invalid.Add([string]$p) } }
         # the evidence's own identity: the clip, the venue and the build the receipt says it is about
@@ -7407,7 +7498,7 @@ function Get-DvVerbatimMetrics {
 
 # HFR-NATIVE-60FPS-FULLRES-1 r19 (sol r18 B2): the measured conform fields a leg's criteria may name, and the re-derived playback block field each comes from.
 # r29 (adversary A2 on cf403dba): the frozen-tail allowance is no longer a constant (r28's 10); Get-DvCriteriaMetrics derives it from the conform line's ends.
-$script:ConformCriteriaMetrics = [ordered]@{ conformSourceFps = 'conformSourceFps'; conformMaxJump = 'conformMaxJump'; conformAudioSyncRequests = 'conformAudioSyncRequests' }
+$script:ConformCriteriaMetrics = [ordered]@{ conformSourceFps = 'conformSourceFps'; conformMaxJump = 'conformMaxJump'; conformAudioSyncRequests = 'conformAudioSyncRequests'; conformRepeats = 'conformRepeats' }
 
 function Get-DvCriteriaMetrics {
     <#
@@ -7431,6 +7522,11 @@ function Get-DvCriteriaMetrics {
     $summarySession = $(if ($null -ne $Playback) { [string](Get-DvProp $Playback 'summarySession') } else { '' })
     $conformSession = $(if ($null -ne $Playback) { [string](Get-DvProp $Playback 'conformSession') } else { '' })
     $sameSession = ($summarySession -ne '') -and ($conformSession -ceq $summarySession)
+    # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 B2): Get-DvPlaybackEvidence leaves out a key the conform line carries twice with different
+    # values, so the value reads absent and the criterion is CouldNotCheck (it FAILS); every such reason names the conflicting keys.
+    $conflictedRaw = $(if ($null -ne $Playback) { Get-DvProp $Playback 'conformConflictingFields' } else { $null })
+    $conflicted = @(@($conflictedRaw) | Where-Object { -not [string]::IsNullOrEmpty([string]$_) })
+    $conflictNote = $(if ($conflicted.Count -gt 0) { " (the playback_smoke.conform line carries $($conflicted -join ', ') more than once with different values, so each is unreadable)" } else { '' })
     foreach ($name in $script:ConformCriteriaMetrics.Keys) {
         $value = $(if ($null -ne $Playback -and $present -and $sameSession) { Get-DvProp $Playback $script:ConformCriteriaMetrics[$name] } else { $null })
         $m[$name] = $value
@@ -7439,7 +7535,7 @@ function Get-DvCriteriaMetrics {
                      elseif (-not $present) { 'no playback_smoke.conform line for the measured session in the run log' }
                      elseif (-not $sameSession) { "the playback_smoke.conform line is for session $conformSession, not the measured session $summarySession" }
                      else { 'the measured session''s playback_smoke.conform line does not carry the field' })
-            $m["${name}CouldNotCheck"] = $why
+            $m["${name}CouldNotCheck"] = $why + $conflictNote
         }
         elseif ($m.Contains("${name}CouldNotCheck")) { $m.Remove("${name}CouldNotCheck") }
     }
@@ -7482,7 +7578,7 @@ function Get-DvCriteriaMetrics {
                                               elseif ($null -eq $engineAdvanced) { 'the run log''s summary carries no readable source_advanced (the engine''s advance), so a frozen presentation tail cannot be ruled out' }
                                               elseif ($missingEnd.Count -gt 0) { "the measured session's playback_smoke.conform line carries no readable non-negative $($missingEnd[0]) (the painted coverage's ends and the engine's last target), so a frozen presentation tail cannot be ruled out" }
                                               elseif ($backwardMissing) { 'the measured session''s playback_smoke.conform line carries no readable non-negative backward (the painted frames'' backward steps), so a seek back cannot be ruled out and the tail cannot be judged' }
-                                              else { "the painted frames stepped backward $backward time(s) (a seek back): engine_target is the engine's high-water target, not its final one, and frames painted before the seek re-count, so a frozen tail cannot be told from a shown one; backward-seek evidence is not judged" })
+                                              else { "the painted frames stepped backward $backward time(s) (a seek back): engine_target is the engine's high-water target, not its final one, and frames painted before the seek re-count, so a frozen tail cannot be told from a shown one; backward-seek evidence is not judged" }) + $conflictNote
     }
     elseif ($null -ne $maxJump) {
         $first = [int64]$ends['first_frame']; $last = [int64]$ends['last_frame']; $target = [int64]$ends['engine_target']
@@ -7502,7 +7598,70 @@ function Get-DvCriteriaMetrics {
             $m['conformFrozenTailFrames'] = $unshown
             $m['conformTailAllowanceFrames'] = $allowed
         }
+        # r2 adversary fix 2 (A1 on 7c84e75a, its input: presented=478 source_advanced=478 max_jump=1 repeats=0 first_frame=1 last_frame=479
+        # engine_target=479): with no backward step, the painted frames make presented - 1 - repeats forward steps, and those steps cover the
+        # line's source_advanced, so at least one step is ceil(source_advanced / steps) long. 478 paints cannot cover 478 frames one at a time: a
+        # step the line's max_jump did not report, so the line contradicts itself and conformMaxJump is CouldNotCheck (conformPaintStepsImpliedMaxJump
+        # names the step). A line that carries
+        # repeats (every build that does also prints presented; 140 venue conform lines checked, none breaks the bound) but no readable presented,
+        # or a forward advance with no forward step, is a missing number: conformMaxJump is left absent with a typed CouldNotCheck.
+        $presentedRead = $(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback 'conformPresented') } else { $null })
+        $repeatsRead = $(if ($null -ne $Playback -and $present -and $sameSession) { ConvertTo-DvInt64 (Get-DvProp $Playback 'conformRepeats') } else { $null })
+        $currentJump = ConvertTo-DvInt64 $m['conformMaxJump']
+        if ($null -ne $repeatsRead -and $null -ne $currentJump) {
+            $steps = $(if ($null -ne $presentedRead -and $presentedRead -ge 0 -and $repeatsRead -ge 0) { $presentedRead - 1 - $repeatsRead } else { $null })
+            if ($null -eq $steps -or ($steps -lt 1 -and [int64]$coverage -gt 0)) {
+                $m['conformMaxJump'] = $null
+                $m['conformMaxJumpCouldNotCheck'] = $(if ($null -eq $steps) { 'the measured session''s playback_smoke.conform line carries repeats but no readable non-negative presented (or a negative repeats), so the painted steps cannot be checked against source_advanced' }
+                                                      else { "the measured session's playback_smoke.conform line says presented=$presentedRead repeats=$repeatsRead (no forward step) but source_advanced=$coverage, so its fields contradict each other" }) + $conflictNote
+            }
+            elseif ($steps -ge 1 -and $steps -gt [int64]$coverage) {
+                # r4 (sol r3 finding 1, fable r3 EVERY-FRAME-CONFORM-LINE-STEPS-EXCEED-ADVANCE-1): the bound has two sides. With no backward step and no
+                # wrap every forward step advances at least one frame, so steps can never exceed source_advanced: 480 paints with repeats=0 over 478
+                # frames make 479 forward steps and hide a repeat. Such a line contradicts itself: conformMaxJump is CouldNotCheck.
+                $m['conformMaxJump'] = $null
+                $m['conformMaxJumpCouldNotCheck'] = "the measured session's playback_smoke.conform line says presented=$presentedRead repeats=$repeatsRead, which is $steps forward step(s), more than the source_advanced=$coverage frames they cover (every forward step advances at least one frame), so its fields contradict each other" + $conflictNote
+            }
+            elseif ($steps -ge 1) {
+                # r4 (sol r3 finding 2, opus r3 blocker): integer arithmetic, never a cast back from [double]. [int64][Math]::Ceiling([double]x / s) cast
+                # 2^63 for x within 512 of Int64.MaxValue and threw, so the leg ended UNRESOLVED RUNNER_ERROR in place of this typed CouldNotCheck.
+                # Here 1 <= steps <= coverage, so the quotient is at most coverage and the +1 only applies when steps >= 2 (quotient <= MaxValue / 2).
+                $remainder = [int64]0
+                $quotient = [Math]::DivRem([int64]$coverage, [int64]$steps, [ref]$remainder)
+                $implied = $(if ($remainder -ne 0) { $quotient + 1 } else { $quotient })
+                if ($implied -gt $currentJump) {
+                    # the line's own max_jump is below the step its counts force: its fields contradict each other (a max_jump=0 line that advanced must
+                    # not be raised into a passing 1), so it is a missing number, never a measured jump
+                    $m['conformMaxJump'] = $null
+                    $m['conformPaintStepsImpliedMaxJump'] = $implied
+                    $m['conformMaxJumpCouldNotCheck'] = "the measured session's playback_smoke.conform line says presented=$presentedRead repeats=$repeatsRead source_advanced=$coverage, so at least one painted step is $implied frames long, but its max_jump reads ${currentJump}, so its fields contradict each other" + $conflictNote
+                }
+            }
+        }
     }
+    # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 (adversary A2 on b56cc731): the engine targets past the LAST painted frame (engine_target - last_frame,
+    # never below 0). conformMaxJump allows one held target (a conform never moves past an unpainted target, so a held one is no skip there), so a run whose
+    # final target was never painted reads max_jump=1; a leg that claims every measured source frame was painted judges this count directly (eq 0). Absent
+    # with a typed CouldNotCheck, so a criterion naming it FAILS, when the measured session's line is absent or another session's, its ends are absent,
+    # unreadable or negative, or it carries no readable non-negative backward or a backward step (a seek back: engine_target is the high-water target).
+    # r2 (key3 opus r1 H1, fable r1 H1): the count is the targets UNPAINTED AT THE MEASURED CLOSE (when the measured session's conform line was written).
+    # The line cannot tell a target still in flight at that close (painted milliseconds later) from one never painted, so this metric never claims
+    # "never painted"; the post-window paint question is EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1. The FAIL rule (eq 0) is unchanged.
+    # r2 (fable r1 H4, sol r1 B2 sibling): ends that contradict each other (last_frame past engine_target: a frame painted beyond the engine's own
+    # high-water target) are unreadable, CouldNotCheck, never clamped to a clean 0.
+    $tailName = 'conformTailUnpaintedFrames'
+    if ($m.Contains("${tailName}CouldNotCheck")) { $m.Remove("${tailName}CouldNotCheck") }
+    $m[$tailName] = $null
+    $tailWhy = $(if ($null -eq $Playback) { 'no playback block was derived from the run log' }
+                 elseif (-not $present) { 'no playback_smoke.conform line for the measured session in the run log' }
+                 elseif (-not $sameSession) { "the playback_smoke.conform line is for session $conformSession, not the measured session $summarySession" }
+                 elseif ($null -eq $ends['last_frame'] -or $null -eq $ends['engine_target']) { 'the measured session''s playback_smoke.conform line carries no readable non-negative last_frame / engine_target, so the unpainted tail cannot be counted' }
+                 elseif ($backwardMissing) { 'the measured session''s playback_smoke.conform line carries no readable non-negative backward, so a seek back cannot be ruled out and the tail cannot be counted' }
+                 elseif ($backward -gt 0) { "the painted frames stepped backward $backward time(s) (a seek back): engine_target is the engine's high-water target, not its final one, so the unpainted tail cannot be counted" }
+                 elseif ([int64]$ends['last_frame'] -gt [int64]$ends['engine_target']) { "the measured session's playback_smoke.conform line carries last_frame=$($ends['last_frame']) past engine_target=$($ends['engine_target']) (a painted frame beyond the engine's own high-water target), so its ends contradict each other and the unpainted tail cannot be counted" }
+                 else { $null })
+    if ($null -eq $tailWhy) { $m[$tailName] = [int64]$ends['engine_target'] - [int64]$ends['last_frame'] }
+    else { $m["${tailName}CouldNotCheck"] = $tailWhy + $conflictNote }
     [pscustomobject]$m
 }
 
@@ -7624,10 +7783,45 @@ function Write-DvReceipt {
     $path
 }
 
+function Get-DvAcceptanceVerdict {
+    <#
+    .SYNOPSIS
+    EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 B1): the ACCEPTANCE verdict a readout reports for one receipt: PASS, FAIL or NOT_MEASURED.
+    A receipt's raw outcome (PASS / FAIL) is what the committed criteria derived from its evidence; it is an acceptance signal ONLY when the evidence-bearing
+    validator (Test-DvReceiptValid) says VERIFIED. Every other verification is NOT_MEASURED, never a FAIL or a PASS: ADVISORY (VENUE_ANCHOR_ABSENT, standing
+    for every production receipt since the 2026-10-02 narrowing exit), VERIFIED_OFFLINE_TEST (a stub run), INVALID, INCOMPLETE, or none (an outcome that is
+    no PASS/FAIL). A raw PASS with an ADVISORY verification is NOT_MEASURED too. The raw outcome and its criteria failures stay in the result as
+    diagnostics (rawOutcome, outcomeDetail), to be quoted as diagnostics. Before r2 the PR #910 readout reported two advisory Bachelor receipts
+    (a877bb17 cuda, 231ea06e cpu) as acceptance FAILs.
+    -VerificationStatus: the validator's status for this receipt. A reader that has not just validated it re-runs Test-DvReceiptValid; Invoke-VenueLeg
+    passes the status Write-DvReceipt stamped from the validation it ran a moment before.
+    #>
+    param($Receipt, $VerificationStatus = '')
+    $rawValue = Get-DvProp $Receipt 'outcome'
+    $raw = [string]$rawValue
+    # r2 adversary A3 on 7272acb4: ORDINAL comparisons. PowerShell's -ceq / -cin compare under the current culture, which ignores a zero-width
+    # character, so `VERIFIED<U+200B>` or `PASS<U+200B>` was taken for the canonical value. r2 adversary A6 on 7c84e75a: both must BE strings; an
+    # array (@('PASS'), @('VERIFIED')) is no canonical value, never coerced into one.
+    $isSignal = ($rawValue -is [string]) -and ([string]::Equals($raw, 'PASS', [StringComparison]::Ordinal) -or [string]::Equals($raw, 'FAIL', [StringComparison]::Ordinal))
+    $measured = $isSignal -and ($VerificationStatus -is [string]) -and [string]::Equals([string]$VerificationStatus, 'VERIFIED', [StringComparison]::Ordinal)
+    $VerificationStatus = $(if ($VerificationStatus -is [string]) { $VerificationStatus } elseif ($null -eq $VerificationStatus) { '' } else { "$(@($VerificationStatus) -join ',') (not a string)" })
+    $reason = $(if ($measured) { $null }
+                elseif (-not $isSignal) { "the receipt outcome '$raw' is no PASS/FAIL measurement" }
+                elseif ([string]::IsNullOrEmpty($VerificationStatus)) { "the raw $raw carries no verification: it is a diagnostic, never an acceptance $raw" }
+                else { "the raw $raw is verified $VerificationStatus, not VERIFIED: it is a diagnostic, never an acceptance $raw" })
+    [pscustomobject]@{
+        verdict = $(if ($measured) { $raw } else { 'NOT_MEASURED' })
+        rawOutcome = $raw
+        verificationStatus = $(if ([string]::IsNullOrEmpty($VerificationStatus)) { $null } else { $VerificationStatus })
+        reason = $reason
+        outcomeDetail = [string](Get-DvProp $Receipt 'outcomeDetail')
+    }
+}
+
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
-    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
+    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict, Get-DvStoredPlaybackFieldProblems

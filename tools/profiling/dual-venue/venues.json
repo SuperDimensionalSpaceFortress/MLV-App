@@ -33,7 +33,8 @@
     "CPU-DUALISO-REDUCED-ISO-NOTCH-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
     "CUDA-HEADROOM-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
     "CUDA-HEADROOM-UTIL-SAMPLER-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
-    "M16-1457-VENUE-BASELINE-DRIFT-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" }
+    "M16-1457-VENUE-BASELINE-DRIFT-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
+    "EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" }
   },
   "defaultRole": "supplementary",
   "ownerFootage": {
