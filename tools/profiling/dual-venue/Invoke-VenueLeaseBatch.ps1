@@ -310,11 +310,12 @@ $script:SpecShapeSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal
 # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (key r10 B1): the key those two maps are read and written under, resolved ONCE per spelled path (Get-SpecDigestKey), and the offline delay seam's state
 $script:SpecDigestKeyMemo = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 $script:SpecDigestKeyCalls = 0
+$script:SpecDigestKeyFallback = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 $script:SpecDigestKeyDelayMs = @{}
 if ($SpecDigestKeyDelay) {
     if ($umRunIsReal) { Stop-Usage '-SpecDigestKeyDelay is an offline test seam: with the real um-run.ps1 the spec digest key is looked up as it is' }
     foreach ($pair in ($SpecDigestKeyDelay -split ',')) {
-        if ($pair.Trim() -cnotmatch '^(\d{1,4}):(\d{1,6})\z') { Stop-Usage "-SpecDigestKeyDelay '$SpecDigestKeyDelay' is not <n>:<ms>[,<n>:<ms>...]" }
+        if ($pair.Trim() -cnotmatch '^([0-9]{1,4}):([0-9]{1,6})\z') { Stop-Usage "-SpecDigestKeyDelay '$SpecDigestKeyDelay' is not <n>:<ms>[,<n>:<ms>...]" }
         $script:SpecDigestKeyDelayMs[[int]$Matches[1]] = [int]$Matches[2]
     }
 }
@@ -1464,11 +1465,25 @@ function Get-SpecDigestKey([string]$Path) {
     if (-not ('VenueLeaseBatchFinalPath' -as [type])) { return $digestFull }
     $script:SpecDigestKeyCalls++
     $keyDelayMs = $(if ($script:SpecDigestKeyDelayMs.ContainsKey([int]$script:SpecDigestKeyCalls)) { [int]$script:SpecDigestKeyDelayMs[[int]$script:SpecDigestKeyCalls] } else { 0 })   # offline seam (-SpecDigestKeyDelay); 0 in production
+    # R10 pass 1 A2 (on 5a73d8e8): the wait is bounded by what is left before -DeadlineUtc too (the read bound's own room, less its 2 s reserve), under the 1 s: a lookup that started with 250 ms left held
+    # the typed refusal 750 ms past the deadline. No room is a wait of 0 (no answer at once), and the read right after it is then the typed SPEC_READ_TIMEOUT before the deadline.
+    $waitMs = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(1.0, [double](Get-SpecReadBoundSec))) * 1000.0)
     $ph = $null; $ik = $null
-    $located = try { [VenueLeaseBatchFinalPath]::LocateWithin($digestFull, $keyDelayMs, 1000, [ref]$ph, [ref]$ik) } catch { $false }
+    $located = try { [VenueLeaseBatchFinalPath]::LocateWithin($digestFull, $keyDelayMs, $waitMs, [ref]$ph, [ref]$ik) } catch { $false }
     $key = $(if ($located -and $ph) { [string]$ph } else { $digestFull })
+    # R10 pass 1 A1 (on 5a73d8e8): a spelling that fell back keeps its fallback for the run, but is recorded: it was not folded with its twin spellings (a twin that resolved has the final path as its key), so
+    # Get-UnresolvedSpecKeyRefusal ends the run before any claim instead of leaving the swap of one twin's bytes to the content guard after the claim
+    if (-not ($located -and $ph)) { $script:SpecDigestKeyFallback[$digestFull] = $true }
     $script:SpecDigestKeyMemo[$digestFull] = $key
     $key
+}
+
+function Get-UnresolvedSpecKeyRefusal([string]$Spec) {
+    # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (adversary pass 1 A1): $null unless this spec's key is the spelled-path fallback (the file system gave no final path in time, or none), in which case a
+    # readable spec cannot be told from a twin spelling of another entry, and the run is refused before any claim: a rerun, not a claim taken and given back by the content guard
+    $full = try { [IO.Path]::GetFullPath($Spec) } catch { return $null }
+    if (-not $script:SpecDigestKeyFallback.ContainsKey($full)) { return $null }
+    "SPEC_KEY_UNRESOLVED '$Spec' cannot be run: the file system gave no final path for this leg spec in time, so it cannot be told apart from another spelling of the same file; no claim or lease is taken on it (run it again)"
 }
 
 function Get-UnjudgedSpecRefusal([string]$Spec, [string]$JudgedSha, [string]$BoundSha) {
@@ -1788,6 +1803,9 @@ foreach ($leg in $plan) {
     $boundSha = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey ([string]$leg.spec))]
     # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (key r10 B1): an entry with no judged digest, or a path bound to none, is refused FIRST, in every form (-LegSpec, -LegPlan, -LegSet): '' -cne '' is false, so
     # the check below let one through, the content guard skipped its re-read and the leg launched with no -ExpectSpecSha256
+    # (adversary pass 1 A1: a key that fell back to the spelled path is refused first, before any claim, so one spelling's swap is never left to the content guard after the claim)
+    $unresolved = Get-UnresolvedSpecKeyRefusal ([string]$leg.spec)
+    if ($unresolved) { if ($legPlanMode) { Stop-PlanRefused 'SPEC_KEY_UNRESOLVED' $leg.planItem ($unresolved -replace '^SPEC_KEY_UNRESOLVED ', '') } else { Stop-Usage $unresolved } }
     $unjudged = Get-UnjudgedSpecRefusal ([string]$leg.spec) ([string]$leg.specSha256) $boundSha
     if ($unjudged) { if ($legPlanMode) { Stop-PlanRefused 'SPEC_NOT_JUDGED' $leg.planItem ($unjudged -replace '^SPEC_NOT_JUDGED ', '') } else { Stop-Usage $unjudged }; }
     if ([string]$leg.specSha256 -cne $boundSha) {

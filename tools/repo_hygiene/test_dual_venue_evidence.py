@@ -6936,15 +6936,25 @@ exit 0
                          "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline, "-SpecDigestKeyDelay", "1:1500,4:1500"],
                         env_extra={"DVT_UPPER_SPEC": "1"}, timeout=420)
         self.assertNotIn("SPEC_CHANGED_AFTER_PREFLIGHT", proc.stderr, "old: a false refusal naming an empty sha256 on a spec nobody changed\n" + proc.stdout + proc.stderr)
-        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        rows = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
-        self.assertGreaterEqual(len(rows), 2, proc.stdout + proc.stderr)
+        # (adversary pass 1 A1: a key that fell back to the spelled path is the typed SPEC_KEY_UNRESOLVED before any claim, never a changed spec and never a run on an unbound key)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE SPEC_KEY_UNRESOLVED ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")], [], "nothing is planned past the refusal")
+        self.assertNotRegex(proc.stderr, r"sha256 +after", "no empty sha256 is ever named")
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+        # control: the same spelled specs with every lookup answering run, each entry bound to its own judged bytes
+        ok = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run-control"),
+                       "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                       "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra={"DVT_UPPER_SPEC": "1"}, timeout=420)
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        rows = [l for l in ok.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
+        self.assertGreaterEqual(len(rows), 2, ok.stdout + ok.stderr)
         for row in rows:
             m = re.fullmatch(r"DVT_PLANNED spec=(\S+) bound=([0-9a-f]{64}) own=([0-9a-f]{64})", row)
             self.assertIsNotNone(m, row)
             self.assertEqual(m.group(2), m.group(3), f"the entry is bound to its own judged bytes: {row}")
             self.assertEqual(m.group(1), m.group(1).upper().replace(".JSON", ".json"), "the spec stayed spelled off its on-disk name, so the test is the key split's input")
-        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "nothing is claimed by this stop")
 
     def test_planned_hash_bind_r2_a2_chain_a_zero_byte_legspec_is_planned_with_the_empty_bytes_hash(self) -> None:
         """A2: `$x = try { <empty byte array> }` enumerated to $null and the hash threw outside the usage catch; an empty file is bytes like any other."""

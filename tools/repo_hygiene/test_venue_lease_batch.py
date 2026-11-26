@@ -5969,10 +5969,61 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 rows = shas.read_text(encoding="utf-8").splitlines() if shas.exists() else []
                 # old: the key split, the entry's digest read '' and the leg ran with 'expect=' (no -ExpectSpecSha256)
                 self.assertEqual([x for x in rows if not x.startswith(f"expect={want} ")], [], "a leg ran with no bound hash (or another one). " + out)
+                self.assertEqual(rows, [], "a leg ran on a spec whose key lookup got no answer. " + out)
+                self.assertEqual(r.returncode, 2, "refused before any claim (SPEC_KEY_UNRESOLVED: a readable spec with no final path cannot be told from a twin spelling). " + out)
+                self.assertIn("SPEC_KEY_UNRESOLVED", r.stderr, out)
                 self.assertNotIn("SPEC_CHANGED_AFTER_PREFLIGHT", r.stderr, out)
+                self.assertEqual([k for k in self.kinds() if k.startswith(("OPEN", "LEG"))], [], out)
+                self.assertFalse(self.claim_path.exists(), f"{mode}: no claim was written. " + out)
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: no lease was opened. " + out)
+        # control: no lookup is late, so the same spelling runs, bound to the bytes it was judged as
+        for mode in ("-LegSpec", "-LegPlan"):
+            with self.subTest(mode=f"control {mode}"):
+                shas.unlink(missing_ok=True)
+                r = self._r10_run(mode, spelled, FAKE_LEG_SPEC_SHA=str(shas))
+                out = f"control {mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
                 self.assertEqual(r.returncode, 0, out)
-                self.assertTrue(rows, "the run did not reach its leg, so the test proves nothing. " + out)
-                self.assertEqual(rows[0], f"expect={want} read={want}", out)
+                self.assertEqual(shas.read_text(encoding="utf-8").splitlines()[:1], [f"expect={want} read={want}"], out)
+
+    def test_r10_a1_a_key_lookup_that_gets_no_answer_never_leaves_a_twin_spellings_swap_to_the_guard_after_the_claim(self) -> None:
+        # adversary pass 1 on 5a73d8e8, A1: entry 1 (S.JSON) fell back to its spelled path and entry 2 (s.json, the same file) resolved to the final one: two keys, so the file's bytes swapped between the two
+        # entries passed the per-entry checks, a claim was taken and only the content guard then refused it. A key that fell back is refused before any claim (SPEC_KEY_UNRESOLVED).
+        spec = self.case / "r10-a1-twin.json"
+        spec.write_text(self.specs[0].read_text(encoding="utf-8"), encoding="utf-8")
+        other = self.case / "r10-a1-other-bytes.json"
+        other.write_text(self.specs[1].read_text(encoding="utf-8"), encoding="utf-8")
+        swap = ("        if ($env:DVT_SWAP_FROM -and [IO.Path]::GetFileName($path) -ceq 'r10-a1-twin.json') { [IO.File]::Copy($env:DVT_SWAP_FROM, $path, $true) }   # TEST FIXTURE: the twin's bytes change before entry 2\n"
+                "        $shapeRefusal = Get-ScalarLegShapeRefusal $path\n")
+        self._mirror_with_bad_sidecar(runner_patches=(("        $shapeRefusal = Get-ScalarLegShapeRefusal $path\n", swap),))
+        shas = self.case / "leg-spec-sha-r10-a1.log"
+        r = self.run_batch([spec.with_name("R10-A1-TWIN.JSON"), spec], "-SpecDigestKeyDelay", "1:1500", FAKE_LEG_SPEC_SHA=str(shas), DVT_SWAP_FROM=str(other))
+        out = r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertEqual(spec.read_bytes(), other.read_bytes(), "the fixture really swapped the twin's bytes between the two entries. " + out)
+        self.assertFalse(shas.exists(), "a leg ran. " + out)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("SPEC_KEY_UNRESOLVED", r.stderr, "old: the claim was taken and the content guard refused it after (SPEC_CHANGED_AFTER_PREFLIGHT). " + out)
+        self.assertNotIn("SPEC_CHANGED_AFTER_PREFLIGHT", r.stderr, out)
+        self.assertEqual(self.kinds(), [], "no claim, lease or leg. " + out)
+        self.assertFalse(self.claim_path.exists(), out)
+        self.assertFalse((self.claims / "bachelor.tickets").exists() and any((self.claims / "bachelor.tickets").iterdir()), "no ticket was taken: the claim was never attempted. " + out)
+
+    def test_r10_a2_a_key_lookup_is_bounded_by_what_is_left_before_the_deadline(self) -> None:
+        # adversary pass 1 on 5a73d8e8, A2: the lookup waited a fixed 1 s, so a spec preflight that started it with 250 ms left refused about 750 ms past -DeadlineUtc. The mirror sets the deadline 250 ms
+        # away right before the -LegSpec shape check and stamps the refusal's own time; the lookup (made to answer 3 s late) must wait only what the read bound allows (nothing here).
+        spec, spelled = self._r10_spelled_spec()
+        patches = (("        $shapeRefusal = Get-ScalarLegShapeRefusal $path\n",
+                    "        $deadline = [DateTime]::UtcNow.AddMilliseconds(250); [Console]::Error.WriteLine('DVT_DEADLINE_UTC=' + $deadline.ToString('o'))   # TEST FIXTURE\n"
+                    "        $shapeRefusal = Get-ScalarLegShapeRefusal $path\n"),
+                   ("function Stop-Usage([string]$Message) { [Console]::Error.WriteLine(\"BATCH_USAGE $Message\");",
+                    "function Stop-Usage([string]$Message) { [Console]::Error.WriteLine('DVT_USAGE_UTC=' + [DateTime]::UtcNow.ToString('o')); [Console]::Error.WriteLine(\"BATCH_USAGE $Message\");"))
+        self._mirror_with_bad_sidecar(runner_patches=patches)
+        r = self.run_batch([spelled], "-SpecDigestKeyDelay", "1:3000")
+        out = r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("SPEC_READ_TIMEOUT", r.stderr, out)
+        stamps = {k: datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", re.search(rf"{k}=(\S+)", r.stderr).group(1)).replace("Z", "+00:00")) for k in ("DVT_DEADLINE_UTC", "DVT_USAGE_UTC")}
+        late = (stamps["DVT_USAGE_UTC"] - stamps["DVT_DEADLINE_UTC"]).total_seconds()
+        self.assertLess(late, 0.4, f"old: the fixed 1 s lookup ended the preflight about 0.75 s past -DeadlineUtc ({late:.2f} s). " + out)
 
     def test_r10_an_entry_with_no_judged_digest_is_refused_before_any_claim_in_every_form(self) -> None:
         # the second half of the fix, whatever made the digest empty: the runner's own store of the budget read's digest is removed in a mirror, so the entry has none. Old: the leg ran
@@ -6001,9 +6052,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("-SpecDigestKeyDelay is an offline test seam", r.stderr)
-        r = self.run_batch([spec], "-SpecDigestKeyDelay", "soon")
-        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("is not <n>:<ms>", r.stderr)
+        for bad in ("soon", "١:1"):   # (adversary pass 1 A4: an Arabic-Indic digit is not a digit of this seam; \d matched it and the Int32 cast threw instead of the typed usage)
+            r = self.run_batch([spec], "-SpecDigestKeyDelay", bad)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("is not <n>:<ms>", r.stderr)
 
     def test_r19_b2_a_stalled_budget_spec_read_is_bounded_by_the_deadline_and_refused_before_the_claim(self) -> None:
         # EXPORT-VENUE-LEG-1 r19 (sol r18 B2 = pass20-A2): the budget preflight's own read of the spec was a synchronous ReadAllBytes BEFORE the remaining-room check, so a share that
