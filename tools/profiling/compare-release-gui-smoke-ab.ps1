@@ -1368,9 +1368,14 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
     $tempOutput = $null
     $wroteOutput = $false
     $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json + [Environment]::NewLine)
+    # adversary-6596e055.json A2: New-Item -Force makes EVERY missing level of the folder, so the topmost missing one is what this call created (the cleanup removes the chain up to it)
+    $firstMissingDir = $null
+    if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
+        for ($probe = $outputDir; -not [string]::IsNullOrEmpty($probe) -and -not (Test-Path -LiteralPath $probe -PathType Container); $probe = Split-Path -Parent $probe) { $firstMissingDir = $probe }
+    }
     try {
         if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
-            $createdDir = -not (Test-Path -LiteralPath $outputDir -PathType Container)
+            $createdDir = $null -ne $firstMissingDir
             New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
         }
         # a report that already exists is judged by its handle identity (read-only, nothing truncated); an input that IS it is refused before anything is written
@@ -1410,8 +1415,11 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
     finally {
         if ($null -ne $tempOutput) { try { Remove-Item -LiteralPath $tempOutput -Force -ErrorAction Stop } catch { } }
         if (-not $wroteOutput -and $createdDir) {
-            # the folder this call made is removed only while it is empty (a file another process put there is never ours to delete)
-            try { if (@(Get-ChildItem -LiteralPath $outputDir -Force -ErrorAction Stop).Count -eq 0) { Remove-Item -LiteralPath $outputDir -Force -ErrorAction Stop } } catch { }
+            # the folders this call made (the deepest up to the topmost missing one) are removed only while each is empty (a file another process put there is never ours to delete)
+            for ($cleanDir = $outputDir; -not [string]::IsNullOrEmpty($cleanDir); $cleanDir = Split-Path -Parent $cleanDir) {
+                try { if (@(Get-ChildItem -LiteralPath $cleanDir -Force -ErrorAction Stop).Count -eq 0) { Remove-Item -LiteralPath $cleanDir -Force -ErrorAction Stop } else { break } } catch { break }
+                if ([string]::Equals($cleanDir, $firstMissingDir, [StringComparison]::OrdinalIgnoreCase)) { break }
+            }
         }
     }
 }

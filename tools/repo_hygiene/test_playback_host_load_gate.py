@@ -3788,7 +3788,7 @@ QUIET_SMOKE = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"colle
 
 def _extract_report_write_block(cmp_source: str) -> str:
     """The comparator's report-write block as it runs (MERGE-RESIDUE-1 r1): from the folder bookkeeping to the end of the cleanup `finally`."""
-    return _extract_block(cmp_source, "    $createdDir = $false\n    $tempOutput = $null", "try { if (@(Get-ChildItem", trailing_lines=2)
+    return _extract_block(cmp_source, "    $createdDir = $false\n    $tempOutput = $null", "if ([string]::Equals($cleanDir, $firstMissingDir", trailing_lines=3)
 
 
 def _report_write_probe(tmp: str, before: Path, after: Path, report: Path, outdir: Path, pre_block: str = "") -> Path:
@@ -4185,20 +4185,22 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
                 p.write_text("{}", encoding="utf-8", newline="")
             evidence = Path(tmp) / "evidence"
             evidence.mkdir()
-            outdir = evidence / "new"
             denied = subprocess.run(["icacls", str(evidence), "/deny", f"{user}:(CI)(IO)(WD)"], capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=60)
             if denied.returncode != 0:
                 self.skipTest("icacls could not set the inherited add-file deny: " + denied.stdout + denied.stderr)
             try:
-                proc = _run_ps_file(_report_write_probe(tmp, before, after, outdir / "report.json", outdir))
-                refused = "RESULT=REFUSED" in proc.stdout
-                left = outdir.exists()
+                # adversary-6596e055.json A2: a report path with TWO absent levels (new\deeper): New-Item -Force makes both, so both are this call's to remove
+                for label, parts in (("one-level", ("new",)), ("two-levels", ("new", "deeper"))):
+                    top = evidence / parts[0]
+                    outdir = evidence.joinpath(*parts)
+                    proc = _run_ps_file(_report_write_probe(tmp, before, after, outdir / "report.json", outdir))
+                    refused, left = "RESULT=REFUSED" in proc.stdout, top.exists()
+                    if top.exists():
+                        shutil.rmtree(top, ignore_errors=True)
+                    self.assertTrue(refused, label + proc.stdout + proc.stderr)
+                    self.assertFalse(left, f"{label}: the empty folder(s) this call created are removed\n" + proc.stdout + proc.stderr)
             finally:
                 subprocess.run(["icacls", str(evidence), "/remove:d", user], capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=60)
-                if outdir.exists():
-                    shutil.rmtree(outdir, ignore_errors=True)
-            self.assertTrue(refused, proc.stdout + proc.stderr)
-            self.assertFalse(left, "the empty folder this call created is removed\n" + proc.stdout + proc.stderr)
 
     def test_r3_a3_a_one_element_candidate_list_is_provisional_not_unrolled_into_its_clean_member(self) -> None:
         # adversary-7efea617.json A3, its input: candidate = [one clean leg]. RED: `$x = if (...) { $Record.candidate }` unrolled the one-element list into its
