@@ -834,7 +834,7 @@ function Probe($text) {
 $cases = [ordered]@{
     'first-venue-has-block' = $head + '"venue":{"name":"bachelor","displayPath":' + $B + '},"venue":{"name":"bachelor"}}'
     'last-venue-has-block' = $head + '"venue":{"name":"bachelor"},"venue":{"name":"bachelor","displayPath":' + $B + '}}'
-    'escaped-second-venue-name' = $head + '"venue":{"name":"bachelor","displayPath":' + $B + '},"venue":{"name":"bachelor"}}'
+    'escaped-second-venue-name' = $head + '"venue":{"name":"bachelor","displayPath":' + $B + '},"v' + [string][char]92 + 'u0065nue":{"name":"bachelor"}}'
     'two-venues-no-block' = $head + '"venue":{"name":"bachelor"},"venue":{"name":"bachelor"}}'
     'two-displaypath-members' = $head + '"venue":{"name":"bachelor","displayPath":' + $B + ',"displayPath":' + $B + '}}'
     'lone-surrogate-elsewhere-no-block' = $head + '"actor":"\ud800","venue":{"name":"bachelor"}}'
@@ -882,6 +882,14 @@ class ResidueR1ReceiptTextTests(unittest.TestCase):
                 with self.subTest(f"{case}|{rep}"):
                     self.assertNotIn("threw", v, v)
                     self.assertEqual(v["marker"], 1, f"{case}|{rep}: the text carries a displayPath member, DISPLAY_PATH_UNBOUND count {v['marker']!r}")
+
+    def test_a1_the_escaped_second_venue_row_really_carries_the_escape(self) -> None:
+        """The row's second member name is a backslash-u escape of an `e`, not a plain `venue` (a tool that decodes escapes would turn it into one)."""
+        text = Path(__file__).read_text(encoding="utf-8")
+        row = [ln for ln in text.splitlines() if ln.lstrip().startswith("'escaped-second-venue-name' =")]
+        self.assertEqual(len(row), 1)
+        self.assertIn("[char]92", row[0])
+        self.assertIn("u0065nue", row[0])
 
     def test_a1_two_venues_with_no_block_owe_no_marker(self) -> None:
         for rep, v in self.each_rep("two-venues-no-block"):

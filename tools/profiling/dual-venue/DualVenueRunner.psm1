@@ -7898,7 +7898,7 @@ function Get-DvReceiptTextDisplayPathFacts {
     Returns [pscustomobject]@{ parsed; venueCount; carries; duplicate }:
       parsed    -- the text is strict JSON with an object root. Not parsed (empty, not strict JSON, an array root): carries and duplicate stay $false, and the
                    caller keeps what the parsed receipt object says (the text cannot say where a member sits).
-      venueCount-- the `venue` members at the root, in any letter case (Test-DvMemberNameIs), `venue` included.
+      venueCount-- the `venue` members at the root, in any letter case (Test-DvMemberNameIs), a name written with a JSON \u escape for one of its letters included (the parser decodes it).
       carries   -- ANY venue occurrence that is an object holds a `displayPath` member (any letter case). This is the whole marker rule for a text reading
                    that is malformed for ANOTHER reason: a lone-surrogate string or member name elsewhere in the receipt (an unreadable name is skipped, it
                    is neither `venue` nor `displayPath`), a bad block, a duplicate. It never looks at what the block holds, so nothing outside `venue` owes it.
