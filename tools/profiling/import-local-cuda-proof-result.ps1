@@ -218,7 +218,7 @@ if ($StrictQuotable -and $proofReportStatus -ne "QUOTABLE_PASS") {
 # (sol c29f8dc1 A3: and the hash that check verified is the hash of the bytes that were parsed: a report replaced between the read and the hash makes the two differ, and no speed claim is bound)
 # (sol 5add23cf A9: the spelling is compared the way the volume compares names, because the report was OPENED by that name: on a case-insensitive volume (Windows) a packet built with -ReportPath ...\Proof-Report.md
 # lists Proof-Report.json and this run opened the very same file as proof-report.json, so a case variant of the genuine report keeps its authority; any other name (another file, a path below it, a suffix) never gains it)
-$nameComparison = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+$nameComparison = Get-VolumeNameComparison -ExistingFile $proofReportJsonPath   # (sol 5add23cf A8: asked of the volume the file was opened on, not guessed from the path separator)
 $speedHashBound = ($failures.Count -eq 0) -and (-not [string]::IsNullOrEmpty([string]$proofReportJudgedSha256)) -and (@($fileChecks | Where-Object { [bool]$_.ok -and [string]::Equals([string]$_.relativePath, "proof-report.json", $nameComparison) -and [string]::Equals([string]$_.actualSha256, [string]$proofReportJudgedSha256, [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1)
 $proofDiagnostics = if ($proofReport) { @($proofReport.diagnostics) } else { @() }
 $proofDiagnosticSummary = if ($proofReport) { $proofReport.diagnosticSummary } else { $null }

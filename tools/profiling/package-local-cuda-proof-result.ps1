@@ -157,30 +157,46 @@ function Get-RealFilePath {
     $full
 }
 
-function Assert-ReportPathsAreNotTheInput {
-    # (adversary 1ce472bc A1: a report path that is the input summary (a -ReportPath named like the summary, whose .json twin is the summary) or the other report would be overwritten by the publication
-    # at the end, so it is refused before anything is written; a directory given as a report path is refused for the same reason)
-    # (adversary 698fffb1 A1: compared by REAL path, so a directory junction or symlink in front of a report path cannot hide that it is the input summary; sol 5add23cf A5: the \\?\ spelling too)
+function Assert-OutputPathsAreSafe {
+    # The four files this run publishes (the two reports, the packet, the manifest) each land at a path that is none of: the input summary (under ANY spelling), another output, a directory.
+    # (adversary 1ce472bc A1: a report path that is the input summary (a -ReportPath named like the summary, whose .json twin is the summary) would be overwritten by the publication at the end, so it is
+    # refused before anything is written; 698fffb1 A1: compared by REAL path, so a junction or symlink in front of a path cannot hide it; sol 5add23cf A5: the \\?\ spelling too.)
+    # R2-RESIDUE-1 r3 (sol 5add23cf A2, A3, A4): the same questions for the packet and the manifest (a packet written over summary.json, a manifest over the JSON report), and a destination that EXISTS
+    # as a file with the input's own bytes is the input under a spelling no path walk can resolve (a SUBST drive, a hard link, an 8.3 name): it is refused as the input. A destination that is an existing
+    # directory is refused: a move onto it would land the file inside it while the manifest recorded the directory.
     param(
         [Parameter(Mandatory = $true)][string]$Summary,
-        [Parameter(Mandatory = $true)][string]$MarkdownReport,
-        [Parameter(Mandatory = $true)][string]$JsonReport
+        [Parameter(Mandatory = $true)][byte[]]$SummaryBytes,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Outputs,
+        [Parameter(Mandatory = $true)][StringComparison]$Comparison
     )
-    $comparison = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
     $summaryFull = Get-RealFilePath $Summary
-    $markdownFull = Get-RealFilePath $MarkdownReport
-    $jsonFull = Get-RealFilePath $JsonReport
-    foreach ($candidate in @($markdownFull, $jsonFull)) {
-        if ([string]::Equals($candidate, $summaryFull, $comparison)) {
-            throw "Proof report path $candidate is the input summary; refusing before anything is written."
+    $summaryHash = $null
+    $names = @($Outputs.Keys)
+    $real = @{}
+    foreach ($name in $names) { $real[$name] = Get-RealFilePath ([string]$Outputs[$name]) }
+    for ($i = 0; $i -lt $names.Count; $i++) {
+        $name = $names[$i]
+        $path = $real[$name]
+        if ([string]::Equals($path, $summaryFull, $Comparison)) {
+            throw "The $name path $path is the input summary; refusing before anything is written."
         }
-    }
-    if ([string]::Equals($markdownFull, $jsonFull, $comparison)) {
-        throw "The Markdown and JSON proof reports share the path $markdownFull; refusing."
-    }
-    foreach ($candidate in @($markdownFull, $jsonFull)) {
-        if (Test-Path -LiteralPath $candidate -PathType Container) {
-            throw "Proof report path $candidate is a directory; refusing."
+        for ($j = $i + 1; $j -lt $names.Count; $j++) {
+            if ([string]::Equals($path, $real[$names[$j]], $Comparison)) {
+                throw "The $name and the $($names[$j]) share the path $path; refusing."
+            }
+        }
+        if (Test-Path -LiteralPath $path -PathType Container) {
+            throw "The $name path $path is a directory; refusing."
+        }
+        if (Test-Path -LiteralPath $path -PathType Leaf) {
+            $existing = Get-Item -LiteralPath $path -Force
+            if ($existing.Length -eq $SummaryBytes.Length) {
+                if ($null -eq $summaryHash) { $summaryHash = Get-BytesSha256 -Bytes $SummaryBytes }
+                if ([string]::Equals((Get-FileSha256 -Path $path), $summaryHash, [StringComparison]::OrdinalIgnoreCase)) {
+                    throw "The $name path $path holds the input summary's own bytes (the input under another spelling); refusing before anything is written."
+                }
+            }
         }
     }
 }
@@ -329,7 +345,6 @@ else {
     $ReportPath = Resolve-RepoPath -Root $root -Path $ReportPath
 }
 $jsonReportPath = [System.IO.Path]::ChangeExtension($ReportPath, ".json")
-Assert-ReportPathsAreNotTheInput -Summary $summaryFullPath -MarkdownReport $ReportPath -JsonReport $jsonReportPath
 
 # 1. THE ONE READ of summary.json (sol 5add23cf A8): its hash, its parse, the copy the children read and the archived file are these bytes.
 $summaryLastWrite = (Get-Item -LiteralPath $summaryFullPath).LastWriteTime
@@ -353,7 +368,10 @@ else {
 }
 $packetFullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PacketPath)
 $manifestPath = Join-Path $runRootResolved "local-cuda-proof-packet-manifest.json"
-$comparison = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+# (sol 5add23cf A8: how the volume compares names is asked of the volume, on the input summary's own directory)
+$comparison = Get-VolumeNameComparison -ExistingFile $summaryFullPath
+# every output path is checked once, before anything is written (sol 5add23cf A2, A3, A4, A5)
+Assert-OutputPathsAreSafe -Summary $summaryFullPath -SummaryBytes $summaryBytes -Comparison $comparison -Outputs ([ordered]@{ "Markdown report" = $ReportPath; "JSON report" = $jsonReportPath; "packet" = $packetFullPath; "manifest" = $manifestPath })
 
 $sourceHead = Get-GitScalar -Repo $root -Args @("rev-parse", "HEAD")
 $sourceBranch = Get-GitScalar -Repo $root -Args @("rev-parse", "--abbrev-ref", "HEAD")
@@ -527,10 +545,11 @@ try {
         $destinationParent = Split-Path -Parent $destination
         if ($destinationParent) { New-Item -ItemType Directory -Force -Path $destinationParent | Out-Null }
     }
-    Move-Item -LiteralPath (Join-Path $privateDir "proof-report.md") -Destination $ReportPath -Force
-    Move-Item -LiteralPath (Join-Path $privateDir "proof-report.json") -Destination $jsonReportPath -Force
-    if (-not $DryRun) { Move-Item -LiteralPath $privatePacket -Destination $packetFullPath -Force }
-    Move-Item -LiteralPath $privateManifest -Destination $manifestPath -Force
+    # (sol 5add23cf A4: [IO.File]::Move replaces a FILE at the destination and throws for a directory, where Move-Item puts the file inside the directory and the manifest would name the directory)
+    [IO.File]::Move((Join-Path $privateDir "proof-report.md"), $ReportPath, $true)
+    [IO.File]::Move((Join-Path $privateDir "proof-report.json"), $jsonReportPath, $true)
+    if (-not $DryRun) { [IO.File]::Move($privatePacket, $packetFullPath, $true) }
+    [IO.File]::Move($privateManifest, $manifestPath, $true)
 }
 finally {
     # the only deletes of the run: the files in this run's own private directory, then the (by then empty) directory itself; never recursive

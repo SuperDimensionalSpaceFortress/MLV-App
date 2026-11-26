@@ -1020,6 +1020,13 @@ function New-PlaybackAbSummaryRow {
     # BENCH-LIGHT-ARM-GAIN-GATES-1: and the delta is refused the same way when either leg ran the HEAVY telemetry arm (a mixed pair too) or its arm is unrecorded: a HEAVY leg's
     # presented fps measures the per-frame logger (about 20-27 % on M16-1457 CUDA fullscreen s1), so only a LIGHT / LIGHT pair may publish an fps gain or cost.
     $fpsArmRefusal = Get-PlaybackAbFpsArmRefusal -Record $Record
+    # R2-RESIDUE-1 r3 (sol 5add23cf A5): a compare that is not measured on the judged pair is not where the per-leg numbers come from either (20 and 60 published beside two legs that both measured 40): the
+    # legs' own figures are read from the legs, and a leg that records none leaves the number empty
+    if ($fpsArmRefusal.refused -and ([string]$fpsArmRefusal.reason -ceq 'fps-verdict-refused:compare-not-judged-pair')) {
+        $judgedCandidateLeg = if ($Record.speedCompare) { $Record.candidateSpeed } else { $Record.candidate }
+        $baselinePresented = Convert-ToNullableDouble $Record.baseline.presentedFps
+        $candidatePresented = Convert-ToNullableDouble $judgedCandidateLeg.presentedFps
+    }
     $fpsDeltaRefused = ([bool]$hostLoadRefusal.provisional -or [bool]$fpsArmRefusal.refused)
     $fpsDeltaRefusedReasons = @()
     if ($hostLoadRefusal.provisional) {

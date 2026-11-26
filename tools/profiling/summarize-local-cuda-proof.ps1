@@ -819,6 +819,14 @@ if ($playbackAb -and $playbackAbSpeedCompare) {
         $(if ($playbackAbFpsArmRefusal.refused) { "avg present interval: withheld ($($playbackAbFpsArmRefusal.reason)); the gap between presents is the fps in another unit" } else { (Format-MetricDeltaLine -Label "avg present interval" -Metric $playbackAbSpeedCompare.avgPresentIntervalMs -Unit " ms" -LowerIsBetter) }),
         (Format-MetricDeltaLine -Label "render total" -Metric $playbackAbSpeedCompare.avgRenderTotalMs -Unit " ms" -LowerIsBetter)
     )
+    # R2-RESIDUE-1 r3 (sol 5add23cf A5, A10): a compare that is not bound to the judged pair publishes NO figure of its own: the stage lines above read the same unbound compare (a render total of 50 -> 25 ms
+    # beside two legs that both measured 10 ms), so all of them are replaced by the typed refusal. A pair refused for its ARM keeps its stage lines (the legs' own stage metrics are valid; only the fps is not).
+    if ($playbackAbFpsArmRefusal.refused -and ([string]$playbackAbFpsArmRefusal.reason -ceq 'fps-verdict-refused:compare-not-judged-pair')) {
+        $playbackSpeedEvidence = @(
+            "comparison_basis=$playbackAbComparisonBasis",
+            "speed compare: withheld ($($playbackAbFpsArmRefusal.reason); $($playbackAbFpsArmRefusal.detail)); a compare that was not measured on the judged pair publishes no presented, GUI, interval or render figure"
+        )
+    }
     # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A9): the packet's cached suggestion is fps-delta-derived, so it is not repeated for a pair the arm gate refused.
     # r15 (adversary r14 pass 18 A7, sol r13 B3): and only when the cached analysis is the judged pair's own (its basis and presented-fps deltaPercent match the published compare)
     if ($playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization -and -not $playbackAbFpsArmRefusal.refused -and

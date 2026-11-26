@@ -2495,7 +2495,10 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         # sol 5add23cf A9: the spelling of the report's name is compared the way the volume compares names (the importer opened the file by that name), so the line is run with its own comparison
         comparison = re.search(r"(?m)^\$nameComparison = .*$", text)
         self.assertIsNotNone(comparison)
-        line = comparison.group(0) + "\n" + line
+        # (sol 5add23cf A8: the comparison is asked of the volume the opened report sits on, so the line runs beside a real proof-report.json in this test's own temp directory)
+        probe_file = self.tmp / "proof-report.json"
+        probe_file.write_text("{}", encoding="utf-8")
+        line = f"$proofReportJsonPath = '{probe_file}'\n" + comparison.group(0) + "\n" + line
         case_insensitive_volume = os.name == "nt"
         # sol c29f8dc1 A3 (importer sibling): the hash the manifest check verified (actualSha256) must be the hash of the bytes that were parsed ($proofReportJudgedSha256); a report replaced between the
         # read and the hash verifies a different file than the one judged. HASH_OF_OTHER_BYTES / NOTHING_JUDGED fail on c29f8dc1, which bound the check to the path alone.
@@ -2940,7 +2943,8 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         self.assertEqual(len(removals), 1, removals)
         self.assertIn("-LiteralPath $leftover.FullName", removals[0])
         self.assertNotIn("Compress-Archive", source)
-        self.assertEqual(len(re.findall(r"Move-Item -LiteralPath", source)), 4)
+        self.assertEqual(len(re.findall(r"\[IO\.File\]::Move\(", source)), 4)
+        self.assertNotIn("Move-Item", source.replace("# (sol 5add23cf A4: [IO.File]::Move replaces a FILE at the destination and throws for a directory, where Move-Item puts the file inside the directory and the manifest would name the directory)", ""))
         self.assertEqual(source.count("[IO.File]::ReadAllBytes($summaryFullPath)"), 1)
         self.assertEqual(source.count("New-Item -ItemType Directory -Path $privateDir -ErrorAction Stop"), 1)
 
@@ -3002,6 +3006,100 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         self.assertIn("Proof-Report.json", [e["relativePath"] for e in json.loads(proc.stdout)["files"]])
         imported = self._import(repo, packet)
         self.assertEqual((imported["status"], imported["proofReport"]["speedHashBound"], imported["proofReport"]["speedQuotable"]), ("imported", True, True))
+
+    # ---- R2-RESIDUE-1 r3, second pass (sol 07d50621 A2-A8) ----
+
+    def test_r3_sol_07d50621_a2_a4_every_output_path_is_checked_against_the_input_and_each_other_and_a_directory(self) -> None:
+        # sol 07d50621 A2 (inputs): -PacketPath = summary.json; -PacketPath = proof-report.json; -ReportPath ...\local-cuda-proof-packet-manifest.md (its JSON twin is the manifest). A4 (inputs): the packet path
+        # or the manifest path is an existing directory (Move-Item put the file inside it and the manifest named the directory). Every one is refused before anything is written, the input stays.
+        repo, run, original = self._pkg_fixture()
+        keep_packet = self.tmp / "out" / "return.zip"
+        keep_packet.mkdir(parents=True)
+        manifest_dir = run / "local-cuda-proof-packet-manifest.json"
+        cases = {
+            "packet-is-the-input": ("-PacketPath", str(run / "summary.json")),
+            "packet-is-the-json-report": ("-PacketPath", str(run / "proof-report.json")),
+            "report-twin-is-the-manifest": ("-ReportPath", str(run / "local-cuda-proof-packet-manifest.md")),
+            "packet-is-a-directory": ("-PacketPath", str(keep_packet)),
+        }
+        for label, args in cases.items():
+            proc = self._package(repo, "-RunRoot", str(run), *args)
+            self.assertNotEqual(proc.returncode, 0, label + proc.stdout)
+            self.assertEqual((run / "summary.json").read_bytes(), original, label)
+            self.assertFalse((run / "proof-report.json").exists(), label)
+            self.assertEqual(list(keep_packet.iterdir()), [], label)
+        manifest_dir.mkdir()
+        proc = self._package(repo, "-RunRoot", str(run), "-PacketPath", str(self.tmp / "out" / "p.zip"))
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual(list(manifest_dir.iterdir()), [])
+        self.assertEqual(self._private_dirs(), [])
+
+    def test_r3_sol_07d50621_a3_an_output_that_is_the_input_under_a_spelling_no_path_walk_resolves_is_refused(self) -> None:
+        # sol 07d50621 A3 (a SUBST drive exposing the run root: -ReportPath S:\summary.md): the path walk cannot resolve it, but the destination EXISTS and holds the input's own bytes, so it is the input. A hard
+        # link is the same shape and needs no drive letter.
+        repo, run, original = self._pkg_fixture()
+        link = run / "summary-link.json"
+        self.ok(f"$null = New-Item -ItemType HardLink -Path '{link}' -Target '{run / 'summary.json'}'\n")
+        proc = self._package(repo, "-RunRoot", str(run), "-ReportPath", str(run / "summary-link.md"), "-DryRun")
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual((run / "summary.json").read_bytes(), original)
+        self.assertEqual(link.read_bytes(), original)
+        self.assertFalse((run / "summary-link.md").exists())
+
+    def test_r3_sol_07d50621_a8_the_volume_is_asked_how_it_compares_names(self) -> None:
+        # sol 07d50621 A8: the comparison followed the path SEPARATOR; the volume is asked instead (an existing file is looked up again with its case flipped)
+        probe = self.tmp / "Mixed-Case.json"
+        probe.write_text("{}", encoding="utf-8")
+        got = self.ok(f"Write-Host ('NAME=' + (Get-VolumeNameComparison -ExistingFile '{probe}'))\n"
+                      f"Write-Host ('MISSING=' + (Get-VolumeNameComparison -ExistingFile '{self.tmp / 'Nope.json'}'))\n"
+                      f"Write-Host ('NOLETTERS=' + (Get-VolumeNameComparison -ExistingFile '{self.tmp / '0123.json'}'))\n")
+        platform_default = "OrdinalIgnoreCase" if os.name == "nt" else "Ordinal"
+        asked = "OrdinalIgnoreCase" if (self.tmp / "MIXED-CASE.JSON").exists() else "Ordinal"
+        out = dict(line.split("=", 1) for line in got.split())
+        self.assertEqual(out, {"NAME": asked, "MISSING": platform_default, "NOLETTERS": platform_default})
+
+    def test_r3_sol_07d50621_a6_a7_a_published_figure_is_exactly_the_producers_and_finite(self) -> None:
+        # sol 07d50621 A6 (inputs): legs 1 and 1e308 with a published percent of 10 (the recomputed percent overflows, the tolerance became Infinity and accepted anything); the generic branch with endpoints
+        # -1e308 / 1e308 and delta 5. A7 (inputs): legs 100 and 99 with deltaPercent -1.0000000005 (the producer rounds to -1.000, and the reader chose its branch on the submitted value); avgQueueWaitMs 4 -> 5
+        # with deltaPercent 24.99999999 (the producer's 25).
+        body = (
+            "function T($b, $c, $m, $extra) { $leg = { param($f) [pscustomobject]@{ presentedFps = $f; avgRenderTotalMs = $f; avgQueueWaitMs = $f } }; "
+            "$cmp = [pscustomobject]@{ presentedFps = [pscustomobject]$m }; if ($extra) { $cmp | Add-Member -NotePropertyName $extra.name -NotePropertyValue ([pscustomobject]$extra.value) }; "
+            "$p = Get-FpsCompareBindingProblem -Compare $cmp -Baseline (& $leg $b) -Candidate (& $leg $c); if ($null -eq $p) { 'OK' } else { 'REFUSED' } }\n"
+            "Write-Host ('overflow-presented=' + (T 1 1e308 @{ baseline = 1; candidate = 1e308; deltaPercent = 10 } $null))\n"
+            "Write-Host ('overflow-generic=' + (T 1 1e308 @{ baseline = 1; candidate = 1; delta = 0; deltaPercent = 0 } @{ name = 'avgRenderTotalMs'; value = @{ baseline = 1; candidate = 1e308; deltaPercent = 10 } }))\n"
+            "Write-Host ('overflow-delta=' + (T -1e308 1e308 @{ baseline = 1; candidate = 1; delta = 0; deltaPercent = 0 } @{ name = 'avgRenderTotalMs'; value = @{ baseline = -1e308; candidate = 1e308; delta = 5 } }))\n"
+            "Write-Host ('threshold-percent=' + (T 100 99 @{ baseline = 100; candidate = 99; delta = -1; deltaPercent = -1.0000000005 } $null))\n"
+            "Write-Host ('threshold-percent-exact=' + (T 100 99 @{ baseline = 100; candidate = 99; delta = -1; deltaPercent = -1 } $null))\n"
+            "Write-Host ('stage-percent=' + (T 4 5 @{ baseline = 4; candidate = 5; delta = 1; deltaPercent = 25 } @{ name = 'avgQueueWaitMs'; value = @{ baseline = 4; candidate = 5; delta = 1; deltaPercent = 24.99999999 } }))\n"
+            "Write-Host ('stage-percent-exact=' + (T 4 5 @{ baseline = 4; candidate = 5; delta = 1; deltaPercent = 25 } @{ name = 'avgQueueWaitMs'; value = @{ baseline = 4; candidate = 5; delta = 1; deltaPercent = 25 } }))\n"
+            "Write-Host ('delta-off-by-a-nano=' + (T 100 99 @{ baseline = 100; candidate = 99; delta = -1.0000000005; deltaPercent = -1 } $null))\n")
+        got = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(got, {"overflow-presented": "REFUSED", "overflow-generic": "REFUSED", "overflow-delta": "REFUSED", "threshold-percent": "REFUSED", "threshold-percent-exact": "OK",
+                               "stage-percent": "REFUSED", "stage-percent-exact": "OK", "delta-off-by-a-nano": "REFUSED"})
+
+    def test_r3_sol_07d50621_a5_a_compare_not_measured_on_the_judged_pair_publishes_no_figure_of_its_own(self) -> None:
+        # sol 07d50621 A5 (input): baseline and candidate both presentedFps 40 / avgRenderTotalMs 10; compare presentedFps 20 -> 60 (+200 %), avgRenderTotalMs 50 -> 25 (-50 %). The summarizer still printed the
+        # render total from the rejected compare, and the machine-perf row published 20 and 60 as the legs' own fps.
+        text = "\n".join(LocalProofSummarizerFpsGateTests.run_summarizer_block(
+            self, "LIGHT", "LIGHT", candidate_fps="40", baseline_fps="40", presented_compare="baseline = 20; candidate = 60; delta = 40; deltaPercent = 200",
+            leg_metrics="guiStatusFps = 40; avgPresentIntervalMs = 25; avgRenderTotalMs = 10; ",
+            compare_metrics=("guiStatusFps = [pscustomobject]@{ baseline = 40; candidate = 40; delta = 0; deltaPercent = 0 }; "
+                             "avgPresentIntervalMs = [pscustomobject]@{ baseline = 25; candidate = 25; delta = 0; deltaPercent = 0 }; "
+                             "avgRenderTotalMs = [pscustomobject]@{ baseline = 50; candidate = 25; delta = -25; deltaPercent = -50 }")))
+        self.assertIn("fps-verdict-refused:compare-not-judged-pair", text)
+        for figure in ("render total: CPU", "CPU 50 ms", "-50%", "presented FPS: CPU", "GUI status FPS: CPU", "avg present interval: CPU"):
+            self.assertNotIn(figure, text)
+        funcs = _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Convert-ToNullableDouble", "Get-PlaybackAbFpsArmRefusal"])
+        source = COMPARE_MACHINE_PERF_SCRIPT.read_text(encoding="utf-8")
+        start = source.index("    $fpsArmRefusal = Get-PlaybackAbFpsArmRefusal -Record $Record")
+        block = source[start:source.index("    $fpsDeltaRefused = ", start)]
+        body = funcs + (
+            "$leg = { [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = 40; hostLoadProvisional = $false; hostLoadState = 'quiet' } }\n"
+            "$Record = [pscustomobject]@{ baseline = (& $leg); candidate = (& $leg); candidateSpeed = $null; speedCompare = $null; compare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 20; candidate = 60; delta = 40; deltaPercent = 200 } } }\n"
+            "$baselinePresented = 20.0; $candidatePresented = 60.0\n" + block +
+            "Write-Host ('PER_LEG=' + $baselinePresented + '|' + $candidatePresented + '|' + $fpsArmRefusal.refused)\n")
+        self.assertEqual(self.ok(body).split(), ["PER_LEG=40|40|True"])
 
     def test_r3_sol_5add23cf_a10_compare_machine_perf_binds_every_metric_even_without_presented_fps(self) -> None:
         # the sibling reader (compare-machine-perf.ps1:572 reads the interval metric for its diagnosis) asked only when presentedFps was non-null, so a compare that dropped presentedFps and kept an

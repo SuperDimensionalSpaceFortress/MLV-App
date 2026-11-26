@@ -398,6 +398,14 @@ function Get-FpsCompareBindingProblem {
     $null
 }
 
+function Test-FpsFigureMatches {
+    # R2-RESIDUE-1 r3 (sol 5add23cf A6, A7): a published delta or deltaPercent is EXACTLY the figure the producer's formula gives (the same arithmetic over the same two doubles, rounded to 6 and 3 places), and
+    # that figure must be a finite number. A tolerance of 1e-9 let -1.0000000005 stand for the producer's -1.000 and flip a threshold read, and an overflowing figure made the tolerance Infinity, which
+    # accepted any published value. Anything that does not compare exactly, and anything not finite on either side, does not match.
+    param($Published, [double]$Expected)
+    $null -ne $Published -and [double]::IsFinite([double]$Expected) -and [double]::IsFinite([double]$Published) -and ([double]$Published -eq $Expected)
+}
+
 function Get-FpsMetricBindingProblem {
     # R2-RESIDUE-1 r3 (sol 5add23cf A10): one NON-presentedFps metric of the speed compare (a New-MetricDelta object: baseline, candidate, delta, deltaPercent). The legs record the same-named figure
     # (the producer builds the metric from the two leg summaries), so an endpoint must equal it (float noise only; a figure the leg does not record binds to nothing), and the published delta / deltaPercent
@@ -430,13 +438,13 @@ function Get-FpsMetricBindingProblem {
     if ($null -ne $publishedDelta) {
         if (-not (& $isNumber $publishedDelta)) { return "the compare's $Name delta is not a finite number" }
         $expectedDelta = [Math]::Round($cand - $base, 6)
-        if ([Math]::Abs([double]$publishedDelta - $expectedDelta) -gt (0.000000001 * [Math]::Max(1.0, [Math]::Abs($expectedDelta)))) { return "the compare's $Name delta is $publishedDelta but candidate $cand minus baseline $base is $expectedDelta" }
+        if (-not (Test-FpsFigureMatches $publishedDelta $expectedDelta)) { return "the compare's $Name delta is $publishedDelta but candidate $cand minus baseline $base is $expectedDelta" }
     }
     if ($null -ne $publishedPercent) {
         if (-not (& $isNumber $publishedPercent)) { return "the compare's $Name deltaPercent is not a finite number" }
         if ([Math]::Abs($base) -le 0.000001) { return "the compare's $Name deltaPercent is $publishedPercent beside a baseline of $base (the producer publishes no percent there)" }
         $expectedPercent = [Math]::Round((($cand - $base) / $base) * 100.0, 3)
-        if ([Math]::Abs([double]$publishedPercent - $expectedPercent) -gt (0.000000001 * [Math]::Max(1.0, [Math]::Abs($expectedPercent)))) { return "the compare's $Name deltaPercent is $publishedPercent but (candidate $cand - baseline $base) / baseline * 100 is $expectedPercent" }
+        if (-not (Test-FpsFigureMatches $publishedPercent $expectedPercent)) { return "the compare's $Name deltaPercent is $publishedPercent but (candidate $cand - baseline $base) / baseline * 100 is $expectedPercent" }
     }
     $null
 }
@@ -472,13 +480,13 @@ function Get-FpsPresentedFpsBindingProblem {
     if ($null -ne $publishedDelta) {
         if (-not (& $isNumber $publishedDelta)) { return "the compare's presentedFps delta is not a finite number" }
         $expectedDelta = [Math]::Round($cand - $base, 6)
-        if ([Math]::Abs([double]$publishedDelta - $expectedDelta) -gt (0.000000001 * [Math]::Max(1.0, [Math]::Abs($expectedDelta)))) { return "the compare's presentedFps delta is $publishedDelta but candidate $cand minus baseline $base is $expectedDelta" }
+        if (-not (Test-FpsFigureMatches $publishedDelta $expectedDelta)) { return "the compare's presentedFps delta is $publishedDelta but candidate $cand minus baseline $base is $expectedDelta" }
     }
     $publishedPercent = & $leaf $metric "deltaPercent"
     if ($null -ne $publishedPercent) {
         if (-not (& $isNumber $publishedPercent)) { return "the compare's presentedFps deltaPercent is not a finite number" }
         $expectedPercent = [Math]::Round((($cand - $base) / $base) * 100.0, 3)
-        if ([Math]::Abs([double]$publishedPercent - $expectedPercent) -gt (0.000000001 * [Math]::Max(1.0, [Math]::Abs($expectedPercent)))) { return "the compare's presentedFps deltaPercent is $publishedPercent but (candidate $cand - baseline $base) / baseline * 100 is $expectedPercent" }
+        if (-not (Test-FpsFigureMatches $publishedPercent $expectedPercent)) { return "the compare's presentedFps deltaPercent is $publishedPercent but (candidate $cand - baseline $base) / baseline * 100 is $expectedPercent" }
     }
     $null
 }
@@ -767,6 +775,24 @@ function Test-FpsProofReportSpeedQuotable {
     Test-FaTextEq (Get-FaProp $section 'status') 'PASS'
 }
 
+function Get-VolumeNameComparison {
+    <#
+    .SYNOPSIS
+    R2-RESIDUE-1 r3 (sol 5add23cf A8): how the volume holding an EXISTING file compares file names, asked of the volume itself and not guessed from the path separator (an NTFS directory can be case
+    sensitive, and a slash-separated path can sit on a case-insensitive volume). The file is looked up again with the case of its name flipped: found = names compare ignoring case, not found = ordinal.
+    A name with no letters to flip cannot tell, so it falls back on the platform default (OrdinalIgnoreCase where the separator is a backslash).
+    #>
+    param([Parameter(Mandatory)][string]$ExistingFile)
+    $platformDefault = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $leaf = [IO.Path]::GetFileName($ExistingFile)
+    $directory = [IO.Path]::GetDirectoryName($ExistingFile)
+    if ([string]::IsNullOrEmpty($leaf) -or [string]::IsNullOrEmpty($directory) -or -not (Test-Path -LiteralPath $ExistingFile -PathType Leaf)) { return $platformDefault }
+    $flipped = -join @($leaf.ToCharArray() | ForEach-Object { if ([char]::IsUpper($_)) { [char]::ToLowerInvariant($_) } elseif ([char]::IsLower($_)) { [char]::ToUpperInvariant($_) } else { $_ } })
+    if ([string]::Equals($flipped, $leaf, [StringComparison]::Ordinal)) { return $platformDefault }
+    if (Test-Path -LiteralPath (Join-Path $directory $flipped) -PathType Leaf) { return [StringComparison]::OrdinalIgnoreCase }
+    [StringComparison]::Ordinal
+}
+
 function Get-FpsJsonRepeatedKeyProblem {
     <#
     .SYNOPSIS
@@ -917,4 +943,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-FpsCompareBindingProblem, Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Test-FpsProofReportSpeedQuotable, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-VolumeNameComparison, Get-FpsCompareBindingProblem, Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Test-FpsProofReportSpeedQuotable, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
