@@ -76,6 +76,14 @@ function ConvertTo-DvJsonString([string]$Value) {
     $sb.ToString()
 }
 
+function Get-DvDictionaryKeys {
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2 r2 (sol r1 B1): the keys of a dictionary read from RECEIPT / venue / probe data. PowerShell resolves
+    # `$dictionary.Keys` to the ENTRY named Keys when there is one (a Hashtable, an OrderedDictionary and ConvertFrom-Json -AsHashtable all do), so a
+    # receipt entry named Keys stood in for the key collection. This reads the IDictionary interface's own Keys property, which no entry can shadow.
+    param([System.Collections.IDictionary]$Dictionary)
+    [System.Collections.IDictionary].GetProperty('Keys').GetValue($Dictionary)
+}
+
 function ConvertTo-DvCanonicalJson {
     <#
     .SYNOPSIS
@@ -89,7 +97,7 @@ function ConvertTo-DvCanonicalJson {
         return [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', $Value)
     }
     if ($Value -is [System.Collections.IDictionary]) {
-        $keys = @($Value.Keys | ForEach-Object { [string]$_ } | Sort-Object -Culture ([Globalization.CultureInfo]::InvariantCulture) -CaseSensitive)
+        $keys = @(Get-DvDictionaryKeys $Value | ForEach-Object { [string]$_ } | Sort-Object -Culture ([Globalization.CultureInfo]::InvariantCulture) -CaseSensitive)
         $parts = foreach ($k in $keys) { (ConvertTo-DvJsonString $k) + ':' + (ConvertTo-DvCanonicalJson $Value[$k]) }
         return '{' + ($parts -join ',') + '}'
     }
@@ -3302,7 +3310,7 @@ function Get-DvStoredPlaybackFieldProblems {
     #>
     param($Stored, $Derived)
     $problems = [System.Collections.Generic.List[string]]::new()
-    $storedNames = @($(if ($Stored -is [System.Collections.IDictionary]) { @($Stored.Keys) } else { @($Stored.PSObject.Properties.Name) }) | ForEach-Object { [string]$_ })
+    $storedNames = @($(if ($Stored -is [System.Collections.IDictionary]) { @(Get-DvDictionaryKeys $Stored) } else { @($Stored.PSObject.Properties.Name) }) | ForEach-Object { [string]$_ })
     foreach ($f in @($script:PlaybackComparedFields) + @($script:PlaybackComparedFieldsWhenStored)) {
         foreach ($n in $storedNames) {
             if ([string]::Equals($n, $f, [StringComparison]::OrdinalIgnoreCase) -and -not [string]::Equals($n, $f, [StringComparison]::Ordinal)) {
@@ -3327,7 +3335,7 @@ function Test-DvNumber($Value) {
 }
 
 function Get-DvKeys($Object) {
-    if ($Object -is [System.Collections.IDictionary]) { return @($Object.Keys | ForEach-Object { [string]$_ }) }
+    if ($Object -is [System.Collections.IDictionary]) { return @(Get-DvDictionaryKeys $Object | ForEach-Object { [string]$_ }) }
     @($Object.PSObject.Properties | ForEach-Object { $_.Name })
 }
 
@@ -7835,7 +7843,7 @@ function Test-DvReceiptCarriesDisplayPath {
     $venue = Get-DvProp $Receipt 'venue'
     if ($null -eq $venue) { return $false }
     if ($venue -is [System.Collections.IDictionary]) {
-        return (@($venue.Keys | Where-Object { [string]::Equals([string]$_, 'displayPath', [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
+        return (@(Get-DvDictionaryKeys $venue | Where-Object { [string]::Equals([string]$_, 'displayPath', [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0)
     }
     $null -ne $venue.PSObject.Properties['displayPath']
 }

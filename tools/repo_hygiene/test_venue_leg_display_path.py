@@ -516,6 +516,90 @@ class AdversaryPass3Tests(RunnerHarness, unittest.TestCase):
             cases_line(P, 3, "reader")
 
 
+KEYS_SHADOW_SCRIPT = r"""
+Import-Module '__MODULE__' -Force
+$m = Get-Module DualVenueRunner
+$blockJson = '{"schema":"mlv-app/venue-display-path/v2","source":"health-probe","adapters":["Intel"],"firstAdapterDriverVersion":"1.0","primaryDisplayDevice":"D1"}'
+$block = [ordered]@{ schema = 'mlv-app/venue-display-path/v2'; source = 'health-probe'; adapters = @('Intel'); firstAdapterDriverVersion = '1.0'; primaryDisplayDevice = 'D1' }
+function Rec($venue) { [ordered]@{ outcome = 'PASS'; card = 'C'; legId = 'L'; subject = [ordered]@{ clipId = 'x' }; venue = $venue } }
+function Marker($venue) { try { @((Test-DvReceiptValid -Receipt (Rec $venue) -AllowOfflineTestMode).unbound | Where-Object { $_ -like 'DISPLAY_PATH_UNBOUND*' }).Count } catch { "threw: $($_.Exception.Message)" } }
+$out = [ordered]@{}
+# sol r1 B1: a venue entry named Keys must never stand in for the dictionary's key collection
+$out['hashtable-block-present-keys-entry'] = Marker @{ name = 'bachelor'; displayPath = $block; Keys = @('name') }
+$out['hashtable-block-absent-keys-entry'] = Marker @{ name = 'bachelor'; Keys = @('displayPath') }
+$out['ordered-block-present-keys-entry'] = Marker ([ordered]@{ name = 'bachelor'; displayPath = $block; Keys = @('name') })
+$out['ordered-block-absent-keys-entry'] = Marker ([ordered]@{ name = 'bachelor'; Keys = @('displayPath') })
+$out['asHashtable-block-present-keys-entry'] = Marker (ConvertFrom-Json -AsHashtable ('{"name":"bachelor","displayPath":' + $blockJson + ',"Keys":["name"]}'))
+$out['asHashtable-block-absent-keys-entry'] = Marker (ConvertFrom-Json -AsHashtable '{"name":"bachelor","Keys":["displayPath"]}')
+$out['hashtable-case-variant-block'] = Marker @{ name = 'bachelor'; DisplayPath = $block; Keys = 'x' }
+$out['hashtable-plain-present'] = Marker @{ name = 'bachelor'; displayPath = $block }
+$out['hashtable-plain-absent'] = Marker @{ name = 'bachelor' }
+# SIBLING_SWEEP: every other key reader over receipt / stored-playback data
+$out['canonical-json'] = try { ConvertTo-DvCanonicalJson @{ Keys = 'a'; b = 1 } } catch { "threw: $($_.Exception.Message)" }
+$out['get-dvkeys'] = try { [string[]]$k = @(& $m { Get-DvKeys @{ Keys = @('x'); a = 1 } }); [Array]::Sort($k, [StringComparer]::Ordinal); $k -join ',' } catch { "threw: $($_.Exception.Message)" }
+$out['json-equivalent-key-sets-differ'] = try { [bool](Test-DvJsonEquivalent @{ Keys = 'a'; z = 1 } @{ Keys = 'a'; y = 1 }) } catch { "threw: $($_.Exception.Message)" }
+$out['stored-playback-case-variant'] = try { @(Get-DvStoredPlaybackFieldProblems -Stored @{ Keys = 'x'; ConformRepeats = 1 } -Derived @{ conformRepeats = 1 } | Where-Object { $_ -like 'PLAYBACK_FIELD_CASE_VARIANT*' }).Count } catch { "threw: $($_.Exception.Message)" }
+Write-Output ('CASES=' + (ConvertTo-Json -InputObject @(, $out) -Depth 5 -Compress))
+"""
+
+
+@requires_windows_pwsh
+class SolR1KeysShadowTests(unittest.TestCase):
+    """r2, sol r1 B1 on 9eb3de01 (DEFECT_CLASS: a dictionary's `.Keys` property read where the data may carry an entry named Keys). PowerShell resolves
+    `$hashtable.Keys` to the ENTRY named Keys, so a venue (or any receipt dictionary) with such an entry made the validator omit DISPLAY_PATH_UNBOUND for a
+    present block, or add it for an absent one. Every key read over receipt data goes through Get-DvDictionaryKeys (the IDictionary interface's own Keys)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = run_pwsh(["-Command", KEYS_SHADOW_SCRIPT.replace("__MODULE__", psq(MODULE))])
+        cls.got = cases_line(proc, 1, "keys-shadow")[0]
+
+    def test_b1_a_venue_entry_named_keys_never_changes_the_unbound_marker(self) -> None:
+        for name, want in (("hashtable-block-present-keys-entry", 1), ("hashtable-block-absent-keys-entry", 0),
+                           ("ordered-block-present-keys-entry", 1), ("ordered-block-absent-keys-entry", 0),
+                           ("asHashtable-block-present-keys-entry", 1), ("asHashtable-block-absent-keys-entry", 0),
+                           ("hashtable-case-variant-block", 1), ("hashtable-plain-present", 1), ("hashtable-plain-absent", 0)):
+            with self.subTest(name):
+                self.assertEqual(self.got[name], want, f"{name}: DISPLAY_PATH_UNBOUND count {self.got[name]!r}, expected {want}")
+
+    def test_b1_siblings_canonical_json_reads_the_dictionary_keys_not_a_keys_entry(self) -> None:
+        self.assertEqual(self.got["canonical-json"], '{"b":1,"Keys":"a"}')   # the module's invariant-culture key order: b before Keys
+
+    def test_b1_siblings_get_dvkeys_returns_every_key(self) -> None:
+        self.assertEqual(self.got["get-dvkeys"], "Keys,a")   # ordinal order
+
+    def test_b1_siblings_json_equivalence_compares_real_key_sets(self) -> None:
+        self.assertIs(self.got["json-equivalent-key-sets-differ"], False)
+
+    def test_b1_siblings_stored_playback_case_variant_is_found_beside_a_keys_entry(self) -> None:
+        self.assertEqual(self.got["stored-playback-case-variant"], 1)
+
+    def test_h1_the_writer_validates_only_the_three_copied_fields_and_the_member_names(self) -> None:
+        """sol r1 H1: docs/dual-venue-evidence.md says which probe strings the writer validates; this pins what the doc says."""
+        rows = [("an unreadable hostName (not a copied field)", dict(HEALTHY_PROBE, hostName="\ud800"), True),
+                ("an unreadable gpuNames element (a copied field)", dict(HEALTHY_PROBE, gpuNames=["Intel\ud800"]), False),
+                ("an unreadable driverVersion (a copied field)", dict(HEALTHY_PROBE, driverVersion="31.\ud800"), False),
+                ("an unreadable displayDevice (a copied field)", dict(HEALTHY_PROBE, displayDevice="\\\\.\\DISPLAY\ud800"), False),
+                ("an unreadable member name at the root", dict(HEALTHY_PROBE, **{"\udc00": "x"}), False)]
+        got = writer_round_trip([p for _, p, _ in rows])
+        self.assertEqual(len(got), len(rows))
+        for (label, _, wrote), g in zip(rows, got):
+            with self.subTest(label):
+                self.assertIsNone(g["threw"], g["threw"])
+                self.assertEqual(g["wrote"], wrote, f"{label}: wrote={g['wrote']} block={g['block']}")
+        text = DOC.read_text(encoding="utf-8")
+        self.assertIn("it does **not** validate any other probe string", text)
+        self.assertIn("member names at the root of the line", text)
+
+    def test_b1_no_dictionary_keys_property_read_is_left_in_the_receipt_key_readers(self) -> None:
+        text = MODULE.read_text(encoding="utf-8")
+        for fn in ("ConvertTo-DvCanonicalJson", "Get-DvStoredPlaybackFieldProblems", "Get-DvKeys", "Test-DvReceiptCarriesDisplayPath"):
+            start = text.index(f"function {fn}")
+            body = text[start:text.index("\nfunction ", start + 10)]
+            with self.subTest(fn):
+                self.assertNotRegex(body, r"\$\w+\.Keys\b", f"{fn} still reads a dictionary's .Keys property")
+
+
 class DocsTests(unittest.TestCase):
     def test_the_doc_states_the_contract(self) -> None:
         text = DOC.read_text(encoding="utf-8")
