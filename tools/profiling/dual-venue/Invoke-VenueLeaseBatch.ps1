@@ -1696,13 +1696,13 @@ function Get-SpecPathJudgedConflict([hashtable]$Seen, [string]$Path) {
     # overwrote each other's: item A's arm was read from the bytes it judged, then the file changed, item B judged the new bytes, and A's leg ran (bound to B's digest) on bytes its recorded
     # arm never described. A path is judged ONCE per run: the first item (or scalar entry) to pass the shape and budget checks records the digest in $Seen, and any later entry whose own
     # judged digest for the same path differs is the typed refusal below (fail closed; no claim, lease or leg). Returns '' when this path's digest is new or unchanged.
-    # (merge with #903: keyed by Get-SpecDigestKey, the file's identity, as the digests are, so two spellings of one file are one path here too)
-    $seenKey = Get-SpecDigestKey $Path
-    $now = [string]$script:SpecBudgetSha256[$seenKey]
-    if ($Seen.ContainsKey($seenKey) -and [string]$Seen[$seenKey] -cne $now) {
-        return "'$Path' cannot be run: two entries of this run name the same leg spec and judged different bytes of it (sha256 $($Seen[$seenKey]), then $(if ($now) { $now } else { 'none recorded' })); one recorded arm and one leg binding must describe one set of bytes, so no claim or lease is taken"
+    # (merge with #903: the digest is READ under Get-SpecDigestKey, the file's identity, where it is stored; this rule's own table stays keyed by the SPELLED path, so a second spelling of one
+    # file (a hard link, a junction) is still refused by #903's own check below with its own code, SPEC_CHANGED_AFTER_PREFLIGHT, and only a path named twice is this rule's)
+    $now = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey $Path)]
+    if ($Seen.ContainsKey($Path) -and [string]$Seen[$Path] -cne $now) {
+        return "'$Path' cannot be run: two entries of this run name the same leg spec and judged different bytes of it (sha256 $($Seen[$Path]), then $(if ($now) { $now } else { 'none recorded' })); one recorded arm and one leg binding must describe one set of bytes, so no claim or lease is taken"
     }
-    $Seen[$seenKey] = $now
+    $Seen[$Path] = $now
     ''
 }
 $specJudgedOnce = @{}
