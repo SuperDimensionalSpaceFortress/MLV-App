@@ -1267,8 +1267,10 @@ function Invoke-VenueBoundedRead {
     # before it (after the worker started), so time spent creating the worker is never added past the caller's end. No -Clock: -TimeoutSec from the wait, as before.
     # r16 (Grok G22 on #814): -EndIsBoundEnd says -EndSec is the end of -TimeoutSec ITSELF (measured from an earlier start on the caller's clock), not a cap the
     # caller set under it; a wait it shortens is then a plain timeout and the "cut ... short" clause is not printed. Absent: any shortening by -EndSec is named.
+    # R2-RESIDUE-1 r1 (adversary-3be19c39.json A1): -EndUtc is the caller's ABSOLUTE end. The stopwatch cap above is sampled once, so a wall clock stepped (or a caller suspended) after the sample left the wait
+    # running past the absolute end. With -EndUtc the wait is taken in slices of at most 0.25 s and the wall clock is read against that end after each, so the wait ends at the earlier of the two.
     param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1.0, 600.0)][double]$TimeoutSec,
-        [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [switch]$EndIsBoundEnd)
+        [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [switch]$EndIsBoundEnd, [DateTime]$EndUtc)
     # r28 (sol r27 blocker VENUE-STAGE-NONFINITE-ENDPOINT-ERASES-CAP-1, catalogue B-03, sibling of Get-VenueStagedBuildManifest -CallBudgetEndSec): an -EndSec that is not a
     # finite number is REFUSED, typed, before the worker starts. NaN skipped both the clamp (NaN -lt x is false: the full -TimeoutSec wait) and the late-answer rejection
     # (Elapsed - NaN -gt 0 is false), so an answer past the caller's end was acted on.
@@ -1296,10 +1298,23 @@ function Invoke-VenueBoundedRead {
         # r13 (Grok G20 on #814): $endCut = the caller's end, not -TimeoutSec, set the wait (as the nightly's capCut), so the message reports the wait actually given
         $waitSec = $TimeoutSec; $endCut = $false
         if ($null -ne $Clock) { $toEnd = $EndSec - $Clock.Elapsed.TotalSeconds; if ($toEnd -lt $waitSec) { $waitSec = [Math]::Max(0.0, $toEnd); $endCut = $true } }
-        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec))) {
+        $answeredInTime = $false; $absoluteEndHit = $false
+        if ($PSBoundParameters.ContainsKey('EndUtc')) {
+            $absEnd = $EndUtc.ToUniversalTime()
+            $waitClock = [Diagnostics.Stopwatch]::StartNew()
+            while ($true) {
+                if ($absEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) { $absoluteEndHit = $true; break }
+                $slice = [Math]::Min(0.25, $waitSec - $waitClock.Elapsed.TotalSeconds)
+                if ($slice -le 0) { break }
+                if ($async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($slice))) { $answeredInTime = $true; break }
+            }
+        }
+        else { $answeredInTime = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec)) }
+        if (-not $answeredInTime) {
             $abandoned = $true
             $script:VenueAbandonedReads++
             try { [void]$ps.BeginStop($null, $null) } catch { }
+            if ($absoluteEndHit) { return [pscustomobject]@{ answered = $false; value = @(); error = "no answer before the caller's absolute end (the wait was cut at that end, not at the $([Math]::Round($waitSec, 2)) s bound)" } }
             return [pscustomobject]@{ answered = $false; value = @()
                 error ="no answer in $([Math]::Round($waitSec, 2)) s$(if ($endCut -and -not $EndIsBoundEnd) { " (the call's end cut the $([Math]::Round($TimeoutSec, 2)) s bound short)" })" }
         }
@@ -1333,7 +1348,7 @@ function Read-VenueFileBytesBounded {
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the worker is handed the ABSOLUTE UTC end of this read (the wait it is given: -TimeoutSec, cut to what is left of the caller's
     # -Clock/-EndSec) and refuses to touch the file once it has passed ($script:VenueFileReadWorkerText checks it before the probe and before ReadAllBytes)
     $boundSec = [Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))
-    $waitSec = $(if ($null -ne $Clock) { [Math]::Min($boundSec, $EndSec - $Clock.Elapsed.TotalSeconds) } else { $boundSec })
+    $waitSec = $(if ($null -ne $Clock) { [Math]::Min([double]$boundSec, $EndSec - $Clock.Elapsed.TotalSeconds) } else { $boundSec })
     $endTicks = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $waitSec)).Ticks
     if ($PSBoundParameters.ContainsKey('EndUtc')) {
         $absoluteEnd = $EndUtc.ToUniversalTime()
@@ -1341,8 +1356,10 @@ function Read-VenueFileBytesBounded {
         if ($absoluteEnd.Ticks -lt $endTicks) { $endTicks = $absoluteEnd.Ticks }
     }
     $workerArg = @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs; endUtcTicks = $endTicks }
-    $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd }
-           else { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec })
+    # R2-RESIDUE-1 r1 (adversary-3be19c39.json A1): the absolute end reaches the WAIT too (-EndUtc), not only the worker's pre-I/O check
+    $endArgs = $(if ($PSBoundParameters.ContainsKey('EndUtc')) { @{ EndUtc = $EndUtc } } else { @{} })
+    $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd @endArgs }
+           else { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec @endArgs })
     if (-not $r.answered) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: $($r.error)" }
     # adversary-d10f5241.json A2: an answer is judged against the ABSOLUTE end when it is OBSERVED too, not only before the read starts: the late-answer check inside Invoke-VenueBoundedRead reads the
     # stopwatch alone, so a wall clock stepped (or a caller suspended) inside the read let bytes seen after the caller's UTC deadline be acted on and a leg be counted
@@ -2014,6 +2031,11 @@ function Get-VenueLegHostLoad {
         }
         $endArgs = @{}
         if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) { $endArgs['EndUtc'] = $CallDeadlineUtc.ToUniversalTime() }
+        # R2-RESIDUE-1 r1 (adversary-3be19c39.json A2): the read's own end check runs before its bytes are handed back, so a caller suspended after it reached the classification (and the export exemption) past
+        # the absolute end and returned a quiet or exempt answer the caller then counted. $pastEnd is asked again right before either of those two answers is returned.
+        $absEnd = $(if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) { $CallDeadlineUtc.ToUniversalTime() } else { $null })
+        $pastEnd = { $null -ne $absEnd -and $absEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow }
+        $lateReason = 'an answer classified after the caller''s absolute end is never acted on'
         $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $budgetSec -Clock $readClock -EndSec $budgetSec @endArgs
         if ($script:VenueTestPostReceiptBytesDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPostReceiptBytesDelayMs) }
         if ($PSBoundParameters.ContainsKey('ExpectReceiptSha256')) {
@@ -2038,7 +2060,9 @@ function Get-VenueLegHostLoad {
             if ($null -eq $boundText -or -not [string]::Equals($boundText, $expectText, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the one the figures were read from (evidence.resultJsonSha256 changed between reads)'; return $unknown }
         }
         $plannedExport = ($PlannedLegType -is [string]) -and [string]::Equals($PlannedLegType, 'export', [StringComparison]::Ordinal)
-        if ($plannedExport -and (Test-VenueReceiptIsExportLeg $rc)) { return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
+        if ($plannedExport -and (Test-VenueReceiptIsExportLeg $rc)) {
+            if (& $pastEnd) { $unknown.reason = $lateReason; return $unknown }
+            return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
         $want = Get-VenueHlMember (Get-VenueHlMember $rc 'evidence') 'resultJsonSha256'
         if (-not ($want -is [string] -and [regex]::IsMatch($want, '\A[0-9a-fA-F]{64}\z'))) { $unknown.reason = 'the receipt binds no evidence.resultJsonSha256'; return $unknown }
         $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
@@ -2058,6 +2082,7 @@ function Get-VenueLegHostLoad {
         $hl = $null
         if (Test-VenueHlObject $doc) { $hl = Get-VenueHlMember $doc 'hostLoad' }
         $s = ConvertFrom-VenueSmokeHostLoad -HostLoad $hl
+        if (& $pastEnd) { $unknown.reason = $lateReason; return $unknown }
         $s | Add-Member -NotePropertyName applies -NotePropertyValue $true
         $s
     } catch {
