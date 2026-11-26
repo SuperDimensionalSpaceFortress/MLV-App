@@ -46,6 +46,9 @@ LOCAL_GPU_CAPABILITY_SCRIPT = ROOT / "tools" / "profiling" / "run-local-gpu-capa
 
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+# r3 (CI repair of d2b38643): the same guard its sibling suites use (test_dual_venue_evidence.py, test_look_flavor_pair.py) for a test that needs GDI+ (System.Drawing)
+# or the Windows-only dual-venue runner (it splits a leg path on a backslash); on the hosted ubuntu profile those tests are skipped, on this Windows host they run.
+requires_windows_pwsh = unittest.skipIf(PWSH is None or os.name != "nt", "needs pwsh on Windows")
 
 
 def _extract_functions(script: Path, names: list[str]) -> str:
@@ -3773,6 +3776,12 @@ def _run_ps_command(command: str, timeout: int = 120) -> subprocess.CompletedPro
                           capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=timeout)
 
 
+def _flat_pwsh_text(text: str) -> str:
+    """A pwsh error as one line of plain text: no ANSI colour codes, and the ErrorView's own line wraps and `|` gutters joined back into single spaces.
+    On the hosted ubuntu profile pwsh colours and wraps an uncaught `throw` message at the console width ("is not strict\\n | JSON"); Windows pwsh did not."""
+    return re.sub(r"\s*\n[\s|]*", " ", re.sub(r"\x1b\[[0-9;]*m", "", text))
+
+
 QUIET_SMOKE = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
 
 
@@ -3827,13 +3836,14 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             record.write_text('{"schema":"release-cuda-playback-ab.v1","baseline":' + baseline + ',"candidate":' + clean + '}', encoding="utf-8", newline="")
             proc = _run_ps_file(COMPARE_MACHINE_PERF_SCRIPT, str(record))
             self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn("is not strict JSON", proc.stdout + proc.stderr)
+            self.assertIn("is not strict JSON", _flat_pwsh_text(proc.stdout + proc.stderr), proc.stdout + proc.stderr)
             summary = Path(tmp) / "summary.json"
             summary.write_text('{"status":"PASS","proof":{"playbackAb":{"baseline":' + baseline + ',"candidate":' + clean + '}}}', encoding="utf-8", newline="")
             proc = _run_ps_file(CUDA_PROOF_SUMMARIZER_SCRIPT, "-SummaryPath", str(summary))
             self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn("is not strict JSON", proc.stdout + proc.stderr)
+            self.assertIn("is not strict JSON", _flat_pwsh_text(proc.stdout + proc.stderr), proc.stdout + proc.stderr)
 
+    @requires_windows_pwsh
     def test_a3_the_planned_leg_type_comes_from_the_planner_never_a_second_read(self) -> None:
         # A3: the matrix parent and the chain re-read each spec path for its type (a spec swapped between the plan and that read changed it), and the chain sent
         # its LegSet child no -ExpectSpecSha256. The planner now records plannedLegType from the bytes it hashed; nobody re-reads the path.
@@ -3895,6 +3905,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         cuda = _extract_functions(CUDA_AB_SCRIPT, ["Read-SmokeSummary"])
         self.assertIn("try { $smokeBytes = [IO.File]::ReadAllBytes($Path) }", cuda)
 
+    @requires_windows_pwsh
     def test_r2_pass4_a1_the_inconclusive_failure_text_carries_no_screenshot_figure(self) -> None:
         # adversary-c2bbe5f8.json A1, its input: black and white PNGs, before hostLoad null, -FailOnScreenshotDelta. RED: failures kept meanAbsRgbDelta=255.
         with tempfile.TemporaryDirectory(prefix="residue-r2-p4a1-") as tmp:
@@ -3933,10 +3944,12 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             proc, report = self._compare(before, alias, out)
             self.assertIsNotNone(report, proc.stdout + proc.stderr)
             self.assertTrue(any("same smoke JSON file" in f for f in report["failures"]), report["failures"])
-            # a case variant of one file on a case-insensitive directory is that same file too
-            out2 = Path(tmp) / "compare2.json"
-            proc, report = self._compare(before, Path(tmp) / "BEFORE.JSON", out2)
-            self.assertTrue(any("same smoke JSON file" in f for f in report["failures"]), report["failures"])
+            # a case variant of one file on a case-insensitive directory is that same file too (on a case-sensitive one, the ubuntu profile, BEFORE.JSON
+            # is no file at all, so there is no case variant to read)
+            if (Path(tmp) / "BEFORE.JSON").exists():
+                out2 = Path(tmp) / "compare2.json"
+                proc, report = self._compare(before, Path(tmp) / "BEFORE.JSON", out2)
+                self.assertTrue(any("same smoke JSON file" in f for f in report["failures"]), report["failures"])
             # two distinct files are read independently: no same-input refusal and no "paths must be distinct"
             other, out3 = Path(tmp) / "other.json", Path(tmp) / "compare3.json"
             other.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
@@ -3980,6 +3993,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             self.assertIn("Output must not overwrite either smoke JSON input.", proc.stdout + proc.stderr)
             self.assertEqual(before.read_text(encoding="utf-8"), QUIET_SMOKE, "the before input is untouched")
 
+    @requires_windows_pwsh
     def test_a7_an_inconclusive_comparison_publishes_no_screenshot_delta(self) -> None:
         # A7, its input: 1x1 screenshots RGB (0,0,0) before and (255,255,255) after, the before host load uncollected, default SampleStep, no FailOnScreenshotDelta.
         # RED: verdict INCONCLUSIVE but the report kept meanAbsRgbDelta=255 / changedSampleRatio=1 and the summary line printed them.
