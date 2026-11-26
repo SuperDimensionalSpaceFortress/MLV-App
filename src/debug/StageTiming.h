@@ -59,6 +59,10 @@ enum { MLV_STAGE_TIMING_SNAPSHOT_CAPACITY = 32 };
 #define MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED        "llrawproc_dual_iso_applied"
 #define MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_APPLIED    "llrawproc_dual_iso_not_applied"
 #define MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_ATTEMPTED  "llrawproc_dual_iso_not_attempted"
+/* r5 (adversary 22d1a0a7 A1): the render-decode mark. One 0.000 record written right after the outcome marker, and
+ * only for a llrawproc run made while the render's getMlvProcessedFrame16 entry is on this thread (video_mlv.c). A cache
+ * prefetch thread never enters that entry, so its runs carry no mark: the reader binds a frame's outcome to the marked run. */
+#define MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER         "llrawproc_dual_iso_render"
 #define MLV_STAGE_EXPORT_SCALE        "export_scale"
 #define MLV_STAGE_EXPORT_PIPE_WRITE   "export_pipe_write"
 #define MLV_STAGE_EXPORT_PIPE_DRAIN   "export_pipe_drain"

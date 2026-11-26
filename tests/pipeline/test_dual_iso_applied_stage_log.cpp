@@ -227,6 +227,11 @@ TEST(DualIsoAppliedOutcome, PreviewWithNoRegressionSampleIsNotApplied)
         const std::size_t y = i / static_cast<std::size_t>(width);
         rows[i] = (y % 4 < 2) ? lo : hi;
     }
+    // r5 (hosted CI run 45766702862): the tiny fixture is restricted-range lossless (LJ92, white < 15000), and that path
+    // rescales the whole frame's range before the preview, with or without a fit (llrawproc.c scale_restricted_range).
+    // These rows are synthetic, not a decode, so this row clears the LJ92 class flag: the run then reaches the preview
+    // with the frame untouched, and `out == rows` proves that no rowscale ran.
+    fixture.video()->MLVI.videoClass &= static_cast<uint16_t>(~MLV_VIDEO_CLASS_FLAG_LJ92);
     std::vector<uint16_t> out;
     fixture.video()->llrawproc->diso_pattern = 0;
     const int outcome = run_dual_iso_outcome(fixture, false, rows, out);
@@ -272,6 +277,7 @@ const char * const kDualIsoStages[] = {
     MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED,
     MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_APPLIED,
     MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_ATTEMPTED,
+    MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER,
 };
 
 bool snapshotHasStage(const char * stage)
@@ -329,6 +335,8 @@ void assertMarkersFollowEachDualIsoRecord(const QString & path, const QString & 
                                   QStringLiteral(MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_ATTEMPTED) };
     int dualIsoRecords = 0;
     int markerRecords = 0;
+    int renderMarks = 0;
+    int renderMarkLine = -1;
     int lastDualIso = -1;
     int processed16 = -1;
     for (int i = 0; i < lines.size(); ++i) {
@@ -338,6 +346,10 @@ void assertMarkersFollowEachDualIsoRecord(const QString & path, const QString & 
         const QString stage = hit.captured(QStringLiteral("s"));
         if (stage == QStringLiteral("processed16_total")) processed16 = i;
         if (markers.contains(stage)) ++markerRecords;
+        if (stage == QStringLiteral(MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER)) {
+            ++renderMarks;
+            renderMarkLine = i;
+        }
         if (stage != QStringLiteral(MLV_STAGE_LLRAWPROC_DUAL_ISO)) continue;
         ++dualIsoRecords;
         lastDualIso = i;
@@ -362,6 +374,18 @@ void assertMarkersFollowEachDualIsoRecord(const QString & path, const QString & 
                   << "\ngot: " << lines[lastDualIso + 1].toStdString() << "\n";
     }
     ASSERT_TRUE(lines[lastDualIso + 1] == expected);
+    // r5 (adversary 22d1a0a7 A1): the render's run, and only it, carries the render-decode mark, right after its outcome
+    // marker. The open and receipt runs before it never enter getMlvProcessedFrame16, so they carry none.
+    const QString expectedMark = QStringLiteral("[mlv-stage-timing] frame=%1 stage=%2 ms=0.000")
+                                     .arg(render.captured(QStringLiteral("f")),
+                                          QStringLiteral(MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER));
+    if (renderMarks != 1 || renderMarkLine != lastDualIso + 2) {
+        std::cerr << "render marks=" << renderMarks << " at line " << renderMarkLine << ", expected one at line "
+                  << (lastDualIso + 2) << "\n";
+    }
+    ASSERT_EQ(1, renderMarks);
+    ASSERT_EQ(lastDualIso + 2, renderMarkLine);
+    ASSERT_TRUE(lines[renderMarkLine] == expectedMark);
 }
 
 } // namespace

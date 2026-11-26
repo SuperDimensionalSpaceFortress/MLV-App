@@ -96,7 +96,11 @@ static MLV_STAGE_THREAD_LOCAL double g_mlv_last_llrawproc_ms = 0.0;
  * after every "llrawproc" note, so the rendered export's stage-timing log can read the clip's dual-ISO class.
  * Off: no getter call and no snapshot write (mlv_stage_timing_note_elapsed writes the snapshot before its check).
  * EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: then one 0.000 marker record naming whether that run applied dual-ISO
- * (llrpGetLastDualIsoOutcome); an UNKNOWN outcome (no run recorded on this thread) writes no marker. */
+ * (llrpGetLastDualIsoOutcome); an UNKNOWN outcome (no run recorded on this thread) writes no marker.
+ * r5 (adversary 22d1a0a7 A1): then, only while the render's getMlvProcessedFrame16 entry is on this thread
+ * (g_mlv_render_decode_depth), one 0.000 render-decode mark record (StageTiming.h). Cache prefetch
+ * threads never enter that entry, so their runs carry none, and the reader no longer tells them apart by position. */
+static MLV_STAGE_THREAD_LOCAL int g_mlv_render_decode_depth = 0;
 static inline void mlv_note_llrawproc_dual_iso(uint64_t frameIndex)
 {
     if (!mlv_stage_timing_enabled()) return;
@@ -107,6 +111,10 @@ static inline void mlv_note_llrawproc_dual_iso(uint64_t frameIndex)
                               : (outcome == LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED) ? MLV_STAGE_LLRAWPROC_DUAL_ISO_NOT_ATTEMPTED
                               : NULL;
     if (marker) mlv_stage_timing_note_elapsed(marker, frameIndex, 0.0);
+    if (marker && g_mlv_render_decode_depth > 0)
+    {
+        mlv_stage_timing_note_elapsed(MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER, frameIndex, 0.0);
+    }
 }
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_raw_float_convert_ms = 0.0;
 static MLV_STAGE_THREAD_LOCAL double g_mlv_last_debayered_frame_ms = 0.0;
@@ -8405,7 +8413,11 @@ processed16_store:
 /* Phase 4A: scale-1 entrypoint preserves the original public API. */
 void getMlvProcessedFrame16(mlvObject_t * video, uint64_t frameIndex, uint16_t * outputFrame, int threads)
 {
+    /* r5 (adversary 22d1a0a7 A1): the render entry (BatchRunner.cpp export loop, CdngSequenceExport.cpp, the GUI
+     * exports). Every llrawproc run this thread makes inside the call carries the render-decode mark. */
+    ++g_mlv_render_decode_depth;
     getMlvProcessedFrame16_with_scale(video, frameIndex, outputFrame, threads, 1, 1, 0);
+    --g_mlv_render_decode_depth;
 }
 
 /* Phase 4A: scale-aware variant. The pipeline still renders at full
