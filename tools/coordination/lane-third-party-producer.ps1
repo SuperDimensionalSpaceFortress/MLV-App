@@ -74,6 +74,11 @@ function Test-ProducerExeIsFixtureStandIn([string]$Path) {
         if (-not [string]::Equals($item.Extension, '.cmd', [System.StringComparison]::OrdinalIgnoreCase)) { return $false }
         if (($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { return $false }
         if ($item.Length -gt 65536) { return $false }
+        # A small .cmd that FORWARDS to a real CLI is not a stand-in for one (adversary pass 5 A1): a script that names either
+        # CLI, by file, folder or bare command, is refused. A wrapper that hides the name on purpose is a hostile local caller,
+        # who could run the CLI directly; the fence guards the sanctioned launch paths against accident, not against that.
+        $text = [System.IO.File]::ReadAllText($item.FullName)
+        if ($text -match '(?i)\.kimi-code|agy[\\/]+bin|agy\.exe|kimi\.exe|antigravity|\bagy\b|\bkimi\b') { return $false }
         return $true
     } catch { return $false }
 }

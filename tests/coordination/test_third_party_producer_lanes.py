@@ -761,8 +761,15 @@ def test_the_helper_refuses_a_direct_call_and_the_real_cli_path_even_with_the_te
     # r2 pass-4 A1: the seam is decided by what the file IS (a small .cmd), so no alias of the real CLI gets through: the plain
     # path, the extended-length prefix, an 8.3-style spelling, a missing file and a non-.cmd file are ALL refused.
     (tmp_path / "not-a-fixture.exe").write_bytes(b"MZ")
+    # pass 5 A1: a small .cmd that FORWARDS to the real CLI is not a fixture either (file, folder and bare-command spellings).
+    for name, body in (("forward-kimi.cmd", '@echo off\r\n"%USERPROFILE%\\.kimi-code\\bin\\kimi.exe" %*\r\nexit /b %errorlevel%\r\n'),
+                       ("forward-neon.cmd", '@echo off\r\n"%LOCALAPPDATA%\\agy\\bin\\agy.exe" %*\r\nexit /b %errorlevel%\r\n'),
+                       ("forward-path.cmd", '@echo off\r\nagy %*\r\n')):
+        (tmp_path / name).write_text(body, encoding="ascii")
     for exe_arg in ("", "-ExeForTest %s" % real, "-ExeForTest ('\\\\?\\' + %s)" % real, "-ExeForTest ((%s) -replace 'layib', 'LAYIB')" % real,
-                    "-ExeForTest (Join-Path $env:T_WT 'missing-fixture.cmd')", "-ExeForTest (Join-Path $env:T_WT 'not-a-fixture.exe')"):
+                    "-ExeForTest (Join-Path $env:T_WT 'missing-fixture.cmd')", "-ExeForTest (Join-Path $env:T_WT 'not-a-fixture.exe')",
+                    "-ExeForTest (Join-Path $env:T_WT 'forward-kimi.cmd')", "-ExeForTest (Join-Path $env:T_WT 'forward-neon.cmd')",
+                    "-ExeForTest (Join-Path $env:T_WT 'forward-path.cmd')"):
         script = ("$script:ledgerCalls = 0; try { Invoke-ThirdPartyProducerLane -Lane %s -Cfg %s -Prompt x -WorkDir $env:T_WT -RunDir $env:T_RUN -TimeoutSec 30 -AllowEdits $true "
                   "-LedgerWriter { $script:ledgerCalls++ } %s | Out-Null; 'NO-THROW' } catch { $_.Exception.Message }; \"calls=$($script:ledgerCalls)\"") % (lane, cfg, exe_arg)
         done = pwsh(script, {"T_WT": str(tmp_path), "T_RUN": str(run)})
