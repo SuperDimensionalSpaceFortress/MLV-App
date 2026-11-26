@@ -208,6 +208,18 @@ class ArmClassifierTests(_Probe):
         want.update({"ASSERT_PLO": "NONE", "ASSERT_RECEIPT": "FPS_JSON_REPEATED_KEY"})
         self.assertEqual(out, want)
 
+    def test_envelope_preempt_residue_a_cached_analysis_basis_is_compared_ordinally(self) -> None:
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 (adversary r1 A2, the basis half): PowerShell's -cne is culture-aware and ignores a soft hyphen (U+00AD), so a cached analysis naming
+        # 'candidate<U+00AD>Speed' was bound to the candidateSpeed pair. The basis must be the same string ordinally; the exact name still binds.
+        body = (
+            "$cmp = [pscustomobject]@{ presentedFps = [pscustomobject]@{ deltaPercent = -20 } }\n"
+            "foreach ($b in @('candidateSpeed', \"candidate$([char]0xAD)Speed\", 'candidatespeed')) {\n"
+            "  $a = [pscustomobject]@{ comparisonBasis = $b; evidence = [pscustomobject]@{ presentedFpsDeltaPercent = -20 } }\n"
+            "  Write-Host ('BOUND=' + (Test-FpsCachedAnalysisBound -Analysis $a -Compare $cmp -ComparisonBasis 'candidateSpeed'))\n"
+            "}\n"
+        )
+        self.assertEqual(self.ok(body).split(), ["BOUND=True", "BOUND=False", "BOUND=False"])
+
     def test_envelope_preempt_residue_a_receipt_reader_still_refuses_an_envelope_array(self) -> None:
         # ENVELOPE-PREEMPT-RESIDUE-1 r1 KEEP item 3: only the lease batch's plan read defers the shape rules. A receipt reader (Read-SmokeJson, Read-JsonRecords) still refuses a record whose
         # `launch` envelope is an array, exactly as at 23b2d55d; the same record with an object envelope is read.

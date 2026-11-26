@@ -1691,9 +1691,6 @@ if ($legPlanMode) {
         if ($planPurposeDeclared) { $planPurpose = $doc.PSObject.Properties['purpose'].Value }
         $purposeRefusal = Get-FpsLegPlanRefusal -Purpose $planPurpose -Items @($items | ForEach-Object { [pscustomobject]@{ item = $_.item; arm = $_.telemetryArm } }) -Declared:$planPurposeDeclared
         if ($purposeRefusal[0]) { Stop-PlanRefused ([string]$purposeRefusal[0]) ([int]$purposeRefusal[1]) ([string]$purposeRefusal[2]) }
-        # ENVELOPE-PREEMPT-RESIDUE-1 r1: the raw shape rules the parse-level read above deferred (r15 A1: an array under a receipt-envelope name; the depth-256 cap), now that every item has
-        # passed its own checks. Still before any build staging read, claim or lease; a bare-array plan root is allowed (the reader above shape-checks its entries).
-        try { Assert-FpsJsonNoRepeatedKey $planText $planPath -AllowArrayRoot } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' has a shape the raw JSON check refuses: $($_.Exception.Message)" }
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
         foreach ($it in $items) {
@@ -1716,7 +1713,11 @@ if ($legPlanMode) {
             # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: and the cached artifacts the manifest's digests name must exist and hash to them (the leg job throws on either after the lease opened)
             if ($st.artifactProblem) { $ap = $st.artifactProblem -split ' ', 2; Stop-PlanRefused $ap[0] $it.item "the staged build for ${short}: $($ap[1])" }
         }
-        $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 (+ adversary r1 A1): the raw shape rules the parse-level read above deferred (r15 A1: an array under a receipt-envelope name; the depth-256 cap), run only
+        # after EVERY per-item refusal (the shape and field checks, the purpose check and each item's build-staging refusals), so each of those keeps its merge-base code and item number.
+        # Still before any claim or lease; a bare-array plan root is allowed (the reader above shape-checks its entries).
+        try { Assert-FpsJsonNoRepeatedKey $planText $planPath -AllowArrayRoot } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' has a shape the raw JSON check refuses: $($_.Exception.Message)" }
+        $ordered =$(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
         $spread = $null
         if ($PlanOrder -ceq 'ThermalSpread') {
             # item 10: heavy is measured from the -HeatFrom receipts (a leg key whose next leg on the same lease read hot), never a hand-kept list

@@ -521,7 +521,8 @@ function Test-FpsCachedAnalysisBound {
     param([AllowNull()]$Analysis, [AllowNull()]$Compare, [string]$ComparisonBasis)
     if ($null -eq $Analysis -or $null -eq $Compare -or [string]::IsNullOrEmpty($ComparisonBasis)) { return $false }
     $basis = Get-FaProp $Analysis 'comparisonBasis'
-    if ($basis -isnot [string] -or $basis -cne $ComparisonBasis) { return $false }
+    # ENVELOPE-PREEMPT-RESIDUE-1 r1 (adversary r1 A2): ORDINAL, not -cne: PowerShell's culture-aware compare ignores a soft hyphen, so 'candidate<U+00AD>Speed' matched 'candidateSpeed'
+    if ($basis -isnot [string] -or -not [string]::Equals($basis, $ComparisonBasis, [StringComparison]::Ordinal)) { return $false }
     $cached = Get-FaProp (Get-FaProp $Analysis 'evidence') 'presentedFpsDeltaPercent'
     $judged = Get-FaProp (Get-FaProp $Compare 'presentedFps') 'deltaPercent'
     $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long] -or $v -is [int16] -or $v -is [byte]) }

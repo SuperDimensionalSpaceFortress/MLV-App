@@ -3649,6 +3649,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # LEG_PLAN_UNREADABLE with no item; the merge base c6ec83ae refuses each BAD_ITEM_SHAPE item=1. Now the shape rules run after every per-item check, so any per-item refusal the
         # merge base gave (BAD_ITEM_SHAPE and the field checks alike) keeps its code and position.
         ok_a = json.dumps(self.item(self.specs[0], "A", self.commit_a))
+        unstaged = json.dumps(self.item(self.specs[0], "A", "3" * 40, manifest="c" * 64))
+        mismatch = json.dumps(self.item(self.specs[0], "B", self.commit_a, manifest="d" * 64))
         cases = {
             "array entry holding an envelope array": ('[[{"proof":[]}]]', "BAD_ITEM_SHAPE item=1 "),
             "same, object container": ('{"legs":[[{"proof":[]}]]}', "BAD_ITEM_SHAPE item=1 "),
@@ -3657,6 +3659,11 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             "a 257-deep nested null": ("[" * 257 + "null" + "]" * 257, "BAD_ITEM_SHAPE item=1 "),
             "valid item then a null, envelope array beside": ('{"legs":[' + ok_a + ',null],"proof":[]}', "BAD_ITEM_SHAPE item=2 "),
             "valid item then an item whose envelope is an array": ('[' + ok_a + ',{"launch":[1]}]', "BAD_SOURCE_COMMIT item=2 "),
+            # adversary r1 A1: the build-staging refusals are per-item refusals too, so the deferred shape rules wait for them
+            "unstaged build beside an envelope array": ('{"legs":[' + unstaged + '],"proof":[]}', "BUILD_NOT_STAGED item=1 "),
+            "unstaged build beside depth-257 nesting": ('{"legs":[' + unstaged + '],"deep":' + "[" * 257 + "1" + "]" * 257 + '}', "BUILD_NOT_STAGED item=1 "),
+            "a later item's field refusal still precedes an earlier item's staging refusal": ('[' + ok_a + ',' + mismatch + ',{"host":[]}]', "BAD_SOURCE_COMMIT item=3 "),
+            "manifest digest mismatch then an envelope array": ('{"legs":[' + ok_a + ',' + mismatch + '],"inputs":["x"]}', "BUILD_MANIFEST_MISMATCH item=2 "),
         }
         for label, (text, want) in cases.items():
             with self.subTest(case=label):
