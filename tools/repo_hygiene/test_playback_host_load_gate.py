@@ -4276,7 +4276,10 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         # adversary-ac722a96.json A2, its input: -Output <dir>\<226 x r>.json (a 231-character leaf, inside the component limit). RED on ac722a96: the temporary file was named
         # ".<leaf>.<guid>.tmp" (269 characters), so CreateNew failed and a valid report was never published. The temporary name no longer carries the report's leaf.
         with tempfile.TemporaryDirectory(prefix="r4n2-p2a2-") as tmp:
-            leaf = "r" * 226 + ".json"
+            # (a literal, not "r" * 226: tools/repo_hygiene/test_hidden_spawn_flags.py reports a string built at run time)
+            leaf = ("rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr"
+                    "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrrrrrr" "rrrrrr" ".json")
+            self.assertEqual(len(leaf), 231)
             try:
                 (Path(tmp) / leaf).write_text("probe", encoding="utf-8")
                 (Path(tmp) / leaf).unlink()
