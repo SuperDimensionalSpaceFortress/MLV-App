@@ -938,7 +938,7 @@ TEST(VisualCaptureBinding, TheBurstRereadsTheClockImmediatelyBeforeEachCaptureSt
     // between the read and the capture: nothing but the branch (whitespace normalised; any statement there is a delay the read does not see).
     // r2 (luna A1 on c4d5d5f6): the capture timer starts immediately BEFORE the gate, so captureMs still spans the capture.
     const QString between = lambda.mid(gateAt + gate.size(), captureAt - gateAt - gate.size()).simplified();
-    ASSERT_EQ(QStringLiteral("{ grab.image ="), between);
+    ASSERT_EQ(std::string("{ grab.image ="), between.toStdString());
     ASSERT_TRUE(lambda.left(gateAt).simplified().endsWith(QStringLiteral("QElapsedTimer captureClock; captureClock.start();")));
     ASSERT_EQ(1, countOccurrences(block, QStringLiteral("visualGrabs.append( grab );")));
 
