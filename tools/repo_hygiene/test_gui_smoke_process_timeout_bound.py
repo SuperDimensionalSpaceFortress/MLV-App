@@ -1234,28 +1234,29 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
 
     def test_the_probe_returns_no_stall_verdict_once_the_whole_budget_is_spent(self) -> None:
         # the adversary's input, scaled down: the watch is armed and quiet beyond its window, then a probe that blocks past the whole budget returns
+        # CI-FLAKE-GUI-SMOKE-STALL-BUDGET-TIMING-1 r2: the budget-left half arms in a bounded loop (one 2 s probe wait can be missed on a loaded runner),
+        # and the past-budget half no longer waits for a real 200 ms wait to end with under 1 ms left (a wait that ends 1 ms early reads budget left)
         out = run_ps(r"""
 $dir = Join-Path $env:GS_TMP 'spentbudget'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 500) -NoNewline
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs 2000
-$arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 20000)
+# the verdict of the call that ARMED the watch (P = that call's reading, so a window of 50 ms has not run out yet)
+$arm = $null
+for ($i = 0; $i -lt 5 -and -not $w.Armed; $i++) { $arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 20000) }
 Start-Sleep -Milliseconds 300
 $w.ProbeDelayMs = 1500
 $stalledWithBudgetLeft = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 20000)
 Stop-GuiSmokeLogProgressWatch -Watch $w
-$w2 = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs 2000
-[void](Test-GuiSmokeLogProgressStalled -Watch $w2 -DeadlineMs 20000)
-Start-Sleep -Milliseconds 300
-$w2.ProbeDelayMs = 1500
-# -2 r1: a deadline 200 ms after this moment, on the watch's launch clock (the old -BudgetRemainingMs 200)
-$stalledPastBudget = [bool](Test-GuiSmokeLogProgressStalled -Watch $w2 -DeadlineMs ([int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w2.LaunchTimestamp) + 200))
-Stop-GuiSmokeLogProgressWatch -Watch $w2
-[pscustomobject]@{ arm = $arm; armed = [bool]$w.Armed; stalledWithBudgetLeft = $stalledWithBudgetLeft; stalledPastBudget = $stalledPastBudget } | ConvertTo-Json -Compress
+[pscustomobject]@{ arm = $arm; armed = [bool]$w.Armed; stalledWithBudgetLeft = $stalledWithBudgetLeft } | ConvertTo-Json -Compress
 """)
         self.assertFalse(out["arm"])
         self.assertTrue(out["armed"])
         self.assertTrue(out["stalledWithBudgetLeft"], "with budget left a quiet armed watch still reports the stall")
-        self.assertFalse(out["stalledPastBudget"], "a probe that returned after the whole budget was spent must not pass a stall verdict: the whole budget decides")
+        # the past-budget half on the module's scripted clock: the quiet armed watch is read with 200 ms of D = 20000 left, the probe never answers, and the
+        # reading after its wait is 20500 (the budget is spent). Only the guard at the verdict stops this one: E is long past (P + 50 ms)
+        spent = TheDeadlineIsReachedWithUnderOneMsOfItLeft._scripted("19800, 19800, 20500", 20000)
+        self.assertTrue(spent["started"])
+        self.assertFalse(spent["stalled"], "a probe that returned after the whole budget was spent must not pass a stall verdict: the whole budget decides")
 
     def test_every_runner_site_that_breaks_on_a_stall_verdict_judges_the_whole_budget(self) -> None:
         wait = _runner_snippet(*_WAIT_REGION)
@@ -1279,7 +1280,10 @@ class TheDeadlineIsReachedWithUnderOneMsOfItLeft(unittest.TestCase):
     The module's own Get-GuiSmokeSinceLaunchMs is replaced in the module scope by a scripted clock, so each reading is placed exactly and the verdict does not
     depend on how precisely the host's wait returns. Class: one deadline with two definitions of reached."""
 
-    def _scripted(self, readings: str, deadline_ms: int) -> dict:
+    @staticmethod
+    def _scripted(readings: str, deadline_ms: int) -> dict:
+        # a staticmethod since CI-FLAKE-GUI-SMOKE-STALL-BUDGET-TIMING-1 r2: AStallVerdictPastTheWholeBudgetIsATimeoutNotNoProgress takes its past-budget
+        # half off the real clock through this same scripted clock
         return run_ps(r"""
 $m = Get-Module gui-smoke-process-boundary
 $dir = Join-Path $env:GS_TMP 'scriptedclock'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
@@ -1860,14 +1864,20 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
     late arming (an explicit -NoProgressTimeoutMs of 2000 ms) still fires by L."""
 
     _DELAYED_ARMING = "Start-Sleep -Milliseconds 2000; Add-Content -LiteralPath $env:GS_LOG -Value 'first line'; Start-Sleep -Seconds 30"
+    # CI-FLAKE-GUI-SMOKE-STALL-BUDGET-TIMING-1 r2 (merge_group run 45756824238, windows unittest heavy 7/14: "the loop ended at 8024 ms since launch"):
+    # the stub's first log line lands at pwsh start-up + 2000 ms on a real clock, and a window that fits needs the watch armed by L - W. With the allowance
+    # at 6000 (H = 8000, L = 6000, W = 2000) that left 2000 ms for a hosted runner's pwsh start-up and first probe; a slower start-up armed the watch too
+    # late, the module rightly passed no silence verdict (E = -1) and the leg ended as `timeout` at H. The two `fits` tests take the wider allowance
+    # below (H = 12000, L = 10000: the watch may arm up to 8000 ms after launch, 4x the headroom); the `cannot run out by L` pair keeps 6000, where a
+    # slower start-up only makes its verdict (no silence expiry) more certain. Same property under test: the expiry is at most H - M.
+    _FITS_ALLOW_MS = 10000
 
-    def _run(self, sample_ms: int, override_ms: int = 0) -> dict:
+    def _run(self, sample_ms: int, override_ms: int = 0, allow_ms: int = 6000) -> dict:
         extra = {"GS_OVERRIDE_MS": str(override_ms)} if override_ms else {}
-        return run_ps(_RUNNER_HARNESS, GS_STUB=self._DELAYED_ARMING, GS_SAMPLE_MS=str(sample_ms), GS_ALLOW_MS="6000",
+        return run_ps(_RUNNER_HARNESS, GS_STUB=self._DELAYED_ARMING, GS_SAMPLE_MS=str(sample_ms), GS_ALLOW_MS=str(allow_ms),
                       GS_DERIVE=_runner_snippet(*_DERIVE_REGION), GS_WAIT=_runner_snippet(*_WAIT_REGION), **extra)
 
-    def _assert_fires_before_the_deadline(self, out: dict, branch: str) -> None:
-        hard, margin = 8000, 2000
+    def _assert_fires_before_the_deadline(self, out: dict, branch: str, hard: int = 8000, margin: int = 2000) -> None:
         self.assertEqual(hard, out["hardLimitMs"])
         self.assertTrue(out["armed"], branch)
         self.assertEqual("process_no_progress", out["outcome"],
@@ -1893,10 +1903,10 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
         self.assertFalse(out["alive"])
 
     def test_a_late_arming_with_a_window_that_fits_expires_by_h_minus_m_in_the_log_only_branch(self) -> None:
-        self._assert_fires_before_the_deadline(self._run(0, override_ms=2000), "log-only")
+        self._assert_fires_before_the_deadline(self._run(0, override_ms=2000, allow_ms=self._FITS_ALLOW_MS), "log-only", hard=2000 + self._FITS_ALLOW_MS)
 
     def test_a_late_arming_with_a_window_that_fits_expires_by_h_minus_m_in_the_host_load_branch(self) -> None:
-        self._assert_fires_before_the_deadline(self._run(500, override_ms=2000), "host-load")
+        self._assert_fires_before_the_deadline(self._run(500, override_ms=2000, allow_ms=self._FITS_ALLOW_MS), "host-load", hard=2000 + self._FITS_ALLOW_MS)
 
     def test_a_late_arming_whose_window_cannot_run_out_by_l_is_left_to_the_deadline_in_the_log_only_branch(self) -> None:
         self._assert_the_deadline_decides(self._run(0), "log-only")
