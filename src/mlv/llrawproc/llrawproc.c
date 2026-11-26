@@ -7487,7 +7487,8 @@ int llrpGetDualIsoMode(mlvObject_t * video)
 
 void llrpSetDualIsoMode(mlvObject_t * video, int value)
 {
-    video->llrawproc->dual_iso = value;
+    /* r3 (adversary 9a8772dd A3): 1 (full) and 2 (preview) are the only modes; any other value is off (0) for every reader. */
+    video->llrawproc->dual_iso = (value == 1 || value == 2) ? value : 0;
 }
 
 int llrpGetDualIsoInterpolationMethod(mlvObject_t * video)
@@ -7551,7 +7552,7 @@ void llrpSetDualIsoPlaybackRuntimeState(mlvObject_t * video,
     if (!video || !video->llrawproc) return;
 
     pthread_mutex_lock(&video->llrawproc_mutex);
-    video->llrawproc->dual_iso = mode;
+    video->llrawproc->dual_iso = (mode == 1 || mode == 2) ? mode : 0;   /* r3 A3: as llrpSetDualIsoMode */
     video->llrawproc->diso_averaging = interpolation;
     video->llrawproc->diso_alias_map = alias_map;
     video->llrawproc->diso_frblending = fullres_blending;

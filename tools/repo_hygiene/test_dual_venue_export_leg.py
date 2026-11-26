@@ -4437,18 +4437,18 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
             self.assertIsNone(g["metrics"]["dualIsoActiveFrames"], g)
 
     def test_a_marker_missing_on_one_frame_is_a_typed_null(self) -> None:
+        # (r3, adversary 9a8772dd A1: and an INCOMPLETE capture, a problem of the evidence, so it is INVALID under any criteria, never a FAIL or PASS the criteria choose)
         one = {i: "applied" for i in range(480) if i != 11}
         proc, got = evidence_cases([self.ctl(piped_stage_log(480, outcome=one))])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         g = got[0]
-        self.assertEqual(g["problems"], [], g)
-        self.assertEqual(g["outcome"], "FAIL", g)
+        self.assertEqual(g["outcome"], "INVALID", g)
+        self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH: DUALISO_OUTCOME_WINDOW_MISMATCH: ") for p in g["problems"]), g)
         self.assertIsNone(g["metrics"]["dualIsoClassAgrees"], g)
         self.assertIsNone(g["metrics"]["dualIsoActiveFrames"], g)
         for k in ("dualIsoActiveFramesCouldNotCheck", "dualIsoClassAgreesCouldNotCheck"):
             self.assertTrue(g["metrics"][k].startswith("DUALISO_OUTCOME_WINDOW_MISMATCH: "), g)
             self.assertIn("marks 479 of the 480", g["metrics"][k])
-        self.assertTrue(g["detail"].startswith("EXPORT_CAPTURED: dualIsoClassAgrees: DUALISO_OUTCOME_WINDOW_MISMATCH:"), g)
 
     def test_mixed_outcomes_never_pass(self) -> None:
         # (a) applied frames beside not-attempted ones; (b) one frame whose two llrawproc runs disagree (two runs fit debayered_frame: 9 + 2 x 15 <= 40)
@@ -4579,6 +4579,57 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
         g = got[0]
         self.assertFalse(any("outcome marker" in p for p in g["problems"]), g)
         self.assertTrue(any("frame loop's order" in p for p in g["problems"]), g)
+
+    # ---- r3 fix iteration 2: adversary 9a8772dd (adversary-9a8772dd.json) A1, A2, A4 (A3 is native: DualIsoAppliedOutcome.ModeThatNamesNoReconstructionReportsNotAttempted)
+    def test_r3_9a8772dd_a1_a_signal_capture_that_leaves_one_run_unmarked_never_passes(self) -> None:
+        """A1: not_applied on every frame but frame 11's marker lost, or applied with that loss on a no-dual-ISO leg, under no criteria: the capture is incomplete (INVALID)."""
+        lost = "[mlv-stage-timing] frame=11 stage=llrawproc_dual_iso_{} ms=0.000\n"
+        na = piped_stage_log(480, outcome="not_applied")
+        ap = piped_stage_log(480, outcome="applied")
+        self.assertIn(lost.format("not_applied"), na)
+        self.assertIn(lost.format("applied"), ap)
+        proc, got = evidence_cases([self.ctl(na.replace(lost.format("not_applied"), ""), criteria=[]),
+                                    self.ctl(ap.replace(lost.format("applied"), ""), criteria=[], dualIsoExpected=False)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH: DUALISO_OUTCOME_WINDOW_MISMATCH: ") for p in g["problems"]), g)
+
+    def test_r3_9a8772dd_a2_a_proven_product_failure_is_returned_before_any_criterion_is_evaluated(self) -> None:
+        """A2: a criterion the evaluator cannot compare (`dualIsoActiveFrames ge "bogus"`) threw before the proven DUALISO_NOT_APPLIED / MIXED was read; the FAIL comes first."""
+        bogus = [{"metric": "dualIsoActiveFrames", "op": "ge", "value": "bogus"}]
+        mixed = {i: ("not_attempted" if i == 3 else "applied") for i in range(480)}
+        mixed_log = piped_stage_log(480, outcome=mixed)
+        dual3 = "[mlv-stage-timing] frame=3 stage=llrawproc_dual_iso ms=30.000\n[mlv-stage-timing] frame=3 stage=llrawproc_dual_iso_not_attempted"
+        mixed_log = mixed_log.replace(dual3, dual3.replace("ms=30.000", "ms=0.000"))
+        # (under Stop, as the venue writer runs: Invoke-VenueLeg.ps1's outer catch turned the conversion error into UNRESOLVED/RUNNER_ERROR)
+        proc, got = evidence_cases([self.ctl(self.interp2(), criteria=bogus), self.ctl(mixed_log, criteria=bogus)], prelude="$ErrorActionPreference = 'Stop'\n")
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, typed in zip(got, ("DUALISO_NOT_APPLIED", "DUALISO_OUTCOME_MIXED")):
+            self.assertEqual(g["outcome"], "FAIL", g)
+            self.assertTrue(g["detail"].startswith(f"EXPORT_CAPTURED: dualIsoClassAgrees: {typed}:"), g)
+
+    def test_r3_9a8772dd_a4_both_macros_are_decided_from_one_header_read(self) -> None:
+        """A4: the pipe class read the build's StageTiming.h, then a second read for the signal macro failed and read 'unknown', which skipped the incomplete-capture check.
+        After the first successful read the header blob is made unreadable (its loose object removed): the signal macro is still decided from the bytes already read."""
+        import subprocess
+        header = ('#define MLV_STAGE_EXPORT_PIPE_WRITE "export_pipe_write"\n'
+                  '#define MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED "llrawproc_dual_iso_applied"\n')
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            sha = ExportRenderPipeTimingTests.header_commit(repo, header)
+            blob = subprocess.run(["git", "-C", str(repo), "rev-parse", f"{sha}:src/debug/StageTiming.h"], capture_output=True, text=True, check=True,
+                                  stdin=subprocess.DEVNULL).stdout.strip()
+            obj = repo / ".git" / "objects" / blob[:2] / blob[2:]
+            self.assertTrue(obj.exists(), obj)
+            script = ("$m = Get-Module DualVenueRunner\n$o = [ordered]@{}\n"
+                      f"$o['pipe'] = & $m {{ param($r, $id) Get-DvRenderPipeBuildClass -BuildId $id -RepoRoot $r }} '{repo}' '{sha}'\n"
+                      f"Remove-Item -LiteralPath '{obj}' -Force\n"
+                      f"$o['signal'] = & $m {{ param($r, $id) Get-DvRenderPipeBuildClass -BuildId $id -RepoRoot $r -Macro 'MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED' }} '{repo}' '{sha}'\n"
+                      "$o | ConvertTo-Json -Compress")
+            proc, got = run_pwsh_json(script)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got, {"pipe": "emits", "signal": "emits"})
 
 
 if __name__ == "__main__":

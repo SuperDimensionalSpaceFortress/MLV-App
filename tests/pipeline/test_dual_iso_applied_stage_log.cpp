@@ -172,6 +172,8 @@ TEST(DualIsoAppliedOutcome, ModeThatNamesNoReconstructionReportsNotAttempted)
 
             std::vector<uint16_t> out;
             llrpSetDualIsoMode(fixture.video(), mode);
+            // (adversary 9a8772dd A3: the value is stored as off, so every reader of dual_iso -- the worker, its pixel repairs, processing -- runs as dual_iso=0)
+            ASSERT_EQ(0, llrpGetDualIsoMode(fixture.video()));
             const int outcome = run_dual_iso_outcome(fixture, with_dims, source, out);
             if (outcome != LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED)
             {

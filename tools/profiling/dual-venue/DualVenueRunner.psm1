@@ -5584,6 +5584,7 @@ function Get-DvBatchExportBindingProblems {
 $script:RenderPipeMarkerPath = 'src/debug/StageTiming.h'
 $script:RenderPipeMarker = '#define MLV_STAGE_EXPORT_PIPE_WRITE'
 $script:RenderPipeBuildClassCache = [hashtable]::new([StringComparer]::Ordinal)
+$script:RenderPipeHeaderCache = [hashtable]::new([StringComparer]::Ordinal)   # (r3, adversary 9a8772dd A4: one header read per build, every macro decided from it)
 
 function Test-DvRenderPipeMarkerDefined {
     # (r4, adversary A6 on 7c66c004: a substring search read `# define MLV_STAGE_EXPORT_PIPE_WRITE ...`, legal preprocessor spacing, as 'older', and a header that only
@@ -5660,23 +5661,32 @@ function Get-DvRenderPipeBuildClass {
     if ($script:RenderPipeBuildClassCache.ContainsKey($key)) { return $script:RenderPipeBuildClassCache[$key] }
     # (r2 fix 1, pass 4 A5: only a header that was READ decides a class, and only a decided class is cached: a failed lookup -- no such object yet, a header git could not
     # read, git not answering -- is 'unknown' this time and is asked again next time, never 'older')
-    $kind = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-t', $BuildId)
-    if ($kind.exitCode -ne 0 -or ([Text.Encoding]::ASCII.GetString($kind.bytes)).Trim() -cne 'commit') { return 'unknown' }
-    $blob = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-p', "${BuildId}:$($script:RenderPipeMarkerPath)")
-    if ($blob.exitCode -eq 0) {
+    # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 r3, adversary 9a8772dd A4: the header is READ once per build and every macro is decided from those same bytes, so the pipe
+    # macro and the applied-signal macro never come from two reads that can disagree -- a second read that failed made the signal 'unknown' beside an 'emits' pipe class
+    # and skipped the completeness check. Only a read that succeeded is kept: a header git READ, or a tree git READ without it ($null text = no header, 'older').)
+    $hkey = "$RepoRoot|$BuildId|$($script:RenderPipeMarkerPath)"
+    if (-not $script:RenderPipeHeaderCache.ContainsKey($hkey)) {
+        $kind = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-t', $BuildId)
+        if ($kind.exitCode -ne 0 -or ([Text.Encoding]::ASCII.GetString($kind.bytes)).Trim() -cne 'commit') { return 'unknown' }
+        $blob = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('cat-file', '-p', "${BuildId}:$($script:RenderPipeMarkerPath)")
+        if ($blob.exitCode -eq 0) { $script:RenderPipeHeaderCache[$hkey] = [pscustomobject]@{ text = (ConvertTo-DvText $blob.bytes) } }
+        else {
+            # (r2 fix 2, adversary A4 on c2da7e24: a commit whose tree git READ and found without the header is a build before stage timing, so 'older'; a tree that lists it or
+            # that git could not read is still 'unknown')
+            # (r4, CI DG-GIT-PATHLIST on c7ec3ab8: -z, so the listing is NUL-terminated and never quoted; any byte at all is a listed path)
+            $tree = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('ls-tree', '-z', '--name-only', $BuildId, '--', $script:RenderPipeMarkerPath)
+            if ($tree.exitCode -ne 0 -or $tree.bytes.Length -gt 0) { return 'unknown' }
+            $script:RenderPipeHeaderCache[$hkey] = [pscustomobject]@{ text = $null }
+        }
+    }
+    $header = $script:RenderPipeHeaderCache[$hkey]
+    if ($null -ne $header.text) {
         # (r4 fix 2, adversary A5: a header whose define this model cannot decide is 'unknown', never cached)
-        $markerState = Get-DvRenderPipeMarkerState (ConvertTo-DvText $blob.bytes) -Macro $Macro
+        $markerState = Get-DvRenderPipeMarkerState ([string]$header.text) -Macro $Macro
         if ($markerState -ceq 'undecidable') { return 'unknown' }
         $class = $(if ($markerState -ceq 'defined') { 'emits' } else { 'older' })
     }
-    else {
-        # (r2 fix 2, adversary A4 on c2da7e24: a commit whose tree git READ and found without the header is a build before stage timing, so 'older'; a tree that lists it or
-        # that git could not read is still 'unknown')
-        # (r4, CI DG-GIT-PATHLIST on c7ec3ab8: -z, so the listing is NUL-terminated and never quoted; any byte at all is a listed path)
-        $tree = Invoke-DvGit -RepoRoot $RepoRoot -GitArgs @('ls-tree', '-z', '--name-only', $BuildId, '--', $script:RenderPipeMarkerPath)
-        if ($tree.exitCode -ne 0 -or $tree.bytes.Length -gt 0) { return 'unknown' }
-        $class = 'older'
-    }
+    else { $class = 'older' }
     $script:RenderPipeBuildClassCache[$key] = $class
     $class
 }
@@ -6174,6 +6184,9 @@ function Get-DvExportEvidence {
                         $why = "$($script:ExportDualIsoOutcomeWindow): the dual-ISO applied signal ($($script:ExportDualIsoOutcomeList)) marks $($markedFrames.Count) of the $($p16Frames.Count) frame(s) processed16_total is timed on$(if ($unmarked.Count -gt 0) { ", and $($unmarked.Count) frame(s) carry an llrawproc_dual_iso record with no marker after it" }); the producer marks every llrawproc_dual_iso record, so the class is not readable"
                         $m.dualIsoActiveFrames = $null; $m['dualIsoActiveFramesCouldNotCheck'] = $why
                         $m.dualIsoClassAgrees = $null; $m['dualIsoClassAgreesCouldNotCheck'] = $why
+                        # (r3, adversary 9a8772dd A1: a signal capture that leaves a timed run unmarked is an INCOMPLETE capture, a problem of the evidence, as a stage on
+                        # another window is above; a typed null alone let a leg with no class criterion read PASS over a run whose other frames did not apply)
+                        $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: $why")
                     }
                     else {
                         $words = @($outcomes.Values)
@@ -6393,13 +6406,13 @@ function Get-DvExportOutcome {
     if (-not $gatesTheWindow -and $null -ne $requested -and ($null -eq $exported -or [int64]$exported -ne [int64]$requested)) {
         return [pscustomobject]@{ outcome = 'INVALID'; detail = "EXPORT_FRAMES_MISMATCH: the batch exported $(if ($null -eq $exported) { 'no countable number of' } else { $exported }) of the $requested requested frame(s) yet the job reported EXPORT_CAPTURED, and no criterion of the leg sets another expectation"; criteria = $null }
     }
-    $verdict = Test-DvCriteria -Criteria $Criteria -Metrics $Evidence.metrics
-    # (r3, adversary 928fad78 A2: the evidence's own product failure is the FAIL before any criterion is read; the criteria's failures, if any, follow it)
+    # (r3, adversary 928fad78 A2: the evidence's own product failure is the FAIL before any criterion is read. Adversary 9a8772dd A2: BEFORE, not beside -- the criteria
+    # are not evaluated at all on that path, so a criterion the evaluator cannot compare can never stand in front of the proven failure)
     $productFailure = [string](Get-DvProp $Evidence 'productFailure')
     if (-not [string]::IsNullOrWhiteSpace($productFailure)) {
-        $rest = @(@($verdict.failures) | Where-Object { -not ([string]$_).StartsWith($productFailure, [StringComparison]::Ordinal) })
-        return [pscustomobject]@{ outcome = 'FAIL'; detail = 'EXPORT_CAPTURED: ' + (@($productFailure) + $rest -join '; '); criteria = $verdict }
+        return [pscustomobject]@{ outcome = 'FAIL'; detail = "EXPORT_CAPTURED: $productFailure"; criteria = $null }
     }
+    $verdict = Test-DvCriteria -Criteria $Criteria -Metrics $Evidence.metrics
     $detail = $(if ($verdict.pass) { "EXPORT_CAPTURED: $(if ($verdict.informational) { 'no gating criteria' } else { 'all criteria met' }); largest stage $($Evidence.metrics.largestStage)" } else { 'EXPORT_CAPTURED: ' + ($verdict.failures -join '; ') })
     [pscustomobject]@{ outcome = $(if ($verdict.pass) { 'PASS' } else { 'FAIL' }); detail = $detail; criteria = $verdict }
 }

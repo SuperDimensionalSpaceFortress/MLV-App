@@ -520,7 +520,8 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     `llrawproc_dual_iso_applied`, `llrawproc_dual_iso_not_applied` or `llrawproc_dual_iso_not_attempted`, always `ms=0.000`. Markers carry no share and no nesting. A
     marker that does not directly follow a `llrawproc_dual_iso` record of its frame, a second marker after one record, or a marker figure that is not a zero is
     `EXPORT_RECORD_INVALID`. Any marker means the log carries the signal, and then it is read instead of the time. It must mark exactly the frames `processed16_total` is
-    timed on (otherwise both metrics are null with `DUALISO_OUTCOME_WINDOW_MISMATCH`). On a dual-ISO leg: every frame applied gives `dualIsoActiveFrames` = N and
+    timed on (otherwise both metrics are null with `DUALISO_OUTCOME_WINDOW_MISMATCH`, and from r3 the run is INVALID with the problem
+    `EXPORT_STAGE_WINDOW_MISMATCH: DUALISO_OUTCOME_WINDOW_MISMATCH: ...`, an incomplete capture, whatever the criteria). On a dual-ISO leg: every frame applied gives `dualIsoActiveFrames` = N and
     `dualIsoClassAgrees` true; any frame not applied is a FAIL typed `DUALISO_NOT_APPLIED` (agrees false, `dualIsoActiveFrames` = the applied count,
     `dualIsoNotAppliedFrames` = k); a frame whose markers disagree, or applied frames beside not-attempted ones, is a FAIL typed `DUALISO_OUTCOME_MIXED`; every frame not
     attempted is `CLIP_CLASS_MISMATCH`. On a no-dual-ISO leg any attempted frame is `CLIP_CLASS_MISMATCH`, and every frame not attempted agrees. The typed reason of a
@@ -533,8 +534,9 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     the signal), and a `not_attempted` marker after a `llrawproc_dual_iso` time above 0 is `EXPORT_RECORD_INVALID` too (`llrawproc.c` adds to that time only inside an
     attempt). `DUALISO_NOT_APPLIED` and `DUALISO_OUTCOME_MIXED` are the run's product failure: `Get-DvExportOutcome` returns that FAIL before it reads the leg's
     criteria, so no criteria (or `dualIsoClassAgrees eq false`) turn it into a PASS. A marker-free log keeps the base reader's `DUALISO_APPLIED_UNKNOWN` text byte for
-    byte, so a receipt written before the signal re-derives the same metrics. On the producer side, only `dual_iso` 1 (full) or 2 (preview) enters the dual-ISO block:
-    another value (a receipt can carry any integer) runs as `dual_iso` 0 and is `not_attempted` with a zero time.
+    byte, so a receipt written before the signal re-derives the same metrics. On the producer side, `dual_iso` 1 (full) and 2 (preview) are the only modes:
+    `llrpSetDualIsoMode` (and the playback runtime setter) store any other value (a receipt can carry any integer) as 0, so every reader, pixel repair included, runs it
+    as `dual_iso` 0 and the run is `not_attempted` with a zero time. The build class reads a build's `StageTiming.h` once and decides both macros from those bytes.
     From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
     so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
     `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).
