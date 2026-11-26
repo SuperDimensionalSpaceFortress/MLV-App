@@ -9682,6 +9682,24 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"block": "A1 B3 A2 B4", "uneven": "A1 B4 A2 A3", "three": "A1 B3 C5 A2 B4 C6", "one": "A1 A2 A3", "mixed": "A1 B2 A4 B3"})
 
+    def test_artifact_preflight_r3_residue_a9_a_stalled_staged_build_read_ends_typed_before_the_batch_deadline(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1-R3-MERGE-RESIDUE-1 (sol 07d50621 A9, on 2ed556bb): a purpose-free plan whose optional arm read timed out goes on to the staging reads, and the pre-claim
+        # staged-build read had only its own 30 s probe / 300 s hash bounds, so it outlived -DeadlineUtc before its typed refusal. It is bounded by the deadline now (less the 2 s the refusal
+        # needs): the manifest read that never answers is SHARE_UNREACHABLE item=1 BEFORE the deadline, not 30 s after the read began. The arm read is not stalled here; the staging read
+        # is the one that is, and it is the same read the stalled-arm path reaches (a purpose-free plan never lets the arm refuse first).
+        c = self.commit_a
+        manifest_probe = self.case / "a9-manifest-probe.ps1"
+        manifest_probe.write_text("param($p)\n[Threading.Thread]::Sleep(120000)\n", encoding="utf-8")
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c)]), "-DeadlineUtc", utc_iso(deadline), "-StagedBuildProbeScript", str(manifest_probe))
+        ended = datetime.now(timezone.utc)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertLess(ended, deadline, f"the typed refusal came {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc")
+        self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
+        source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("-ArtifactProbeScript $artifactProbe -CallDeadlineUtc $deadline.AddSeconds(-2.0) -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }", source)
+
 
 # the runner cases are inherited only for their fixtures: they run once, in their own class (unittest collects callable test_* attributes only)
 for _name in [n for n in vars(VenueLeaseBatchRunnerTests) if n.startswith("test_")]:

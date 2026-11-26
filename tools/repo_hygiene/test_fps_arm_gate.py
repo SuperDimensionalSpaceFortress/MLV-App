@@ -744,6 +744,8 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
         script.write_text(
             "$ErrorActionPreference = 'Stop'\n" f"Import-Module '{MODULE}' -Force\n" + fn("Get-BytesSha256") + fn("Get-LegSpecTelemetryArm") +
             "function Get-SpecReadBoundSec { 5.0 }\n"
+            # (merge with #903: the judged digests are keyed by Get-SpecDigestKey; this fixture's key is the spelled path, which the stubbed reads use throughout)
+            "function Get-SpecDigestKey([string]$Path) { $Path }\n"
             f"function Read-SpecBytesWithin($Path, $Bound) {{ [pscustomobject]@{{ state = 'OK'; bytes = [Text.Encoding]::UTF8.GetBytes('{light}'); error = '' }} }}\n"
             f"$heavyBytes = [Text.Encoding]::UTF8.GetBytes('{heavy}')\n$lightBytes = [Text.Encoding]::UTF8.GetBytes('{light}')\n"
             "$script:SpecBudgetSha256 = @{}\n"
@@ -821,6 +823,54 @@ class CudaPlaybackAbFpsGateTests(_Probe):
         self.assertEqual(r["compare"]["presentedFps"]["deltaPercent"], 10.0)
         self.assertIsNotNone(r["compare"]["avgPresentIntervalMs"]["deltaPercent"], "an allowed pair keeps the interval delta")
         self.assertNotEqual(r["analysis"]["dominantBottleneck"], "fps-arm-refused")
+
+    def test_r3_residue_a11_a_cached_label_is_published_only_when_it_is_the_producers_own_for_the_evidence(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1-R3-MERGE-RESIDUE-1 (sol 07d50621 A11, on 2ed556bb): Test-FpsCachedAnalysisBound bound the cached analysis to the judged compare by its INPUTS only
+        # (basis, fps delta, and every stage field equal or both absent). Fps +10 % with every stage field absent matched a cached queue-wait-bound, so the readers repeated advice the
+        # producer would never give for that pair (it says none / validate_same_clip_on_second_machine). The label must be the one New-PlaybackAbAnalysis itself gives. Here the producer's
+        # own function runs over one compare per branch of its ladder: its own output is bound, the same output with another label is not, and a label that is not a string is not.
+        def metric(delta: str, candidate: str = "$null") -> str:
+            return f"[pscustomobject]@{{ deltaPercent = {delta}; candidate = {candidate} }}"
+
+        def compare(**fields: str) -> str:
+            return "[pscustomobject]@{ " + "; ".join(f"{name} = {value}" for name, value in fields.items()) + " }"
+
+        cases = {
+            "NONE": compare(presentedFps=metric("10")),
+            "ABS_QUEUE": compare(presentedFps=metric("12"), avgQueueWaitMs=metric("$null", "20")),
+            "ABS_DRAW": compare(presentedFps=metric("12"), avgDrawTotalMs=metric("$null", "20")),
+            "ABS_TEXTURE": compare(presentedFps=metric("12"), avgTextureTotalMs=metric("$null", "12")),
+            "MIXED": compare(presentedFps=metric("5")),
+            "PRESENT_SYNC": compare(presentedFps=metric("-2"), avgQueueWaitMs=metric("30"), avgDrawTotalMs=metric("12")),
+            "QUEUE": compare(presentedFps=metric("-2"), avgQueueWaitMs=metric("30")),
+            "PACING": compare(presentedFps=metric("-2"), avgPresentPacingMs=metric("30")),
+            "JITTER": compare(presentedFps=metric("-2"), avgDrawTotalMs=metric("16")),
+            "RECON": compare(presentedFps=metric("-2"), avgLlrawprocMs=metric("12")),
+            "CADENCE": compare(presentedFps=metric("-2")),
+        }
+        body = ""
+        for label, cmp in cases.items():
+            body += (f"$cmp = {cmp}\n$a = New-PlaybackAbAnalysis -Compare $cmp -ProofFailures @() -ComparisonBasis 'candidateSpeed'\n"
+                     f"Write-Host ('{label}=' + $a.dominantBottleneck + ',' + (Test-FpsCachedAnalysisBound -Analysis $a -Compare $cmp -ComparisonBasis 'candidateSpeed'))\n")
+        # the attack of the finding: fps +10 % and nothing else, with queue-wait advice (the producer's own text for a queue-wait regression) cached beside it
+        body += (f"$cmp = {cases['NONE']}\n$a = New-PlaybackAbAnalysis -Compare $cmp -ProofFailures @() -ComparisonBasis 'candidateSpeed'\n"
+                 "$a.dominantBottleneck = 'queue-wait-bound'; $a.suggestedOptimization = 'reduce_render_queue_wait_or_present_signal_latency'\n"
+                 "Write-Host ('FORGED_BOTH=' + (Test-FpsCachedAnalysisBound -Analysis $a -Compare $cmp -ComparisonBasis 'candidateSpeed'))\n"
+                 "$a = New-PlaybackAbAnalysis -Compare $cmp -ProofFailures @() -ComparisonBasis 'candidateSpeed'\n"
+                 "$a.suggestedOptimization = 'reduce_render_queue_wait_or_present_signal_latency'\n"
+                 "Write-Host ('FORGED_SUGGESTION=' + (Test-FpsCachedAnalysisBound -Analysis $a -Compare $cmp -ComparisonBasis 'candidateSpeed'))\n"
+                 "$a = New-PlaybackAbAnalysis -Compare $cmp -ProofFailures @() -ComparisonBasis 'candidateSpeed'\n"
+                 "$a.dominantBottleneck = @('none')\n"
+                 "Write-Host ('NOT_A_STRING=' + (Test-FpsCachedAnalysisBound -Analysis $a -Compare $cmp -ComparisonBasis 'candidateSpeed'))\n")
+        out = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(out, {"NONE": "none,True", "ABS_QUEUE": "queue-wait-bound,True", "ABS_DRAW": "present-bound,True", "ABS_TEXTURE": "gpu-texture-bound,True", "MIXED": "mixed,True",
+                               "PRESENT_SYNC": "present-bound,True", "QUEUE": "queue-wait-bound,True", "PACING": "frame-pacing-bound,True", "JITTER": "present-bound,True",
+                               "RECON": "recon-bound,True", "CADENCE": "cadence-bound,True", "FORGED_BOTH": "False", "FORGED_SUGGESTION": "False", "NOT_A_STRING": "False"})
+        # every reader that repeats a cached label goes through that one function (the three sites the finding names)
+        for script, call in (("compare-machine-perf.ps1", "Test-FpsCachedAnalysisBound -Analysis $playbackAb.analysis -Compare $playbackAbCompare"),
+                             ("compare-machine-perf.ps1", "Test-FpsCachedAnalysisBound -Analysis $Record.analysis -Compare $cachedCompare"),
+                             ("summarize-local-cuda-proof.ps1", "Test-FpsCachedAnalysisBound -Analysis $playbackAb.analysis -Compare $playbackAbSpeedCompare")):
+            self.assertIn(call, (PROFILING / script).read_text(encoding="utf-8"), script)
 
     def test_a_heavy_pair_refuses_the_fps_delta_and_keeps_stage_deltas(self) -> None:
         r = self.run_ab(self.leg("HEAVY", 40.0, 5.0), self.leg("HEAVY", 44.0, 2.5))

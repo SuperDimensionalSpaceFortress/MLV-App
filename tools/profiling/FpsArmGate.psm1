@@ -734,7 +734,51 @@ function Test-FpsCachedAnalysisBound {
             if (($side -is [int] -or $side -is [long]) -and [Math]::Abs([double]$side) -ge 9007199254740992) { return $false }
         }
     }
+    # R3-MERGE-RESIDUE-1 (sol 07d50621 A11): matching INPUTS did not make the cached TEXT the diagnosis of those inputs (fps +10 % with every stage field absent matched a cached
+    # queue-wait-bound, where the producer says none / validate_same_clip_on_second_machine). A label the cached analysis carries must be the one the producer's own ladder gives for
+    # the evidence that was just proved equal to the judged compare's; a label that is not (or is not a string) leaves the analysis unbound, so no reader repeats it.
+    $diagnosis = Get-FpsEvidenceDiagnosis $evidence
+    foreach ($field in @(@('dominantBottleneck', 0), @('suggestedOptimization', 1))) {
+        $cachedText = Get-FaProp $Analysis $field[0]
+        if ($null -eq $cachedText -or ($cachedText -is [string] -and $cachedText.Length -eq 0)) { continue }
+        if ($cachedText -isnot [string] -or -not [string]::Equals($cachedText, [string]$diagnosis[$field[1]], [StringComparison]::Ordinal)) { return $false }
+    }
     $true
+}
+
+function Get-FpsEvidenceDiagnosis {
+    <#
+    .SYNOPSIS
+    R3-MERGE-RESIDUE-1 (sol 07d50621 A11): the (dominantBottleneck, suggestedOptimization) pair New-PlaybackAbAnalysis (run-release-cuda-playback-ab.ps1) gives for a recorded analysis.evidence
+    object (a gated pair: neither host-load provisional nor arm refused). The thresholds and the order of the branches are the producer's own; a field that is absent or not a finite number
+    reads as no regression, as the producer's Test-DeltaAtLeast reads a null delta.
+    #>
+    param([AllowNull()]$Evidence)
+    $num = {
+        param($name)
+        $v = Get-FaProp $Evidence $name
+        if ($null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long] -or $v -is [int16] -or $v -is [byte]) -and [double]::IsFinite([double]$v)) { [double]$v } else { $null }
+    }
+    $atLeast = { param($v, $t) $null -ne $v -and $v -ge $t }
+    $fps = & $num 'presentedFpsDeltaPercent'
+    $presentInterval = & $num 'presentIntervalDeltaPercent'; $renderWork = & $num 'renderWorkDeltaPercent'; $queueWait = & $num 'queueWaitDeltaPercent'
+    $llrawproc = & $num 'llrawprocDeltaPercent'; $drawTotal = & $num 'drawTotalDeltaPercent'; $uiSignal = & $num 'presentUiSignalLatencyDeltaPercent'
+    $drawPresent = & $num 'presentDrawPresentDeltaPercent'; $pacing = & $num 'presentPacingDeltaPercent'; $prepBeforeFinish = & $num 'prepBeforeFinishDeltaPercent'
+    $candQueue = & $num 'candidateQueueWaitMs'; $candDraw = & $num 'candidateDrawTotalMs'; $candTexture = & $num 'candidateTextureTotalMs'
+    if ($null -eq $fps) { return @('unknown', 'rerun_playback_ab_for_stage_metrics') }
+    if ($fps -lt -1.0) {
+        if ((& $atLeast $queueWait 25.0) -and ((& $atLeast $drawTotal 10.0) -or (& $atLeast $prepBeforeFinish 10.0) -or (& $atLeast $presentInterval 10.0))) { return @('present-bound', 'reduce_gpu_present_draw_queue_sync') }
+        if ((& $atLeast $queueWait 25.0) -or (& $atLeast $uiSignal 25.0)) { return @('queue-wait-bound', 'reduce_render_queue_wait_or_present_signal_latency') }
+        if (& $atLeast $pacing 25.0) { return @('frame-pacing-bound', 'stabilize_playback_frame_pacing') }
+        if ((& $atLeast $drawTotal 15.0) -or (& $atLeast $drawPresent 15.0) -or (& $atLeast $prepBeforeFinish 15.0) -or (& $atLeast $presentInterval 15.0)) { return @('present-bound', 'reduce_gpu_present_jitter') }
+        if ((& $atLeast $llrawproc 10.0) -or (& $atLeast $renderWork 10.0)) { return @('recon-bound', 'optimize_cuda_recon_kernel_or_state_setup') }
+        return @('cadence-bound', 'profile_playback_cadence_with_stage_timing')
+    }
+    if ($fps -lt 10.0) { return @('mixed', 'profile_present_decode_and_recon_stages') }
+    if ($null -ne $candQueue -and $candQueue -ge 15.0 -and ($null -eq $candTexture -or $candQueue -ge $candTexture)) { return @('queue-wait-bound', 'reduce_render_queue_wait_or_pipeline_gpu_tex_nr_present') }
+    if ($null -ne $candDraw -and $candDraw -ge 15.0 -and ($null -eq $candTexture -or $candDraw -ge $candTexture)) { return @('present-bound', 'reduce_gpu_present_draw_queue_sync') }
+    if ($null -ne $candTexture -and $candTexture -ge 10.0) { return @('gpu-texture-bound', 'optimize_direct_device_recon_amaze_texture_kernel') }
+    @('none', 'validate_same_clip_on_second_machine')
 }
 # analysis.evidence field -> compare metric and the metric's field, as New-PlaybackAbAnalysis (run-release-cuda-playback-ab.ps1) records them
 $script:FpsCachedAnalysisEvidence = @(

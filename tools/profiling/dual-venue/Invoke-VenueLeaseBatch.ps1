@@ -1782,7 +1782,10 @@ if ($legPlanMode) {
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
         foreach ($it in $items) {
-            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }
+            # R3-MERGE-RESIDUE-1 (sol 07d50621 A9): this read is bounded by -DeadlineUtc too (less the 2 s the typed refusal needs, as Get-SpecReadBoundSec leaves). A purpose-free plan whose optional arm
+            # read timed out goes on to the staging refusal below, and the manifest's 30 s probe and 300 s artifact hash would otherwise outlive the batch deadline before it. No room left is the
+            # read's own UNREACHABLE answer, so the typed SHARE_UNREACHABLE refusal lands before the deadline.
+            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe -CallDeadlineUtc $deadline.AddSeconds(-2.0) -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }
             $st = $builds[$it.sourceCommit]
             $short = $it.sourceCommit.Substring(0, 12)
             # #705 r14 (adversary r14 pass 2 A1): a manifest that WAS read, whose cached artifacts could not be hashed (artifactsUnhashed: a locked or stalled artifact), is refused only
