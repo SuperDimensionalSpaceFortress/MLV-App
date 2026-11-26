@@ -739,6 +739,36 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
             self.assertIn("-ExpectReceiptSha256 $receiptSha -ReadTimeoutSec 20.0 -CallDeadlineUtc $deadline", text, label)
             self.assertNotIn("[Math]::Min(20.0, ($deadline - [DateTime]::UtcNow).TotalSeconds)", text, f"{label}: the remainder is no longer sampled as a number")
 
+    def test_r4n2_p2_a4_the_absolute_deadline_reaches_the_file_read_even_when_the_wall_clock_is_stepped_after_the_sample(self) -> None:
+        # adversary-ac722a96.json A4, its input: Get-VenueLegHostLoad -CallDeadlineUtc <now+2 s> with a 20 s -ReadTimeoutSec; the wall clock steps forward (a VM resume, an NTP step) after
+        # the reader sampled its 2 s budget. RED on ac722a96: the read got only the relative budget (the worker's end was recomputed from the stepped clock), so the read ran after the deadline.
+        # Now the read is handed the absolute end itself: with the wall clock stepped 10 s (the test seam VenueTestUtcStepSec) no read starts and the standing is unknown. Read-VenueFileBytesBounded
+        # -EndUtc is the same rule on its own: an end already passed, or passed on the stepped clock, throws before a worker is made; an end far off still reads.
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            quiet = json.dumps({"hostLoad": QUIET})
+            sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            rid = "abababab-abab-4bab-8bab-abababababab"
+            path = self.write_leg(Path(d), rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+            blob = Path(d) / "f.bin"
+            blob.write_bytes(b"abc")
+            p = run_ps(
+                "$vc = Get-Module VenueChain; "
+                f"$a = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(5)); Write-Output ('A=' + $a.state + '/' + $a.provisional); "
+                "& $vc { $script:VenueTestUtcStepSec = 10 }; "
+                f"$b = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(5)); Write-Output ('B=' + $b.state + '/' + $b.provisional); "
+                f"$c = try {{ & $vc {{ param($f) $sw = [Diagnostics.Stopwatch]::StartNew(); Read-VenueFileBytesBounded -Path $f -TimeoutSec 5 -Clock $sw -EndSec 5 -EndUtc ([DateTime]::UtcNow.AddSeconds(5)) }} '{blob}'; 'READ' }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('C=' + $c); "
+                "& $vc { $script:VenueTestUtcStepSec = 0 }; "
+                f"$e = try {{ & $vc {{ param($f) $sw = [Diagnostics.Stopwatch]::StartNew(); Read-VenueFileBytesBounded -Path $f -TimeoutSec 5 -Clock $sw -EndSec 5 -EndUtc ([DateTime]::UtcNow.AddSeconds(-1)) }} '{blob}'; 'READ' }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('E=' + $e); "
+                f"$f2 = try {{ & $vc {{ param($f) $sw = [Diagnostics.Stopwatch]::StartNew(); Read-VenueFileBytesBounded -Path $f -TimeoutSec 5 -Clock $sw -EndSec 5 -EndUtc ([DateTime]::UtcNow.AddSeconds(60)) }} '{blob}'; 'READ' }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('F=' + $f2)")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["A"], "quiet/False", "no step: the read inside the deadline reads: " + p.stdout)
+        self.assertEqual(got["B"], "unknown/True", "the clock stepped past the absolute deadline: nothing is read: " + p.stdout)
+        self.assertTrue(got["C"].startswith("THROWN") and "absolute end" in got["C"], p.stdout)
+        self.assertTrue(got["E"].startswith("THROWN") and "absolute end" in got["E"], p.stdout)
+        self.assertTrue(got["F"].endswith("READ"), p.stdout)
+
     def test_r2_pass2_a5_a7_a13_the_matrix_refuses_a_replaced_receipt_the_planner_refuses_a_duplicated_legtype_the_verdict_keeps_a_list(self) -> None:
         # adversary-b3d61554.json A5: the matrix drops the receipt whose bytes are not the ones the child published (as the baseline refuses them), so a replacement's outcome and
         # fps are never attributed to the planned leg. A7: a spec that declares legType twice is planned 'unknown', never 'export'. A13: the GUI verdict helper never unrolls a

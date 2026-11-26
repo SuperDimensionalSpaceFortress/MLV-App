@@ -1317,14 +1317,23 @@ function Read-VenueFileBytesBounded {
     # pass 2 (adversary-b3d61554.json A1): -Clock / -EndSec are the CALLER's one budget across every read it makes (Get-VenueLegHostLoad starts one Stopwatch and gives both reads the
     # same end), so two reads never each get a fresh bound, the wait is cut to what is left of it, and an answer that arrives after the end is never acted on (Invoke-VenueBoundedRead's
     # own late-answer check). Without them -TimeoutSec alone bounds this one read.
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][double]$TimeoutSec, [switch]$MissingIsNull, [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0)
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-ac722a96.json A4): -EndUtc is the caller's ABSOLUTE end (Get-VenueLegHostLoad's -CallDeadlineUtc). The worker's own end is the EARLIER of that and
+    # the one derived from the stopwatch budget (an instant computed from a remainder on a wall clock that was stepped since the caller sampled it would otherwise land past the caller's end), and a
+    # read whose absolute end has already passed on the wall clock starts nothing.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][double]$TimeoutSec, [switch]$MissingIsNull, [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [DateTime]$EndUtc)
     # (-VenueTestFileReadDelayMs is a test-only seam: the worker sleeps that long first, as a share that answers late does; production leaves it 0)
     # pass 2 (A11): $ErrorActionPreference Stop, so a failed read is a terminating error the bounded read reports (its message names the cause), never an empty answer read as "no file"
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the worker is handed the ABSOLUTE UTC end of this read (the wait it is given: -TimeoutSec, cut to what is left of the caller's
     # -Clock/-EndSec) and refuses to touch the file once it has passed ($script:VenueFileReadWorkerText checks it before the probe and before ReadAllBytes)
     $boundSec = [Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))
     $waitSec = $(if ($null -ne $Clock) { [Math]::Min($boundSec, $EndSec - $Clock.Elapsed.TotalSeconds) } else { $boundSec })
-    $workerArg = @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs; endUtcTicks = ([DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $waitSec)).Ticks) }
+    $endTicks = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $waitSec)).Ticks
+    if ($PSBoundParameters.ContainsKey('EndUtc')) {
+        $absoluteEnd = $EndUtc.ToUniversalTime()
+        if ($absoluteEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: the caller's absolute end had already passed; nothing was started" }
+        if ($absoluteEnd.Ticks -lt $endTicks) { $endTicks = $absoluteEnd.Ticks }
+    }
+    $workerArg = @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs; endUtcTicks = $endTicks }
     $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd }
            else { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec })
     if (-not $r.answered) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: $($r.error)" }
@@ -1990,7 +1999,9 @@ function Get-VenueLegHostLoad {
             if (-not ($toDeadline -ge 1.0)) { $unknown.reason = 'no time was left before the caller''s deadline to read the leg''s receipt and smoke result'; return $unknown }
             if ($toDeadline -lt $budgetSec) { $budgetSec = $toDeadline }
         }
-        $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $budgetSec -Clock $readClock -EndSec $budgetSec
+        $endArgs = @{}
+        if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) { $endArgs['EndUtc'] = $CallDeadlineUtc.ToUniversalTime() }
+        $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $budgetSec -Clock $readClock -EndSec $budgetSec @endArgs
         if ($PSBoundParameters.ContainsKey('ExpectReceiptSha256')) {
             $rcGot = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes))
             if ([string]::IsNullOrEmpty($ExpectReceiptSha256) -or -not [string]::Equals($rcGot, $ExpectReceiptSha256, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the bytes the figures were read from'; return $unknown }
@@ -2019,7 +2030,7 @@ function Get-VenueLegHostLoad {
         $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
         $evidence = Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))
         $result = Join-Path $evidence 'result.json'
-        $bytes = Read-VenueFileBytesBounded -Path $result -TimeoutSec $budgetSec -MissingIsNull -Clock $readClock -EndSec $budgetSec
+        $bytes = Read-VenueFileBytesBounded -Path $result -TimeoutSec $budgetSec -MissingIsNull -Clock $readClock -EndSec $budgetSec @endArgs
         if ($null -eq $bytes) { return $unknown }
         $got =[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
         if (-not [string]::Equals($got, $want, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = "result.json does not match the receipt's evidence.resultJsonSha256"; return $unknown }

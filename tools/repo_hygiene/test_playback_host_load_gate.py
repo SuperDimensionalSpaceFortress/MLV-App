@@ -3788,7 +3788,9 @@ QUIET_SMOKE = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"colle
 
 def _extract_report_write_block(cmp_source: str) -> str:
     """The comparator's report-write block as it runs (MERGE-RESIDUE-1 r1): from the folder bookkeeping to the end of the cleanup `finally`."""
-    return _extract_block(cmp_source, "    $createdDir = $false\n    $tempOutput = $null", "if ([string]::Equals($cleanDir, $firstMissingDir", trailing_lines=3)
+    if "    $createdDirs = [System.Collections.Generic.List[string]]::new()\n" in cmp_source:
+        return _extract_block(cmp_source, "    $createdDirs = [System.Collections.Generic.List[string]]::new()\n", "-Force -ErrorAction Stop } else { break } } catch { break }", trailing_lines=3)
+    return _extract_block(cmp_source, "    $createdDir = $false\n    $tempOutput = $null", "if ([string]::Equals($cleanDir, $firstMissingDir", trailing_lines=3)   # the shape before R4-NARROW-1 r2 (adversary-ac722a96.json A3)
 
 
 def _report_write_probe(tmp: str, before: Path, after: Path, report: Path, outdir: Path, pre_block: str = "") -> Path:
@@ -4242,6 +4244,92 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
         block = _extract_report_write_block(cmp)
         self.assertGreaterEqual(block.count("Get-SmokeReparsePointComponent"), 2, "the refusal runs at the start of the write block and again right before the temporary file is made")
+
+    @requires_windows_pwsh
+    def test_r4n2_p2_a1_the_inputs_are_held_open_so_a_report_name_that_comes_to_reach_one_cannot_replace_it(self) -> None:
+        # adversary-ac722a96.json A1 (blocker), its input class: every reparse walk and identity read has finished, and THEN a concurrent process renames the report folder aside and makes the
+        # name a junction to the inputs' folder, so the report name (and the temporary file's folder) reach before.json's own entry. A path check cannot close that window. RED on ac722a96:
+        # the move replaced before.json with the report. The probe models the swap exactly at the last identity read (after both checks): the report name now IS before.json's entry.
+        # Now the two inputs are held open (read sharing only, no delete sharing) from the identity re-read to the move, so a replacing move over either is a sharing violation, whatever
+        # name reached it: refused, nothing written, both inputs byte for byte as they were.
+        with tempfile.TemporaryDirectory(prefix="r4n2-p2a1-") as tmp:
+            before, after, report = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "out" / "report.json"
+            (Path(tmp) / "out").mkdir()
+            for p in (before, after):
+                p.write_text("{}", encoding="utf-8", newline="")
+            pre = (
+                "$origIdentity = ${function:Get-SmokeFileIdentity}\n"
+                "function Get-SmokeFileIdentity { param([IO.FileStream]$Stream, [string]$ResolvedPath)\n"
+                "  $id = & $origIdentity -Stream $Stream -ResolvedPath $ResolvedPath\n"
+                "  if ([string]::Equals($ResolvedPath, $script:afterJsonPath, [StringComparison]::OrdinalIgnoreCase)) { $script:outputDir = Split-Path -Parent $script:beforeJsonPath; $script:resolvedOutput = $script:beforeJsonPath }\n"
+                "  $id }\n")
+            proc = _run_ps_file(_report_write_probe(tmp, before, after, report, report.parent, pre_block=pre))
+            self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
+            self.assertEqual(before.read_text(encoding="utf-8"), "{}", "the input the report name came to reach is not replaced\n" + proc.stdout + proc.stderr)
+            self.assertEqual(after.read_text(encoding="utf-8"), "{}")
+            self.assertEqual(sorted(x.name for x in Path(tmp).iterdir() if x.name.endswith(".tmp")), [], "no temporary file is left")
+        block = _extract_report_write_block(COMPARE_SCRIPT.read_text(encoding="utf-8"))
+        self.assertIn("[IO.FileShare]::Read)", block, "the input handles are opened with read sharing only")
+
+    @requires_pwsh
+    def test_r4n2_p2_a2_a_long_report_name_is_published_whatever_its_temporary_file_is_called(self) -> None:
+        # adversary-ac722a96.json A2, its input: -Output <dir>\<226 x r>.json (a 231-character leaf, inside the component limit). RED on ac722a96: the temporary file was named
+        # ".<leaf>.<guid>.tmp" (269 characters), so CreateNew failed and a valid report was never published. The temporary name no longer carries the report's leaf.
+        with tempfile.TemporaryDirectory(prefix="r4n2-p2a2-") as tmp:
+            leaf = "r" * 226 + ".json"
+            try:
+                (Path(tmp) / leaf).write_text("probe", encoding="utf-8")
+                (Path(tmp) / leaf).unlink()
+            except OSError as exc:
+                self.skipTest(f"this file system / path length cannot hold a 231-character leaf: {exc}")
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / leaf
+            for p in (before, after):
+                p.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            proc, report = self._compare(before, after, out)
+            self.assertIsNotNone(report, _flat_pwsh_text(proc.stdout + proc.stderr))
+            self.assertEqual(sorted(x.name for x in Path(tmp).iterdir() if x.name.endswith(".tmp")), [])
+
+    @requires_windows_pwsh
+    def test_r4n2_p2_a3_a_folder_level_another_process_made_is_never_removed_by_the_cleanup(self) -> None:
+        # adversary-ac722a96.json A3, its input: the report folder a\b is absent when this call looks, another process makes both levels (empty) before this call's own mkdir, and the write is
+        # then refused. RED on ac722a96: the earlier absence observation was taken as ownership, New-Item -Force accepted the existing folders, and the cleanup removed a and b. Now a level
+        # counts as this call's only when its own non-forced creation succeeded; a level that already exists then is not ours. The probe models the other process by making Test-Path read
+        # "absent" for the two levels until the first New-Item (they exist for real from the start).
+        with tempfile.TemporaryDirectory(prefix="r4n2-p2a3-") as tmp:
+            before, after = Path(tmp) / "before.json", Path(tmp) / "after.json"
+            for p in (before, after):
+                p.write_text("{}", encoding="utf-8", newline="")
+            level_a, level_b = Path(tmp) / "a", Path(tmp) / "a" / "b"
+            level_b.mkdir(parents=True)
+            report = level_b / "report.json"
+            pre = (
+                "$script:lie = $true\n"
+                f"$script:lieAbout = @('{level_a}', '{level_b}')\n"
+                "function Test-Path { param([string]$LiteralPath, [string]$PathType) if ($script:lie -and $PathType -eq 'Container' -and $script:lieAbout -contains $LiteralPath) { return $false }; Microsoft.PowerShell.Management\\Test-Path @PSBoundParameters }\n"
+                "function New-Item { $script:lie = $false; Microsoft.PowerShell.Management\\New-Item @args }\n"
+                f"Remove-Item -LiteralPath '{before}'\n")
+            proc = _run_ps_file(_report_write_probe(tmp, before, after, report, level_b, pre_block=pre))
+            self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
+            self.assertTrue(level_b.is_dir() and level_a.is_dir(), "folders another process made are not this call's to remove\n" + proc.stdout + proc.stderr)
+        block = _extract_report_write_block(COMPARE_SCRIPT.read_text(encoding="utf-8"))
+        self.assertNotIn("New-Item -ItemType Directory -Force", block, "no -Force mkdir: a level that already exists is not claimed")
+
+    @requires_pwsh
+    def test_r4n2_p2_a6_a_smoke_file_the_figure_parser_refused_leaves_no_clean_host_load_standing(self) -> None:
+        # adversary-ac722a96.json A6, its input: Before holds a quiet hostLoad and {"extra":{"x":1,"X":2}} (members differing only in case: the figure parser refuses the text), After a
+        # quiet hostLoad. RED on ac722a96: the strict host-load scan skips a non-hostLoad member, so the refused file still read quiet/collected and the comparison came out FAIL (a
+        # regression-shaped verdict) with no refusal. A source whose text the figure parser refused judges its host load as unknown: INCONCLUSIVE.
+        quiet = json.loads(QUIET_SMOKE)["hostLoad"]
+        with tempfile.TemporaryDirectory(prefix="r4n2-p2a6-") as tmp:
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+            before.write_text('{"hostLoad":' + json.dumps(quiet) + ',"extra":{"x":1,"X":2}}', encoding="utf-8", newline="")
+            after.write_text(json.dumps({"hostLoad": quiet}), encoding="utf-8", newline="")
+            proc, report = self._compare(before, after, out)
+            self.assertIsNotNone(report, proc.stdout + proc.stderr)
+            self.assertEqual(report["verdict"], "INCONCLUSIVE", (report["verdict"], report["failures"]))
+            self.assertEqual(report["hostLoadEvidence"]["before"]["state"], "unknown", report["hostLoadEvidence"])
+            self.assertTrue(report["hostLoadEvidence"]["before"]["provisional"])
+            self.assertFalse(report["hostLoadEvidence"]["after"]["provisional"], "the clean leg still reads clean")
 
     @requires_pwsh
     def test_r4n2_a7_a_one_element_root_array_is_not_unwrapped_into_a_figure_object(self) -> None:

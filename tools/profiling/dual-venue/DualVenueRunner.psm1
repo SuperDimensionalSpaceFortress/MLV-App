@@ -2879,6 +2879,12 @@ function Get-DvLegSetPlan {
         if ([string]::Equals($specPlannedLegType, 'unknown', [StringComparison]::Ordinal)) {
             throw "DVE_LEGSET_INVALID leg '$($spec.legId)' has a legType the strict spec reader cannot judge (a member repeated in any spelling, or a spec that is not one JSON object); a spec whose legType is ambiguous is never planned"
         }
+        # adversary-ac722a96.json A5: the strict reader types ["export"] or "ex<soft hyphen>port" as playback, while the loose casts downstream took them for export. A legType that is present must be ONE string of the schema's
+        # enum, compared ordinally (the rule Get-DvLegSpecShapeRefusal applies to a leg that runs), or the spec is refused here; and the cell is chosen from the strict planned type below, never from the raw member.
+        $rawLegType = Get-DvProp $spec 'legType'
+        if ($null -ne $rawLegType -and -not ($rawLegType -is [string] -and @($script:LegTypes | Where-Object { [string]::Equals([string]$_, $rawLegType, [StringComparison]::Ordinal) }).Count -eq 1)) {
+            throw "DVE_LEGSET_INVALID leg '$($spec.legId)' has a legType that is not one string of the schema's enum ($($script:LegTypes -join ', ')); a spec whose legType is an array, an object or a look-alike spelling is never planned"
+        }
         $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256; plannedLegType = $specPlannedLegType })
     }
     $backends = [System.Collections.Generic.List[string]]::new()
@@ -2890,7 +2896,7 @@ function Get-DvLegSetPlan {
             if ($b -notin @($s.spec.backends)) { continue }
             $mode = $(if ($null -ne (Get-DvProp $s.spec 'displayMode')) { [string]$s.spec.displayMode } else { 'fullscreen' })
             # EXPORT-VENUE-LEG-1: an export leg plays nothing and has no display mode; its cell is its format, so both formats of one clip are two cells
-            $cellId = $(if ([string](Get-DvProp $s.spec 'legType') -ceq 'export') { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
+            $cellId = $(if ([string]::Equals([string]$s.plannedLegType, 'export', [StringComparison]::Ordinal)) { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
             if ($seen.ContainsKey($cellId)) { throw "DVE_LEGSET_INVALID two legs of the set make the cell $cellId" }
             $seen[$cellId] = $true
             $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor; plannedLegType = $s.plannedLegType })

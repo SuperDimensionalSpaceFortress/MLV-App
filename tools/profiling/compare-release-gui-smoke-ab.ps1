@@ -1388,14 +1388,16 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
     # made). Now the bytes go to a NEW file (CreateNew: it can alias nothing) beside the report, and only a complete one is moved over the report name: a rename replaces
     # the directory entry and never touches the inode any other name (an input, a link, a symlink target) still points at. Any refusal or failure removes that
     # temporary file and, when this call created it, the empty folder; the report that was there before is left exactly as it was.
-    $createdDir = $false
+    $createdDirs = [System.Collections.Generic.List[string]]::new()
+    $inputHolds = [System.Collections.Generic.List[IO.FileStream]]::new()
     $tempOutput = $null
     $wroteOutput = $false
     $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json + [Environment]::NewLine)
-    # adversary-6596e055.json A2: New-Item -Force makes EVERY missing level of the folder, so the topmost missing one is what this call created (the cleanup removes the chain up to it)
-    $firstMissingDir = $null
+    # adversary-ac722a96.json A3: the missing levels of the report folder (topmost first) as seen now; a level is THIS call's only when its own non-forced creation succeeds below, so a level another
+    # process makes in the meantime (New-Item -Force would have accepted it silently) is never claimed and never removed by the cleanup
+    $missingDirs = @()
     if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
-        for ($probe = $outputDir; -not [string]::IsNullOrEmpty($probe) -and -not (Test-Path -LiteralPath $probe -PathType Container); $probe = Split-Path -Parent $probe) { $firstMissingDir = $probe }
+        for ($probe = $outputDir; -not [string]::IsNullOrEmpty($probe) -and -not (Test-Path -LiteralPath $probe -PathType Container); $probe = Split-Path -Parent $probe) { $missingDirs = @($probe) + $missingDirs }
     }
     try {
         # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A1, NARROWED): an input or output path with a reparse-point component (a symlink or junction) is refused before
@@ -1405,9 +1407,9 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
             $linkComponent = Get-SmokeReparsePointComponent -Path $linkCheck.Path
             if ($null -ne $linkComponent) { throw "Output refused: the $($linkCheck.Name) path has a reparse-point (symlink or junction) component ($linkComponent), so a swap of it for a link to the report cannot be ruled out; nothing was written." }
         }
-        if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
-            $createdDir = $null -ne $firstMissingDir
-            New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
+        foreach ($level in $missingDirs) {
+            try { New-Item -ItemType Directory -Path $level -ErrorAction Stop | Out-Null; $createdDirs.Add($level) }
+            catch { if (-not (Test-Path -LiteralPath $level -PathType Container)) { throw } }   # a level that exists now was made by someone else: not ours
         }
         # a report that already exists is judged by its handle identity (read-only, nothing truncated); an input that IS it is refused before anything is written
         $outIdentity = $null
@@ -1422,14 +1424,17 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         }
         # adversary-7efea617.json A1: the identities above were read when the inputs were first opened. An input path swapped for a hard link to the report since then is
         # the report, so the CURRENT file each input path names is read again here through a fresh handle; one that cannot be read is refused, nothing written.
+        # adversary-ac722a96.json A1: these two handles are KEPT OPEN (read sharing only: no write, no delete sharing) until the report has been moved into place (the finally below
+        # closes them). A path check cannot close the window between its last look and the move (a folder renamed aside and replaced by a junction reaches an input's own directory entry);
+        # a replacing move over a file that is held open without delete sharing is a sharing violation, whatever name reached it, so the report can never replace an input.
         foreach ($currentLeg in @([pscustomobject]@{ Name = 'before'; Path = $beforeJsonPath }, [pscustomobject]@{ Name = 'after'; Path = $afterJsonPath })) {
             $currentStream = $null
             try {
-                $currentStream = [IO.FileStream]::new($currentLeg.Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                $currentStream = [IO.FileStream]::new($currentLeg.Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
                 $currentIdentity = Get-SmokeFileIdentity -Stream $currentStream -ResolvedPath $currentLeg.Path
+                $inputHolds.Add($currentStream)
             }
-            catch { throw "Output refused: the current file identity of the $($currentLeg.Name) smoke JSON could not be read at the write ($($_.Exception.Message -replace '\s+', ' ')); nothing was written." }
-            finally { if ($null -ne $currentStream) { $currentStream.Dispose() } }
+            catch { if ($null -ne $currentStream) { $currentStream.Dispose() }; throw "Output refused: the current file identity of the $($currentLeg.Name) smoke JSON could not be read at the write ($($_.Exception.Message -replace '\s+', ' ')); nothing was written." }
             if ($null -ne $outIdentity -and [string]::Equals([string]$currentIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
         }
         foreach ($linkCheck in @([pscustomobject]@{ Name = 'before smoke JSON'; Path = $beforeJsonPath }, [pscustomobject]@{ Name = 'after smoke JSON'; Path = $afterJsonPath }, [pscustomobject]@{ Name = 'report folder'; Path = $outputDir }, [pscustomobject]@{ Name = 'report'; Path = $resolvedOutput })) {
@@ -1437,7 +1442,8 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
             $linkComponent = Get-SmokeReparsePointComponent -Path $linkCheck.Path
             if ($null -ne $linkComponent) { throw "Output refused: the $($linkCheck.Name) path has a reparse-point (symlink or junction) component ($linkComponent), so a swap of it for a link to the report cannot be ruled out; nothing was written." }
         }
-        $tempOutput = Join-Path $outputDir ('.' +[IO.Path]::GetFileName($resolvedOutput) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        # adversary-ac722a96.json A2: the temporary name never carries the report's leaf (a 231-character report name plus ".", a guid and ".tmp" is past the 255-character component limit), so a valid report is published
+        $tempOutput = Join-Path $outputDir ('.mlvsmoke.' + [Guid]::NewGuid().ToString('N') + '.tmp')
         $tempStream = [IO.FileStream]::new($tempOutput, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
         try {
             $tempStream.Write($outBytes, 0, $outBytes.Length)
@@ -1449,12 +1455,12 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         $wroteOutput = $true
     }
     finally {
+        foreach ($hold in $inputHolds) { try { $hold.Dispose() } catch { } }
         if ($null -ne $tempOutput) { try { Remove-Item -LiteralPath $tempOutput -Force -ErrorAction Stop } catch { } }
-        if (-not $wroteOutput -and $createdDir) {
-            # the folders this call made (the deepest up to the topmost missing one) are removed only while each is empty (a file another process put there is never ours to delete)
-            for ($cleanDir = $outputDir; -not [string]::IsNullOrEmpty($cleanDir); $cleanDir = Split-Path -Parent $cleanDir) {
-                try { if (@(Get-ChildItem -LiteralPath $cleanDir -Force -ErrorAction Stop).Count -eq 0) { Remove-Item -LiteralPath $cleanDir -Force -ErrorAction Stop } else { break } } catch { break }
-                if ([string]::Equals($cleanDir, $firstMissingDir, [StringComparison]::OrdinalIgnoreCase)) { break }
+        if (-not $wroteOutput) {
+            # only the folder levels whose own creation this call succeeded (deepest first) are removed, and only while each is empty (a file another process put there is never ours to delete)
+            for ($levelIndex = $createdDirs.Count - 1; $levelIndex -ge 0; $levelIndex--) {
+                try { if (@(Get-ChildItem -LiteralPath $createdDirs[$levelIndex] -Force -ErrorAction Stop).Count -eq 0) { Remove-Item -LiteralPath $createdDirs[$levelIndex] -Force -ErrorAction Stop } else { break } } catch { break }
             }
         }
     }
