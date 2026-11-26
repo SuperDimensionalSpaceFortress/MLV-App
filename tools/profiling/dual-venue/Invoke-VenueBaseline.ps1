@@ -391,7 +391,7 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     if (-not $outcomeText) { return $f }      # no outcome, no figure: the caller types a RAN leg whose receipt names none
     $f.outcome = $outcomeText
     if ($f.verification.status -ceq 'NO_SIGNAL') { $f.noFigure = 'RECEIPT_NO_SIGNAL'; return $f }
-    if ($outcomeText -cnotin @('PASS', 'FAIL')) { $f.noFigure = "RECEIPT_OUTCOME_$outcomeText"; return $f }
+    if (-not (Test-DvOrdinalIn $outcomeText @('PASS', 'FAIL'))) { $f.noFigure = "RECEIPT_OUTCOME_$outcomeText"; return $f }
     $m =Get-DvProp $rc 'metrics'; $pb = Get-DvProp $rc 'playback'; $pm = Get-DvProp $m 'presentMonStats'
     $entry = [pscustomobject]@{ seq = 1; repeat = 1; cellId = $Leg.legId; backend = $Backend; displayMode = [string](Get-DvProp (Get-DvProp $rc 'display') 'requestedMode'); scaleFactor = Get-DvProp (Get-DvProp $rc 'scale') 'requestedScale' }
     $row = try { Get-DvMatrixRow -PlanEntry $entry -Receipt $rc } catch { $null }

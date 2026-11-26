@@ -1671,6 +1671,17 @@ function Test-VenueHlObject([object]$O) {
     -not ($O -is [Array] -or $O -is [System.Collections.IList])
 }
 
+function Test-VenueOrdinalIn {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r1 (adversary-fd0141e8.json A2): membership by ORDINAL, case-sensitive comparison of printable ASCII only.
+    # PowerShell's -ceq / -cin / -cnotin compare by the current culture, which ignores a soft hyphen (U+00AD) and other ignorable characters, so 'PA<U+00AD>SS' -cin
+    # @('PASS') is true. A token or a member name with any character outside 0x20-0x7E is never in the set, whatever it would collate to.
+    param([object]$Value, [string[]]$Set)
+    if ($Value -isnot [string]) { return $false }
+    foreach ($ch in $Value.ToCharArray()) { if ([int]$ch -lt 0x20 -or [int]$ch -gt 0x7E) { return $false } }
+    foreach ($member in $Set) { if ([string]::Equals($Value, $member, [StringComparison]::Ordinal)) { return $true } }
+    return $false
+}
+
 function Get-VenueHlMember([object]$O, [string]$N) {
     # The member's value as it is (the unary comma stops the pipeline unrolling a one-element array); a dictionary is read by key (adversary-b0c05520.json A8).
     if (-not (Test-VenueHlObject $O)) { return $null }
@@ -1829,7 +1840,8 @@ function Test-VenueReceiptIsExportLeg([object]$Rc) {
     # variant) is a playback binding, so a receipt where one is non-null is not an export leg.
     if ($null -ne $evd) {
         $evdNames = $(if ($evd -is [System.Collections.IDictionary]) { @($evd.Keys | ForEach-Object { [string]$_ }) } else { @($evd.PSObject.Properties | ForEach-Object { $_.Name }) })
-        foreach ($n in $evdNames) { if ($n -cnotin @('summaryJsonSha256', 'umRunJsonSha256', 'localEvidenceDir', 'umRunOutcome') -and $null -ne (Get-VenueHlMember $evd $n)) { return $false } }
+        # adversary-fd0141e8.json A2: the allow-list is matched ORDINALLY (a name with a soft hyphen is not 'summaryJsonSha256')
+        foreach ($n in $evdNames) { if (-not (Test-VenueOrdinalIn $n @('summaryJsonSha256', 'umRunJsonSha256', 'localEvidenceDir', 'umRunOutcome')) -and $null -ne (Get-VenueHlMember $evd $n)) { return $false } }
     }
     $ex = Get-VenueHlMember $Rc 'export'
     if (-not (Test-VenueHlObject $ex)) { return $false }
@@ -1847,10 +1859,11 @@ function Test-VenueReceiptIsExportLeg([object]$Rc) {
     # writer's only before the export ran, and that receipt's outcome is never PASS or FAIL (the export branch sets the verdict before it completes a
     # PASS/FAIL), so a PASS or FAIL beside a null verdict is not the writer's.
     $outcome = Get-VenueHlMember $Rc 'outcome'
-    if (-not ($outcome -is [string] -and $outcome -cin $script:VenueReceiptOutcomeEnum)) { return $false }
-    if ($null -eq $verdict) { return -not ($outcome -ceq 'PASS' -or $outcome -ceq 'FAIL') }
-    if (-not ($verdict -is [string] -and $verdict -cin $script:VenueReceiptOutcomeEnum)) { return $false }
-    [string]::Equals($verdict, $outcome, [StringComparison]::Ordinal) -or (($outcome -ceq 'INVALID' -or $outcome -ceq 'UNRESOLVED') -and ($verdict -ceq 'PASS' -or $verdict -ceq 'FAIL'))
+    # adversary-fd0141e8.json A2: every token comparison here is ORDINAL ASCII (Test-VenueOrdinalIn / String.Equals), never the culture-aware -cin / -ceq
+    if (-not (Test-VenueOrdinalIn $outcome $script:VenueReceiptOutcomeEnum)) { return $false }
+    if ($null -eq $verdict) { return -not (Test-VenueOrdinalIn $outcome @('PASS', 'FAIL')) }
+    if (-not (Test-VenueOrdinalIn $verdict $script:VenueReceiptOutcomeEnum)) { return $false }
+    [string]::Equals($verdict, $outcome, [StringComparison]::Ordinal) -or ((Test-VenueOrdinalIn $outcome @('INVALID', 'UNRESOLVED')) -and (Test-VenueOrdinalIn $verdict @('PASS', 'FAIL')))
 }
 
 function Get-VenuePlannedLegType {

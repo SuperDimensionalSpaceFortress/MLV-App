@@ -396,7 +396,7 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
         # destination itself failing (this second write, or a first write that threw for any other reason) ends the run as DVE_RECEIPT_WRITE_FAILED, exit 2.
         $invalidPrefix = 'DVE_RECEIPT_INVALID '
         $ioPrefix = 'DVE_EVIDENCE_VALIDATION_IO|'
-        if ($Outcome -cin @('PASS', 'FAIL') -and $refusal.StartsWith($invalidPrefix, [StringComparison]::Ordinal)) {
+        if ((Test-DvOrdinalIn $Outcome @('PASS', 'FAIL')) -and $refusal.StartsWith($invalidPrefix, [StringComparison]::Ordinal)) {
             $receipt.outcome = 'INVALID'
             $receipt.outcomeDetail = "INVALID: the job result was $Outcome ($Detail) but the receipt writer refuses it as a ${Outcome}: $($refusal.Substring($invalidPrefix.Length))"
             $Outcome = 'INVALID'
@@ -859,7 +859,7 @@ if ($isExport) {
     $exportCriteria = Get-DvProp (Get-DvProp (Get-DvProp $spec 'criteria') ([string]$role)) 'cpu'
     $exportOutcome = Get-DvExportOutcome -ResultToken $token -ExitCode $exitCode -Evidence $exportEvidence -Criteria $exportCriteria
     $exportFinal = $exportOutcome.outcome; $exportDetail = [string]$exportOutcome.detail
-    if ($exportFinal -cin @('PASS', 'FAIL') -and $identityProblems.Count -gt 0) { $exportFinal = 'INVALID'; $exportDetail = "the job result derives $($exportOutcome.outcome) but the run does not bind: $($identityProblems -join '; ')" }
+    if ((Test-DvOrdinalIn $exportFinal @('PASS', 'FAIL')) -and $identityProblems.Count -gt 0) { $exportFinal = 'INVALID'; $exportDetail = "the job result derives $($exportOutcome.outcome) but the run does not bind: $($identityProblems -join '; ')" }
     $receipt.export.verdict = $exportFinal
     Write-Output ("DVE_EXPORT format={0} framesExported={1} exportFps={2} largestStage={3} problems={4}" -f $spec.export.format, $exportEvidence.metrics.framesExported, $exportEvidence.metrics.exportFps, $exportEvidence.metrics.largestStage, @($exportEvidence.problems).Count)
     Complete-Receipt $exportFinal $exportDetail

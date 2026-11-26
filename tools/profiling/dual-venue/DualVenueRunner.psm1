@@ -213,6 +213,17 @@ $script:BlanketScope = 'any clip id, any venue'
 $script:ConsentRelativePath = 'tools/profiling/dual-venue/venue-clip-consent.json'
 $script:VenueTableRelativePath = 'tools/profiling/dual-venue/venues.json'
 
+function Test-DvOrdinalIn {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r1 (adversary-fd0141e8.json A2): membership by ORDINAL, case-sensitive comparison of printable ASCII only.
+    # -ceq / -cin / -cnotin compare by the current culture, which ignores a soft hyphen (U+00AD): 'PA<U+00AD>SS' -cin @('PASS') is true. A token with any
+    # character outside 0x20-0x7E is never in the set.
+    param([object]$Value, [string[]]$Set)
+    if ($Value -isnot [string]) { return $false }
+    foreach ($ch in $Value.ToCharArray()) { if ([int]$ch -lt 0x20 -or [int]$ch -gt 0x7E) { return $false } }
+    foreach ($member in $Set) { if ([string]::Equals($Value, $member, [StringComparison]::Ordinal)) { return $true } }
+    return $false
+}
+
 function Get-DvProp {
     # A property of a hashtable OR an object, $null when absent (StrictMode-safe). `return ,` keeps an empty array an
     # empty array (it is unrolled once by the caller, so a scalar still arrives as a scalar).
@@ -3153,7 +3164,7 @@ function Get-DvMatrixRow {
     }
     $scale = Get-DvProp $Receipt 'scale'
     if ($null -ne $scale) { $row.effectiveScale = Get-DvProp $scale 'effectiveScale' }
-    if ($row.outcome -cnotin @('PASS', 'FAIL')) { $row.note = [string](Get-DvProp $Receipt 'outcomeDetail'); return [pscustomobject]$row }
+    if (-not (Test-DvOrdinalIn $row.outcome @('PASS', 'FAIL'))) { $row.note = [string](Get-DvProp $Receipt 'outcomeDetail'); return [pscustomobject]$row }
     $evidence = Get-DvProp $Receipt 'evidence'
     $dir = [string](Get-DvProp $evidence 'localEvidenceDir'); $claimed = [string](Get-DvProp $evidence 'logSha256')
     $logPath = $(if ($dir) { Join-Path $dir 'logs\smoke-run.log' } else { '' })
@@ -3176,7 +3187,7 @@ function Test-DvMatrixRowMeasured {
     # r6 (sol r5 B3, opus r5 A4): the host-load half is Test-DvHostLoadRowClean (state exactly 'quiet' AND provisional a real $false): a row that says
     # unknown, exceeded or no state beside provisional=false is never counted, whoever built it.
     param([Parameter(Mandatory)]$Row)
-    ($Row.outcome -cin @('PASS', 'FAIL')) -and ($null -ne $Row.presentedFps) -and (Test-DvHostLoadRowClean -Row $Row)
+    (Test-DvOrdinalIn $Row.outcome @('PASS', 'FAIL')) -and ($null -ne $Row.presentedFps) -and (Test-DvHostLoadRowClean -Row $Row)
 }
 
 function Test-DvHostLoadRowClean {
@@ -5566,7 +5577,7 @@ function Get-DvExportOutcome {
     $base = Resolve-DvJobOutcome -ResultToken $ResultToken -ExitCode $ExitCode
     # Only the export's own failure terminals are a product FAIL. A clip-length refusal (the job's RESULT is the gate's verdict), an owner-footage or work-dir
     # refusal, a missing RESULT line or any unknown token falls through Resolve-DvJobOutcome to FAIL; for an export leg that is no measurement: INVALID.
-    if ($base.outcome -eq 'FAIL' -and $ResultToken -cnotin $script:ExportFailResults) {
+    if ($base.outcome -eq 'FAIL' -and -not (Test-DvOrdinalIn $ResultToken $script:ExportFailResults)) {
         $why = $(if ($ResultToken -cin $script:PlayLengthRefusalReasons) { 'the clip failed the export length gate' } else { 'not an export failure terminal' })
         return [pscustomobject]@{ outcome = 'INVALID'; detail = "$(if ([string]::IsNullOrEmpty($ResultToken)) { 'no RESULT line' } else { $ResultToken }) (job exit ${ExitCode}): $why, so it is no product result"; criteria = $null }
     }
@@ -5684,7 +5695,7 @@ function Test-DvExportReceiptValid {
             $role = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'role')
             $criteria = Get-DvProp (Get-DvProp (Get-DvProp $contract 'criteria') $role) 'cpu'
             $derived = Get-DvExportOutcome -ResultToken ([string](Get-DvProp $umRun 'resultToken')) -ExitCode ([int]$exit) -Evidence $ev -Criteria $criteria
-            if ($derived.outcome -cnotin @('PASS', 'FAIL')) { $Invalid.Add("OUTCOME_NOT_DERIVABLE: the export evidence derives $($derived.outcome) ($($derived.detail)), which is not a PASS/FAIL signal") }
+            if (-not (Test-DvOrdinalIn $derived.outcome @('PASS', 'FAIL'))) { $Invalid.Add("OUTCOME_NOT_DERIVABLE: the export evidence derives $($derived.outcome) ($($derived.detail)), which is not a PASS/FAIL signal") }
             elseif ($derived.outcome -cne $Outcome) { $Invalid.Add("OUTCOME_NOT_DERIVED: the export evidence and the leg's criteria derive $($derived.outcome) but the receipt says $Outcome") }
         }
     }
@@ -5730,8 +5741,9 @@ function Test-DvReceiptValid {
     $invalid = [System.Collections.Generic.List[string]]::new()
     $outcome = [string](Get-DvProp $Receipt 'outcome')
     # Case-sensitive on purpose: 'pass' / 'PASS ' is not an outcome the writer can produce, so it is neither a signal nor "no signal".
-    if ($outcome -cnotin $script:OutcomeEnum) { return [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @('OUTCOME_UNKNOWN: the receipt outcome is not one of the typed outcomes'); unbound = @() } }
-    if ($outcome -cnotin @('PASS', 'FAIL')) { return [pscustomobject]@{ valid = $true; status = 'NO_SIGNAL'; reasons = @(); unbound = @() } }
+    # adversary-fd0141e8.json A2: ORDINAL ASCII, so 'PA<U+00AD>SS' is neither PASS nor a typed outcome
+    if (-not (Test-DvOrdinalIn $outcome $script:OutcomeEnum)) { return [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @('OUTCOME_UNKNOWN: the receipt outcome is not one of the typed outcomes'); unbound = @() } }
+    if (-not (Test-DvOrdinalIn $outcome @('PASS', 'FAIL'))) { return [pscustomobject]@{ valid = $true; status = 'NO_SIGNAL'; reasons = @(); unbound = @() } }
     # Claims the receipt makes that NO hashed artifact carries (fable r1 B1 / sol r1 B3). They are recorded, typed, and never used as a verdict input.
     $unbound = @('CLIP_CONTENT_UNBOUND: subject.clipContentSha256 is computed by the local generator and written to no artifact the venue returns; it is recorded, never trusted',
                  'LEG_IDENTITY_UNBOUND: legId / legSpecSha256 name a committed spec, but no hashed artifact carries them; only the leg TYPE (summary.lookLeg), look flavor, backend, venue, clip and build are bound')
@@ -6545,7 +6557,7 @@ function Resolve-DvJobOutcome {
     if ($reasonSuffix -and $SmokeRefusalReason -in $script:PlayLengthRefusalReasons -and $ResultToken -notin $script:VenueConditionResults -and $ResultToken -notin $script:DeviceUnavailableResults) {
         return [pscustomobject]@{ outcome = 'INVALID'; detail = ($ResultToken + $reasonSuffix) }
     }
-    if ($ResultToken -cin $script:ExportFailResults) { return [pscustomobject]@{ outcome = 'FAIL'; detail = "$ResultToken (job exit $ExitCode)" } }
+    if (Test-DvOrdinalIn $ResultToken $script:ExportFailResults) { return [pscustomobject]@{ outcome = 'FAIL'; detail = "$ResultToken (job exit $ExitCode)" } }
     if ($ResultToken -cin $script:ExportInvalidResults) { return [pscustomobject]@{ outcome = 'INVALID'; detail = "$ResultToken (job exit $ExitCode): the export's stage evidence or output does not bind, so it is no measurement" } }
     if ($ResultToken -cin $script:ExportToolingResults) { return [pscustomobject]@{ outcome = 'VENUE_TOOLING'; detail = "$ResultToken (job exit $ExitCode): the staged package carries no ffmpeg.exe for the rendered export" } }
     if ($ResultToken -eq 'VENUE_NOT_QUIESCENT') { return [pscustomobject]@{ outcome = 'VENUE_NOT_QUIESCENT'; detail = $ResultToken } }
@@ -6909,8 +6921,8 @@ function Write-DvReceipt {
     Returns the path written.
     #>
     param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot, [string]$RepoRoot = '', [switch]$OfflineTestMode, [byte[]]$LegSpecBytes = $null)
-    if ($Receipt['outcome'] -notin $script:OutcomeEnum) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
-    if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {
+    if (-not (Test-DvOrdinalIn $Receipt['outcome'] $script:OutcomeEnum)) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
+    if (Test-DvOrdinalIn $Receipt['outcome'] @('PASS', 'FAIL')) {
         # The writer never records a signal without its proof, whatever the caller believed: the SAME evidence-bearing validator a
         # reader calls re-derives the admission from the committed blobs and the run from the hashed evidence files.
         # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r5 (sol r4 B4): the validator RE-READS the hashed evidence. A throw there (a file held with FileShare.None
@@ -6948,7 +6960,7 @@ function Get-DvLastWrittenReceiptSha256 {
     [string]$script:DvLastWrittenReceiptSha256
 }
 
-Export-ModuleMember -Function Get-DvLastWrittenReceiptSha256, Get-DvOutcomeEnum,ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
+Export-ModuleMember -Function Test-DvOrdinalIn, Get-DvLastWrittenReceiptSha256, Get-DvOutcomeEnum,ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,

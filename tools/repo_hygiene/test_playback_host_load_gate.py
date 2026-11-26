@@ -4016,6 +4016,96 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         self.assertTrue(line, proc.stdout)
         self.assertIn("screenshot_status=withheld-inconclusive mean_abs_rgb_delta= changed_sample_ratio= ", line[0])
 
+    @requires_windows_pwsh
+    def test_r3_a1_an_unreadable_input_identity_refuses_the_output_before_any_write(self) -> None:
+        # adversary-fd0141e8.json A1, its input: Before is held with FileShare.None during its initial open (its identity reads null), and -Output is a hard
+        # link to it. RED: the null identity skipped both alias checks (the precheck and the write-time check), so an -Output that was not an alias was written
+        # and an alias was a candidate for overwrite. The identity of both inputs is now required before any write: a typed refusal, nothing written.
+        with tempfile.TemporaryDirectory(prefix="residue-r3-a1-") as tmp:
+            before, after, alias, fresh = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "out-alias.json", Path(tmp) / "out-fresh.json"
+            before.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            after.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            os.link(before, alias)
+            holder = subprocess.Popen([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                                       f"$f = [IO.File]::Open('{before}', 'Open', 'Read', 'None'); [Console]::Out.WriteLine('READY'); [Console]::Out.Flush(); Start-Sleep -Seconds 120"],
+                                      stdout=subprocess.PIPE, text=True, creationflags=_NO_WINDOW)
+            try:
+                self.assertEqual((holder.stdout.readline() or "").strip(), "READY")
+                proc_fresh = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", str(fresh))
+                proc_alias = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", str(alias))
+            finally:
+                holder.kill()
+                holder.wait(timeout=30)
+            for proc in (proc_fresh, proc_alias):
+                self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("Output refused: the file identity of the before smoke JSON could not be read", _flat_pwsh_text(proc.stdout + proc.stderr), proc.stdout + proc.stderr)
+            self.assertFalse(fresh.exists(), "nothing is written when an input identity cannot be read")
+            self.assertEqual(before.read_text(encoding="utf-8"), QUIET_SMOKE, "the before input is untouched")
+        cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("if ($null -ne $inputIdentity -and [string]::Equals(", cmp, "neither alias check skips a null identity")
+
+    def test_r3_a2_a_soft_hyphen_in_an_outcome_token_or_an_evidence_name_is_not_the_writers(self) -> None:
+        # adversary-fd0141e8.json A2, its input: outcome and export.verdict 'PA<U+00AD>SS', and (sibling) ordinary PASS tokens with evidence member
+        # 'summaryJsonSha<U+00AD>256'. RED: -cin / -cnotin compare by culture and ignore U+00AD, so the receipt read as an export leg. The comparison is ordinal ASCII.
+        base = ('"schema":"mlv-app/dual-venue-receipt/v1","scale":null,"display":null,"export":{"format":"prores","receiptSha256":"' + "0" * 64 + '","verdict":%s}')
+        cases = {
+            "soft-token": '{' + base % '"PA\\u00adSS"' + ',"outcome":"PA\\u00adSS","evidence":{}}',
+            "soft-verdict-only": '{' + base % '"PA\\u00adSS"' + ',"outcome":"PASS","evidence":{}}',
+            "soft-outcome-only": '{' + base % '"PASS"' + ',"outcome":"PA\\u00adSS","evidence":{}}',
+            "soft-evidence-name": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"summaryJsonSha\\u00ad256":"b"}}',
+            "soft-pass-null-verdict": '{' + base % 'null' + ',"outcome":"INVALID","evidence":{"umRunOutcome\\u00ad":"x"}}',
+            "writer-pass": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"summaryJsonSha256":"' + "e" * 64 + '"}}',
+            "writer-downgraded": '{' + base % '"PASS"' + ',"outcome":"INVALID","evidence":{}}',
+        }
+        with tempfile.TemporaryDirectory(prefix="residue-r3-a2-") as tmp:
+            lines = []
+            for name, text in cases.items():
+                (Path(tmp) / f"{name}.json").write_text(text, encoding="ascii", newline="")
+                lines.append(f"$rc = Get-Content -Raw -LiteralPath '{Path(tmp) / f'{name}.json'}' | ConvertFrom-Json; Write-Output ('{name}=' + (& $m {{ param($r) Test-VenueReceiptIsExportLeg $r }} $rc))")
+            proc = _run_ps_command(f"$m = Import-Module '{VENUE_CHAIN_MODULE}' -DisableNameChecking -PassThru; " + "; ".join(lines))
+        got = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+        self.assertEqual(got, {"soft-token": "False", "soft-verdict-only": "False", "soft-outcome-only": "False", "soft-evidence-name": "False",
+                               "soft-pass-null-verdict": "False", "writer-pass": "True", "writer-downgraded": "True"}, proc.stdout + proc.stderr)
+
+    def test_r3_a2_the_runner_validator_and_writer_refuse_a_soft_hyphen_outcome(self) -> None:
+        # adversary-fd0141e8.json A2 siblings (DualVenueRunner.psm1 outcome checks): a receipt outcome 'PA<U+00AD>SS' is no typed outcome (Test-DvReceiptValid
+        # says OUTCOME_UNKNOWN, Write-DvReceipt throws DVE_RECEIPT_OUTCOME_INVALID), and the shared helper is ordinal ASCII for every token class.
+        runner = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
+        with tempfile.TemporaryDirectory(prefix="residue-r3-a2r-") as tmp:
+            script = Path(tmp) / "probe.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module '{runner}' -Force -DisableNameChecking\n"
+                "$soft = 'PA' + [char]0xAD + 'SS'\n"
+                "Write-Output ('H1=' + (Test-DvOrdinalIn $soft @('PASS', 'FAIL')))\n"
+                "Write-Output ('H2=' + (Test-DvOrdinalIn 'PASS' @('PASS', 'FAIL')))\n"
+                "Write-Output ('H3=' + (Test-DvOrdinalIn 'pass' @('PASS', 'FAIL')))\n"
+                "Write-Output ('H4=' + (Test-DvOrdinalIn $null @('PASS', 'FAIL')))\n"
+                "Write-Output ('H5=' + (Test-DvOrdinalIn ('PASS' + [char]0xE9) @('PASS' + [char]0xE9)))\n"
+                "$v = Test-DvReceiptValid -Receipt @{ outcome = $soft } -RepoRoot ''\n"
+                "Write-Output ('V=' + $v.status + ' ' + ($v.reasons -join '|'))\n"
+                f"try {{ Write-DvReceipt -Receipt @{{ outcome = $soft }} -ReceiptRoot '{tmp}' | Out-Null; Write-Output 'W=NOTHROW' }} catch {{ Write-Output ('W=' + $_.Exception.Message.Substring(0, 27)) }}\n",
+                encoding="utf-8")
+            proc = _run_ps_file(script)
+        out = proc.stdout
+        self.assertIn("H1=False", out, out + proc.stderr)
+        self.assertIn("H2=True", out, out + proc.stderr)
+        self.assertIn("H3=False", out, out + proc.stderr)
+        self.assertIn("H4=False", out, out + proc.stderr)
+        self.assertIn("H5=False", out, "a non-ASCII token is never a member, even of a set that names it")
+        self.assertIn("V=INVALID OUTCOME_UNKNOWN", out, out + proc.stderr)
+        self.assertIn("W=DVE_RECEIPT_OUTCOME_INVALID", out, out + proc.stderr)
+
+    def test_r3_a2_no_cited_site_compares_a_receipt_token_by_culture(self) -> None:
+        # adversary-fd0141e8.json A2 siblings, as a static pin on every cited site: none of them is a -cin / -cnotin / -notin on a receipt or result token.
+        dv = ROOT / "tools" / "profiling" / "dual-venue"
+        for name in ("VenueChain.psm1", "DualVenueRunner.psm1", "Invoke-VenueBaseline.ps1", "Invoke-VenueLeg.ps1"):
+            text = (dv / name).read_text(encoding="utf-8")
+            # (the plain `-in @('PASS', 'FAIL')` lines of Invoke-VenueLeg.ps1 test the leg's own derived local outcome, not a receipt or result token)
+            for pattern in (r"-c(not)?in @\('PASS', 'FAIL'\)", r"-cin \$script:VenueReceiptOutcomeEnum", r"-c?notin \$script:OutcomeEnum",
+                            r"-cnotin \$script:ExportFailResults", r"-cin \$script:ExportFailResults", r"-cnotin @\('summaryJsonSha256'"):
+                self.assertEqual([m.group(0) for m in re.finditer(pattern, text)], [], f"{name}: {pattern}")
+
     def test_p3_siblings_of_a8_and_a9(self) -> None:
         # A8 (P3 :1308): collected was replaced by false when the text was provisional. A9 (P3 :589, :1182): the object parse threw before the refusal was recorded.
         p3 = P3_VALIDATION_SCRIPT.read_text(encoding="utf-8")

@@ -1014,13 +1014,19 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         [string]::Equals($resolvedOutput, $afterJsonPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Output must not overwrite either smoke JSON input."
     }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r1 (adversary-fd0141e8.json A1): an input whose file identity could not be read (its first read failed:
+    # a lock, a sharing violation) has identity null, which no alias check can compare, so an -Output that is a hard link to it would overwrite it. The
+    # identity of BOTH inputs is therefore required before ANY write: a report with no readable input identity is refused, typed, and nothing is written.
+    foreach ($identityLeg in @([pscustomobject]@{ Name = 'before'; Source = $beforeSource }, [pscustomobject]@{ Name = 'after'; Source = $afterSource })) {
+        if ($null -eq $identityLeg.Source.identity) { throw "Output refused: the file identity of the $($identityLeg.Name) smoke JSON could not be read, so an -Output that is a hard link to it cannot be ruled out; nothing was written." }
+    }
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A6 sibling): an existing output that IS an input under another spelling (a hard
     # link) is that input too, judged by the same handle identity the inputs were read by
     if (Test-Path -LiteralPath $resolvedOutput -PathType Leaf) {
         $outputStream = [IO.FileStream]::new($resolvedOutput, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
         try { $outputIdentity = Get-SmokeFileIdentity -Stream $outputStream -ResolvedPath $resolvedOutput } finally { $outputStream.Dispose() }
         foreach ($inputIdentity in @($beforeSource.identity, $afterSource.identity)) {
-            if ($null -ne $inputIdentity -and [string]::Equals([string]$inputIdentity, $outputIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
+            if ($null -eq $inputIdentity -or [string]::Equals([string]$inputIdentity, $outputIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
         }
     }
 }
@@ -1355,7 +1361,7 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
     try {
         $outIdentity = Get-SmokeFileIdentity -Stream $outStream -ResolvedPath $resolvedOutput
         foreach ($inputIdentity in @($beforeSource.identity, $afterSource.identity)) {
-            if ($null -ne $inputIdentity -and [string]::Equals([string]$inputIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
+            if ($null -eq $inputIdentity -or [string]::Equals([string]$inputIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
         }
         $outStream.SetLength(0)
         $outStream.Write($outBytes, 0, $outBytes.Length)
