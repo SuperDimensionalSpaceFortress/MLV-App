@@ -3473,9 +3473,10 @@
       "anchor": "ASSERT_EQ ( 0.0 , llrpGetLastDualIsoMilliseconds ( ) ) ;",
       "class": "not_run_proof_structural",
       "clock": "qpc_stage_clock",
-      "justification": "EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: negative-lane check in RunWithoutDualIsoReportsNotAttempted that a run with dual-ISO off reads the run-entry reset value 0.0 ms; it never proves a stage ran, and is paired with llrpGetLastDualIsoOutcome() == LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED directly above it.",
+      "justification": "EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: negative-lane check in RunWithoutDualIsoReportsNotAttempted that a run with dual-ISO off reads the run-entry reset value 0.0 ms; it never proves a stage ran, and is paired with llrpGetLastDualIsoOutcome() == LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED directly above it. r3 (adversary 928fad78 A5): the same negative-lane check in ModeThatNamesNoReconstructionReportsNotAttempted (line 181) that a dual_iso mode naming no reconstruction (3, 4, -1) times no dual-ISO; the proof there is the NOT_ATTEMPTED outcome above it and the output equal to the dual_iso=0 run.",
       "lines": [
-        146
+        146,
+        181
       ]
     }
   ]

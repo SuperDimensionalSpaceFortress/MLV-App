@@ -4452,13 +4452,18 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
 
     def test_mixed_outcomes_never_pass(self) -> None:
         # (a) applied frames beside not-attempted ones; (b) one frame whose two llrawproc runs disagree (two runs fit debayered_frame: 9 + 2 x 15 <= 40)
+        # (r3, adversary 928fad78 A3: a not-attempted run times no dual-ISO, llrawproc.c adds to the timer only inside an attempt, so its paired timer is 0.000)
         split = {i: ("not_attempted" if i == 3 else "applied") for i in range(480)}
+        split_log = piped_stage_log(480, outcome=split)
+        dual3 = "[mlv-stage-timing] frame=3 stage=llrawproc_dual_iso ms=30.000\n[mlv-stage-timing] frame=3 stage=llrawproc_dual_iso_not_attempted"
+        self.assertIn(dual3, split_log)
+        split_log = split_log.replace(dual3, dual3.replace("ms=30.000", "ms=0.000"))
         two = piped_stage_log(480, llrawproc_ms=15.0, dual_iso_ms=10.0, outcome="applied")
         tail5 = "[mlv-stage-timing] frame=5 stage=llrawproc_dual_iso_applied ms=0.000\n"
         self.assertIn(tail5, two)
-        two = two.replace(tail5, tail5 + "[mlv-stage-timing] frame=5 stage=llrawproc ms=15.000\n[mlv-stage-timing] frame=5 stage=llrawproc_dual_iso ms=10.000\n"
+        two = two.replace(tail5, tail5 + "[mlv-stage-timing] frame=5 stage=llrawproc ms=15.000\n[mlv-stage-timing] frame=5 stage=llrawproc_dual_iso ms=0.000\n"
                                           "[mlv-stage-timing] frame=5 stage=llrawproc_dual_iso_not_attempted ms=0.000\n")
-        proc, got = evidence_cases([self.ctl(piped_stage_log(480, outcome=split)), self.ctl(two)])
+        proc, got = evidence_cases([self.ctl(split_log), self.ctl(two)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         for g, mixed in ((got[0], 0), (got[1], 1)):
             self.assertNotEqual(g["outcome"], "PASS", g)
@@ -4492,6 +4497,88 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
         self.assertTrue(any(p.startswith("EXPORT_PROFILE_FOREIGN") and "applied signal" in p for p in got[3]["problems"]), got[3])
         # (that build has no signal, so its marker-free log keeps the r3 reading)
         assert_clean_but_dual_iso_unknown(self, got[4])
+
+    # ---- r3: the five introduced adversary findings on 928fad78 (adversary-928fad78.json) and the venue read of the real producer's log
+    BASE_UNKNOWN_ABOVE = ("DUALISO_APPLIED_UNKNOWN: llrawproc_dual_iso is above 0 ms on 480 of 480 timed frame(s), and a time above 0 is the attempt's (llrawproc.c times it, "
+                          "dualiso.c can refuse the reconstruction inside it), so whether dual-ISO was applied is not readable until the producer publishes an applied signal "
+                          "(successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1)")
+    BASE_UNKNOWN_ZERO = ("DUALISO_APPLIED_UNKNOWN: llrawproc_dual_iso reads 0.000 ms on every one of 480 timed frame(s), and the figure is rounded to the microsecond "
+                         "(StageTiming.h %.3f), so it cannot show that no dual-ISO attempt ran until the producer publishes an applied signal "
+                         "(successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1)")
+
+    def test_r3_a1_a_marker_free_log_reads_the_base_readers_unknown_text_byte_for_byte(self) -> None:
+        """A1: a receipt the base reader (c6ec83ae) wrote over a marker-free log stores these reason texts in its metrics; the replay compares the metrics whole
+        (DualVenueRunner.psm1 Test-DvExportReceiptValid, METRICS_NOT_FROM_EVIDENCE), so the marker-free reading must be the base's exactly, not a reworded one."""
+        proc, got = evidence_cases([self.ctl(piped_stage_log(480)), self.ctl(piped_stage_log(480, dual_iso_ms=0.0), dualIsoExpected=False)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, want in ((got[0], self.BASE_UNKNOWN_ABOVE), (got[1], self.BASE_UNKNOWN_ZERO)):
+            self.assertEqual(g["metrics"]["dualIsoActiveFramesCouldNotCheck"], want, g)
+            self.assertEqual(g["metrics"]["dualIsoClassAgreesCouldNotCheck"], want, g)
+            self.assertNotIn("dualIsoNotAppliedFrames", g["metrics"], "the marker-free shape is the base's")
+        assert_clean_but_dual_iso_unknown(self, got[0])
+
+    def test_r3_a2_not_applied_and_mixed_never_pass_whatever_the_criteria(self) -> None:
+        """A2: DUALISO_NOT_APPLIED and DUALISO_OUTCOME_MIXED are product failures of the run, not a value a criterion may accept: with no criteria, or with
+        `dualIsoClassAgrees eq false`, the run is still the typed FAIL (never PASS)."""
+        mixed = {i: ("not_attempted" if i == 3 else "applied") for i in range(480)}
+        mixed_log = piped_stage_log(480, outcome=mixed)
+        dual3 = "[mlv-stage-timing] frame=3 stage=llrawproc_dual_iso ms=30.000\n[mlv-stage-timing] frame=3 stage=llrawproc_dual_iso_not_attempted"
+        self.assertIn(dual3, mixed_log)
+        mixed_log = mixed_log.replace(dual3, dual3.replace("ms=30.000", "ms=0.000"))
+        eq_false = [{"metric": "dualIsoClassAgrees", "op": "eq", "value": False}]
+        cases = []
+        for log in (self.interp2(), mixed_log):
+            cases += [self.ctl(log, criteria=[]), self.ctl(log, criteria=eq_false)]
+        proc, got = evidence_cases(cases)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, typed in zip(got, ("DUALISO_NOT_APPLIED", "DUALISO_NOT_APPLIED", "DUALISO_OUTCOME_MIXED", "DUALISO_OUTCOME_MIXED")):
+            self.assertEqual(g["outcome"], "FAIL", g)
+            self.assertIn(typed, g["detail"], g)
+            self.assertIs(g["metrics"]["dualIsoClassAgrees"], False, g)
+
+    def test_r3_a3_a_not_attempted_marker_after_a_timed_dual_iso_record_is_not_the_producers(self) -> None:
+        """A3: llrawproc.c resets the dual-ISO time at each run entry and adds to it only inside an attempt, so a not_attempted marker after a llrawproc_dual_iso
+        record above 0 ms is a producer-impossible pair: EXPORT_RECORD_INVALID, and a no-dual-ISO leg never PASSes on it."""
+        control = leg("m16-1456-export-prores")["criteria"]["acceptance"]["cpu"]
+        log = piped_stage_log(480, dual_iso_ms=30.0, outcome="not_attempted")
+        proc, got = evidence_cases([self.ctl(log, dualIsoExpected=False), self.ctl(log, dualIsoExpected=False, criteria=[]),
+                                    self.ctl(log, dualIsoExpected=False, criteria=control)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "outcome marker" in p and "not_attempted" in p for p in g["problems"]), g)
+            self.assertIsNone(g["metrics"]["dualIsoClassAgrees"], g)
+
+    def test_r3_a4_a_marker_whose_frame_has_no_llrawproc_run_certifies_nothing(self) -> None:
+        """A4: video_mlv.c notes llrawproc, then llrawproc_dual_iso, then the marker, for one run. With every `llrawproc` record removed the markers name no timed
+        llrawproc run (the legacy parentless dual-ISO leaf stays a timing rule only), so the class is not read from them."""
+        clean = piped_stage_log(480, outcome="applied")
+        orphan = "".join(l + "\n" for l in clean.splitlines() if " stage=llrawproc ms=" not in l)
+        self.assertNotIn(" stage=llrawproc ms=", orphan)
+        proc, got = evidence_cases([self.ctl(orphan), self.ctl(orphan, criteria=[])])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertNotEqual(g["outcome"], "PASS", g)
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "outcome marker" in p and "llrawproc record" in p for p in g["problems"]), g)
+            self.assertIsNone(g["metrics"]["dualIsoClassAgrees"], g)
+
+    def test_r3_venue_a_marker_follows_its_own_frames_dual_iso_record_when_threads_interleave_the_log(self) -> None:
+        """The Bachelor m16-1456 leg on 928fad78 (receipt 13313451-d9dd-4a6f-bd28-00b7f6d2beb3): the MLV cache threads decode frames side by side, so another frame's
+        record can land between a frame's llrawproc_dual_iso and its marker. Each run's three notes are one thread's, in order, so the marker is bound to the previous
+        record OF ITS FRAME, never to the previous line. (The frame-order check of EXPORT-RENDER-PIPE-TIMING-1 still types such a log; that is its successor's.)"""
+        clean = piped_stage_log(480, outcome="applied")
+        dual0 = "[mlv-stage-timing] frame=0 stage=llrawproc_dual_iso ms=30.000\n"
+        mark0 = "[mlv-stage-timing] frame=0 stage=llrawproc_dual_iso_applied ms=0.000\n"
+        other = "[mlv-stage-timing] frame=1 stage=raw_uint16_disk_read ms=3.000\n"
+        self.assertIn(dual0 + mark0, clean)
+        self.assertEqual(clean.count(other), 1)
+        woven = clean.replace(other, "").replace(dual0 + mark0, dual0 + other + mark0)
+        proc, got = evidence_cases([self.ctl(woven)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        g = got[0]
+        self.assertFalse(any("outcome marker" in p for p in g["problems"]), g)
+        self.assertTrue(any("frame loop's order" in p for p in g["problems"]), g)
 
 
 if __name__ == "__main__":

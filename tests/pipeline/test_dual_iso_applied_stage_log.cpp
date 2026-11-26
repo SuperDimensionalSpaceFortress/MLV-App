@@ -153,6 +153,37 @@ TEST(DualIsoAppliedOutcome, RunWithoutDualIsoReportsNotAttempted)
     }
 }
 
+// r3 (adversary 928fad78 A5): a dual_iso mode that names neither reconstruction (a receipt can carry any integer,
+// ReceiptApplier.cpp forwards it to llrpSetDualIsoMode) runs no reconstruction, so the run is NOT_ATTEMPTED with a
+// zero dual-ISO time and the output of a dual_iso=0 run, never an "attempted" NOT_APPLIED. Both entries.
+TEST(DualIsoAppliedOutcome, ModeThatNamesNoReconstructionReportsNotAttempted)
+{
+    for (const bool with_dims : { false, true })
+    {
+        for (const int mode : { 3, 4, -1 })
+        {
+            MlvPipelineFixture fixture;
+            open_dual_iso_outcome_fixture(fixture);
+            const std::vector<uint16_t> source = decode_dual_iso_outcome_frame(fixture);
+            std::vector<uint16_t> off_out;
+            llrpSetDualIsoMode(fixture.video(), 0);
+            ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED),
+                      run_dual_iso_outcome(fixture, with_dims, source, off_out));
+
+            std::vector<uint16_t> out;
+            llrpSetDualIsoMode(fixture.video(), mode);
+            const int outcome = run_dual_iso_outcome(fixture, with_dims, source, out);
+            if (outcome != LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED)
+            {
+                std::fprintf(stderr, "with_dims=%d mode=%d outcome=%d\n", with_dims ? 1 : 0, mode, outcome);
+            }
+            ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED), outcome);
+            ASSERT_EQ(0.0, llrpGetLastDualIsoMilliseconds());
+            ASSERT_TRUE(out == off_out);   // nothing dual-ISO ran: the dual_iso=0 output
+        }
+    }
+}
+
 TEST(DualIsoAppliedOutcome, PreviewModeReportsWhetherTheRowscaleApplied)
 {
     MlvPipelineFixture fixture;

@@ -4868,20 +4868,21 @@ $script:ExportCdngStageWindowTable = @(
     # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 forced companion: every llrawproc.c window below moved with that card's outcome writes, re-derived by the Guard)
     [ordered]@{ name = 'llrawproc_dark_frame'; parent = 'llrawproc'; windows = @('llrawproc.c:5171-5191', 'llrawproc.c:5388-5395') }
     [ordered]@{ name = 'llrawproc_vertical_stripes'; parent = 'llrawproc'; windows = @('llrawproc.c:5293-5303', 'llrawproc.c:5400-5407') }
-    [ordered]@{ name = 'llrawproc_focus_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5324-5344', 'llrawproc.c:5412-5423', 'llrawproc.c:6146-6157') }
-    # (bad_pixels calls llrawproc_reset_force_bad_pixel_search, :4690-4698, only from inside its windows, :5441 and :6180)
-    [ordered]@{ name = 'llrawproc_bad_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5349-5375', 'llrawproc.c:5428-5443', 'llrawproc.c:6167-6182', 'llrawproc.c:4690-4698') }
+    # (r3 forced companion: the A5 comment above the dual-ISO gate moved every window from llrawproc.c:5511 on by 4 lines, re-derived by the Guard)
+    [ordered]@{ name = 'llrawproc_focus_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5324-5344', 'llrawproc.c:5412-5423', 'llrawproc.c:6150-6161') }
+    # (bad_pixels calls llrawproc_reset_force_bad_pixel_search, :4690-4698, only from inside its windows, :5441 and :6184)
+    [ordered]@{ name = 'llrawproc_bad_pixels'; parent = 'llrawproc'; windows = @('llrawproc.c:5349-5375', 'llrawproc.c:5428-5443', 'llrawproc.c:6171-6186', 'llrawproc.c:4690-4698') }
     [ordered]@{ name = 'llrawproc_pattern_noise'; parent = 'llrawproc'; windows = @('llrawproc.c:5448-5461') }
-    # (dual_iso: :5565-5591, :5596-6024, :6216-6229)
-    [ordered]@{ name = 'llrawproc_dual_iso'; parent = 'llrawproc'; windows = @('llrawproc.c:5565-5591', 'llrawproc.c:5596-6024', 'llrawproc.c:6216-6229') }
-    [ordered]@{ name = 'llrawproc_chroma_smooth'; parent = 'llrawproc'; windows = @('llrawproc.c:6268-6281') }
+    # (dual_iso: :5569-5595, :5600-6028, :6220-6233)
+    [ordered]@{ name = 'llrawproc_dual_iso'; parent = 'llrawproc'; windows = @('llrawproc.c:5569-5595', 'llrawproc.c:5600-6028', 'llrawproc.c:6220-6233') }
+    [ordered]@{ name = 'llrawproc_chroma_smooth'; parent = 'llrawproc'; windows = @('llrawproc.c:6272-6285') }
     # The lock times. shared_lock: the first lock :5145-5291 (or :5145-5379 when the stripes block :5288-5320 does not run; both lie inside the two windows listed), the stripes publish lock
-    # :5305-5315 and the relock :5317-5379, the reset lock :4690-4698 (:4698), AND the refine and publish lock times added to it (:6137, :6303).
+    # :5305-5315 and the relock :5317-5379, the reset lock :4690-4698 (:4698), AND the refine and publish lock times added to it (:6141, :6307).
     # (adversary pass17 A1: because shared_lock ACCUMULATES the refine and publish lock times, it CONTAINS them: each, and their disjoint sum, is inside shared_lock; contains = those rows)
     [ordered]@{ name = 'llrawproc_shared_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:5145-5291', 'llrawproc.c:5305-5379', 'llrawproc.c:4690-4698',
-        'llrawproc.c:6069-6136', 'llrawproc.c:6298-6302'); contains = @('llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock') }
-    [ordered]@{ name = 'llrawproc_dualiso_refine_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6069-6136') }
-    [ordered]@{ name = 'llrawproc_publish_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6298-6302') }
+        'llrawproc.c:6073-6140', 'llrawproc.c:6302-6306'); contains = @('llrawproc_dualiso_refine_lock', 'llrawproc_publish_lock') }
+    [ordered]@{ name = 'llrawproc_dualiso_refine_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6073-6140') }
+    [ordered]@{ name = 'llrawproc_publish_lock'; parent = 'llrawproc'; windows = @('llrawproc.c:6302-6306') }
     # pre_dualiso_fix: the worker resets it (:5036) and writes it only inside `if (stop_before_dual_iso)` (:5461-5463), which export's literal 0 never enters, so on export it accrues
     # NOWHERE and has no window (r17 key3 B1: the row carried the scaled call :6606-7076, which met dual_iso's scaled windows and kept it out of every group). A row with no window meets
     # no other row, so it joins every disjoint group: any value export publishes for it is work outside every timed window of llrawproc, and is held inside llrawproc with the rest.
@@ -5453,7 +5454,9 @@ $script:ExportRenderStartFpsMax = [decimal]'4294970000'
 # r3 (adversary A2 on c2da7e24): the typed reason a ProRes run's dual-ISO class is not readable from a timed attempt, and the card that adds the producer's applied signal
 # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: that signal is the llrawproc_dual_iso_applied / _not_applied / _not_attempted marker; a log without any marker keeps this reading)
 $script:ExportDualIsoAppliedUnknown = 'DUALISO_APPLIED_UNKNOWN'
-$script:ExportDualIsoAppliedSuccessor = 'the llrawproc_dual_iso_applied / _not_applied / _not_attempted marker of EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1, which this log does not carry'
+# (r3, adversary 928fad78 A1: the marker-free reason text is the BASE reader's, byte for byte -- this one, and the "until the producer publishes an applied signal"
+# wording of the two UNKNOWN reasons below -- so a receipt the base wrote over a marker-free log re-derives the same metrics and is never METRICS_NOT_FROM_EVIDENCE)
+$script:ExportDualIsoAppliedSuccessor = 'successor EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1'
 function Get-DvRenderStartDeclaration {
     # The one RENDER_START line of a rendered export's batch log, for the clip DONE names: the start part of ConvertFrom-DvBatchExportLog, which already holds it to
     # exactly one line, to DONE's clip (ordinal prefix: view-0 and a zero-width space is another clip) and to the line grammar. Returns [pscustomobject]@{ problem; scaled;
@@ -5702,13 +5705,17 @@ function Test-DvExportStageLogRecords {
     $lastPerFrameLine = 0                                          # the line of the last per-frame record (any stage that is not a once-per-clip one)
     $seq = [System.Collections.Generic.List[object]]::new()        # every tabled per-frame record in line order (r2 fix 1, pass 4 A2)
     $outcomeRecs = [System.Collections.Generic.List[object]]::new()   # EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1: each outcome marker with the record it follows
+    # (r3, the Bachelor m16-1456 leg on 928fad78: the MLV cache threads decode frames side by side, so the stream interleaves frames. One llrawproc run's notes --
+    # llrawproc, llrawproc_dual_iso, the outcome marker -- are one thread's, in that order, so a marker is bound to the previous record OF ITS FRAME, never to the
+    # previous line. Cleared on a malformed line, as $prev is: that record's frame is not known.)
+    $prevByFrame = [hashtable]::new([StringComparer]::Ordinal)
     $lineNo = 0
     foreach ($line in ($Text -split "`r?`n")) {
         $lineNo++
         if (-not $line.Contains($script:ExportStageLogTag)) { continue }
         $hit = [regex]::Match($line, $script:ExportStageLogRecord)
         $why = $null
-        if (-not $hit.Success) { $why = 'is not one record of the form frame=N stage=NAME ms=NUMBER'; $prev = $null }
+        if (-not $hit.Success) { $why = 'is not one record of the form frame=N stage=NAME ms=NUMBER'; $prev = $null; $prevByFrame.Clear() }
         else {
             $ms = [double]::Parse($hit.Groups['ms'].Value, [Globalization.CultureInfo]::InvariantCulture)
             # (r2 fix 2, adversary A5 on c2da7e24: the record's EXACT figure, [decimal] from its text: the ceiling is held on it (86400000.000000001 parsed to a double rounds onto
@@ -5716,16 +5723,18 @@ function Test-DvExportStageLogRecords {
             $msD = [decimal]::Parse($hit.Groups['ms'].Value, [Globalization.CultureInfo]::InvariantCulture)
             $why = Get-DvExportTimingProblem $ms
             if ($null -eq $why -and $msD -gt [decimal]$script:ExportTimingMaxMs) { $why = "is past the $($script:ExportTimingMaxMs) ms ceiling" }
-            if ($null -ne $why) { $prev = $null }
+            if ($null -ne $why) { $prev = $null; $prevByFrame.Clear() }
             if ($null -eq $why) {
                 $s = $hit.Groups['s'].Value
                 $f = $hit.Groups['f'].Value.TrimStart('0'); if ($f -eq '') { $f = '0' }
                 $before = $prev
-                $prev = [pscustomobject]@{ stage = $s; frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo }
+                $beforeSame = $prevByFrame[$f]
+                $prev = [pscustomobject]@{ stage = $s; frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; afterSame = $beforeSame }
+                $prevByFrame[$f] = $prev
                 if ($clipRecords.ContainsKey($s)) { $clipRecords[$s].Add([pscustomobject]@{ frame = $f; ms = $ms; msD = $msD; line = $lineNo }); continue }
                 $lastPerFrameLine = $lineNo   # (r2 fix 1, pass 4 A1: ANY per-frame record, a stage this reader does not table included; the producer writes none after the drain)
                 $seq.Add([pscustomobject]@{ stage = $s; frame = $f; line = $lineNo })   # (r2 fix 2, adversary A1 on c2da7e24: untabled stages are frame records too)
-                if ($script:ExportDualIsoOutcomeWord.ContainsKey($s)) { $outcomeRecs.Add([pscustomobject]@{ stage = $s; frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $before }); continue }
+                if ($script:ExportDualIsoOutcomeWord.ContainsKey($s)) { $outcomeRecs.Add([pscustomobject]@{ stage = $s; frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $beforeSame }); continue }
                 if (-not $perStage.ContainsKey($s)) { continue }
                 if ($s -ceq 'llrawproc_dual_iso') { $dualRecs.Add([pscustomobject]@{ frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $before }) }
                 $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
@@ -5779,11 +5788,19 @@ function Test-DvExportStageLogRecords {
     $outcomeBad = [System.Collections.Generic.List[string]]::new()
     $outcomes = [hashtable]::new([StringComparer]::Ordinal)
     $markedDualLines = @{}
+    # (r3: "right after" is among the records OF ITS FRAME ($o.after is that frame's previous record; see $prevByFrame), and the marker is bound to the whole run it
+    # reports. Adversary 928fad78 A4: the dual-ISO record it follows directly follows that frame's llrawproc record, so it certifies a TIMED llrawproc run (the legacy
+    # parentless dual-ISO leaf above stays a timing rule and never feeds the signal). A3: a not_attempted marker after a dual-ISO time above 0 is no producer outcome
+    # (llrawproc.c resets that time at each run entry and adds to it only inside an attempt), so it is typed here, never read as a run that did not attempt dual-ISO.)
+    $zeroMs = '\A0(?:\.0{1,9})?\z'
     foreach ($o in $outcomeRecs) {
         $a = $o.after
         if ($null -ne $a -and $script:ExportDualIsoOutcomeWord.ContainsKey($a.stage)) { $outcomeBad.Add("line $($o.line) records $($o.stage) for frame $($o.frame) after another outcome marker (line $($a.line)); the producer writes one marker per llrawproc_dual_iso record"); continue }
-        if ($null -eq $a -or $a.stage -cne 'llrawproc_dual_iso' -or $a.frame -cne $o.frame) { $outcomeBad.Add("line $($o.line) records $($o.stage) for frame $($o.frame), which does not directly follow an llrawproc_dual_iso record of that frame"); continue }
-        if ($o.msText -cnotmatch '\A0(?:\.0{1,9})?\z') { $outcomeBad.Add("line $($o.line) records $($o.stage) at $($o.msText) ms; an outcome marker is a 0.000 record, never a timing"); continue }
+        if ($null -eq $a -or $a.stage -cne 'llrawproc_dual_iso' -or $a.frame -cne $o.frame) { $outcomeBad.Add("line $($o.line) records $($o.stage) for frame $($o.frame), which does not directly follow an llrawproc_dual_iso record of that frame (among that frame's records)"); continue }
+        $run = $a.afterSame
+        if ($null -eq $run -or $run.stage -cne 'llrawproc' -or $run.frame -cne $o.frame) { $outcomeBad.Add("line $($o.line) records $($o.stage) for frame $($o.frame) after an llrawproc_dual_iso record (line $($a.line)) that does not directly follow an llrawproc record of that frame; a marker reports one timed llrawproc run (video_mlv.c notes llrawproc, then llrawproc_dual_iso, then the marker)"); continue }
+        if ($o.msText -cnotmatch $zeroMs) { $outcomeBad.Add("line $($o.line) records $($o.stage) at $($o.msText) ms; an outcome marker is a 0.000 record, never a timing"); continue }
+        if ($script:ExportDualIsoOutcomeWord[$o.stage] -ceq 'not_attempted' -and $a.msText -cnotmatch $zeroMs) { $outcomeBad.Add("line $($o.line) records $($o.stage) for frame $($o.frame) after a $($a.msText) ms llrawproc_dual_iso record (line $($a.line)); llrawproc.c times dual-ISO only inside an attempt, so a timed run that did not attempt it is no producer outcome"); continue }
         $markedDualLines[$a.line] = $true
         $word = $script:ExportDualIsoOutcomeWord[$o.stage]
         $outcomes[$o.frame] = $(if (-not $outcomes.ContainsKey($o.frame) -or $outcomes[$o.frame] -ceq $word) { $word } else { 'mixed' })
@@ -5856,6 +5873,9 @@ function Get-DvExportEvidence {
                      profileFramesFailed = $null; stageFramesSeen = $null; dualIsoActiveFrames = $null; dualIsoClassAgrees = $null; outputFileCount = $null; outputBytes = $null
                      wallSeconds = $null; exportFps = $null; largestStage = $null; largestStageShare = $null }
     $classMismatch = $false; $classDetail = $null
+    # (r3, adversary 928fad78 A2: a product failure the run's own evidence proves -- DUALISO_NOT_APPLIED, DUALISO_OUTCOME_MIXED -- is the typed FAIL whatever the leg's
+    # criteria say; Get-DvExportOutcome reads it before the criteria, so no criteria, or `dualIsoClassAgrees eq false`, can never turn it into a PASS)
+    $productFailure = $null
     $wallExact = $null   # the DONE elapsed exactly as the log wrote it plus half its last printed place (r5: the largest wall that figure rounds from), [decimal]; null when there is no single DONE line (the wall gates then have nothing to compare)
     $containmentAdvisory = @()   # (r18's advisory channel, kept EMPTY for the receipt shape the leg runner writes (receipt.export.containmentAdvisory): EXPORT-CDNG-STAGE-CONTAINMENT-1 r1 made the check gate again)
     # -- the batch log: exactly one DONE line for the one clip
@@ -6173,10 +6193,12 @@ function Get-DvExportEvidence {
                         elseif ($nMixed -gt 0 -or ($nApplied -gt 0 -and $nNotAttempted -gt 0)) {
                             $m.dualIsoClassAgrees = $false
                             $m['dualIsoClassAgreesFailReason'] = "$($script:ExportDualIsoOutcomeMixed): the applied signal is not one class across the $n timed frame(s): $nApplied applied, $nNotApplied not applied, $nNotAttempted not attempted, $nMixed with disagreeing markers"
+                            $productFailure = "dualIsoClassAgrees: $($m['dualIsoClassAgreesFailReason'])"
                         }
                         elseif ($nNotApplied -gt 0) {
                             $m.dualIsoClassAgrees = $false
                             $m['dualIsoClassAgreesFailReason'] = "$($script:ExportDualIsoNotApplied): $nNotApplied of $n timed frame(s) attempted dual-ISO and the reconstruction did not apply"
+                            $productFailure = "dualIsoClassAgrees: $($m['dualIsoClassAgreesFailReason'])"
                         }
                         elseif ($nApplied -eq $n) { $m.dualIsoClassAgrees = $true }
                         else {
@@ -6186,7 +6208,7 @@ function Get-DvExportEvidence {
                     }
                 }
                 else {
-                    # r3 (adversary A2 on c2da7e24): FAIL CLOSED. A time above 0 ms is the dual-ISO ATTEMPT's, never proof the reconstruction applied: llrawproc.c:6024 times
+                    # r3 (adversary A2 on c2da7e24): FAIL CLOSED. A time above 0 ms is the dual-ISO ATTEMPT's, never proof the reconstruction applied: llrawproc.c:6028 times
                     # the attempt and dualiso.c:7484-7487 refuses a receipt's dualIsoInterpolation 2 inside it (the worker then restores the frame and publishes the elapsed
                     # attempt), and a log without the producer's applied signal (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1's outcome marker, read above when present) carries
                     # no other proof that it APPLIED. So a frame timed above 0 is no active frame: the class of a run with any
@@ -6205,13 +6227,13 @@ function Get-DvExportEvidence {
                             $classMismatch = $true; $classDetail = "CLIP_CLASS_MISMATCH: dualIsoExpected is true but llrawproc_dual_iso reads 0.000 ms on every one of $($p16Frames.Count) timed frame(s); the figure is rounded to the microsecond (StageTiming.h %.3f), so it shows that no frame was reconstructed (a reconstruction takes far longer than half a microsecond), not whether a shorter dual-ISO attempt ran"
                         }
                         else {
-                            $zero = "$($script:ExportDualIsoAppliedUnknown): llrawproc_dual_iso reads 0.000 ms on every one of $($p16Frames.Count) timed frame(s), and the figure is rounded to the microsecond (StageTiming.h %.3f), so it cannot show that no dual-ISO attempt ran without the producer's applied signal ($($script:ExportDualIsoAppliedSuccessor))"
+                            $zero = "$($script:ExportDualIsoAppliedUnknown): llrawproc_dual_iso reads 0.000 ms on every one of $($p16Frames.Count) timed frame(s), and the figure is rounded to the microsecond (StageTiming.h %.3f), so it cannot show that no dual-ISO attempt ran until the producer publishes an applied signal ($($script:ExportDualIsoAppliedSuccessor))"
                             $m.dualIsoActiveFrames = $null; $m['dualIsoActiveFramesCouldNotCheck'] = $zero
                             $m.dualIsoClassAgrees = $null; $m['dualIsoClassAgreesCouldNotCheck'] = $zero
                         }
                     }
                     else {
-                        $unknown = "$($script:ExportDualIsoAppliedUnknown): llrawproc_dual_iso is above 0 ms on $attempted of $($p16Frames.Count) timed frame(s), and a time above 0 is the attempt's (llrawproc.c times it, dualiso.c can refuse the reconstruction inside it), so whether dual-ISO was applied is not readable without the producer's applied signal ($($script:ExportDualIsoAppliedSuccessor))"
+                        $unknown = "$($script:ExportDualIsoAppliedUnknown): llrawproc_dual_iso is above 0 ms on $attempted of $($p16Frames.Count) timed frame(s), and a time above 0 is the attempt's (llrawproc.c times it, dualiso.c can refuse the reconstruction inside it), so whether dual-ISO was applied is not readable until the producer publishes an applied signal ($($script:ExportDualIsoAppliedSuccessor))"
                         $m.dualIsoActiveFrames = $null; $m['dualIsoActiveFramesCouldNotCheck'] = $unknown
                         $m.dualIsoClassAgrees = $null; $m['dualIsoClassAgreesCouldNotCheck'] = $unknown
                         if (-not $DualIsoExpected) {
@@ -6264,7 +6286,7 @@ function Get-DvExportEvidence {
                 $problems.Add("EXPORT_PROFILE_ABSENT: $incompleteSignal, so the run reads no product result")
                 $m.dualIsoActiveFrames = $null; $m['dualIsoActiveFramesCouldNotCheck'] = $incompleteSignal
                 $m.dualIsoClassAgrees = $null; $m['dualIsoClassAgreesCouldNotCheck'] = $incompleteSignal
-                $classMismatch = $false; $classDetail = $null
+                $classMismatch = $false; $classDetail = $null; $productFailure = $null
             }
             elseif ($signalClass -ceq 'older' -and $records.outcomeRecords -gt 0) {
                 $problems.Add("EXPORT_PROFILE_FOREIGN: stage-timing.log carries the dual-ISO applied signal ($($script:ExportDualIsoOutcomeList)), which build $ExpectedBuildId cannot write (its src/debug/StageTiming.h defines no $($script:ExportDualIsoSignalMacro)), so the log is not the build's the job ran")
@@ -6335,7 +6357,8 @@ function Get-DvExportEvidence {
             }
         }
     }
-    [pscustomobject]@{ metrics = [pscustomobject]$m; stages = $stages; problems = @($problems); classMismatch = $classMismatch; classDetail = $classDetail; containmentAdvisory = [string[]]@($containmentAdvisory) }
+    [pscustomobject]@{ metrics = [pscustomobject]$m; stages = $stages; problems = @($problems); classMismatch = $classMismatch; classDetail = $classDetail; containmentAdvisory = [string[]]@($containmentAdvisory)
+                       productFailure = $productFailure }
 }
 
 function Get-DvExportOutcome {
@@ -6371,6 +6394,12 @@ function Get-DvExportOutcome {
         return [pscustomobject]@{ outcome = 'INVALID'; detail = "EXPORT_FRAMES_MISMATCH: the batch exported $(if ($null -eq $exported) { 'no countable number of' } else { $exported }) of the $requested requested frame(s) yet the job reported EXPORT_CAPTURED, and no criterion of the leg sets another expectation"; criteria = $null }
     }
     $verdict = Test-DvCriteria -Criteria $Criteria -Metrics $Evidence.metrics
+    # (r3, adversary 928fad78 A2: the evidence's own product failure is the FAIL before any criterion is read; the criteria's failures, if any, follow it)
+    $productFailure = [string](Get-DvProp $Evidence 'productFailure')
+    if (-not [string]::IsNullOrWhiteSpace($productFailure)) {
+        $rest = @(@($verdict.failures) | Where-Object { -not ([string]$_).StartsWith($productFailure, [StringComparison]::Ordinal) })
+        return [pscustomobject]@{ outcome = 'FAIL'; detail = 'EXPORT_CAPTURED: ' + (@($productFailure) + $rest -join '; '); criteria = $verdict }
+    }
     $detail = $(if ($verdict.pass) { "EXPORT_CAPTURED: $(if ($verdict.informational) { 'no gating criteria' } else { 'all criteria met' }); largest stage $($Evidence.metrics.largestStage)" } else { 'EXPORT_CAPTURED: ' + ($verdict.failures -join '; ') })
     [pscustomobject]@{ outcome = $(if ($verdict.pass) { 'PASS' } else { 'FAIL' }); detail = $detail; criteria = $verdict }
 }

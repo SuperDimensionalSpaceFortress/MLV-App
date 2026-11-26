@@ -5508,7 +5508,11 @@ void applyLLRawProcObjectWorker(mlvObject_t * video,
         }
     }
 
-    if (diso_validity && dual_iso_mode)
+    /* EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 r3 (adversary 928fad78 A5): only the two modes that name a reconstruction
+     * (1 = full, 2 = preview) enter the block. Another value (a receipt can carry any integer, ReceiptApplier.cpp
+     * forwards it) ran neither branch below but was range-scaled and reported as an attempt; it now runs as dual_iso=0
+     * and the run stays NOT_ATTEMPTED with a zero dual-ISO time. */
+    if (diso_validity && (dual_iso_mode == 1 || dual_iso_mode == 2))
     {
         /* Attempted: every early return below reports NOT_APPLIED. */
         g_llrawproc_last_dual_iso_outcome = LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED;

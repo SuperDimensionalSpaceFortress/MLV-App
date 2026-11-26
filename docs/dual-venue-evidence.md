@@ -527,6 +527,14 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     read-but-failing metric is `<metric>FailReason`, which `Test-DvCriteria` puts first in the failure text. The build identity decides too: a build whose
     `src/debug/StageTiming.h` defines `MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED`, beside a log with `llrawproc_dual_iso` records and no marker, is an incomplete capture
     (`EXPORT_PROFILE_ABSENT`, never the r3 reading); markers beside a build that cannot write them are `EXPORT_PROFILE_FOREIGN`.
+    From its r3 the marker is bound to the run it reports. "Directly follows" is among the records **of its frame**: the MLV cache threads decode frames side by side, so
+    the stream interleaves frames, but one run's `llrawproc`, `llrawproc_dual_iso` and marker are one thread's notes, in that order. A marker is `EXPORT_RECORD_INVALID`
+    when its `llrawproc_dual_iso` record does not itself directly follow that frame's `llrawproc` record (the parentless dual-ISO leaf stays a timing rule and never feeds
+    the signal), and a `not_attempted` marker after a `llrawproc_dual_iso` time above 0 is `EXPORT_RECORD_INVALID` too (`llrawproc.c` adds to that time only inside an
+    attempt). `DUALISO_NOT_APPLIED` and `DUALISO_OUTCOME_MIXED` are the run's product failure: `Get-DvExportOutcome` returns that FAIL before it reads the leg's
+    criteria, so no criteria (or `dualIsoClassAgrees eq false`) turn it into a PASS. A marker-free log keeps the base reader's `DUALISO_APPLIED_UNKNOWN` text byte for
+    byte, so a receipt written before the signal re-derives the same metrics. On the producer side, only `dual_iso` 1 (full) or 2 (preview) enters the dual-ISO block:
+    another value (a receipt can carry any integer) runs as `dual_iso` 0 and is `not_attempted` with a zero time.
     From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
     so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
     `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).
