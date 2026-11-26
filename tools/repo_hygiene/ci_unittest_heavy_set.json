@@ -48,6 +48,7 @@
         "tools.repo_hygiene.test_fps_arm_gate.CompareMachinePerfSuggestionFpsGateTests",
         "tools.repo_hygiene.test_fps_arm_gate.CudaPlaybackAbFpsGateTests",
         "tools.repo_hygiene.test_fps_arm_gate.CudaPlaybackAbRequireImprovementBlockTests",
+        "tools.repo_hygiene.test_fps_arm_gate.EnvelopePreemptR1ResidueTests",
         "tools.repo_hygiene.test_fps_arm_gate.GuiSmokeInheritedEnvironmentRecordTests",
         "tools.repo_hygiene.test_fps_arm_gate.LeaseBatchPlanCheckerTests",
         "tools.repo_hygiene.test_fps_arm_gate.LegPlanRuleTests",
