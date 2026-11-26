@@ -101,8 +101,13 @@ $legs = foreach ($s in $specs) {
                 $rc['evidence'] = [ordered]@{ resultJsonSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rb)).ToLowerInvariant() }
             }
             Set-Content -LiteralPath $rp -Value ($rc | ConvertTo-Json -Depth 8)
+            # adversary-7efea617.json A2: like the real chain row (Invoke-VenueChain.ps1 receiptSha256), the row carries the sha256 of the receipt bytes the leg published;
+            # FAKE_CHAIN_NO_PUBLISHED_SHA=1 leaves the member out, as a legacy chain row does
+            $rsha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($rp))).ToLowerInvariant()
             if ($mode -ceq 'noreceipt') { Remove-Item -LiteralPath $rp -Force }
-            [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = $outc; legExit = 0; receipt = $rp }
+            $row = [ordered]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = $outc; legExit = 0; receipt = $rp }
+            if ($env:FAKE_CHAIN_NO_PUBLISHED_SHA -cne '1') { $row['receiptSha256'] = $rsha }
+            [pscustomobject]$row
         }
         { $_ -ceq 'legfail' -or ($_ -ceq 'ranfail' -and $n -gt 1) } { [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'LEG_FAILED'; verdict = 'QUIET'; outcome = 'INVALID'; printedOutcome = 'PASS'; legExit = 5; receipt = $null } }
         default { [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'NOT_RUN'; verdict = 'DEADLINE'; reason = 'deadline-before-leg' } }
@@ -797,6 +802,22 @@ class VenueBaselineTests(unittest.TestCase):
         self.assertNotIn("REFERENCE_PROVISIONAL", p.stdout)
         rows = [json.loads(l) for l in self.trend.read_text(encoding="utf-8").splitlines() if l.strip()]
         self.assertEqual({(r["hostLoadState"], r["hostLoadProvisional"]) for r in rows}, {("quiet", False)}, rows)
+
+    def test_hostload_r2_a2_a_chain_row_without_a_published_sha_binds_no_host_load(self) -> None:
+        """adversary-7efea617.json A2 (the legacy-row tail), its input: a chain row with NO receiptSha256 member over a quiet, hash-bound smoke result. RED on 7c79d20b: the
+        baseline used the sha256 of its own read as the expectation of that read, so the row read quiet and was measured. With no published sha the standing is unknown and
+        provisional (never measured); the same chain with the member still reads quiet and is measured."""
+        self.trend.unlink(missing_ok=True)
+        p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet", FAKE_CHAIN_NO_PUBLISHED_SHA="1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("REFERENCE_PROVISIONAL leg=rcpt-", p.stdout)
+        res = self.result(p.stdout)
+        self.assertEqual((res["reason"], res["rowsAppended"], res["measuredRows"]), ("NO_MEASUREMENT", 4, 0), res)
+        rows = [json.loads(l) for l in self.trend.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertEqual({(r["status"], r["hostLoadState"], r["hostLoadProvisional"]) for r in rows}, {("RAN", "unknown", True)}, rows)
+        self.trend.unlink(missing_ok=True)
+        p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet")
+        self.assertEqual((self.result(p.stdout)["reason"], self.result(p.stdout)["measuredRows"]), ("OK", 4), p.stdout)
 
     # F: the receipt read must be the one this run's leg wrote.
     def test_f_a_receipt_that_is_not_the_one_this_run_wrote_yields_no_figures(self) -> None:

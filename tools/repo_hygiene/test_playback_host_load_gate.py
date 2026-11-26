@@ -4100,7 +4100,9 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         chain = (dv / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
         self.assertIn("receipt = $receipt; receiptSha256 = $receiptSha }", chain)
         baseline = (dv / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
-        self.assertIn("-ExpectReceiptSha256 $(if ($null -ne $publishedSha) { $publishedSha } else { [string]$fig.receiptSha256 })", baseline)
+        # (r2 legacy-row tail: a chain row with no receiptSha256 member has NO expectation; the baseline's own read hash is never one)
+        self.assertIn("$hlExpectSha = $(if ($null -ne $publishedSha) { [string]$publishedSha } else { '' })", baseline)
+        self.assertNotIn("else { [string]$fig.receiptSha256 }", baseline)
         # (Get-RowFigures declares its parameters inline, which _extract_functions' `function <name> {` pattern does not match)
         figures_function = re.search(r"function Get-RowFigures\(.*?\n\}\r?\n", baseline, re.DOTALL).group(0)
         with tempfile.TemporaryDirectory(prefix="residue-r3-a2b-") as tmp:

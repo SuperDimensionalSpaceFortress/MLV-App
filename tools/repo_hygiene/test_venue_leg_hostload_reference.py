@@ -564,6 +564,75 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertIn("A=unknown/True", p.stdout, "a receipt that is not the bytes the figures came from is unknown")
         self.assertIn("B=quiet/False", p.stdout, "the same bytes still read their own standing")
 
+    def test_r2_a4_a_host_load_read_that_does_not_answer_is_given_up_on_at_its_bound(self) -> None:
+        # adversary-7efea617.json A4, its input: a final leg whose receipt/result.json read returns its bytes only after a long stall. RED on 7c79d20b: the readers were
+        # synchronous ([IO.File]::ReadAllBytes, no bound and no -ReadTimeoutSec at all), so a deadline stop waited out the stall. The two reads now run on
+        # Invoke-VenueBoundedRead's worker: a read not answered inside -ReadTimeoutSec is 'unknown' (uncounted) with that reason, one given up on is counted for
+        # Complete-VenueProcess, a bound under 1 s starts no read, and an unstalled read still reads its own standing.
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            quiet = json.dumps({"hostLoad": QUIET})
+            sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            rid = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+            path = self.write_leg(Path(d), rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+            p = run_ps(
+                "& (Get-Module VenueChain) { $script:VenueTestFileReadDelayMs = 6000 }; "
+                f"$t = [Diagnostics.Stopwatch]::StartNew(); $a = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 1; $ms = $t.ElapsedMilliseconds; "
+                "Write-Output ('A=' + $a.state + '/' + $a.provisional + '/' + $a.collected); Write-Output ('AMS=' + $ms); Write-Output ('AWHY=' + $a.reason); "
+                "Write-Output ('ABANDONED=' + (& (Get-Module VenueChain) { $script:VenueAbandonedReads })); "
+                f"$t = [Diagnostics.Stopwatch]::StartNew(); $b = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 0.25; $bms = $t.ElapsedMilliseconds; "
+                "Write-Output ('B=' + $b.state + '/' + $b.provisional); Write-Output ('BMS=' + $bms); Write-Output ('BWHY=' + $b.reason); "
+                "& (Get-Module VenueChain) { $script:VenueTestFileReadDelayMs = 0 }; "
+                f"$c = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20; Write-Output ('C=' + $c.state + '/' + $c.provisional); "
+                "Complete-VenueProcess -ExitCode 0; Write-Output 'NOT-REACHED-WHEN-A-READ-WAS-ABANDONED'")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["A"], "unknown/True/False", p.stdout)
+        self.assertIn("did not finish", got["AWHY"], p.stdout)
+        self.assertLess(int(got["AMS"]), 5500, "the read was waited out past its 1 s bound (the stall is 6 s): " + p.stdout)
+        self.assertGreaterEqual(int(got["ABANDONED"]), 1, "a read given up on is counted so Complete-VenueProcess ends the process: " + p.stdout)
+        self.assertEqual(got["B"], "unknown/True", p.stdout)
+        self.assertIn("no time was left", got["BWHY"], p.stdout)
+        self.assertLess(int(got["BMS"]), 1500, "a bound under 1 s must not start a read: " + p.stdout)
+        self.assertEqual(got["C"], "quiet/False", "an unstalled read still reads its own standing: " + p.stdout)
+        self.assertNotIn("NOT-REACHED", p.stdout, "Complete-VenueProcess must end the process at once when a read was abandoned")
+
+    def test_r2_a4_every_caller_bounds_the_read_and_the_batch_by_its_deadline(self) -> None:
+        # The class guard for A4: the batch hands over what is left before -DeadlineUtc (capped at 20 s); the reader's two file reads are bounded reads, never a raw
+        # ReadAllBytes; the matrix runner (which calls the reader) ends through Complete-VenueProcess so an abandoned read cannot hold its exit.
+        dv = ROOT / "tools" / "profiling" / "dual-venue"
+        batch = (dv / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertIn("-ExpectReceiptSha256 $receiptSha -ReadTimeoutSec ([Math]::Min(20.0, ($deadline - [DateTime]::UtcNow).TotalSeconds))", batch)
+        module = MODULE.read_text(encoding="utf-8")
+        reader = module[module.index("function Get-VenueLegHostLoad {"):module.index("function Get-VenueReferenceHostLoadRefusal {")]
+        self.assertNotIn("ReadAllBytes", reader)
+        self.assertNotIn("Test-Path", reader.split("$root = Split-Path")[1].split("$bytes = ")[0], "the result.json existence probe runs on the bounded worker too")
+        self.assertEqual(reader.count("= Read-VenueFileBytesBounded -Path "), 2)
+        leg = (dv / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("Get-VenuePlannedLegType, Complete-VenueProcess -DisableNameChecking -Force", leg)
+        self.assertIn("Complete-VenueProcess -ExitCode 0   # a host-load read given up on", leg)
+
+    def test_r2_a2_a_legacy_chain_row_without_a_published_sha_binds_no_host_load(self) -> None:
+        # adversary-7efea617.json A2 (the legacy-row tail), its input: a chain row with no receiptSha256 member over a receipt and result.json replaced together. RED on
+        # 7c79d20b: the baseline fell back to the sha256 of its OWN read of the receipt as the expectation, so the replacement judged itself and read quiet. An empty
+        # expectation never matches: the standing is unknown and provisional.
+        import hashlib
+        dv = ROOT / "tools" / "profiling" / "dual-venue"
+        baseline = (dv / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
+        self.assertIn("$hlExpectSha = $(if ($null -ne $publishedSha) { [string]$publishedSha } else { '' })", baseline)
+        for line in baseline.splitlines():
+            if "Get-VenueLegHostLoad -ReceiptPath" in line and not line.lstrip().startswith("#"):
+                self.assertNotIn("$fig.receiptSha256", line, "the baseline's own read hash must never be the expectation of that read: " + line)
+                self.assertEqual(line.count("-ExpectReceiptSha256"), line.count("Get-VenueLegHostLoad -ReceiptPath"), line)
+        with tempfile.TemporaryDirectory() as d:
+            quiet = json.dumps({"hostLoad": QUIET})
+            sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            rid = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+            path = self.write_leg(Path(d), rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+            p = run_ps(f"$a = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ExpectReceiptSha256 ''; Write-Output ('A=' + $a.state + '/' + $a.provisional)")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("A=unknown/True", p.stdout)
+
     def test_r6_b2_every_driver_passes_the_planned_type_to_the_reader(self) -> None:
         # The class guard: every production call of Get-VenueLegHostLoad passes -PlannedLegType from the planned spec (Get-VenuePlannedLegType).
         # adversary-de8e3799.json A3: chain, baseline and matrix read the planned type AT PLANNING (before any leg runs); the batch binds its read to the

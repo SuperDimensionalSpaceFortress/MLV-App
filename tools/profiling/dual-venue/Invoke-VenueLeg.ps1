@@ -165,7 +165,8 @@ if ($null -ne $setPlan) {
     $rows = [System.Collections.Generic.List[object]]::new()
     $total = @($setPlan.plan).Count
     # r6 (adversary-de8e3799.json A3): every entry's planned leg type is read HERE, at planning, before any leg runs (a spec replaced later grants nothing)
-    Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenuePlannedLegType -DisableNameChecking -Force
+    # (adversary-7efea617.json A4: Complete-VenueProcess too, so a bounded read of a receipt or result.json given up on never holds this process at its exit)
+    Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenuePlannedLegType, Complete-VenueProcess -DisableNameChecking -Force
     $plannedTypes = @{}
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3): no re-read of the path. The type is the planner's (Get-DvLegSetPlan judged it from the
     # bytes the child is pinned to by -ExpectSpecSha256); an entry without one reads 'unknown' (never exempt)
@@ -262,6 +263,7 @@ if ($null -ne $setPlan) {
     [IO.File]::WriteAllText((Join-Path $summaryDir 'summary.json'), ($rowsJson | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false))
     Write-Output $table
     Write-Output "DVE_MATRIX_SUMMARY=$summaryPath"
+    Complete-VenueProcess -ExitCode 0   # a host-load read given up on (Get-VenueLegHostLoad's bounded read) is a live thread the host would wait for at exit
     exit 0
 }
 

@@ -3013,7 +3013,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # recorded them), never from the receipt's shape
                 $plannedType = $(if ($script:SpecPlannedLegType.ContainsKey([string]$leg.spec)) { [string]$script:SpecPlannedLegType[[string]$leg.spec] } else { 'unknown' })
                 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): read only from the receipt bytes the child wrote (a receipt and result.json swapped in together read unknown)
-                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType $plannedType -ExpectReceiptSha256 $receiptSha
+                # (adversary-7efea617.json A4: each file read is bounded by 20 s or what is left before -DeadlineUtc, whichever is less; under 1 s left it is not started and the standing is unknown, uncounted)
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType $plannedType -ExpectReceiptSha256 $receiptSha -ReadTimeoutSec ([Math]::Min(20.0, ($deadline - [DateTime]::UtcNow).TotalSeconds))
                 $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 $class = $(if ($leaseClass) { $leaseClass } elseif ($legFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })
                 $counted = ($class -ceq 'QUIET_PRELOAD_OK')

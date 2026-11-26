@@ -476,7 +476,10 @@ foreach ($b in $StandardBackends) {
             # (adversary-01a12498.json A2: bound to the receipt Get-RowFigures took the figures from; no receipt read there means no figures and no expectation)
             # r6 (sol r5 B2): the export exemption comes only from the PLANNED leg type (the plan leg's spec), never from the receipt's shape
             $hlPlanned = $(if ($null -ne $planLeg -and $planLeg.PSObject.Properties['plannedLegType']) { [string]$planLeg.plannedLegType } else { 'unknown' })
-            $hl = $(if ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned -ExpectReceiptSha256 $(if ($null -ne $publishedSha) { $publishedSha } else { [string]$fig.receiptSha256 }) } else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned })
+            # adversary-7efea617.json A2 (the legacy-row tail, r2): the expectation is ONLY the sha256 the leg published. A chain row with no receiptSha256 member (a legacy or stub row) has none,
+            # so its standing is 'unknown' (an empty expectation never matches), never this read's own hash judging itself; a receipt Get-RowFigures refused (no figures, no binding) is unknown too.
+            $hlExpectSha = $(if ($null -ne $publishedSha) { [string]$publishedSha } else { '' })
+            $hl = $(if ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned -ExpectReceiptSha256 $hlExpectSha } else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' })
             $hlLine = Get-VenueReferenceHostLoadRefusal -LegId $(if ($hlReceipt) { [IO.Path]::GetFileNameWithoutExtension($hlReceipt) } else { [string]$planLeg.legId }) -Standing $hl
             if ($hlLine -and $legStatus -ceq 'RAN') { Out-Line $hlLine }
             $rows.Add([ordered]@{
