@@ -6521,7 +6521,9 @@ function Test-DvReceiptValid {
     # too (bound to subject.legSpecSha256); production ignores it and reads the committed spec.
     # -ReceiptText (R3-RESIDUE-1 A1): the TEXT the receipt object was parsed from. ConvertFrom-Json keeps only the last of two same-name members, so a duplicate
     # `venue` / `venue.displayPath` member is visible only in the text: with it, a PASS/FAIL receipt that names either twice is INVALID (DISPLAY_PATH_DUPLICATE_MEMBER),
-    # and DISPLAY_PATH_UNBOUND is owed when ANY venue occurrence in the text carries a displayPath member (Get-DvReceiptTextDisplayPathFacts). The file readers
+    # and, for text the strict reader can inspect, DISPLAY_PATH_UNBOUND is owed when ANY venue occurrence in the text carries a displayPath member
+    # (Get-DvReceiptTextDisplayPathFacts). For PASS/FAIL text it cannot inspect (DISPLAY_PATH_TEXT_UNREADABLE) the receipt is INVALID regardless and the marker follows
+    # the parsed object alone, so it is NOT guaranteed there; no consumer branches on the marker (status alone gates a receipt). The file readers
     # (Invoke-VenueBaseline, New-VenueSheetPair, New-VenueFlavorPair) and Write-DvReceipt pass it; a caller that omits it is judged on the parsed object, as before.
     param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null, [AllowNull()][AllowEmptyString()][string]$ReceiptText = '')
     $incomplete = [System.Collections.Generic.List[string]]::new()
@@ -7909,9 +7911,11 @@ function Get-DvReceiptTextDisplayPathFacts {
                    ruled out in such a text, so the validator types a PASS/FAIL receipt carrying it INVALID (DISPLAY_PATH_TEXT_UNREADABLE) and never takes the
                    parsed object's answer. Empty text is not unreadable: it is a caller that did not supply the text, and keeps today's reading.
       venueCount-- the `venue` members at the root, in any letter case (Test-DvMemberNameIs), a name written with a JSON \u escape for one of its letters included (the parser decodes it).
-      carries   -- ANY venue occurrence that is an object holds a `displayPath` member (any letter case). This is the whole marker rule for a text reading
-                   that is malformed for ANOTHER reason: a lone-surrogate string or member name elsewhere in the receipt (an unreadable name is skipped, it
+      carries   -- ANY venue occurrence that is an object holds a `displayPath` member (any letter case). This is the marker rule for a text the strict reader
+                   CAN inspect that is malformed for ANOTHER reason: a lone-surrogate member name elsewhere in the receipt (an unreadable name is skipped, it
                    is neither `venue` nor `displayPath`), a bad block, a duplicate. It never looks at what the block holds, so nothing outside `venue` owes it.
+                   It is NOT a guarantee for `unreadable` text (a comment, a trailing comma, depth past 64, a non-object root): there the walk is not run, `carries`
+                   stays $false, the receipt is INVALID regardless, and the marker follows the parsed object alone (Test-DvReceiptCarriesDisplayPath).
       duplicate -- `venue` appears more than once, or one venue holds `displayPath` more than once.
     #>
     param([AllowNull()][AllowEmptyString()][string]$ReceiptText)
@@ -7947,8 +7951,9 @@ function Test-DvReceiptCarriesDisplayPath {
     # (Test-DvMemberNameIs, via Get-DvObjectMembersNamed), so `Venue` in a case-sensitive dictionary owes the marker exactly as the reader's `present` says;
     # when a receipt names venue in two letter cases the reader types it malformed, and the marker is owed if ANY of them carries a displayPath member.
     # R3-RESIDUE-1 A1: -ReceiptText is the text the receipt was parsed from. The parsed object keeps only the LAST of two same-name members, so the text is
-    # asked too (Get-DvReceiptTextDisplayPathFacts: ANY venue occurrence in the text carrying a displayPath member owes the marker, whatever else is
-    # malformed in it). A caller that omits it gets the object's answer alone, as before.
+    # asked too (Get-DvReceiptTextDisplayPathFacts: ANY venue occurrence in a text the strict reader can inspect carrying a displayPath member owes the marker).
+    # For PASS/FAIL text it cannot inspect (a comment, a trailing comma, depth past 64) the receipt is INVALID regardless and the marker follows the parsed object
+    # alone, so it is not guaranteed there. A caller that omits it gets the object's answer alone, as before.
     param($Receipt, [AllowNull()][AllowEmptyString()][string]$ReceiptText = '')
     foreach ($venue in @(Get-DvObjectMembersNamed $Receipt 'venue')) {
         if (@(Get-DvObjectMembersNamed $venue.Value 'displayPath').Count -gt 0) { return $true }

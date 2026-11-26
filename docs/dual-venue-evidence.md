@@ -728,7 +728,8 @@ A receipt therefore carries ONE display-path block, written by ONE writer and re
 timing work were not carried over: this block adds no venue read, no CIM query, no clock and no wait.
 
 **Writer.** `New-DvDisplayPathBlock -ProbeStdout <the health probe job's stdout>` (`DualVenueRunner.psm1`), called once by `Invoke-VenueLeg.ps1`
-right after the health probe's fields are copied, so an unhealthy or host-mismatched leg carries the block too. It reads the same `DVE_PROBE=` line
+right after the health probe job returns and BEFORE the probe's other fields are parsed and copied (so the block is attached even when
+`ConvertFrom-DvProbeStdout` later refuses the line, and an unhealthy or host-mismatched leg carries the block too). It reads the same `DVE_PROBE=` line
 `ConvertFrom-DvProbeStdout` reads (the first one), but with `System.Text.Json` and strict options, and copies three fields the probe already reports:
 
 | Field | Type | Value |
@@ -755,9 +756,13 @@ receipt cannot show a first `venue` block that the strict reader types `malforme
 parsed from>` therefore reads the text too (`Get-DvReceiptTextDisplayPathFacts`, `System.Text.Json`, the same name rule as the reader). The two
 file readers that pair receipts (`New-VenueSheetPair.ps1`, `New-VenueFlavorPair.ps1`), `Invoke-VenueBaseline.ps1` and `Write-DvReceipt` pass it.
 With the text: a PASS / FAIL receipt that names `venue` more than once, or one `venue` that names `displayPath` more than once, in any letter
-case, is `INVALID` with `DISPLAY_PATH_DUPLICATE_MEMBER` (it fails closed); and `DISPLAY_PATH_UNBOUND` is owed when ANY `venue` occurrence in the
-text holds a `displayPath` member, whatever else in the text is malformed. That rule looks only at the `venue` and `displayPath` member names, so a
-lone-surrogate string or member name elsewhere in the receipt owes no marker. A text that was supplied and that the strict reader cannot inspect
+case, is `INVALID` with `DISPLAY_PATH_DUPLICATE_MEMBER` (it fails closed); and, for text the strict `System.Text.Json` reader can inspect,
+`DISPLAY_PATH_UNBOUND` is owed when ANY `venue` occurrence in the text holds a `displayPath` member. That rule looks only at the `venue` and
+`displayPath` member names, so a lone-surrogate string or member name elsewhere in the receipt owes no marker. The "any occurrence" guarantee does NOT
+extend to PASS / FAIL text the strict reader cannot inspect (the `DISPLAY_PATH_TEXT_UNREADABLE` case below: a comment, a trailing comma, nesting past
+its depth limit, a root that is not an object, a lone surrogate): that receipt is `INVALID` whatever the marker says, and there the
+`DISPLAY_PATH_UNBOUND` marker follows the parsed object alone (`ConvertFrom-Json` keeps the last of two same-name members), so it is not guaranteed
+when only an earlier duplicate `venue` holds the block. No consumer branches on the marker (status alone gates a receipt), so the receipt is refused either way. A text that was supplied and that the strict reader cannot inspect
 (not strict JSON for `System.Text.Json` default options: a comment, a trailing comma, nesting deeper than 64, which `ConvertFrom-Json` reads up to 1024;
 or a root that is not an object, or any name or string that cannot be read back, an escaped lone surrogate) cannot be ruled free of a duplicate member, so a PASS / FAIL receipt carrying it is `INVALID` with
 `DISPLAY_PATH_TEXT_UNREADABLE`; the parsed object's own status is never the answer for it. The depth limit is not raised: the strict reader's grammar is
