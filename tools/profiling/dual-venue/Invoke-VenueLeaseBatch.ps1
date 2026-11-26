@@ -259,9 +259,15 @@ param(
     # r4 (sol r3 B1): '<claim|open>:<existence|identity|spec>=<sec>' makes that guard's read of that kind take <sec> longer, so a test can time a slow file system read inside
     # the guard. Offline only: refused with the real um-run.ps1, like the two probe seams above. r5 (sol r4 B1): '<guard>:rundir=<sec>' delays every read of -RunDir itself, in that
     # guard's worker and on the main thread after it (Wait-RunDirReadSeam), as a -RunDir that stopped answering would. r6: and every TEMP read after it that reaches -RunDir (Get-TempReadSeamMs).
-    [string]$GuardReadDelay = ''
+    [string]$GuardReadDelay = '',
+    # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1: '<n>:<ms>[,<n>:<ms>...]' makes the n-th file-system key lookup of the run (Get-SpecDigestKey's LocateWithin; counted from 1, one per spelled
+    # path, as the memo answers every later call) answer <ms> late, so a test can time out one lookup (its bound is 1 s) while the others answer. Offline only: refused with the real um-run.ps1.
+    [string]$SpecDigestKeyDelay = ''
 )
 $ErrorActionPreference = 'Stop'
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A3 sibling): a caller's $PSNativeCommandUseErrorActionPreference = $true is inherited by `& script`; with Stop it would turn the
+# raw quiet launch's documented non-zero exits into a terminating error. Every raw launch here reads $LASTEXITCODE itself.
+$PSNativeCommandUseErrorActionPreference = $false
 $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
@@ -301,8 +307,23 @@ $script:ExportBudgetPreflightReserveSec = 2
 $script:ExportBudgetPreflightCleanupMs = 1500   # (adversary r11 A6: the one budget the killed child's kill wait and stream waits share, taken out of the room before the bound is set)
 # r19 (sol r18 B1): the sha256 of the leg spec bytes the export-budget preflight judged, by spec path (Get-ExportBudgetRefusal records it). Every later read of that spec before a
 # lease or a leg is compared with it (Get-InputContentRefusal, and the leg itself through -ExpectSpecSha256), so a lease is never spent on bytes the budget did not judge.
-$script:SpecBudgetSha256 = @{}
-$script:SpecShapeSha256 = @{}   # (and of the bytes the preflight's shape check judged, which the budget's read must equal)
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 (adversary pass 2 A2): ORDINAL keys. A PowerShell @{} folds case, so on a case-sensitive directory two distinct files A.json and
+# a.json shared one digest and the second read overwrote the first's (a false SPEC_CHANGED_AFTER_PREFLIGHT before the claim, and the guard and child bound to the other file's bytes).
+$script:SpecBudgetSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal)
+$script:SpecShapeSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal)   # (and of the bytes the preflight's shape check judged, which the budget's read must equal)
+# DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (key r10 B1): the key those two maps are read and written under, resolved ONCE per spelled path (Get-SpecDigestKey), and the offline delay seam's state
+$script:SpecDigestKeyMemo = [Collections.Hashtable]::new([StringComparer]::Ordinal)
+$script:SpecDigestKeyCalls = 0
+$script:SpecDigestKeyFallback = [Collections.Hashtable]::new([StringComparer]::Ordinal)
+$script:SpecDigestKeyDelayMs = @{}
+if ($SpecDigestKeyDelay) {
+    if ($umRunIsReal) { Stop-Usage '-SpecDigestKeyDelay is an offline test seam: with the real um-run.ps1 the spec digest key is looked up as it is' }
+    foreach ($pair in ($SpecDigestKeyDelay -split ',')) {
+        # (the ordinal counts from 1; adversary pass 2 A9: a 0 named a lookup that never exists)
+        if ($pair.Trim() -cnotmatch '^([1-9][0-9]{0,3}):([0-9]{1,6})\z') { Stop-Usage "-SpecDigestKeyDelay '$SpecDigestKeyDelay' is not <n>:<ms>[,<n>:<ms>...]" }
+        $script:SpecDigestKeyDelayMs[[int]$Matches[1]] = [int]$Matches[2]
+    }
+}
 foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object { $_ }) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage "no script at '$s'" } }
 $stagedBuildProbe = $(if ($StagedBuildProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript)) } else { $null })
 $artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript)) } else { $null })
@@ -1435,7 +1456,9 @@ function Get-LegSpecTelemetryArm([string]$Path) {
         # r6 (adversary pass 5 A5): a read that got no answer in its bound is a TIMEOUT the caller must see (readTimedOut), not a quiet UNKNOWN the plan goes on from toward a refusal after -DeadlineUtc
         if ($r.state -ceq 'TIMEOUT') { return [pscustomobject]@{ arm = 'UNKNOWN'; source = 'spec'; reason = 'the spec read for the arm did not answer within the time left before -DeadlineUtc'; readTimedOut = $true } }
         if ($r.state -ceq 'OK') {
-            $judged = if ($script:SpecBudgetSha256 -is [hashtable] -and $script:SpecBudgetSha256.ContainsKey($Path)) { [string]$script:SpecBudgetSha256[$Path] } else { '' }
+            # (merge with #903: the digests are keyed by Get-SpecDigestKey, the file's identity, never the spelled path)
+            $armDigestKey = Get-SpecDigestKey $Path
+            $judged = if ($script:SpecBudgetSha256 -is [hashtable] -and $script:SpecBudgetSha256.ContainsKey($armDigestKey)) { [string]$script:SpecBudgetSha256[$armDigestKey] } else { '' }
             # r14 (sol r13 B4): a spec that repeats a key throws here (caught below: the arm is UNKNOWN), never collapses to the last value
             if ($judged -and ((Get-BytesSha256 ([byte[]]$r.bytes)) -ceq $judged)) { $specText = [Text.Encoding]::UTF8.GetString([byte[]]$r.bytes); Assert-FpsJsonNoRepeatedKey $specText $Path; $spec = $specText | ConvertFrom-Json }
             else { return (New-FpsArm 'UNKNOWN' 'spec' 'the spec bytes read for the arm are not the bytes the preflight judged and the leg is bound to (changed between reads, or no judged digest)') }
@@ -1454,6 +1477,58 @@ function Get-SpecReadBoundSec {
     # Read-SpecBytesWithin starts no read on it (TIMEOUT at once), so every caller's typed refusal lands before -DeadlineUtc
     # r20 (hosted CI on 41f4ffd9, test_artifact_preflight_r10_no_dual_venue_math_min_or_max_rounds_a_double_through_an_integer_first_operand): the first operand is a double in its own text
     [Math]::Min([double]$cap, ($dl - [DateTime]::UtcNow).TotalSeconds - 2.0)
+}
+
+function Get-SpecDigestKey([string]$Path) {
+    # DV-PLANNED-SPEC-HASH-BIND-R9-R2-RESIDUE-1 (adversary pass 2 A3): the key SpecBudgetSha256 / SpecShapeSha256 are read and written under. The maps are ORDINAL (r3 A2: A.json and a.json
+    # are two files in a case-sensitive directory), so the key must be the file's own canonical name: the path the file system opens (GetFinalPathNameByHandle: the on-disk case, links
+    # resolved), read on a pool thread and given up on after 1 s. One file named by two spellings (a case twin, a junction) is then ONE key, so the second read overwrites the first's digest
+    # and the first entry is refused (SPEC_CHANGED_AFTER_PREFLIGHT) before any claim; two distinct files of a case-sensitive directory stay two. A path that cannot be resolved (missing,
+    # no answer in time) falls back to its full path, still ordinal.
+    # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (key r10 B1, fable + opus): that choice was made PER CALL, so a spelling off the on-disk name (a case twin, 8.3, subst, a mapped drive) whose
+    # first call got no answer in 1 s stored a digest under the spelled path and was looked up under the final one: an entry with no digest, which '' -cne '' did not refuse, and a leg
+    # launched with no -ExpectSpecSha256. The key is now resolved ONCE per spelled path for the run (the memo, by the full path), so every call for one spelling gets the same key whichever way the
+    # first one went; and an entry with no judged digest is refused before any claim in every form (Get-UnjudgedSpecRefusal), whatever the key did.
+    $digestFull = try { [IO.Path]::GetFullPath($Path) } catch { return $Path }
+    if ($script:SpecDigestKeyMemo.ContainsKey($digestFull)) { return [string]$script:SpecDigestKeyMemo[$digestFull] }
+    if (-not ('VenueLeaseBatchFinalPath' -as [type])) { try { $null = Get-PhysicalPath $PSScriptRoot } catch { } }
+    if (-not ('VenueLeaseBatchFinalPath' -as [type])) { return $digestFull }
+    # R10 pass 1 A2 (on 5a73d8e8): the wait is bounded by what is left before -DeadlineUtc too (the read bound's own room, less its 2 s reserve), under the 1 s: a lookup that started with 250 ms left held
+    # the typed refusal 750 ms past the deadline. R10 pass 2 A3 (on 0cffc10b): no room is NO lookup (a zero wait still handed the pool a task that opened the file after the caller gave up), and the
+    # read right after it is then the typed SPEC_READ_TIMEOUT before the deadline. R10 pass 2 A4: the deadline is read as the script's own variable, never through the variable-lookup cmdlet (a caller's
+    # $PSDefaultParameterValues default for its Scope parameter made that call answer nothing, and the room fell back to the 120 s cap).
+    $room = $(if ($script:deadline -is [datetime]) { ($script:deadline - [DateTime]::UtcNow).TotalSeconds - 2.0 } else { 120.0 })
+    $waitMs = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(1.0, $room)) * 1000.0)
+    $located = $false; $ph = $null; $ik = $null
+    if ($waitMs -gt 0) {
+        $script:SpecDigestKeyCalls++
+        $keyDelayMs = $(if ($script:SpecDigestKeyDelayMs.ContainsKey([int]$script:SpecDigestKeyCalls)) { [int]$script:SpecDigestKeyDelayMs[[int]$script:SpecDigestKeyCalls] } else { 0 })   # offline seam (-SpecDigestKeyDelay); 0 in production
+        $located = try { [VenueLeaseBatchFinalPath]::LocateWithin($digestFull, $keyDelayMs, $waitMs, [ref]$ph, [ref]$ik) } catch { $false }
+    }
+    # R10 pass 2 A1 (on 0cffc10b): the key is the file's IDENTITY (volume serial + file index, the second answer LocateWithin gives), not its final path: two hard links of one file have two final paths and one
+    # identity, so the second read overwrites the first's digest and the first entry is refused before any claim, as a case twin or a junction spelling is; two distinct files stay two. (An identity
+    # cannot collide with the spelled-path fallback: it has no path separator.)
+    $key = $(if ($located -and $ik) { [string]$ik } else { $digestFull })
+    # R10 pass 1 A1 (on 5a73d8e8): a spelling that fell back keeps its fallback for the run, but is recorded: it was not folded with its twin spellings (a twin that resolved has the identity as its key), so
+    # Get-UnresolvedSpecKeyRefusal ends the run before any claim instead of leaving the swap of one twin's bytes to the content guard after the claim
+    if (-not ($located -and $ik)) { $script:SpecDigestKeyFallback[$digestFull] = $true }
+    $script:SpecDigestKeyMemo[$digestFull] = $key
+    $key
+}
+
+function Get-UnresolvedSpecKeyRefusal([string]$Spec) {
+    # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (adversary pass 1 A1): $null unless this spec's key is the spelled-path fallback (the file system gave no final path in time, or none), in which case a
+    # readable spec cannot be told from a twin spelling of another entry, and the run is refused before any claim: a rerun, not a claim taken and given back by the content guard
+    $full = try { [IO.Path]::GetFullPath($Spec) } catch { return $null }
+    if (-not $script:SpecDigestKeyFallback.ContainsKey($full)) { return $null }
+    "SPEC_KEY_UNRESOLVED '$Spec' cannot be run: the file system gave no final path for this leg spec in time, so it cannot be told apart from another spelling of the same file; no claim or lease is taken on it (run it again)"
+}
+
+function Get-UnjudgedSpecRefusal([string]$Spec, [string]$JudgedSha, [string]$BoundSha) {
+    # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (key r10 B1): $null when the entry has a judged digest AND its path is bound to one. An empty one (nothing stored it, or it was stored under another key)
+    # is never "equal to another empty one": a leg is never launched without -ExpectSpecSha256, and the typed refusal comes before any claim or lease.
+    if ($JudgedSha -and $BoundSha) { return $null }
+    "SPEC_NOT_JUDGED '$Spec' cannot be run: no export budget read judged this leg spec's bytes (entry sha256 '$JudgedSha', path-bound sha256 '$BoundSha'), so no leg could be bound to them with -ExpectSpecSha256; no claim or lease is taken on bytes nothing judged"
 }
 
 function Read-SpecBytesWithin([string]$Path, [double]$BoundSec, [int]$DelayMs = 0) {
@@ -1507,7 +1582,7 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
     # r19 (sol r18 B1 sibling): the bytes this shape check judged, so the budget preflight can prove it judged the same ones (Get-ExportBudgetRefusal)
     # r20: and the third element of a '' answer, so the content guard compares THESE bytes with the judged ones (one read, after master's own typed refusals)
     $judgedSha = Get-BytesSha256 $specRead.bytes
-    if ($script:SpecShapeSha256 -is [hashtable]) { $script:SpecShapeSha256[$Path] = $judgedSha }
+    if ($script:SpecShapeSha256 -is [hashtable]) { $script:SpecShapeSha256[(Get-SpecDigestKey $Path)] = $judgedSha }   # (R9-R2 A3: keyed by the file's canonical name)
     $shapeRefusal = Get-DvLegSpecShapeRefusal -Spec $spec
     if ($null -ne $shapeRefusal) { return 'LEG_SPEC_INVALID', "'$Path' cannot be run: $shapeRefusal" }
     if ($spec.schema -ne 'mlv-app/dual-venue-leg/v1') { return 'LEG_SPEC_INVALID', "'$Path' schema is '$($spec.schema)', expected mlv-app/dual-venue-leg/v1" }
@@ -1547,10 +1622,11 @@ function Get-ExportBudgetRefusal([string]$Path) {
     # r19 (sol r18 B1 = pass20-A1): these are the bytes the budget judges. Their sha256 is recorded, and every later read before a lease or a leg is compared with it
     # (Get-InputContentRefusal; the leg's own read through -ExpectSpecSha256). The shape check's earlier read must have judged the same bytes, or the two checks judged two specs.
     $judgedSha = Get-BytesSha256 $specBytes
-    if ($script:SpecShapeSha256.ContainsKey($Path) -and [string]$script:SpecShapeSha256[$Path] -cne $judgedSha) {
-        return 'SPEC_CHANGED_AFTER_PREFLIGHT', "'$Path' cannot be run: the leg spec changed between the preflight's shape check (sha256 $($script:SpecShapeSha256[$Path])) and its export budget read (sha256 $judgedSha); no claim or lease is taken on bytes no single check judged"
+    $digestKey = Get-SpecDigestKey $Path   # DV-PLANNED-SPEC-HASH-BIND-R9-R2-RESIDUE-1 (adversary pass 2 A3): one file under two spellings is one key
+    if ($script:SpecShapeSha256.ContainsKey($digestKey) -and [string]$script:SpecShapeSha256[$digestKey] -cne $judgedSha) {
+        return 'SPEC_CHANGED_AFTER_PREFLIGHT', "'$Path' cannot be run: the leg spec changed between the preflight's shape check (sha256 $($script:SpecShapeSha256[$digestKey])) and its export budget read (sha256 $judgedSha); no claim or lease is taken on bytes no single check judged"
     }
-    $script:SpecBudgetSha256[$Path] = $judgedSha
+    $script:SpecBudgetSha256[$digestKey] = $judgedSha
     try { $spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec no longer parses on the export budget preflight's read ($($_.Exception.Message -replace '\s+', ' ')), so its job budget is unchecked; no claim or lease is taken on it" }
     if ($spec -isnot [System.Management.Automation.PSCustomObject]) { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec is no longer one JSON object on the export budget preflight's read, so its job budget is unchecked; no claim or lease is taken on it" }
@@ -1602,12 +1678,15 @@ function Get-ScalarLegShapeRefusal([string]$Path) {
     # fix 2 (adversary r8 fix-1 A1): a root the leg rejects is refused too -- bytes that are not JSON (the leg's ConvertFrom-Json throws) and a JSON null (it parses
     # to $null, which the predicate refuses as not one object); a predicate that throws is a refusal, never an unhandled exit.
     # r19 (sol r18 B2 sibling :1421): a bounded read (Read-SpecBytesWithin); no answer before -DeadlineUtc is the typed SPEC_READ_TIMEOUT (its caller stops on the code itself)
+    if ($script:SpecShapeSha256 -is [hashtable]) { [void]$script:SpecShapeSha256.Remove((Get-SpecDigestKey $Path)) }   # BATCH-3 r9 (adversary pass 11 A2): only THIS read may answer for the path (a read that fails leaves no digest)
     $specRead = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec)
     if ($specRead.state -ceq 'TIMEOUT') { return "SPEC_READ_TIMEOUT '$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc; no claim or lease is taken on it" }
     if ($specRead.state -cne 'OK') { return "the leg spec is not valid JSON (it could not be read: $($specRead.error -replace '\s+', ' '))" }
+    # r19 (sol r18 B1 sibling): the bytes this shape check judged. DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r9 (adversary pass 11 A2): recorded BEFORE the parse, so the
+    # -LegSet caller compares them with the planner's sha256 before a parse refusal can stand in for SPEC_CHANGED_AFTER_PREFLIGHT
+    $script:SpecShapeSha256[(Get-SpecDigestKey $Path)] = Get-BytesSha256 $specRead.bytes
     try { $spec = [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return "the leg spec is not valid JSON ($($_.Exception.Message -replace '\s+', ' '))" }
-    $script:SpecShapeSha256[$Path] = Get-BytesSha256 $specRead.bytes  # r19 (sol r18 B1 sibling): the bytes this shape check judged
     try { $refusal = Get-DvLegSpecShapeRefusal -Spec $spec } catch { return "the leg spec cannot be shape-checked ($($_.Exception.Message -replace '\s+', ' '))" }
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
@@ -1617,11 +1696,13 @@ function Get-SpecPathJudgedConflict([hashtable]$Seen, [string]$Path) {
     # overwrote each other's: item A's arm was read from the bytes it judged, then the file changed, item B judged the new bytes, and A's leg ran (bound to B's digest) on bytes its recorded
     # arm never described. A path is judged ONCE per run: the first item (or scalar entry) to pass the shape and budget checks records the digest in $Seen, and any later entry whose own
     # judged digest for the same path differs is the typed refusal below (fail closed; no claim, lease or leg). Returns '' when this path's digest is new or unchanged.
-    $now = [string]$script:SpecBudgetSha256[$Path]
-    if ($Seen.ContainsKey($Path) -and [string]$Seen[$Path] -cne $now) {
-        return "'$Path' cannot be run: two entries of this run name the same leg spec and judged different bytes of it (sha256 $($Seen[$Path]), then $(if ($now) { $now } else { 'none recorded' })); one recorded arm and one leg binding must describe one set of bytes, so no claim or lease is taken"
+    # (merge with #903: keyed by Get-SpecDigestKey, the file's identity, as the digests are, so two spellings of one file are one path here too)
+    $seenKey = Get-SpecDigestKey $Path
+    $now = [string]$script:SpecBudgetSha256[$seenKey]
+    if ($Seen.ContainsKey($seenKey) -and [string]$Seen[$seenKey] -cne $now) {
+        return "'$Path' cannot be run: two entries of this run name the same leg spec and judged different bytes of it (sha256 $($Seen[$seenKey]), then $(if ($now) { $now } else { 'none recorded' })); one recorded arm and one leg binding must describe one set of bytes, so no claim or lease is taken"
     }
-    $Seen[$Path] = $now
+    $Seen[$seenKey] = $now
     ''
 }
 $specJudgedOnce = @{}
@@ -1687,7 +1768,8 @@ if ($legPlanMode) {
             # answer) and goes on to the base's own reads, so a stalled arm read never pre-empts its staging refusal (BUILD_NOT_STAGED item=<n>).
             if ($armRead.readTimedOut -and $armDecides) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n "'$path' cannot be run: the leg spec could not be read for its telemetry arm within the time left before -DeadlineUtc; no claim or lease is taken on it" }   # r6 (adversary pass 5 A5)
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
-                    telemetryArm = $armRead.arm })
+                    telemetryArm = $armRead.arm
+                    specSha256 = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey $path)] })   # r2 (adversary A1 class): THIS item's judged bytes
         }
         # BENCH-LIGHT-ARM-GAIN-GATES-1 (hub ruling 2026-11-20T05:25:54Z item 2): a plan may declare `purpose`. 'fps-ab' = its legs are compared on presented fps, so every leg must run the LIGHT
         # telemetry arm (a HEAVY leg's fps measures the per-frame logger; a spec that names no arm is UNKNOWN and refused alike). 'stage-attribution' = stage metrics only: HEAVY allowed. No
@@ -1732,7 +1814,7 @@ if ($legPlanMode) {
         }
         foreach ($it in $ordered) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
-                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; telemetryArm = $it.telemetryArm })
+                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; telemetryArm = $it.telemetryArm; specSha256 = $it.specSha256 })
         }
         $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; purpose = $planPurpose; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
             legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; telemetryArm = $_.telemetryArm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
@@ -1747,13 +1829,32 @@ if ($legPlanMode) {
     $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
     foreach ($e in $sp.plan) {
         $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath)   # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): before the lease, as -LegPlan does
-        if ($shapeRefusal -clike 'SPEC_READ_TIMEOUT *') { Stop-Usage $shapeRefusal }   # r19 (sol r18 B2 sibling): the read's own typed code
+        if ($shapeRefusal -clike 'SPEC_READ_TIMEOUT *') { Stop-Usage "$shapeRefusal (planned_sha256=$($e.specSha256))" }   # r19 (sol r18 B2 sibling): the read's own typed code (r2 A4: with the planner's hash, as the other -LegSet refusals)
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r9 (adversary pass 11 A2): the planner comparison comes BEFORE the shape and budget verdicts, so bytes that changed after
+        # planning are named as changed (with the planned hash) whatever those checks would have said about the new bytes
+        $shapeSha = [string]$script:SpecShapeSha256[(Get-SpecDigestKey ([string]$e.specPath))]
+        if ($shapeSha -and $shapeSha -cne [string]$e.specSha256) {
+            Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg spec read as sha256 $shapeSha after the leg-set planner judged sha256 $($e.specSha256) (planned_sha256=$($e.specSha256)); no claim or lease is taken on bytes the planner did not judge"
+        }
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$($e.specPath)' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal ([string]$e.specPath)   # r8 (adversary r7 A3): before the lease, as -LegPlan does
-        if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
-        $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce ([string]$e.specPath)   # r6 (adversary A7 sibling): one judged digest per spec path
+        # DV-PLANNED-SPEC-HASH-BIND-R9-RESIDUE-1 r1 (sol r9): bytes replaced AFTER the shape read and BEFORE the budget read are refused by the budget read itself, whose message knows no
+        # planner. In this -LegSet loop that refusal names the planner's hash like every other spec-changed refusal here.
+        # (r2, adversary pass 1 A4: every budget-read refusal here, SPEC_READ_FAILED and the preflight timeout included, names the hash the planner judged)
+        if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1]) (planned_sha256=$($e.specSha256))" }
+        # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 (sol r6 INV-3 sibling): the set planner judged THESE bytes (legId, twin, the name it reached; Get-DvLegSetPlan's specSha256), and the
+        # shape and budget reads above are later reads of the same path. The bytes they judged (and every later read, the leg's own -ExpectSpecSha256 included, is bound to) must
+        # be the planner's, or bytes swapped in after planning (a committed visual twin's) would pass both checks and run in the planned speed slot. Refused before any claim or lease.
+        $entryBoundSha = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey ([string]$e.specPath))]
+        # R10 (key r10 B1): no digest at all is not "changed bytes" (the old refusal named an empty sha256): it is bytes nothing judged
+        $unjudged = Get-UnjudgedSpecRefusal ([string]$e.specPath) ([string]$e.specSha256) $entryBoundSha
+        if ($unjudged) { Stop-Usage "$unjudged (planned_sha256=$($e.specSha256))" }
+        if ($entryBoundSha -cne [string]$e.specSha256) {
+            Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg spec read as sha256 $entryBoundSha after the leg-set planner judged sha256 $($e.specSha256) (planned_sha256=$($e.specSha256)); no claim or lease is taken on bytes the planner did not judge"
+        }
+        $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce ([string]$e.specPath)   # r6 (adversary A7 sibling): one judged digest per spec path (after the planner comparison above, which names planner-changed bytes first)
         if ($judgedConflict) { Stop-Usage "SPEC_CHANGED_BETWEEN_PLAN_ITEMS $judgedConflict" }
-        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend })
+        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256 })
     }
 } else {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
@@ -1773,9 +1874,27 @@ if ($legPlanMode) {
         $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce $path   # r6 (adversary A7 sibling): one judged digest per spec path
         if ($judgedConflict) { Stop-Usage "SPEC_CHANGED_BETWEEN_PLAN_ITEMS $judgedConflict" }
         $legId = Get-LegSpecId $path
+        $judgedSha = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey $path)]   # r2 (adversary A1 class): THIS entry's judged bytes
         for ($r = 1; $r -le $Repeats; $r++) {
-            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }) })
+            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); specSha256 = $judgedSha })
         }
+    }
+}
+# DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A1): the input guard and the leg child below are bound through the PATH-keyed SpecBudgetSha256, which holds the LAST
+# preflight read of a path. A path named by two entries (a set, a -LegSpec list or a plan naming it twice) whose bytes changed between their preflights would bind the first
+# entry (planned and judged as other bytes) to the second's. Every entry must have been judged as the bytes its path is bound to, in every form, before any claim or lease.
+foreach ($leg in $plan) {
+    $boundSha = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey ([string]$leg.spec))]
+    # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (key r10 B1): an entry with no judged digest, or a path bound to none, is refused FIRST, in every form (-LegSpec, -LegPlan, -LegSet): '' -cne '' is false, so
+    # the check below let one through, the content guard skipped its re-read and the leg launched with no -ExpectSpecSha256
+    # (adversary pass 1 A1: a key that fell back to the spelled path is refused first, before any claim, so one spelling's swap is never left to the content guard after the claim)
+    $unresolved = Get-UnresolvedSpecKeyRefusal ([string]$leg.spec)
+    if ($unresolved) { if ($legPlanMode) { Stop-PlanRefused 'SPEC_KEY_UNRESOLVED' $leg.planItem ($unresolved -replace '^SPEC_KEY_UNRESOLVED ', '') } else { Stop-Usage $unresolved } }
+    $unjudged = Get-UnjudgedSpecRefusal ([string]$leg.spec) ([string]$leg.specSha256) $boundSha
+    if ($unjudged) { if ($legPlanMode) { Stop-PlanRefused 'SPEC_NOT_JUDGED' $leg.planItem ($unjudged -replace '^SPEC_NOT_JUDGED ', '') } else { Stop-Usage $unjudged }; }
+    if ([string]$leg.specSha256 -cne $boundSha) {
+        $msg = "'$($leg.spec)' cannot be run: leg $($leg.name) was judged as sha256 $($leg.specSha256) but a later preflight read of the same path judged sha256 $boundSha (planned_sha256=$($leg.specSha256)); no claim or lease is taken on bytes this leg's checks did not judge"
+        if ($legPlanMode) { Stop-PlanRefused 'SPEC_CHANGED_AFTER_PREFLIGHT' $leg.planItem $msg } else { Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT $msg" }
     }
 }
 # r11 (sol r10 blocker 2): every generated output name is checked HERE, before any claim, for every form: a leg name built from an accepted spec's own basename (the legId fallback) and a
@@ -1790,7 +1909,7 @@ foreach ($leg in $plan) {
 # r11 (sol r10 blocker 3): the validated inputs, kept for the re-check once the claim is held (Get-InputOutputRefusal). A -LegSet's specs are inputs too, so they are checked now as well.
 $script:guardedInputs = [System.Collections.Generic.List[object]]::new()
 if ($legPlanMode) { $script:guardedInputs.Add([pscustomobject]@{ path = $planPath; kind = 'plan'; item = 0 }) }
-foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend; specSha256 = [string]$script:SpecBudgetSha256[[string]$p.spec] }) }   # r19 (sol r18 B1): the judged bytes' sha256
+foreach ($p in $plan) { $script:guardedInputs.Add([pscustomobject]@{ path = $p.spec; kind = 'spec'; item = $(if ($legPlanMode) { $p.planItem } else { 0 }); backend = $p.backend; specSha256 = [string]$p.specSha256 }) }   # r19 (sol r18 B1): the judged bytes' sha256; r3 (A2 class): THIS entry's own, never a path-keyed lookup
 # r12 (adversary r12 A1): and each staged build manifest the plan reads (-LegPlan only; the scalar form's one build is read inside the leg job, after the lease)
 if ($legPlanMode) { foreach ($b in $builds.GetEnumerator()) { $first = @($items | Where-Object { [string]::Equals([string]$_.sourceCommit, [string]$b.Key, [StringComparison]::Ordinal) })[0]; $script:guardedInputs.Add([pscustomobject]@{ path = $b.Value.path; kind = 'build'; item = $first.item; commit = $b.Key; sha256 = $first.buildManifestSha256 }) } }
 # r6 pass 3 (adversary r6 pass 2 A1): each input's physical path and file identity as accepted (the preflight guard just resolved it), for Get-WriteDestinationHit
@@ -2953,7 +3072,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $leg.sourceCommit, '-BuildManifestSha256', $leg.buildManifestSha256, '-LeaseBatch', $token)
                 if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
                 # r19 (sol r18 B1): the leg itself compares the bytes IT reads with the ones the export-budget preflight judged, and refuses before anything is generated or submitted
-                if ($script:SpecBudgetSha256[[string]$leg.spec]) { $lArgs += @('-ExpectSpecSha256', [string]$script:SpecBudgetSha256[[string]$leg.spec]) }
+                # r3 (adversary pass 2 A2 class): THIS entry's own judged sha256 (every form carries it, and the plan check above proved it is the one its path was bound to)
+                # R10 (key r10 B1): unconditional. Get-UnjudgedSpecRefusal refused an entry with no digest before any claim; a leg is never launched without the bound hash (an empty one fails the leg's own 64-hex pattern)
+                $lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256)
                 if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
                 if ($ReceiptRoot) { $lArgs += @('-ReceiptRoot', $ReceiptRoot) }   # LEASE-BATCH-RECEIPT-ROOT-1: the one leg call site, so an in-lease retry forwards it too; empty adds no argument
                 L "LEG $($leg.name) RUN batch=$batchNo lease=$($b.leaseId) quietMean=$(Format-Mean $q.mean) roomSec=$room legBudgetSec=$legBudget spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })$(if ($legPlanMode) { " arm=$($leg.arm) sourceCommit=$($leg.sourceCommit) buildManifestSha256=$($leg.buildManifestSha256)" })"
