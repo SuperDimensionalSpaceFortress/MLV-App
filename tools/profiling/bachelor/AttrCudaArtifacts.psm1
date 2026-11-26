@@ -5070,8 +5070,11 @@ function Get-AttrCudaProcessTreeSnapshot {
         # creation-time ordering the orphan classification below relies on is untrustworthy: the tree is unknown (fail closed), never classified by a rolled-back clock.
         # -NowTicks is the test seam; the check is inline because VenueChain and DualVenueRunner embed this function alone, by name.
         $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [DateTime]::UtcNow.Ticks })
+        # r2 (sol r1 A1, hub ruling 2026-11-26): ONE clock-ambiguity band, $skewTicks (2 s), serves the future-row check, the climb's parent hop and the outsider test. A
+        # rollback inside the band cannot be seen as a step, so two stamps inside it are never ordered: anything the walk cannot PROVE an outsider counts as a member.
+        $skewTicks = 20000000L
         foreach ($row in $rows) {
-            if ($null -ne $row -and $null -ne $row.CreationDate -and ([datetime]$row.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + 20000000L)) { return (& $unknown "clock-stepped-back pid=$($row.ProcessId)") }
+            if ($null -ne $row -and $null -ne $row.CreationDate -and ([datetime]$row.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + $skewTicks)) { return (& $unknown "clock-stepped-back pid=$($row.ProcessId)") }
         }
         $byParent = @{}
         $rootTicks = $null
@@ -5135,8 +5138,10 @@ function Get-AttrCudaProcessTreeSnapshot {
                 $climb.Add($cur)
                 $curTicks = $rowTicks[$cur]
                 $up = $rowParent[$cur]
-                if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -lt [int64]$curTicks) { $cur = $up; continue }
-                $verdict = ($null -ne $curTicks) -and ([int64]$curTicks -ge [int64]$rootTicks)
+                # r2: a parent is followed only when it is older than the child by MORE than the band (a recycled number whose stamp reads older through a small rollback is no parent);
+                # the top is an outsider only when its stamp is older than the root's by MORE than the band. Equal, inside-the-band, newer or missing: a member (fail closed).
+                if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -lt ([int64]$curTicks - $skewTicks)) { $cur = $up; continue }
+                $verdict = -not (($null -ne $curTicks) -and ([int64]$curTicks -lt ([int64]$rootTicks - $skewTicks)))
                 break
             }
             foreach ($q in $climb) { $late[$q] = $verdict }
@@ -5182,6 +5187,7 @@ function Wait-AttrCudaProcessTreeGone {
     # r1 fix 2 (adversary A3 advisory on 348c4357): a snapshot whose identities do not convert is an unknown tree, never a throw.
     $recorded = @{}
     $known = @{}
+    $skewTicks = 20000000L
     try {
         $recorded[[int64]$Snapshot.rootProcessId] = [int64]$Snapshot.rootCreationTicks
         foreach ($m in @($(if ($null -ne $snapProps['members']) { $snapProps['members'].Value } else { @() }))) { $recorded[[int64]$m.processId] = $(if ($null -eq $m.creationTicks) { $null } else { [int64]$m.creationTicks }) }
@@ -5191,24 +5197,27 @@ function Wait-AttrCudaProcessTreeGone {
     } catch { return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: unreadable snapshot identity" } }
     # r1 fix 2 (adversary A2 on 348c4357): a scan is STARTED only while at least $scanFloorMs (CIM's own 1 s OperationTimeoutSec floor) is left, under a timeout no
     # longer than what is left, and no sleep runs into that floor; so no scan is granted past the bound. A bound under 1 s is no time to confirm.
+    # r2 (sol r1 A2): a scan costs CIM's 1 s floor PLUS the time between reading the clock and dispatching the call, so it starts only with $scanFloorMs + $scanMarginMs left and
+    # its timeout is the whole seconds of the exact remaining milliseconds (a double) less that margin; a truncated clock read granted 1 s with 999.8 ms left.
     $scanFloorMs = 1000
+    $scanMarginMs = 50
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $survivors = @()
     $lastError = 'no-time-to-confirm'
     # r7b (adversary A3 on 1413e30f): the clock is read to the fraction of a millisecond; ElapsedMilliseconds truncates, so 1200.6 ms read as inside a 1200 ms bound.
-    while (($WaitMs - $clock.Elapsed.TotalMilliseconds) -ge $scanFloorMs) {
+    while (($WaitMs - $clock.Elapsed.TotalMilliseconds) -ge ($scanFloorMs + $scanMarginMs)) {
         try {
             # r5b fix 2 (adversary A2 on e75704ae): the floor is re-checked at the moment the scan's timeout is granted (the 250 ms sleep and the work since the loop
             # test have used budget), so a scan never starts, or is granted its 1 s minimum, with less than $scanFloorMs left.
             $remainMs = $WaitMs - $clock.Elapsed.TotalMilliseconds
-            if ($remainMs -lt $scanFloorMs) { break }
-            $leftSec = [int][Math]::Floor($remainMs / 1000.0)
+            if ($remainMs -lt ($scanFloorMs + $scanMarginMs)) { break }
+            $leftSec = [int][Math]::Floor(($remainMs - $scanMarginMs) / 1000.0)
             $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
             # r5b fix (adversary A2 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started; the
             # creation-time ordering of the climb below is then untrustworthy, so the kill is UNCONFIRMED (fail closed), whatever the other rows show.
             $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [DateTime]::UtcNow.Ticks })
             foreach ($futureRow in $rows) {
-                if ($null -ne $futureRow -and $null -ne $futureRow.CreationDate -and ([datetime]$futureRow.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + 20000000L)) {
+                if ($null -ne $futureRow -and $null -ne $futureRow.CreationDate -and ([datetime]$futureRow.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + $skewTicks)) {
                     return [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = "clock-stepped-back pid=$($futureRow.ProcessId)" }
                 }
             }
@@ -5267,7 +5276,10 @@ function Wait-AttrCudaProcessTreeGone {
                     $climb.Add($cur)
                     $curTicks = $rowTicks[$cur]
                     $up = $rowParent[$cur]
-                    if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -lt [int64]$curTicks) { $cur = $up; continue }
+                    if ($null -ne $up -and $null -ne $curTicks -and $up -ne $cur -and -not $climb.Contains($up) -and $rowTicks.ContainsKey($up) -and $null -ne $rowTicks[$up] -and [int64]$rowTicks[$up] -lt ([int64]$curTicks - $skewTicks)) { $cur = $up; continue }
+                    # r2 (sol r1 A1): the hop needs a parent older by MORE than the clock-ambiguity band, and the top is an outsider only when the snapshot PROVED it one (same pid and
+                    # stamp in .others, which the snapshot admits only when older than the root by more than the band). Anything else, a recycled number with an older-reading stamp
+                    # included, is unproven: a survivor.
                     $verdict = -not (($null -ne $curTicks) -and $known.ContainsKey($cur) -and ($null -ne $known[$cur]) -and ([int64]$known[$cur] -eq [int64]$curTicks))
                     break
                 }
@@ -5284,7 +5296,8 @@ function Wait-AttrCudaProcessTreeGone {
             if ($clock.Elapsed.TotalMilliseconds -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
             if ($survivors.Count -eq 0 -and $null -eq $noPidUnder) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
         } catch { $lastError = "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
-        $sleepMs = [Math]::Min(250, $WaitMs - $clock.ElapsedMilliseconds - $scanFloorMs)
+        # r2 (sol r1 A2): the sleep is read from the exact remaining milliseconds (a double), floored, so it never runs into the scan floor and margin.
+        $sleepMs = [Math]::Floor([Math]::Min(250.0, $WaitMs - $clock.Elapsed.TotalMilliseconds - $scanFloorMs - $scanMarginMs))
         if ($sleepMs -lt 0) { break }
         if ($sleepMs -gt 0) { Start-Sleep -Milliseconds ([int]$sleepMs) }
     }

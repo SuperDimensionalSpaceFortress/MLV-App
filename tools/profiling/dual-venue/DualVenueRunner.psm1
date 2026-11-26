@@ -7140,7 +7140,9 @@ function New-DvHealthProbeJobText {
     # here, beside the other read-only venue helper, so the scan reads and clears both bodies (read-only process tables, no write). r7 (sol r6d B3): the probe never calls
     # them, so the text is discarded and the probe carries neither (test_r7_b3_the_health_probe_carries_no_process_tree_helper_and_the_scan_still_reads_both).
     # r7b (adversary A4 on 1413e30f): a read that fails here (the module locked between the two extractions) can never cost the probe, which needs neither body.
-    try { $null = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone') } catch { }
+    # r2 (sol r1 A3): the listing is a script block that is NEVER invoked: it costs the probe's path nothing (no synchronous source read, nothing to stall or throw), and the scan
+    # still reads its literal -Name list from the file text.
+    $null = { Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone') }
     $body = @"
 `$ErrorActionPreference = 'Stop'
 `$AgentRoot = '$root'

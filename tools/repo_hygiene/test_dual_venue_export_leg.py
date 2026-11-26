@@ -4662,11 +4662,13 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         start = wait_src.index("function Wait-AttrCudaProcessTreeGone")
         body = wait_src[start:wait_src.index("function Get-AttrCudaProcessCpuSnapshot")]
         self.assertIn("$remainMs = $WaitMs - $clock.Elapsed.TotalMilliseconds\n", body)
-        self.assertIn("if ($remainMs -lt $scanFloorMs) { break }", body, "the floor is re-checked where the scan's timeout is granted")
+        # r2 (sol r1 A2): the floor now includes the dispatch margin, and the grant is the whole seconds of the exact remaining milliseconds less that margin
+        self.assertIn("if ($remainMs -lt ($scanFloorMs + $scanMarginMs)) { break }", body, "the floor and margin are re-checked where the scan's timeout is granted")
+        self.assertIn("$leftSec = [int][Math]::Floor(($remainMs - $scanMarginMs) / 1000.0)", body)
         self.assertNotIn("[Math]::Max(1,", body, "no 1 s minimum is forced on a scan the budget cannot cover")
         venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         line = next(ln for ln in venue.splitlines() if "Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id" in ln)
-        self.assertIn("$grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds) / 1000.0); if ($grantSec -ge 1)", line)
+        self.assertIn("$grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 50.0) / 1000.0); if ($grantSec -ge 1)", line)
         self.assertNotIn("$leftMs", line, "the snapshot timeout is read at the grant, never from a stored value")
 
     def test_r3_a_new_child_on_a_reused_member_pid_is_a_survivor(self) -> None:
@@ -4726,8 +4728,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             "$reuse = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 203 202 $t.AddSeconds(5)), (Row 202 4 $t.AddSeconds(5))))\n"
             "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1))))\n"
             "$reuseWait = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(5)), (Row 202 4 $t.AddSeconds(5)))) }\n"
-            "$old = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 203 202 $t.AddTicks(-10))))\n"
-            "$oldWait = Wait-AttrCudaProcessTreeGone -Snapshot $old -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddTicks(-10)))) }\n"
+            # r2 (sol r1 A1): "strictly older" is no longer enough: an outsider is older than the root by MORE than the 2 s clock-ambiguity band (see the r2 A1 test)
+            "$old = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 203 202 $t.AddSeconds(-5))))\n"
+            "$oldWait = Wait-AttrCudaProcessTreeGone -Snapshot $old -WaitMs 1200 -Scan { @($sys + @((Row 203 202 $t.AddSeconds(-5)))) }\n"
             "[ordered]@{ eqMembers = @($eq.members | ForEach-Object { $_.processId }); eqOthers = @($eq.others.Keys | Sort-Object); eqWait = $eqWait.confirmed;\n"
             "            eqSurvivors = @($eqWait.survivors); reuseMembers = @($reuse.members | ForEach-Object { $_.processId }); reuseWait = $reuseWait.confirmed;\n"
             "            reuseSurvivors = @($reuseWait.survivors); oldMembers = @($old.members | ForEach-Object { $_.processId }); oldOthers = @($old.others.Keys | Sort-Object);\n"
@@ -4816,8 +4819,10 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertLess(load, text.index("function Invoke-VenueBoundedProcess"), "the helpers are defined once, at the module's top level")
         self.assertIn("if ($cleanup.Elapsed.TotalMilliseconds -gt $CleanupWaitMs) { $treeGone = $false }", body)
         dvr = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
-        self.assertIn("try { $null = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone') } catch { }", dvr,
-                      "adversary A4 on 1413e30f: the discarded listing read can never cost the health probe")
+        # r2 (sol r1 A3): the listing is a script block that is never invoked, so no read (stalled, throwing or slow) can ever cost the health probe
+        self.assertIn("$null = { Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone') }", dvr,
+                      "adversary A3 on 76dd1e12: the discarded listing is off the synchronous probe path")
+        self.assertNotIn("try { $null = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot'", dvr)
 
     def test_r7_b3_the_health_probe_carries_no_process_tree_helper_and_the_scan_still_reads_both(self) -> None:
         """r7, sol r6d B3. DualVenueRunner.psm1 lists the two process-tree helpers by a literal -Name so the ATTR-3 spliced-body scan reads and clears them (forced by
@@ -4835,6 +4840,94 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         self.assertIn("Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone')", text,
                       "the literal listing the ATTR-3 scan reads stays")
+
+    def test_r2_a3_the_discarded_helper_listing_is_never_executed_on_the_probe_path(self) -> None:
+        """r2, sol r1 A3 on 76dd1e12. The listing that keeps the ATTR-3 scan's literal -Name list was a synchronous extractor read inside New-DvHealthProbeJobText, so a
+        read that stalled (a 65 s IOException against a 60 s bound) spent the probe's bound before the probe was submitted. It is now a script block that is never
+        invoked. AST: the call sits inside a ScriptBlockExpression that is not the target of any invocation, and no CommandAst of the extractor with these names is
+        reachable outside one."""
+        got = json.loads(run_pwsh(["-Command",
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$ast = [System.Management.Automation.Language.Parser]::ParseFile('{DV / 'DualVenueRunner.psm1'}', [ref]$null, [ref]$null)\n"
+            "$fn = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'New-DvHealthProbeJobText' }, $true)\n"
+            "$calls = @($fn.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Get-AttrCudaEmbeddedFunctionSource' -and $n.Extent.Text -like '*Get-AttrCudaProcessTreeSnapshot*' }, $true))\n"
+            "$inBlock = 0; $outside = 0; $invoked = 0\n"
+            "foreach ($c in $calls) { $p = $c.Parent; $blk = $null; while ($null -ne $p -and $p -ne $fn) { if ($p -is [System.Management.Automation.Language.ScriptBlockExpressionAst]) { $blk = $p; break }; $p = $p.Parent }\n"
+            "  if ($null -eq $blk) { $outside++ } else { $inBlock++; $par = $blk.Parent; if ($par -is [System.Management.Automation.Language.CommandAst] -or $par -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) { $invoked++ } } }\n"
+            "[ordered]@{ calls = $calls.Count; inBlock = $inBlock; outside = $outside; invoked = $invoked } | ConvertTo-Json -Compress"], timeout=300).stdout.strip().splitlines()[-1])
+        self.assertEqual(got["calls"], 1, got)
+        self.assertEqual(got["outside"], 0, f"the listing is never a statement that runs on the probe path: {got}")
+        self.assertEqual(got["inBlock"], 1, got)
+        self.assertEqual(got["invoked"], 0, f"the script block is never invoked: {got}")
+
+    def test_r2_a1_a_clock_ambiguity_never_turns_a_live_orphan_into_a_proven_outsider(self) -> None:
+        """r2, sol r1 A1 on 76dd1e12 (hub ruling: any process the walk cannot PROVE an outsider counts as NOT confirmed gone). One clock-ambiguity band (2 s) serves the
+        parent hop and the outsider test, in the snapshot and the wait. Rows: (a) a one-second rollback leaves a live orphan reading 500 ms OLDER than the root: a
+        member, and the wait names it; (b) an orphan whose dead parent's number is held by a recycled process reading older by less than the band: no hop, a member;
+        (c) the same in the wait with the clock a fraction behind the new rows: a survivor; (d) an equal-time and a missing stamp stay members. Controls: an orphan older
+        than the root by MORE than the band is an outsider, and a legitimate new outsider tree under an old outsider (older by more than the band at every hop) is no survivor."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$base = @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1))))\n"
+            # (a) rollback: the orphan reads 500 ms older than the root
+            "$a = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($base + @((Row 208 204 $t.AddMilliseconds(-500))))\n"
+            "$aWait = Wait-AttrCudaProcessTreeGone -Snapshot $a -WaitMs 1200 -Scan { @($sys + @((Row 208 204 $t.AddMilliseconds(-500)))) }\n"
+            # the band edge: 1.999 s older is a member, 3 s older is an outsider (control)
+            "$edge = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($base + @((Row 209 204 $t.AddMilliseconds(-1999)), (Row 210 204 $t.AddSeconds(-3))))\n"
+            "$edgeWait = Wait-AttrCudaProcessTreeGone -Snapshot $edge -WaitMs 1200 -Scan { @($sys + @((Row 209 204 $t.AddMilliseconds(-1999)), (Row 210 204 $t.AddSeconds(-3)))) }\n"
+            # (b) snapshot side, recycled parent number reading 500 ms older than its child
+            "$b = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($base + @((Row 204 4 $t.AddMilliseconds(-200)), (Row 208 204 $t.AddMilliseconds(300))))\n"
+            # (c) wait side: member 201 recorded; its child 204 created after the snapshot exited; a recycled 204 (parent 4) and the orphan 208 read 700 ms apart, the clock behind both
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($base)\n"
+            "$c = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 204 4 $t.AddSeconds(899.6)), (Row 208 204 $t.AddSeconds(900.3)))) } -NowTicks $t.AddSeconds(899.8).Ticks\n"
+            # (d) equal-time and missing stamp
+            "$d = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 211 212 $t), (Row 213 4 $null))) }\n"
+            # control: a new outsider tree under an old outsider (older by more than the band at every hop) is not the tree
+            "$ctl = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys + @((Row 204 4 $t.AddSeconds(897)), (Row 208 204 $t.AddSeconds(900.3)))) } -NowTicks $t.AddSeconds(901).Ticks\n"
+            "[ordered]@{ aMembers = @($a.members | ForEach-Object { $_.processId }); aOthers = @($a.others.Keys | Sort-Object); aWait = $aWait.confirmed; aSurvivors = @($aWait.survivors);\n"
+            "            edgeMembers = @($edge.members | ForEach-Object { $_.processId }); edgeOthers = @($edge.others.Keys | Sort-Object); edgeWait = $edgeWait.confirmed; edgeSurvivors = @($edgeWait.survivors);\n"
+            "            bMembers = @($b.members | ForEach-Object { $_.processId }); bOthers = @($b.others.Keys | Sort-Object);\n"
+            "            c = $c.confirmed; cSurvivors = @($c.survivors); d = $d.confirmed; dSurvivors = @($d.survivors); ctl = $ctl.confirmed; ctlSurvivors = @($ctl.survivors) } | ConvertTo-Json -Compress")
+        self.assertEqual(sorted(got["aMembers"]), [201, 208], f"a rollback never makes a live orphan an outsider: {got}")
+        self.assertNotIn(208, got["aOthers"], got)
+        self.assertFalse(got["aWait"], got)
+        self.assertEqual(got["aSurvivors"], [208], got)
+        self.assertEqual(sorted(got["edgeMembers"]), [201, 209], f"a stamp inside the band is a member: {got}")
+        self.assertEqual(sorted(got["edgeOthers"]), [0, 4, 210], f"control: an orphan older than the root by more than the band is an outsider: {got}")
+        self.assertFalse(got["edgeWait"], got)
+        self.assertEqual(got["edgeSurvivors"], [209], got)
+        self.assertIn(208, got["bMembers"], f"a recycled parent number reading older inside the band is no proof of ancestry: {got}")
+        self.assertNotIn(208, got["bOthers"], got)
+        self.assertFalse(got["c"], f"a reused pid inside the band is never followed into a known outsider: {got}")
+        self.assertIn(208, got["cSurvivors"], got)
+        self.assertFalse(got["d"], got)
+        self.assertEqual(sorted(got["dSurvivors"]), [211, 213], f"an equal stamp, an unreadable parent and a missing stamp are survivors: {got}")
+        self.assertTrue(got["ctl"], f"control: a new tree under an old outsider (older at every hop by more than the band) is not a survivor: {got}")
+
+    def test_r2_a2_no_scan_starts_without_its_floor_plus_margin_left_and_the_grants_are_floored_doubles(self) -> None:
+        """r2, sol r1 A2 on 76dd1e12. A scan needs CIM's 1 s floor plus the dispatch margin (50 ms); a clock read at 499.6 ms that dispatched at 500.2 ms started a 1 s scan
+        with 999.8 ms left. Behavior: -WaitMs 1040 starts no scan, 1100 starts one. Source: no truncated ElapsedMilliseconds read feeds a grant in the wait or the bounded
+        process."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1))))\n"
+            "$global:scans = 0\n"
+            "$band = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1040 -Scan { $global:scans++; @($sys) }\n"
+            "$bandScans = $global:scans; $global:scans = 0\n"
+            "$fits = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1100 -Scan { $global:scans++; @($sys) }\n"
+            "[ordered]@{ band = $band.confirmed; bandWhy = $band.error; bandScans = $bandScans; fits = $fits.confirmed; fitsScans = $global:scans } | ConvertTo-Json -Compress")
+        self.assertFalse(got["band"], got)
+        self.assertEqual(got["bandScans"], 0, f"no scan starts with under floor + margin left: {got}")
+        self.assertEqual(got["bandWhy"], "no-time-to-confirm", got)
+        self.assertTrue(got["fits"], got)
+        self.assertEqual(got["fitsScans"], 1, got)
+        wait_src = ARTIFACTS_MODULE.read_text(encoding="utf-8")
+        body = wait_src[wait_src.index("function Wait-AttrCudaProcessTreeGone"):wait_src.index("function Get-AttrCudaProcessCpuSnapshot")]
+        self.assertNotIn("ElapsedMilliseconds", body, "the wait reads the clock to the fraction of a millisecond everywhere")
+        venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        bounded = venue[venue.index("function Invoke-VenueBoundedProcess"):venue.index("function Get-VenueDriverScriptMissing")]
+        self.assertNotIn("$cleanup.ElapsedMilliseconds", bounded, "every cleanup grant is read from the exact remaining time")
+        self.assertNotIn("[Math]::Max(0,", bounded)
 
 
 if __name__ == "__main__":

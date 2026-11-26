@@ -2060,16 +2060,17 @@ function Invoke-VenueBoundedProcess {
         # (r3, adversary A3 on 4d69f211: the budget is re-read from the one $cleanup stopwatch, and the scan gets only the whole seconds still left; when less than the
         # 1 s floor is left no scan starts and the tree is unknown. r7b: the helpers were defined when this module loaded, above; the clock is read to the fraction of
         # a millisecond (adversary A3 on 1413e30f: a truncated 500.6 ms granted a 1 s scan with 999.4 ms left))
-        if ($script:VenueProcessTreeHelpersLoaded -and $CleanupWaitMs -ge 1000) { try { $grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds) / 1000.0); if ($grantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -OperationTimeoutSec $grantSec } } catch { $tree = $null } }
+        if ($script:VenueProcessTreeHelpersLoaded -and $CleanupWaitMs -ge 1000) { try { $grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 50.0) / 1000.0); if ($grantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -OperationTimeoutSec $grantSec } } catch { $tree = $null } }
         # (r6, adversary pass 7 A2 sibling: the whole seconds left are read at the moment the scan's timeout is granted, not from a value taken earlier, and under the 1 s floor no scan starts)
         if ($cleanup.Elapsed.TotalMilliseconds -ge $CleanupWaitMs) { $tree = $null }
-        try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
+        # r2 (sol r1 A2): every grant below is the whole milliseconds of the exact remaining time (a double); a truncated ElapsedMilliseconds read granted up to a millisecond too much.
+        try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit([int][Math]::Floor([Math]::Max(0.0, $CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds)))
         $treeGone = $(if ($null -eq $tree) { $false } else { [bool](Wait-AttrCudaProcessTreeGone -Snapshot $tree -WaitMs ([int][Math]::Floor([Math]::Max(0.0, $CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds)))).confirmed })
         # r7b (adversary A3 on 1413e30f): the wait's own clock starts after its -WaitMs was read from this one, so its bound can end past this allowance; a confirmation
         # that returns past the one cleanup allowance is late evidence and confirms nothing.
         if ($cleanup.Elapsed.TotalMilliseconds -gt $CleanupWaitMs) { $treeGone = $false }
     }
-    [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
+    [void]$outTask.Wait([int][Math]::Floor([Math]::Max(0.0, $CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds))); [void]$errTask.Wait([int][Math]::Floor([Math]::Max(0.0, $CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds)))
     [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited -and $treeGone } else { $true })
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
 }

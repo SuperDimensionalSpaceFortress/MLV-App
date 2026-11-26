@@ -493,7 +493,8 @@ class GitCallsAreBoundedTests(unittest.TestCase):
     def read_child_probe(self, out: str) -> tuple[str, str]:
         """(in-job, alive) as the cleanup gate saw them, after proving IsProcessInJob itself answered: a failed call is reported with its Win32 error."""
         # EXPORT-KILL-DESCENDANT-CONFIRM-1-R8-CI-RESIDUE-1: a positive pid of any width (hosted run 45712709620 read `SEEN pid=8 ok=True ...`, which `\d{2,}` refused as "never saw a child")
-        seen = re.search(r"SEEN pid=([1-9]\d*) ok=(\w+) win32=(\d+) injob=(\w+) alive=(\w+)", out)
+        # r2 (sol r1 A5): anchored to a line start (an `UNSEEN pid=8 ...` substring is no record) and ASCII only (a non-ASCII digit such as U+0661 is no pid)
+        seen = re.search(r"(?m)^SEEN pid=([1-9][0-9]*) ok=(\w+) win32=([0-9]+) injob=(\w+) alive=(\w+)", out, re.ASCII)
         self.assertIsNotNone(seen, f"the cleanup gate never saw a created child: {out}")
         self.assertEqual(seen.group(2), "True", f"IsProcessInJob failed (GetLastError={seen.group(3)}), so its membership answer was never given: {out}")
         self.assertIn(seen.group(4), ("True", "False"), f"IsProcessInJob returned no 0/1 membership answer: {out}")
@@ -503,7 +504,10 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         # The reader parses the probe line the gate prints; a recycled one-digit pid is still a created child (the hosted shard-6 failure), a pid of 0 or none is not.
         self.assertEqual(self.read_child_probe("SEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True"), ("False", "True"))
         self.assertEqual(self.read_child_probe("SEEN pid=12044 ok=True win32=0 injob=True alive=True"), ("True", "True"))
-        for line in ("SEEN pid=0 ok=True win32=0 injob=False alive=True", "SEEN pid= ok=True win32=0 injob=False alive=True"):
+        # r2 (sol r1 A5): a CRLF line end is still a line start, but an `UNSEEN` substring and a mixed-script pid are refused
+        self.assertEqual(self.read_child_probe("HITS \r\nSEEN pid=8 ok=True win32=0 injob=False alive=True\r\nGONE True"), ("False", "True"))
+        for line in ("SEEN pid=0 ok=True win32=0 injob=False alive=True", "SEEN pid= ok=True win32=0 injob=False alive=True",
+                     "UNSEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True", "SEEN pid=8١ ok=True win32=0 injob=False alive=True"):
             with self.assertRaises(AssertionError):
                 self.read_child_probe(line)
 
