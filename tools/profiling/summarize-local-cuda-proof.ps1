@@ -506,7 +506,7 @@ function New-ActionPlan {
 
 $root = (Resolve-Path -LiteralPath $RepoRoot).Path
 if ([string]::IsNullOrWhiteSpace($SummaryPath)) {
-    $SummaryPath = Join-Path $root ".claude-state\profiling\local-cuda-playback-dng-smoke-latest.json"
+    $SummaryPath = Join-Path $root ".claude-state/profiling/local-cuda-playback-dng-smoke-latest.json"
 }
 else {
     $SummaryPath = Resolve-RepoPath -Root $root -Path $SummaryPath

@@ -106,7 +106,10 @@ function Invoke-ProofSummarizer {
         [Parameter(Mandatory = $true)][string]$JsonReport
     )
 
-    $summaryScript = Join-Path $Repo "tools\profiling\summarize-local-cuda-proof.ps1"
+    # ENVELOPE-PREEMPT-R1-RESIDUE-1 r2 (hosted run 45786756378, Linux): a backslash is a file-name character on Linux, so the repo-relative path is joined with forward slashes (also valid on
+    # Windows), and the child is `pwsh.exe` only where the directory separator is a backslash.
+    $summaryScript = Join-Path $Repo "tools/profiling/summarize-local-cuda-proof.ps1"
+    $pwshExe = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) { "pwsh.exe" } else { "pwsh" }
     if (!(Test-Path -LiteralPath $summaryScript -PathType Leaf)) {
         throw "Proof summarizer not found: $summaryScript"
     }
@@ -117,7 +120,7 @@ function Invoke-ProofSummarizer {
         if (Test-Path -LiteralPath $stale -PathType Leaf) { Remove-Item -LiteralPath $stale -Force }
     }
 
-    & pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+    & $pwshExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
         -File $summaryScript `
         -RepoRoot $Repo `
         -SummaryPath $Summary `
@@ -130,7 +133,7 @@ function Invoke-ProofSummarizer {
         throw "Markdown proof report generation exited with code $markdownExit and wrote no report at $MarkdownReport (the summary was refused)."
     }
 
-    & pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+    & $pwshExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
         -File $summaryScript `
         -RepoRoot $Repo `
         -SummaryPath $Summary `
@@ -161,7 +164,7 @@ function Convert-ToInt64 {
 $root = (Resolve-Path -LiteralPath $RepoRoot).Path
 if ([string]::IsNullOrWhiteSpace($SummaryPath)) {
     if ([string]::IsNullOrWhiteSpace($RunRoot)) {
-        $SummaryPath = Join-Path $root ".claude-state\profiling\local-cuda-playback-dng-smoke-latest.json"
+        $SummaryPath = Join-Path $root ".claude-state/profiling/local-cuda-playback-dng-smoke-latest.json"
     }
     else {
         $SummaryPath = Join-Path (Resolve-RepoPath -Root $root -Path $RunRoot) "summary.json"

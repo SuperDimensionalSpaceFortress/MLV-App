@@ -2397,16 +2397,34 @@ class EnvelopePreemptR1ResidueTests(_Probe):
                                  ("WRITES", "param($RepoRoot, $SummaryPath, $Output, [switch]$Json)\n[IO.File]::WriteAllText($Output, 'fresh')\nexit 1\n")):
             body += (f"[IO.File]::WriteAllText('{fake}', @'\n{fake_body}'@)\n"
                      f"[IO.File]::WriteAllText('{md}', 'stale'); [IO.File]::WriteAllText('{js}', 'stale')\n"
-                     f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary 's.json' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
+                     f"$msg = ''\n"
+                     f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary 's.json' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW'; $msg = $_.Exception.Message }}\n"
                      f"$left = if (Test-Path -LiteralPath '{js}') {{ [IO.File]::ReadAllText('{js}') }} else {{ 'none' }}\n"
-                     f"Write-Host ('{label}=' + $res + '|' + $left)\n")
+                     f"Write-Host ('{label}=' + $res + '|' + $left)\n"
+                     f"Write-Host ('MSG_{label}=' + ($msg -replace '\\s', '_'))\n")
         # adversary 0e9672e5 A2: the cleanup removes report FILES only; a directory given as the report path is kept (and the run is still a packaging error, no report was written)
         keep = self.tmp / "keep"
         body += (f"[IO.File]::WriteAllText('{fake}', 'exit 1')\n$null = New-Item -ItemType Directory -Path '{keep}'\n"
                  f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary 's.json' -MarkdownReport '{keep}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
                  f"Write-Host ('DIR=' + $res + '|' + (Test-Path -LiteralPath '{keep}' -PathType Container))\n")
         out = dict(line.split("=", 1) for line in self.ok(body).split())
-        self.assertEqual(out, {"REFUSES": "THREW|none", "WRITES": "OK|fresh", "DIR": "THREW|True"})
+        # hosted run 45786756378 (Linux): the thrown message is what names the cause, so a mismatch prints it
+        thrown = {key: out.pop(key) for key in [k for k in out if k.startswith("MSG_")]}
+        self.assertEqual(out, {"REFUSES": "THREW|none", "WRITES": "OK|fresh", "DIR": "THREW|True"}, thrown)
+
+    def test_p2_a5_the_packager_launches_its_summarizer_by_a_path_and_a_name_that_exist_on_linux(self) -> None:
+        # hosted run 45786756378 (ubuntu shard 3/4): Invoke-ProofSummarizer joined "tools\profiling\summarize-local-cuda-proof.ps1" (one file name on Linux, so "Proof summarizer not
+        # found") and launched `pwsh.exe` (no such command on Linux). A static pin so the Windows shards catch the same shape: no backslash in a repo-relative path of the three CUDA-proof
+        # scripts, and the child's name is chosen by the directory separator.
+        scripts = [PROFILING / name for name in ("package-local-cuda-proof-result.ps1", "import-local-cuda-proof-result.ps1", "summarize-local-cuda-proof.ps1")]
+        shape = re.compile(r"""Join-Path\s+\S+\s+(["'])[A-Za-z_.\-]+\\""")
+        for script in scripts:
+            for number, line in enumerate(script.read_text(encoding="utf-8").splitlines(), 1):
+                self.assertIsNone(shape.search(line), f"{script.name}:{number} joins a repo-relative path with a backslash: {line.strip()}")
+        packager = scripts[0].read_text(encoding="utf-8")
+        self.assertIn('[IO.Path]::DirectorySeparatorChar -eq [char]92) { "pwsh.exe" } else { "pwsh" }', packager)
+        self.assertEqual(packager.count("& $pwshExe -NoLogo"), 2)
+        self.assertNotRegex(packager, r"(?m)^\s*&\s+pwsh\.exe")
 
     def test_p3_a1_a_purpose_free_plan_is_not_refused_by_a_stalled_arm_read(self) -> None:
         # adversary 835a5faf A1: a purpose-free plan whose arm read got no answer exited SPEC_READ_TIMEOUT item=1 before staging, where the base gave up on the optional ID read and returned

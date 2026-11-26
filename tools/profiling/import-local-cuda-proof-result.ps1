@@ -91,7 +91,7 @@ if (!(Test-Path -LiteralPath $packetFullPath -PathType Leaf)) {
 $packetItem = Get-Item -LiteralPath $packetFullPath
 
 if ([string]::IsNullOrWhiteSpace($DestinationRoot)) {
-    $DestinationRoot = Join-Path $root ".claude-state\profiling\local-cuda-proof-packets\imported"
+    $DestinationRoot = Join-Path $root ".claude-state/profiling/local-cuda-proof-packets/imported"
 }
 else {
     $DestinationRoot = Resolve-RepoPath -Root $root -Path $DestinationRoot
