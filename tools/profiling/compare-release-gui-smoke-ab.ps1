@@ -80,121 +80,8 @@ public static class MlvSmokeFileIdentityV2 {
     return ([string]$stat).Trim()
 }
 
-function Initialize-SmokeOwnedFs {
-    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1-R2-RESIDUE-1 r1 (adversary-3be19c39.json A3 and A4): the report's temporary file and the report folders this call makes are held and acted on through ONE
-    # handle each, never through a second lookup of their path (which another process can have re-pointed in between). Windows only (the callers branch); returns $true when the type is ready.
-    #   CreateDirectoryOwned: NtCreateFile FILE_CREATE of a directory, so the handle returned IS the folder THIS call created (a name that already exists returns $null: not ours). It is opened with DELETE
-    #     access and read/write sharing only, so nobody can rename or delete the folder while it is held (a rename-aside is a sharing violation), and DeleteDirIfEmpty removes it by that handle.
-    #   CreateTempFile / RenameOver / DeleteByHandle: the temporary report file is created CreateNew with DELETE access and NO sharing, written through the handle, then renamed over the report BY the
-    #     handle (SetFileInformationByHandle FileRenameInfo with ReplaceIfExists), and on any failure deleted by the handle. The bytes published are the bytes this call wrote.
-    if (-not ($IsWindows -or $null -eq $IsWindows)) { return $false }
-    if (-not ('MlvSmokeOwnedFsV1' -as [type])) {
-        Add-Type -TypeDefinition @'
-using System;
-using System.ComponentModel;
-using System.IO;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
-public static class MlvSmokeOwnedFsV1 {
-    [StructLayout(LayoutKind.Sequential)]
-    private struct UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
-    [StructLayout(LayoutKind.Sequential)]
-    private struct OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory; public IntPtr ObjectName; public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
-    [StructLayout(LayoutKind.Sequential)]
-    private struct IO_STATUS_BLOCK { public IntPtr Status; public IntPtr Information; }
-    [DllImport("ntdll.dll")]
-    private static extern int NtCreateFile(out SafeFileHandle FileHandle, uint DesiredAccess, ref OBJECT_ATTRIBUTES ObjectAttributes, out IO_STATUS_BLOCK IoStatusBlock, IntPtr AllocationSize, uint FileAttributes, uint ShareAccess, uint CreateDisposition, uint CreateOptions, IntPtr EaBuffer, uint EaLength);
-    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-    private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, IntPtr buffer, uint size);
-    public static SafeFileHandle CreateDirectoryOwned(string fullPath) {
-        // adversary-f1221390.json A4: the NT spelling of every Win32 form: \\?\UNC\s\x and \\?\C:\x (extended-length) and \\.\ (device) already carry their own prefix, \\s\x is UNC, C:\x is a drive path
-        string nt;
-        if (fullPath.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) { nt = @"\??\UNC\" + fullPath.Substring(8); }
-        else if (fullPath.StartsWith(@"\\?\") || fullPath.StartsWith(@"\\.\")) { nt = @"\??\" + fullPath.Substring(4); }
-        else if (fullPath.StartsWith(@"\\")) { nt = @"\??\UNC\" + fullPath.Substring(2); }
-        else { nt = @"\??\" + fullPath; }
-        IntPtr text = Marshal.StringToHGlobalUni(nt);
-        IntPtr name = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
-        try {
-            UNICODE_STRING u = new UNICODE_STRING();
-            u.Length = (ushort)(nt.Length * 2); u.MaximumLength = (ushort)(u.Length + 2); u.Buffer = text;
-            Marshal.StructureToPtr(u, name, false);
-            OBJECT_ATTRIBUTES oa = new OBJECT_ATTRIBUTES();
-            oa.Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)); oa.ObjectName = name; oa.Attributes = 0x40;
-            SafeFileHandle handle; IO_STATUS_BLOCK io;
-            // DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE; share read+write (no delete); FILE_CREATE; FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT
-            int status = NtCreateFile(out handle, 0x00110080u, ref oa, out io, IntPtr.Zero, 0x80u, 3u, 2u, 0x00200021u, IntPtr.Zero, 0u);
-            if (status == unchecked((int)0xC0000035)) { return null; } // STATUS_OBJECT_NAME_COLLISION: the name exists: not ours
-            if (status < 0) { throw new IOException("the report folder could not be created (NTSTATUS 0x" + status.ToString("X8") + ")"); }
-            return handle;
-        } finally { Marshal.FreeHGlobal(name); Marshal.FreeHGlobal(text); }
-    }
-    public static bool DeleteDirIfEmpty(SafeFileHandle handle) {
-        IntPtr buffer = Marshal.AllocHGlobal(4);
-        try {
-            Marshal.WriteInt32(buffer, 1);
-            if (SetFileInformationByHandle(handle, 4, buffer, 1)) { return true; } // FileDispositionInfo: removed when this handle closes
-            int error = Marshal.GetLastWin32Error();
-            if (error == 145) { return false; } // ERROR_DIR_NOT_EMPTY
-            throw new Win32Exception(error);
-        } finally { Marshal.FreeHGlobal(buffer); }
-    }
-    public static SafeFileHandle CreateTempFile(string fullPath) {
-        // GENERIC_WRITE | DELETE, no sharing, CREATE_NEW, FILE_ATTRIBUTE_NORMAL
-        SafeFileHandle handle = CreateFileW(fullPath, 0x40000000u | 0x00010000u, 0u, IntPtr.Zero, 1u, 0x80u, IntPtr.Zero);
-        if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
-        return handle;
-    }
-    public static void DeleteByHandle(SafeFileHandle handle) {
-        IntPtr buffer = Marshal.AllocHGlobal(4);
-        try {
-            Marshal.WriteInt32(buffer, 1);
-            if (!SetFileInformationByHandle(handle, 4, buffer, 1)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
-        } finally { Marshal.FreeHGlobal(buffer); }
-    }
-    public static void RenameOver(SafeFileHandle handle, string destinationFullPath) {
-        // the extended-length spelling, so a destination past MAX_PATH (a long report name in a deep folder) is renamed to like any other
-        if (!destinationFullPath.StartsWith(@"\\?\")) { destinationFullPath = destinationFullPath.StartsWith(@"\\") ? @"\\?\UNC\" + destinationFullPath.Substring(2) : @"\\?\" + destinationFullPath; }
-        int nameOffset = IntPtr.Size * 2 + 4;
-        int bytes = destinationFullPath.Length * 2;
-        IntPtr buffer = Marshal.AllocHGlobal(nameOffset + bytes + 2);
-        try {
-            for (int i = 0; i < nameOffset + bytes + 2; i++) { Marshal.WriteByte(buffer, i, 0); }
-            Marshal.WriteInt32(buffer, 0, 1); // ReplaceIfExists
-            Marshal.WriteInt32(buffer, IntPtr.Size * 2, bytes); // FileNameLength
-            for (int i = 0; i < destinationFullPath.Length; i++) { Marshal.WriteInt16(buffer, nameOffset + i * 2, (short)destinationFullPath[i]); }
-            if (!SetFileInformationByHandle(handle, 3, buffer, (uint)(nameOffset + bytes + 2))) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
-        } finally { Marshal.FreeHGlobal(buffer); }
-    }
-} // MlvSmokeOwnedFsV1 (never a bare column-0 brace: the function extractors end a function at one)
-'@
-    }
-    return $true
-}
-
-function Get-SmokeReparsePointComponent {
-    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A1, NARROWED): the first existing component of $Path, from the root down (the leaf
-    # included), that is a reparse point (a symlink or a directory junction), else $null. A component that can be swapped for a link to the report folder after the
-    # identity checks is what the report move would replace, so an input or output path holding one is refused, typed, before anything is written. A component that does not
-    # exist yet (a folder this call is about to make) is no link; one whose attributes cannot be read cannot be ruled out and is returned.
-    param([string]$Path)
-
-    $full = [IO.Path]::GetFullPath($Path)
-    $root = [IO.Path]::GetPathRoot($full)
-    $chain = @()
-    for ($probe = $full; -not [string]::IsNullOrEmpty($probe) -and $probe.Length -gt $root.Length; $probe = [IO.Path]::GetDirectoryName($probe)) { $chain += $probe }
-    [array]::Reverse($chain)
-    foreach ($component in $chain) {
-        try { $attributes = [IO.File]::GetAttributes($component) }
-        catch [IO.FileNotFoundException] { continue }
-        catch [IO.DirectoryNotFoundException] { continue }
-        catch { return $component }
-        if (($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { return $component }
-    }
-    return $null
-}
+# R2-NARROW-1 r2: the owned-folder / handle-held temporary-file helper (native NtCreateFile, CreateFileW and SetFileInformationByHandle) and the reparse-point walk are
+# REVERTED with the report write that used them: this script writes its report as master does (see the end of the script).
 
 function Read-SmokeSourceOnce {
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): the comparator's ONE read of a smoke file. One ReadAllBytes feeds both the parse (the
@@ -1139,21 +1026,7 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         [string]::Equals($resolvedOutput, $afterJsonPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Output must not overwrite either smoke JSON input."
     }
-    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r1 (adversary-fd0141e8.json A1): an input whose file identity could not be read (its first read failed:
-    # a lock, a sharing violation) has identity null, which no alias check can compare, so an -Output that is a hard link to it would overwrite it. The
-    # identity of BOTH inputs is therefore required before ANY write: a report with no readable input identity is refused, typed, and nothing is written.
-    foreach ($identityLeg in @([pscustomobject]@{ Name = 'before'; Source = $beforeSource }, [pscustomobject]@{ Name = 'after'; Source = $afterSource })) {
-        if ($null -eq $identityLeg.Source.identity) { throw "Output refused: the file identity of the $($identityLeg.Name) smoke JSON could not be read, so an -Output that is a hard link to it cannot be ruled out; nothing was written." }
-    }
-    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A6 sibling): an existing output that IS an input under another spelling (a hard
-    # link) is that input too, judged by the same handle identity the inputs were read by
-    if (Test-Path -LiteralPath $resolvedOutput -PathType Leaf) {
-        $outputStream = [IO.FileStream]::new($resolvedOutput, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-        try { $outputIdentity = Get-SmokeFileIdentity -Stream $outputStream -ResolvedPath $resolvedOutput } finally { $outputStream.Dispose() }
-        foreach ($inputIdentity in @($beforeSource.identity, $afterSource.identity)) {
-            if ($null -eq $inputIdentity -or [string]::Equals([string]$inputIdentity, $outputIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
-        }
-    }
+    # R2-NARROW-1 r2: master's path-spelling check above is the whole output-alias guard again (the handle-identity alias checks are reverted, see the write below).
 }
 $beforeScreenshot = Resolve-SmokeScreenshotPath -Smoke $beforeSmoke
 $afterScreenshot = Resolve-SmokeScreenshotPath -Smoke $afterSmoke
@@ -1476,131 +1349,14 @@ if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]
 $json = $result | ConvertTo-Json -Depth 24
 if (-not [string]::IsNullOrWhiteSpace($Output)) {
     $outputDir = Split-Path -Parent $resolvedOutput
-    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R3-MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A2 and A7): the report is NEVER written through a handle on the path it names. The old
-    # code opened that path (OpenOrCreate), judged its identity, then SetLength(0)/Write on the same open handle, so an input path swapped for a link to the report
-    # between the last identity check and the write was truncated and rewritten, and a refused or half-finished write left a partial report (or the folder this call
-    # made). Now the bytes go to a NEW file (CreateNew: it can alias nothing) beside the report, and only a complete one is moved over the report name: a rename replaces
-    # the directory entry and never touches the inode any other name (an input, a link, a symlink target) still points at. Any refusal or failure removes that
-    # temporary file and, when this call created it, the empty folder; the report that was there before is left exactly as it was.
-    # R2-RESIDUE-1 r1 (adversary-3be19c39.json A3 and A4): on Windows each report folder level this call makes and the temporary report file are HELD by a handle from the moment they are created (see
-    # Initialize-SmokeOwnedFs) and acted on only through it; elsewhere the older path-based steps stand ($ownedFs false). Each $createdDirs entry carries its handle (Windows) or its creation time (elsewhere).
-    $createdDirs = [System.Collections.Generic.List[object]]::new()
-    $ownedFs = Initialize-SmokeOwnedFs   # (inside the write block proper: the block is what the tests extract and run, so the route it takes is decided by its own text)
-    $inputHolds = [System.Collections.Generic.List[IO.FileStream]]::new()
-    $tempOutput = $null
-    $tempStream = $null
-    $tempHandle = $null
-    $wroteOutput = $false
-    $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json + [Environment]::NewLine)
-    # adversary-ac722a96.json A3: the missing levels of the report folder (topmost first) as seen now; a level is THIS call's only when its own non-forced creation succeeds below, so a level another
-    # process makes in the meantime (New-Item -Force would have accepted it silently) is never claimed and never removed by the cleanup
-    $missingDirs = @()
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r2: the report write is master's own again (a folder made with New-Item -Force, the report written with Set-Content).
+    # The handle-held temporary file, the owned folder levels, the reparse-point walk and the output-identity checks the earlier rounds added here are REVERTED:
+    # the acceptance of this card (a leg whose host load is provisional or unknown is never counted) does not need them, and they kept producing new findings
+    # (adversary-7c5bfe86.json A1 A2 A3). The hardening is refiled as ONE P3 card (refile-hardening.md in the r2 run dir).
     if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
-        for ($probe = $outputDir; -not [string]::IsNullOrEmpty($probe) -and -not (Test-Path -LiteralPath $probe -PathType Container); $probe = Split-Path -Parent $probe) { $missingDirs = @($probe) + $missingDirs }
+        New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     }
-    try {
-        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A1, NARROWED): an input or output path with a reparse-point component (a symlink or junction) is refused before
-        # anything is made or written; the same check runs again right before the temporary file below, so a link put in place since is refused too
-        foreach ($linkCheck in @([pscustomobject]@{ Name = 'before smoke JSON'; Path = $beforeJsonPath }, [pscustomobject]@{ Name = 'after smoke JSON'; Path = $afterJsonPath }, [pscustomobject]@{ Name = 'report folder'; Path = $outputDir }, [pscustomobject]@{ Name = 'report'; Path = $resolvedOutput })) {
-            if ([string]::IsNullOrWhiteSpace($linkCheck.Path)) { continue }
-            $linkComponent = Get-SmokeReparsePointComponent -Path $linkCheck.Path
-            if ($null -ne $linkComponent) { throw "Output refused: the $($linkCheck.Name) path has a reparse-point (symlink or junction) component ($linkComponent), so a swap of it for a link to the report cannot be ruled out; nothing was written." }
-        }
-        foreach ($level in $missingDirs) {
-            # adversary-d10f5241.json A1: each level this call made is remembered WITH the creation time of the folder it made, so the cleanup removes that folder and never a different empty
-            # folder another process later put under the same name (a rename-aside plus a new mkdir keeps the path and changes the creation time)
-            # R2-RESIDUE-1 r1 (adversary-3be19c39.json A3): on Windows the level is created THROUGH a handle that is kept (NtCreateFile FILE_CREATE), so the folder held IS the one this call made: a name that
-            # already exists returns $null (not ours) and a replacement can never be recorded as owned. Held without delete sharing, it cannot be renamed aside while the write runs.
-            if ($ownedFs) {
-                $levelHandle = [MlvSmokeOwnedFsV1]::CreateDirectoryOwned([IO.Path]::GetFullPath($level))
-                if ($null -ne $levelHandle) { $createdDirs.Add([pscustomobject]@{ Path = $level; Handle = $levelHandle; Stamp = $null }) }
-            }
-            else {
-                try { New-Item -ItemType Directory -Path $level -ErrorAction Stop | Out-Null; $createdDirs.Add([pscustomobject]@{ Path = $level; Handle = $null; Stamp = "$([IO.Directory]::GetCreationTimeUtc($level).Ticks)|$level" }) }
-                catch { if (-not (Test-Path -LiteralPath $level -PathType Container)) { throw } }   # a level that exists now was made by someone else: not ours
-            }
-        }
-        # a report that already exists is judged by its handle identity (read-only, nothing truncated); an input that IS it is refused before anything is written
-        $outIdentity = $null
-        if (Test-Path -LiteralPath $resolvedOutput -PathType Leaf) {
-            $outStream = [IO.FileStream]::new($resolvedOutput, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
-            try { $outIdentity = Get-SmokeFileIdentity -Stream $outStream -ResolvedPath $resolvedOutput } finally { $outStream.Dispose() }
-        }
-        if ($null -ne $outIdentity) {
-            foreach ($inputIdentity in @($beforeSource.identity, $afterSource.identity)) {
-                if ($null -eq $inputIdentity -or [string]::Equals([string]$inputIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
-            }
-        }
-        # adversary-7efea617.json A1: the identities above were read when the inputs were first opened. An input path swapped for a hard link to the report since then is
-        # the report, so the CURRENT file each input path names is read again here through a fresh handle; one that cannot be read is refused, nothing written.
-        # adversary-ac722a96.json A1: these two handles are KEPT OPEN (read sharing only: no write, no delete sharing) until the report has been moved into place (the finally below
-        # closes them). A path check cannot close the window between its last look and the move (a folder renamed aside and replaced by a junction reaches an input's own directory entry);
-        # a replacing move over a file that is held open without delete sharing is a sharing violation, whatever name reached it, so the report can never replace an input.
-        foreach ($currentLeg in @([pscustomobject]@{ Name = 'before'; Path = $beforeJsonPath }, [pscustomobject]@{ Name = 'after'; Path = $afterJsonPath })) {
-            $currentStream = $null
-            try {
-                $currentStream = [IO.FileStream]::new($currentLeg.Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-                $currentIdentity = Get-SmokeFileIdentity -Stream $currentStream -ResolvedPath $currentLeg.Path
-                $inputHolds.Add($currentStream)
-            }
-            catch { if ($null -ne $currentStream) { $currentStream.Dispose() }; throw "Output refused: the current file identity of the $($currentLeg.Name) smoke JSON could not be read at the write ($($_.Exception.Message -replace '\s+', ' ')); nothing was written." }
-            if ($null -ne $outIdentity -and [string]::Equals([string]$currentIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
-        }
-        foreach ($linkCheck in @([pscustomobject]@{ Name = 'before smoke JSON'; Path = $beforeJsonPath }, [pscustomobject]@{ Name = 'after smoke JSON'; Path = $afterJsonPath }, [pscustomobject]@{ Name = 'report folder'; Path = $outputDir }, [pscustomobject]@{ Name = 'report'; Path = $resolvedOutput })) {
-            if ([string]::IsNullOrWhiteSpace($linkCheck.Path)) { continue }
-            $linkComponent = Get-SmokeReparsePointComponent -Path $linkCheck.Path
-            if ($null -ne $linkComponent) { throw "Output refused: the $($linkCheck.Name) path has a reparse-point (symlink or junction) component ($linkComponent), so a swap of it for a link to the report cannot be ruled out; nothing was written." }
-        }
-        # adversary-ac722a96.json A2: the temporary name never carries the report's leaf (a 231-character report name plus ".", a guid and ".tmp" is past the 255-character component limit), so a valid report is published
-        $tempOutput = Join-Path $outputDir ('.mlvsmoke.' + [Guid]::NewGuid().ToString('N') + '.tmp')
-        # R2-RESIDUE-1 r1 (adversary-3be19c39.json A4): on Windows the temporary file is created with DELETE access and NO sharing and stays open from its creation to its publication, so no other process can
-        # rename it aside or swap a file under its name; it is renamed over the report BY THIS HANDLE (never a second lookup of the temporary name) and, if anything fails first, deleted BY THE HANDLE.
-        if ($ownedFs) {
-            $tempHandle = [MlvSmokeOwnedFsV1]::CreateTempFile($tempOutput)
-            # test-only seam (R2-RESIDUE-1 r2, adversary-f1221390.json A6): a script block a test sets to fail between the raw handle and its stream wrapper; production leaves it unset
-            if ($null -ne $script:SmokeTestAfterTempHandle) { & $script:SmokeTestAfterTempHandle }
-            $tempStream = [IO.FileStream]::new($tempHandle, [IO.FileAccess]::Write, 4096, $false)
-        }
-        else { $tempStream = [IO.FileStream]::new($tempOutput, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None) }
-        $tempStream.Write($outBytes, 0, $outBytes.Length)
-        $tempStream.Flush($true)
-        # test-only seam (R2-RESIDUE-1 r1, adversary-3be19c39.json A4): a script block a test sets to act in the gap between the temporary file being written and its publication; production leaves it unset
-        if ($null -ne $script:SmokeTestAfterTempWrite) { & $script:SmokeTestAfterTempWrite $tempOutput }
-        if ($ownedFs) { [MlvSmokeOwnedFsV1]::RenameOver($tempHandle, [IO.Path]::GetFullPath($resolvedOutput)) }
-        else { $tempStream.Dispose(); $tempStream = $null; [IO.File]::Move($tempOutput, $resolvedOutput, $true) }
-        $tempOutput = $null
-        $wroteOutput = $true
-    }
-    finally {
-        foreach ($hold in $inputHolds) { try { $hold.Dispose() } catch { } }
-        # a refused or failed write removes the temporary file BY ITS OWN HANDLE (Windows), so a different file another process put under the temporary name is never touched; the handle is closed after
-        if ($null -ne $tempHandle -and -not $wroteOutput) { try { [MlvSmokeOwnedFsV1]::DeleteByHandle($tempHandle) } catch { } }
-        if ($null -ne $tempStream) { try { $tempStream.Dispose() } catch { } }
-        # adversary-f1221390.json A6: the raw handle is closed here too (a stream that was never built, or one that does not own it, leaves it open): the delete requested above completes only when the last handle
-        # closes, so the folder cleanup below must run after it. A handle the stream already closed is a no-op.
-        if ($null -ne $tempHandle) { try { $tempHandle.Dispose() } catch { } }
-        if ($null -ne $tempOutput -and -not $ownedFs) { try { Remove-Item -LiteralPath $tempOutput -Force -ErrorAction Stop } catch { } }
-        if (-not $wroteOutput) {
-            # only the folder levels whose own creation this call succeeded (deepest first) are removed, and only while each is empty (a file another process put there is never ours to delete)
-            for ($levelIndex = $createdDirs.Count - 1; $levelIndex -ge 0; $levelIndex--) {
-                $level = $createdDirs[$levelIndex]
-                try {
-                    if ($null -ne $level.Handle) {
-                        # R2-RESIDUE-1 r1 (adversary-3be19c39.json A3): the delete is by the handle taken at creation (it fails while the folder holds anything): no path is looked up a second time
-                        if ($null -ne $script:SmokeTestBeforeDirCleanup) { & $script:SmokeTestBeforeDirCleanup $level.Path }
-                        if (-not [MlvSmokeOwnedFsV1]::DeleteDirIfEmpty($level.Handle)) { break }
-                        $level.Handle.Dispose()
-                        continue
-                    }
-                    if ("$([IO.Directory]::GetCreationTimeUtc($level.Path).Ticks)|$($level.Path)" -cne $level.Stamp) { break }
-                    if (@(Get-ChildItem -LiteralPath $level.Path -Force -ErrorAction Stop).Count -ne 0) { break }
-                    if ($null -ne $script:SmokeTestBeforeDirCleanup) { & $script:SmokeTestBeforeDirCleanup $level.Path }
-                    Remove-Item -LiteralPath $level.Path -Force -ErrorAction Stop
-                } catch { break }
-            }
-        }
-        foreach ($held in $createdDirs) { if ($null -ne $held.Handle) { try { $held.Handle.Dispose() } catch { } } }
-    }
+    Set-Content -LiteralPath $resolvedOutput -Value $json -Encoding UTF8
 }
 
 Write-Host ((
