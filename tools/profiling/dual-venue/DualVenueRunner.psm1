@@ -4356,7 +4356,7 @@ function Get-DvVisualVerdict {
     # clip A frame 479 and clip B frame 479 are one number and two positions. r2 (pass 3 A3): a count that contradicts -AppDistinctDisplayFrames (no
     # labelled frame while one display frame is declared) is not known either, so a caller-supplied tuple cannot make the reason say "0 of".
     # R3-KEY-RESIDUE-1 (sol r3 blocker, opus VISUAL-GATE-DISTINCT-HASHES-RANGE-1): the CONTRACT is "omit": a count that cannot be true for the judged set
-    # (a distinct-picture count outside 1..PlayFrames, a distinct-display-frame count outside 0..PlayFrames, a repeat count over PlayFrames) is never quoted
+    # (a distinct-picture count outside 1..PlayFrames, a distinct-display-frame count outside 0..PlayFrames, a repeat count over PlayFrames minus the distinct pictures) is never quoted
     # as observed evidence. The verdict is whatever it was (production derives every count from the judged set, so none of these fires there); only the
     # reason drops the number, in words that state no more than the verdict's own condition.
     if ($AppDistinctDisplayFrames -lt 2) {
@@ -4380,7 +4380,10 @@ function Get-DvVisualVerdict {
         return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY_SUSPECTED'; counted = $true; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them, but nothing records whether the source frames differ (a static clip shows one picture legitimately): suspected, not excluded" }
     }
     if ($RepeatedPlayFrames -ge 2 -and $SourceDifference -ceq 'known-differ') {
-        return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "$(if ($RepeatedPlayFrames -le $PlayFrames) { "$RepeatedPlayFrames" } else { 'two or more' }) of the $PlayFrames judged play frames repeat the picture before them while the app's label advanced and the source frames are known to differ: the display's own paint stopped landing for part of the tail" }
+        # a repeat is a judged frame equal to the one before it: N frames over D distinct pictures hold at most N - D of them (N - 1 when D itself cannot be true)
+        # (sol r1 pass A1: 4 repeats over 6 frames and 3 pictures, or 6 repeats over 6 frames, were quoted although no judged set holds them)
+        $repeatMax = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { $PlayFrames - $DistinctContentHashes } else { $PlayFrames - 1 })
+        return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "$(if ($RepeatedPlayFrames -le $repeatMax) { "$RepeatedPlayFrames" } else { 'two or more' }) of the $PlayFrames judged play frames repeat the picture before them while the app's label advanced and the source frames are known to differ: the display's own paint stopped landing for part of the tail" }
     }
     if (($null -ne $LabelBound -or $null -ne $PausedLabelBound) -and -not ($LabelBound -eq $true -and $PausedLabelBound -eq $true)) {
         $unbound = @(if ($LabelBound -ne $true) { "the paused-instant capture (label_bound $(if ($null -eq $LabelBound) { 'missing' } else { 'false' }))" }

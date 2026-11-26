@@ -11121,6 +11121,18 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         self.assertTrue(out["reason"].startswith("two or more of the 6 judged play frames repeat"), out["reason"])
         out = self.visual_verdict("known-differ", 6, 0, 3, repeats=3)
         self.assertTrue(out["reason"].startswith("3 of the 6 judged play frames repeat"), out["reason"])
+        # adversary pass 1 A1 (its input verbatim): N frames over D distinct pictures hold at most N - D adjacent repeats, so 4 repeats over 6 frames and 3
+        # pictures (and 6 repeats over 6 frames) cannot be true; on 7f07a3e7 the reason read '4 of the 6 judged play frames repeat'. The verdict is unchanged.
+        for distinct, repeats in ((3, 4), (3, 6), (6, 2), (2, 5), (9, 6), (0, 6)):
+            with self.subTest(distinct=distinct, repeats=repeats):
+                out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertTrue(out["reason"].startswith("two or more of the 6 judged play frames repeat"), out["reason"])
+        for distinct, repeats in ((2, 4), (6, 0), (9, 5), (0, 5)):
+            if repeats >= 2:
+                with self.subTest(distinct=distinct, repeats=repeats, quoted=True):
+                    out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+                    self.assertTrue(out["reason"].startswith(f"{repeats} of the 6 judged play frames repeat"), out["reason"])
         # a negative judged-frame count is worded as unknown (the early verdicts are unchanged)
         proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames -1 -DistinctContentHashes 0 -AppDistinctDisplayFrames 0 -FlatPlayFrames 0 "
                                   "| ConvertTo-Json -Compress")
