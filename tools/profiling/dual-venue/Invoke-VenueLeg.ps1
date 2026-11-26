@@ -424,6 +424,10 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
     # (the writer relabels an advisory production PASS/FAIL in outcomeDetail and stamps receipt.verification: say so here too)
     Write-Output "DVE_DETAIL=$($receipt.outcomeDetail)"
     if ($null -ne $receipt['verification']) { Write-Output "DVE_VERIFICATION=$($receipt['verification'].status)" }
+    # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 B1): the acceptance verdict a readout reports (Get-DvAcceptanceVerdict). DVE_OUTCOME stays the
+    # raw outcome the chain records; an advisory (or any not-VERIFIED) PASS/FAIL is NOT_MEASURED here, its criteria failures only diagnostics.
+    $acceptance = Get-DvAcceptanceVerdict -Receipt $receipt -VerificationStatus $(if ($null -ne $receipt['verification']) { [string]$receipt['verification'].status } else { '' })
+    Write-Output "DVE_ACCEPTANCE=$($acceptance.verdict)"
     # PLAYBACK-VISUAL-INSPECTION-1: the visual verdict and the strip a reviewer opens.
     if ($null -ne $receipt['visual']) { Write-Output "DVE_VISUAL=$($receipt['visual'].verdict) STRIP=$(if ($receipt['visual'].stripCopyPath) { $receipt['visual'].stripCopyPath } elseif ($receipt['visual'].stripPath) { $receipt['visual'].stripPath } else { 'none' })" }
     Write-Output "DVE_RECEIPT_PATH=$path"

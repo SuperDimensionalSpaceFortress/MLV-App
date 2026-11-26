@@ -655,12 +655,12 @@ void get_mlv_raw_frame_debayered(mlvObject_t * video,
                                   uint64_t frame_index,
                                   float * temp_memory,
                                   uint16_t * output_frame,
-                                  int debayer_type ); /* Debayer type: 0=bilinear 1=amaze */
+                                  int debayer_type ); /* Debayer type: a doesMlvAlwaysUseAmaze value, see getMlvDebayerName */
 void get_mlv_raw_frame_debayered_isolated_analysis(mlvObject_t * video,
                                                    uint64_t frame_index,
                                                    float * temp_memory,
                                                    uint16_t * output_frame,
-                                                   int debayer_type ); /* Debayer type: 0=bilinear 1=amaze */
+                                                   int debayer_type ); /* Debayer type: a doesMlvAlwaysUseAmaze value, see getMlvDebayerName */
 /* The tail both of the above run after their decode + llrawproc (see frame_caching.c). */
 int get_mlv_raw_frame_debayered_from_processed_raw_u16(mlvObject_t * video,
                                                        uint64_t frame_index,
@@ -670,6 +670,7 @@ int get_mlv_raw_frame_debayered_from_processed_raw_u16(mlvObject_t * video,
                                                        int bit_shift,
                                                        int debayer_threads,
                                                        const char * capture_path_label);
+const char * getMlvDebayerName(int debayer_type); /* name of a doesMlvAlwaysUseAmaze value (macros.h setters); "unknown" otherwise */
 /* Cache-free isolated-analysis source for reduced thumbnails. This decodes and
  * runs llrawproc at full resolution through the direct path, then emits a
  * reduced RGB16 frame via Bayer->RGB block averaging. Returns 1 on success. */

@@ -85,6 +85,7 @@ int mlvCacheWorkerCount(mlvObject_t * video);
 #define setMlvCpuCores(video, cores) (video)->cpu_cores = (cores)
 #define getMlvCpuCores(video) (video)->cpu_cores
 
+/* A new use_amaze value set below must also be named in getMlvDebayerName (video_mlv.c). */
 /* Use setMlvAlwaysUseAmaze() to always get AMaZE frames, for best quality always */
 #define setMlvAlwaysUseAmaze(video) do { (video)->use_amaze = 1; resetMlvCachedFrame(video); } while(0)
 /* Or this one for speed/ultimate playback performance, will give AMaZE if it is in cache, 

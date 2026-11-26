@@ -2829,7 +2829,7 @@
       "clock": "qpc_stage_clock",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r3: lastDeliveryPostMs() is a timestamp getter whose negative value is the 'no delivery firing now' sentinel; the assert checks the sentinel outside the fire callback. The delivery itself is proven by pumpDueWakeMessages returning 1 and the callback's captured post/receive times.",
       "lines": [
-        410
+        628
       ]
     },
     {
@@ -2839,7 +2839,7 @@
       "clock": "qpc_stage_clock",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r3: the notifier fallback carries no post time, so its timestamp getter reads the negative sentinel; a structural check of the fallback's contract, no duration compared.",
       "lines": [
-        414
+        632
       ]
     },
     {
@@ -2849,8 +2849,8 @@
       "clock": "qpc_stage_clock",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r5 (adversary pass 9 A1): postMs is a TIMESTAMP (PostMessageW's return time from lastDeliveryPostMs), and a negative value is the 'not published, unsplit' sentinel. The assert checks that a native delivery is exactly one of split or unsplit. That is the sentinel's contract; no duration is compared and nothing is proven to have run.",
       "lines": [
-        454,
-        926
+        622,
+        1127
       ]
     },
     {
@@ -2860,7 +2860,47 @@
       "clock": "qpc_stage_clock",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r5 (adversary pass 9 A1): the retry loop stops at the first delivery whose post-return TIMESTAMP was published (sentinel < 0 = unsplit). It reads a sentinel and compares no duration. The delivery itself is proven by pumpDueWakeMessages returning 1.",
       "lines": [
-        455
+        623
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "if ( ! ( foreign . calls >= 1 && foreign . handlerStartMs >= 0.0 && foreign . handlerEndMs >= foreign . handlerStartMs ) )",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r1 (sol r5 B1): handlerStartMs and handlerEndMs are TIMESTAMPS (the fixture handler's QPC reads), and -1 is their 'handler never ran' sentinel. The guard fails a sample whose handler reads are unset before the R3A3 trace scan can start from -1 ms. It compares no duration. That the handler ran is proven by its own call count (foreign.calls), which is the admission witness.",
+      "lines": [
+        3258
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "const bool seen = tagSeenMs >= 0.0 ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r2 (sol r1 B1): tagSeenMs is a TIMESTAMP (the WH_CALLWNDPROC hook's QPC read of the tagged WM_NULL reaching the wake's window), and -1 is its 'the hook never saw it' sentinel. The comparison only separates the observed case from the sentinel; no duration is compared. An observed read is then validated against the product's dispatch span record (a span must contain it, or the record is lost), which is the run-proof.",
+      "lines": [
+        2747
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "if ( dueWakeRedR1Gate ( ) ) return literalRow && tagSeenMs >= 0.0 && wokenOtherDelta > 0 && ! spansS . empty ( ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r2 (sol r1 B1): the opt-in RED replay (MLV_R17A1_RED_R1_GATE=1) of bebd354c's credit rule. tagSeenMs >= 0.0 reads the hook timestamp's 'never saw it' sentinel (-1), standing in for bebd354c's boolean witness; wokenOtherDelta is a dispatch count. No duration is compared. The replay only fails more samples than the fix, and never runs unless the variable is exactly 1.",
+      "lines": [
+        2763
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "&& g_r3a3LiteralSeenMs < 0.0 )",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CI-FLAKE-R17A1-DISPATCH-RECORD-ADMISSION-1 r2 (sol r1 B1): g_r3a3LiteralSeenMs is a TIMESTAMP, and -1 is its 'not seen yet' sentinel. The hook stamps only the first time it sees the tagged WM_NULL, so a later dispatch of the same tag cannot move the read. It compares no duration and proves nothing ran; the span record that must contain the read is the proof.",
+      "lines": [
+        3033
       ]
     },
     {
@@ -2870,7 +2910,7 @@
       "clock": "qpc_stage_clock",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r5 (adversary pass 9 A1): it selects a split delivery (post-return TIMESTAMP published, sentinel < 0 otherwise) before comparing that timestamp with the message's first stamp. It reads a sentinel, never a duration, and the delivery is proven by handleNativeMessage returning true.",
       "lines": [
-        927
+        1128
       ]
     },
     {
@@ -2880,7 +2920,7 @@
       "clock": "qpc_stage_clock",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r6 (adversary pass 10 A2): firstMs is a TIMESTAMP (the first stamp from lastDeliveryPostFirstMs), and a negative value is the 'unsplit, no post interval' sentinel. The assert checks the sentinel on an unsplit delivery; no duration is compared and nothing is proven to have run (handleNativeMessage returning true proves the delivery).",
       "lines": [
-        958
+        1136
       ]
     },
     {
@@ -2890,7 +2930,7 @@
       "clock": "other",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r6 (adversary pass 10 A2): a pure arithmetic check of playbackDueWakeSplitBounds on the finding's synthetic input (due 100, first stamp 100, return stamp 140, receive 150 ms): the lower due-to-post bound is exactly 0. Constant inputs, no clock read, never a run-proof.",
       "lines": [
-        1071
+        1251
       ]
     },
     {
@@ -2900,7 +2940,17 @@
       "clock": "other",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r6 (adversary pass 10 A2): checks that the true due-to-post (0 ms) of the finding's synthetic input lies inside the [lo, hi] bounds playbackDueWakeSplitBounds computed. Constant inputs, no clock read, never a run-proof.",
       "lines": [
-        1076
+        1256
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_due_wake_native.cpp",
+      "anchor": "if ( overlapMs > 0.0 ) sleptBeforeSendMs -= overlapMs ;",
+      "class": "value_fallback_select",
+      "clock": "qpc_stage_clock",
+      "justification": "CI-FLAKE-R17A1-FOREIGN-FIRST-FLOOR-1 (adversary pass 1 A2): R17A1's foreign-first old-window floor is the time from the sleep's entry stamp to the sender's pre-send QPC read, less each recorded dispatch span's overlap with that interval. overlapMs is the length of an interval intersection, which is <= 0 when the span lies wholly outside the interval; the comparison only skips a span that does not intersect (nothing to subtract). A data-validity filter on an interval computation, never a run-proof: that the sleep and its dispatches ran is proven by the stamp count, the span record and the handler's own reads asserted around it.",
+      "lines": [
+        4411
       ]
     },
     {
@@ -3132,7 +3182,7 @@
       "clock": "other",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): pure arithmetic check of playbackDueWakeSliceWaitMs on the finding's synthetic input (now == deadline 100 ms): no wait is left. Constant inputs, no clock read, never a run-proof.",
       "lines": [
-        1623
+        1885
       ]
     },
     {
@@ -3142,7 +3192,7 @@
       "clock": "other",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): pure arithmetic check on the finding's input (the worker resumes at 150 ms past a 100 ms budget): 0, so no attempt starts. Constant inputs, no clock read, never a run-proof.",
       "lines": [
-        1624
+        1886
       ]
     },
     {
@@ -3152,7 +3202,7 @@
       "clock": "other",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2 sibling): pure arithmetic check on the finding's input (the settle resumes at 1500 ms past its 1100 ms deadline): 0, no stale relative wait. Constant inputs, no clock read, never a run-proof.",
       "lines": [
-        1628
+        1890
       ]
     },
     {
@@ -3162,7 +3212,7 @@
       "clock": "other",
       "justification": "HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1 r8 (adversary pass 17 A2): a source-text pin (QString::indexOf over PlaybackDueWake.cpp) that the retry loop stops when the computed wait is 0; the duration token is inside a string literal. Nothing is timed or proven to have run.",
       "lines": [
-        1637
+        1899
       ]
     },
     {
