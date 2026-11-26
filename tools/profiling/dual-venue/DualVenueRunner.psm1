@@ -7591,10 +7591,10 @@ function Get-DvTailVisualEvidence {
         $recorded = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
         foreach ($r in @($RecordedFrames)) {
             if ($null -eq $r) { continue }
-            $rk = Get-DvProp $r 'kind'; $ri = Get-DvProp $r 'index'; $rs = Get-DvProp $r 'sha256'
-            if ($rk -isnot [string] -or -not (($ri -is [int]) -or ($ri -is [long]))) { continue }
-            $key = "$rk|$([int64]$ri)"
-            $value = $(if ($rs -is [string] -and $rs -cmatch '^[0-9a-f]{64}$') { $rs } else { $null })
+            $recKind = Get-DvProp $r 'kind'; $recIndex = Get-DvProp $r 'index'; $recSha = Get-DvProp $r 'sha256'
+            if ($recKind -isnot [string] -or -not (($recIndex -is [int]) -or ($recIndex -is [long]))) { continue }
+            $key = "$recKind|$([int64]$recIndex)"
+            $value = $(if ($recSha -is [string] -and $recSha -cmatch '^[0-9a-f]{64}$') { $recSha } else { $null })
             if ($recorded.ContainsKey($key)) { $recorded[$key] = $null } else { $recorded[$key] = $value }
         }
         $dir = Join-Path $EvidenceDir 'visual'
