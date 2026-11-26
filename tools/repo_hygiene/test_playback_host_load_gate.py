@@ -4050,7 +4050,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         # existing report. RED: the write compared the report with the two HISTORICAL identities (read when the inputs were first opened), so it truncated and wrote
         # the inode before.json now names. The write block runs here as extracted, after the swap; the current files are re-read through fresh handles.
         cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
-        block = _extract_block(cmp, "    $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json", "    finally { $outStream.Dispose() }", trailing_lines=0)
+        block = _extract_block(cmp, "    $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json", "if ($createdDir) { try { if (@(Get-ChildItem", trailing_lines=2)
         with tempfile.TemporaryDirectory(prefix="residue-r3-a1b-") as tmp:
             before, after, report = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "report.json"
             for p in (before, after, report):
@@ -4069,6 +4069,52 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
         self.assertNotIn("RESULT=WRITTEN", proc.stdout)
 
+    def test_r2_a2_the_output_aliases_are_checked_against_the_paths_the_caller_gave(self) -> None:
+        # adversary-b3d61554.json A2, its input: -Before and -After are hard links of one file (read once, so the after SOURCE carries the before path); after the early
+        # check -After is swapped for a hard link to the report. RED: $afterJsonPath came from the source, so the write-time re-read opened before.json twice and the real
+        # -After path was never judged. The two paths now come from the parameters (each resolved on its own).
+        cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("$afterJsonPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($After)", cmp)
+        self.assertIn("$beforeJsonPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Before)", cmp)
+        self.assertNotIn("$afterJsonPath = $afterSource.path", cmp)
+        self.assertNotIn("$beforeJsonPath = $beforeSource.path", cmp)
+        # and end to end: the same file given twice is still refused as same-input with nothing written for the report
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a2-") as tmp:
+            before, after, report = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "report.json"
+            before.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            os.link(before, after)
+            proc = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", str(report))
+            text = _flat_pwsh_text(proc.stdout + proc.stderr)
+            self.assertNotIn("Output must not overwrite", text, text)
+            self.assertTrue(report.exists(), text)
+            self.assertIn("same smoke JSON file", report.read_text(encoding="utf-8"))
+
+    def test_r2_a3_a_refused_write_leaves_no_empty_report_or_folder_this_call_created(self) -> None:
+        # adversary-b3d61554.json A3, its input: a report path whose folder is absent, and a smoke input that is gone at the write-time identity re-read. RED: the
+        # report was opened with OpenOrCreate, the refusal said "nothing was written", and a zero-byte report (and its new folder) stayed behind.
+        cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        block = _extract_block(cmp, "    $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json", "if ($createdDir) { try { if (@(Get-ChildItem", trailing_lines=2)
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a3-") as tmp:
+            before, after = Path(tmp) / "before.json", Path(tmp) / "after.json"
+            outdir = Path(tmp) / "reports"
+            report = outdir / "report.json"
+            for p in (before, after):
+                p.write_text("{}", encoding="utf-8", newline="")
+            script = Path(tmp) / "write.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity"]) +
+                f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $outputDir = '{outdir}'; $json = '{{\"report\":true}}'\n"
+                "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
+                "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
+                f"Remove-Item -LiteralPath '{before}'\n"
+                "New-Item -ItemType Directory -Force -Path $outputDir | Out-Null; $createdDir = $true; $createdOutput = $true; $wroteOutput = $false\n"
+                "try {\n" + block + "\nWrite-Output 'RESULT=WRITTEN' } catch { Write-Output ('RESULT=REFUSED ' + $_.Exception.Message) }\n",
+                encoding="utf-8")
+            proc = _run_ps_file(script)
+            self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
+            self.assertFalse(report.exists(), "the empty report this call created is removed\n" + proc.stdout + proc.stderr)
+            self.assertFalse(outdir.exists(), "the empty folder this call created is removed\n" + proc.stdout + proc.stderr)
+
     def test_r3_a3_a_one_element_candidate_list_is_provisional_not_unrolled_into_its_clean_member(self) -> None:
         # adversary-7efea617.json A3, its input: candidate = [one clean leg]. RED: `$x = if (...) { $Record.candidate }` unrolled the one-element list into its
         # member before the list guard, so the member's own clean standing counted and a +50 percent delta was published. A plain assignment keeps the list.
@@ -4083,11 +4129,23 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
                 f"$speed = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"x\":1}},\"candidateSpeed\":[{clean}]}}' | ConvertFrom-Json\n"
                 "Write-Output ('LISTED=' + (Get-PlaybackAbHostLoadRefusal -Record $listed).provisional)\n"
                 "Write-Output ('PLAIN=' + (Get-PlaybackAbHostLoadRefusal -Record $plain).provisional)\n"
-                "Write-Output ('SPEED=' + (Get-PlaybackAbHostLoadRefusal -Record $speed).provisional)\n", encoding="utf-8")
+                "Write-Output ('SPEED=' + (Get-PlaybackAbHostLoadRefusal -Record $speed).provisional)\n"
+                # adversary-b3d61554.json A6: speedCompare is the comparison basis whatever else is there; no candidateSpeed (absent, null or empty) is no leg: provisional
+                f"$noleg = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"presentedFps\":{{\"baseline\":20,\"candidate\":30}}}}}}' | ConvertFrom-Json\n"
+                f"$nullleg = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"x\":1}},\"candidateSpeed\":null}}' | ConvertFrom-Json\n"
+                f"$emptyleg = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"x\":1}},\"candidateSpeed\":[]}}' | ConvertFrom-Json\n"
+                f"$goodspeed = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"x\":1}},\"candidateSpeed\":{clean}}}' | ConvertFrom-Json\n"
+                "Write-Output ('NOLEG=' + (Get-PlaybackAbHostLoadRefusal -Record $noleg).provisional)\n"
+                "Write-Output ('NULLLEG=' + (Get-PlaybackAbHostLoadRefusal -Record $nullleg).provisional)\n"
+                "Write-Output ('EMPTYLEG=' + (Get-PlaybackAbHostLoadRefusal -Record $emptyleg).provisional)\n"
+                "Write-Output ('GOODSPEED=' + (Get-PlaybackAbHostLoadRefusal -Record $goodspeed).provisional)\n", encoding="utf-8")
             proc = _run_ps_file(script)
         self.assertIn("LISTED=True", proc.stdout, proc.stdout + proc.stderr)
         self.assertIn("PLAIN=False", proc.stdout, proc.stdout + proc.stderr)
         self.assertIn("SPEED=True", proc.stdout, proc.stdout + proc.stderr)
+        for name in ("NOLEG", "NULLLEG", "EMPTYLEG"):
+            self.assertIn(f"{name}=True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("GOODSPEED=False", proc.stdout, proc.stdout + proc.stderr)
         summarizer = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn("$playbackAbCandidateLeg = if (", summarizer)
         self.assertIn("$playbackAbCandidateLeg = $playbackAb.candidate\n", summarizer)

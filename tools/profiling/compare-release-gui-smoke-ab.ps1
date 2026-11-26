@@ -604,12 +604,16 @@ function Get-GuiSmokeAbVerdict {
     )
     $refusals = @()
     foreach ($legName in @("before", "after")) {
-        $legEvidence = if ($null -ne $HostLoadEvidence) { $HostLoadEvidence.$legName } else { $null }
+        # adversary-b3d61554.json A13: plain assignments, never `$x = if (...) { $list }`: an if-expression's output unrolls a one-element list into its member, which then read as a
+        # clean standing. A leg evidence that is a list (not one object) is no standing: it is passed on as $null, which Get-VenueReferenceHostLoadRefusal refuses.
+        $legEvidence = $null
+        if ($null -ne $HostLoadEvidence) { $legEvidence = $HostLoadEvidence.$legName }
         # r6 (sol r5 B1): the venue reader's own refusal rule (VenueChain.psm1 Get-VenueReferenceHostLoadRefusal): clean only for state exactly 'quiet',
         # provisional a real $false and collected a real $true. Only those three members are passed, so no caller-supplied applies=$false can skip the rule.
-        $standing = if ($null -ne $legEvidence) {
-            [pscustomobject]@{ state = $legEvidence.state; provisional = $legEvidence.provisional; collected = $legEvidence.collected }
-        } else { $null }
+        $standing = $null
+        if ($null -ne $legEvidence -and $legEvidence -isnot [System.Collections.IList]) {
+            $standing = [pscustomobject]@{ state = $legEvidence.state; provisional = $legEvidence.provisional; collected = $legEvidence.collected }
+        }
         $line = Get-VenueReferenceHostLoadRefusal -LegId $legName -Standing $standing
         if ($null -eq $line) { continue }
         $refusals += $line
@@ -1001,8 +1005,11 @@ $beforeSource = Read-SmokeSourceOnce -Path $Before
 # adversary-07b6a932.json A6: "the same file" is the open handle's file-system identity (a hard link or a case variant is the same file; two
 # case-distinct files in a case-sensitive directory are two files), never path spelling.
 $afterSource = Read-SmokeSourceOnce -Path $After -SameFileAs $beforeSource
-$beforeJsonPath = $beforeSource.path
-$afterJsonPath = $afterSource.path
+# adversary-b3d61554.json A2: the paths the OUTPUT must never alias are the two paths the caller GAVE, each resolved on its own. When -After is the same physical file as -Before,
+# Read-SmokeSourceOnce returns the before source (read once), whose .path is the before path: taking the after path from it left the real -After path unwatched, so a later swap of it
+# for a hard link to the report was never seen at the write. The source objects still carry the figures and the identity; the paths come from the parameters.
+$beforeJsonPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Before)
+$afterJsonPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($After)
 $beforeSmokeText = $beforeSource.text
 $afterSmokeText = $afterSource.text
 $beforeSmoke = $beforeSource.smoke
@@ -1351,9 +1358,14 @@ if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]
 $json = $result | ConvertTo-Json -Depth 24
 if (-not [string]::IsNullOrWhiteSpace($Output)) {
     $outputDir = Split-Path -Parent $resolvedOutput
+    # adversary-b3d61554.json A3: a refusal after this point leaves nothing behind that this call created (the empty report and, when it made it, its empty folder)
+    $createdDir = $false
     if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
+        $createdDir = -not (Test-Path -LiteralPath $outputDir -PathType Container)
         New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     }
+    $createdOutput = -not (Test-Path -LiteralPath $resolvedOutput -PathType Leaf)
+    $wroteOutput = $false
     # adversary-c2bbe5f8.json A2: the report is written through the SAME handle whose identity is checked (opened without truncation, no sharing), so a
     # hard link to an input swapped in after the earlier check is refused here and never truncated or written
     $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json + [Environment]::NewLine)
@@ -1378,8 +1390,16 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         }
         $outStream.SetLength(0)
         $outStream.Write($outBytes, 0, $outBytes.Length)
+        $wroteOutput = $true
     }
-    finally { $outStream.Dispose() }
+    finally {
+        $outStream.Dispose()
+        if (-not $wroteOutput -and $createdOutput) {
+            # only a still-empty report is removed (a file another process filled in the meantime is never ours to delete), then its folder when this call made it and it is empty
+            try { if ((Get-Item -LiteralPath $resolvedOutput -Force -ErrorAction Stop).Length -eq 0) { Remove-Item -LiteralPath $resolvedOutput -Force -ErrorAction Stop } } catch { }
+            if ($createdDir) { try { if (@(Get-ChildItem -LiteralPath $outputDir -Force -ErrorAction Stop).Count -eq 0) { Remove-Item -LiteralPath $outputDir -Force -ErrorAction Stop } } catch { } }
+        }
+    }
 }
 
 Write-Host ((

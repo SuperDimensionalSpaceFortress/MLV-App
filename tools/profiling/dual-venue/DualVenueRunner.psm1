@@ -2795,7 +2795,11 @@ function Get-DvLegSetPlan {
         # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3): the PLANNED leg type comes from THESE bytes (the ones the child is pinned to by
         # specSha256), by the child's own rule (Invoke-VenueLeg.ps1 $isExport: legType exactly the string 'export'), so no caller re-reads the path to learn it
         $specLegTypeRaw = Get-DvProp $spec 'legType'
-        $specPlannedLegType = $(if ($specLegTypeRaw -is [string] -and [string]::Equals($specLegTypeRaw, 'export', [StringComparison]::Ordinal)) { 'export' } else { 'playback' })
+        # adversary-b3d61554.json A7: a spec that declares legType more than once is ambiguous (ConvertFrom-Json keeps the LAST one, so a playback declaration ahead of an export one read
+        # as export and earned the export exemption). Get-VenuePlannedLegType reads such bytes as 'unknown' (never exempt); the planner reaches the same answer from the same bytes by
+        # counting the member name in the text (a nested member of the same name only makes a spec 'unknown', the side that grants nothing).
+        $specLegTypeDeclarations = [regex]::Matches($specText, '"legType"\s*:', [Text.RegularExpressions.RegexOptions]::IgnoreCase).Count
+        $specPlannedLegType = $(if ($specLegTypeDeclarations -gt 1) { 'unknown' } elseif ($specLegTypeRaw -is [string] -and [string]::Equals($specLegTypeRaw, 'export', [StringComparison]::Ordinal)) { 'export' } else { 'playback' })
         $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256; plannedLegType = $specPlannedLegType })
     }
     $backends = [System.Collections.Generic.List[string]]::new()

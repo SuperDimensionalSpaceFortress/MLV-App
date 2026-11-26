@@ -485,7 +485,9 @@ function Get-PlaybackAbHostLoadRefusal {
     # adversary-7efea617.json A3: a plain assignment, never `$x = if (...) { $list }`: an if-expression's output unrolls a one-element list into its member,
     # so the list guard of Get-PlaybackAbLegHostLoadProvisional never saw it and the member's own clean standing counted
     $candidateLeg = $Record.candidate
-    if ($Record.speedCompare -and $Record.candidateSpeed) { $candidateLeg = $Record.candidateSpeed }
+    # adversary-b3d61554.json A6: the comparison basis is speedCompare alone (lines 362/520/883/890/947 all pick candidateSpeed on `$Record.speedCompare`), so the leg judged is
+    # candidateSpeed whenever speedCompare is there; a missing, null or empty candidateSpeed is then no leg at all, which reads provisional, never the ordinary candidate's clean standing
+    if ($Record.speedCompare) { $candidateLeg = $Record.candidateSpeed }
     $baselineProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $Record.baseline
     $candidateProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $candidateLeg
     [pscustomobject]@{

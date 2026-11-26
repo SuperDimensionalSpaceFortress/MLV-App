@@ -1295,13 +1295,21 @@ function Read-VenueFileBytesBounded {
     path that stopped answering (a dead share, a stalled disk) costs the caller its bound and never an unbounded wait. Returns the byte array; $null when -MissingIsNull and the file
     does not exist. A read that fails or does not answer in time THROWS a message that names the leaf and the reason, so the caller's own catch types it.
     #>
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][double]$TimeoutSec, [switch]$MissingIsNull)
+    # pass 2 (adversary-b3d61554.json A1): -Clock / -EndSec are the CALLER's one budget across every read it makes (Get-VenueLegHostLoad starts one Stopwatch and gives both reads the
+    # same end), so two reads never each get a fresh bound, the wait is cut to what is left of it, and an answer that arrives after the end is never acted on (Invoke-VenueBoundedRead's
+    # own late-answer check). Without them -TimeoutSec alone bounds this one read.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][double]$TimeoutSec, [switch]$MissingIsNull, [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0)
     # (-VenueTestFileReadDelayMs is a test-only seam: the worker sleeps that long first, as a share that answers late does; production leaves it 0)
-    $worker = 'param($a) if ($a.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$a.delayMs) }; if ($a.missingOk -and -not (Test-Path -LiteralPath $a.path -PathType Leaf)) { return }; ,[IO.File]::ReadAllBytes($a.path)'
-    $r = Invoke-VenueBoundedRead -ScriptText $worker -Argument @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs } -TimeoutSec ([Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec)))
+    # pass 2 (A11): $ErrorActionPreference Stop, so a failed read is a terminating error the bounded read reports (its message names the cause), never an empty answer read as "no file"
+    $worker = 'param($a) $ErrorActionPreference = ''Stop''; if ($a.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$a.delayMs) }; if ($a.missingOk -and -not (Test-Path -LiteralPath $a.path -PathType Leaf)) { return }; ,[IO.File]::ReadAllBytes($a.path)'
+    $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $worker -Argument @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs } -TimeoutSec ([Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))) -Clock $Clock -EndSec $EndSec -EndIsBoundEnd }
+           else { Invoke-VenueBoundedRead -ScriptText $worker -Argument @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs } -TimeoutSec ([Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))) })
     if (-not $r.answered) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: $($r.error)" }
     $got = @($r.value)
-    if ($got.Count -eq 0) { return $null }
+    if ($got.Count -eq 0) {
+        if ($MissingIsNull) { return $null }
+        throw "the read of '$([IO.Path]::GetFileName($Path))' returned nothing"
+    }
     return ,([byte[]]$got[0])
 }
 
@@ -1948,7 +1956,9 @@ function Get-VenueLegHostLoad {
     try {
         if (-not $ReceiptPath) { return $unknown }
         if (-not ($ReadTimeoutSec -ge 1.0)) { $unknown.reason = 'no time was left to read the leg''s receipt and smoke result'; return $unknown }
-        $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $ReadTimeoutSec
+        # pass 2 (adversary-b3d61554.json A1): ONE budget for both reads (this Stopwatch and the same end), never a fresh bound per read, and an answer past the end is not acted on
+        $readClock = [Diagnostics.Stopwatch]::StartNew()
+        $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $ReadTimeoutSec -Clock $readClock -EndSec $ReadTimeoutSec
         if ($PSBoundParameters.ContainsKey('ExpectReceiptSha256')) {
             $rcGot = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes))
             if ([string]::IsNullOrEmpty($ExpectReceiptSha256) -or -not [string]::Equals($rcGot, $ExpectReceiptSha256, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the bytes the figures were read from'; return $unknown }
@@ -1977,7 +1987,7 @@ function Get-VenueLegHostLoad {
         $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
         $evidence = Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))
         $result = Join-Path $evidence 'result.json'
-        $bytes = Read-VenueFileBytesBounded -Path $result -TimeoutSec $ReadTimeoutSec -MissingIsNull
+        $bytes = Read-VenueFileBytesBounded -Path $result -TimeoutSec $ReadTimeoutSec -MissingIsNull -Clock $readClock -EndSec $ReadTimeoutSec
         if ($null -eq $bytes) { return $unknown }
         $got =[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
         if (-not [string]::Equals($got, $want, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = "result.json does not match the receipt's evidence.resultJsonSha256"; return $unknown }

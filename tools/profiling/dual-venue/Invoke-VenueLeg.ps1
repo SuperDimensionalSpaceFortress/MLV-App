@@ -202,7 +202,9 @@ if ($null -ne $setPlan) {
             # r6 (adversary-de8e3799.json A4): read the receipt bytes ONCE; the figures come from them and the host-load read is bound to their sha256
             try { $legReceiptBytes = [IO.File]::ReadAllBytes($receiptPath); $legReceiptSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($legReceiptBytes)); $legReceipt = [IO.StreamReader]::new([IO.MemoryStream]::new($legReceiptBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { $legReceipt = $null; $legReceiptSha = '' }
             # (a receipt that is not the bytes the child wrote binds no host load: the read below gets '' and is unknown)
-            if (-not [string]::Equals($legReceiptSha, $childReceiptSha, [StringComparison]::OrdinalIgnoreCase)) { $legReceiptSha = '' }
+            # adversary-b3d61554.json A5: bytes that are not the ones the child published are not this leg's receipt at all (as the baseline refuses them in Get-RowFigures): no figures and no
+            # outcome are taken from them, so the row reads as a leg with no receipt, never the replacement's PASS and presented fps
+            if (-not [string]::Equals($legReceiptSha, $childReceiptSha, [StringComparison]::OrdinalIgnoreCase)) { $legReceiptSha = ''; $legReceipt = $null }
         }
         # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing, from its own hash-bound smoke result (the reader the lease batch and the chain
         # use); a provisional or unknown leg is printed as REFERENCE_PROVISIONAL, its row carries hostLoadState / hostLoadProvisional, and it is never measured.

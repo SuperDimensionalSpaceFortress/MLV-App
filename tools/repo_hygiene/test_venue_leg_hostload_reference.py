@@ -584,6 +584,14 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
                 "Write-Output ('B=' + $b.state + '/' + $b.provisional); Write-Output ('BMS=' + $bms); Write-Output ('BWHY=' + $b.reason); "
                 "& (Get-Module VenueChain) { $script:VenueTestFileReadDelayMs = 0 }; "
                 f"$c = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20; Write-Output ('C=' + $c.state + '/' + $c.provisional); "
+                # adversary-b3d61554.json A1: ONE budget across the two reads. Each read alone answers in 0.6 s (inside a 1 s bound), together they do not: the second is cut to what is
+                # left, so the standing is unknown; the same two reads under a 20 s budget are quiet. RED on b3d61554: each read got a fresh bound and the pair read quiet.
+                "& (Get-Module VenueChain) { $script:VenueTestFileReadDelayMs = 600 }; "
+                f"$d = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 1.0; Write-Output ('D=' + $d.state + '/' + $d.provisional); "
+                f"$e = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20; Write-Output ('E=' + $e.state + '/' + $e.provisional); "
+                # A11: a receipt that is not there names its leaf and the cause, never a null read
+                "& (Get-Module VenueChain) { $script:VenueTestFileReadDelayMs = 0 }; "
+                f"$f = Get-VenueLegHostLoad -ReceiptPath '{Path(d) / 'receipts' / 'CARD-1' / 'leg-x' / 'bachelor' / 'missing.json'}' -PlannedLegType 'playback' -ReadTimeoutSec 5; Write-Output ('FWHY=' + $f.reason); "
                 "Complete-VenueProcess -ExitCode 0; Write-Output 'NOT-REACHED-WHEN-A-READ-WAS-ABANDONED'")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
@@ -595,6 +603,10 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertIn("no time was left", got["BWHY"], p.stdout)
         self.assertLess(int(got["BMS"]), 1500, "a bound under 1 s must not start a read: " + p.stdout)
         self.assertEqual(got["C"], "quiet/False", "an unstalled read still reads its own standing: " + p.stdout)
+        self.assertEqual(got["D"], "unknown/True", "two reads that each fit the bound but not together must not both be granted a fresh one: " + p.stdout)
+        self.assertEqual(got["E"], "quiet/False", p.stdout)
+        self.assertIn("missing.json", got["FWHY"], p.stdout)
+        self.assertNotIn("HashData", got["FWHY"], "a failed receipt read names its leaf, not a null-argument error: " + p.stdout)
         self.assertNotIn("NOT-REACHED", p.stdout, "Complete-VenueProcess must end the process at once when a read was abandoned")
 
     def test_r2_a4_every_caller_bounds_the_read_and_the_batch_by_its_deadline(self) -> None:
@@ -611,6 +623,21 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         leg = (dv / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         self.assertIn("Get-VenuePlannedLegType, Complete-VenueProcess -DisableNameChecking -Force", leg)
         self.assertIn("Complete-VenueProcess -ExitCode 0   # a host-load read given up on", leg)
+
+    def test_r2_pass2_a5_a7_a13_the_matrix_refuses_a_replaced_receipt_the_planner_refuses_a_duplicated_legtype_the_verdict_keeps_a_list(self) -> None:
+        # adversary-b3d61554.json A5: the matrix drops the receipt whose bytes are not the ones the child published (as the baseline refuses them), so a replacement's outcome and
+        # fps are never attributed to the planned leg. A7: a spec that declares legType twice is planned 'unknown', never 'export'. A13: the GUI verdict helper never unrolls a
+        # one-element evidence list into its clean member.
+        dv = ROOT / "tools" / "profiling" / "dual-venue"
+        leg = (dv / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("{ $legReceiptSha = ''; $legReceipt = $null }", leg)
+        runner = (dv / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("$specLegTypeDeclarations = [regex]::Matches($specText, '\"legType\"\\s*:', [Text.RegularExpressions.RegexOptions]::IgnoreCase).Count", runner)
+        self.assertIn("if ($specLegTypeDeclarations -gt 1) { 'unknown' }", runner)
+        gui = (ROOT / "tools" / "profiling" / "compare-release-gui-smoke-ab.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("$legEvidence = if (", gui)
+        self.assertNotIn("$standing = if (", gui)
+        self.assertIn("$legEvidence -isnot [System.Collections.IList]", gui)
 
     def test_r2_a2_a_legacy_chain_row_without_a_published_sha_binds_no_host_load(self) -> None:
         # adversary-7efea617.json A2 (the legacy-row tail), its input: a chain row with no receiptSha256 member over a receipt and result.json replaced together. RED on
