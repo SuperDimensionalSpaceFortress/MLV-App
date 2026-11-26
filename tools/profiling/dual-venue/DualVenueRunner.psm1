@@ -5604,8 +5604,15 @@ function Get-DvRenderPipeMarkerState {
     param([AllowNull()][AllowEmptyString()][string]$Text, [ValidatePattern('\A[A-Za-z_][A-Za-z0-9_]*\z')][string]$Macro = 'MLV_STAGE_EXPORT_PIPE_WRITE')
     if ([string]::IsNullOrEmpty($Text)) { return 'undefined' }
     $code = [regex]::Replace($Text, '\\\r?\n', '')
-    $code = [regex]::Replace($code, '(?s)/\*.*?\*/', ' ')
-    $code = [regex]::Replace($code, '//[^\r\n]*', '')
+    # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 r4 fix 2, adversary 22d1a0a7 A2: comments are lexed in ONE left-to-right pass, as the C preprocessor does: a '/*' inside a
+    # line comment or a string opens nothing, so '// /*' and a later '// */' no longer erase the live define between them. A block comment becomes a space (newlines kept,
+    # so directive lines stay lines), a line comment is dropped, a string or character literal is kept as it is.)
+    $code = [regex]::Replace($code, '(?s)(?<s>"(?:\\.|[^"\\\r\n])*"|''(?:\\.|[^''\\\r\n])*'')|//[^\r\n]*|/\*.*?\*/', {
+            param($mm)
+            if ($mm.Groups['s'].Success) { return $mm.Value }
+            if ($mm.Value.StartsWith('//', [StringComparison]::Ordinal)) { return '' }
+            return ' ' + ([regex]::Replace($mm.Value, '[^\r\n]', ''))
+        })
     $directives = [System.Collections.Generic.List[object]]::new()
     foreach ($line in ($code -split '\r?\n')) {
         # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 r4 fix 1, adversary 25ae968d A5: '%:' is the C digraph of '#', so '%:define' is a directive too)
@@ -5852,6 +5859,18 @@ function Test-DvExportStageLogRecords {
         }
     }
     if ($repeats.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($repeats.Count) frame(s) carry another count of a once-per-frame stage than the producer notes per frame, so no one figure of it is that frame's (first: $($repeats[0]))") }
+    # (r4 fix 2, adversary 22d1a0a7 A3: the counts above are the render decode's; an earlier decode, which is never summed, is held to the same producer rule, so a
+    # start-up decode cannot carry an llrawproc run with no dual-ISO record (and so no marker). When the log carries any llrawproc_dual_iso record, every frame carries
+    # exactly one per llrawproc record over ALL its decodes.)
+    if ($dualRecs.Count -gt 0) {
+        $allLlr = [hashtable]::new([StringComparer]::Ordinal); $allDual = [hashtable]::new([StringComparer]::Ordinal)
+        foreach ($t in $tabled) {
+            if ($t.stage -ceq 'llrawproc') { $allLlr[$t.frame] = 1 + $(if ($allLlr.ContainsKey($t.frame)) { $allLlr[$t.frame] } else { 0 }) }
+            elseif ($t.stage -ceq 'llrawproc_dual_iso') { $allDual[$t.frame] = 1 + $(if ($allDual.ContainsKey($t.frame)) { $allDual[$t.frame] } else { 0 }) }
+        }
+        $runGap = @($allLlr.Keys | Where-Object { -not $allDual.ContainsKey($_) -or $allDual[$_] -ne $allLlr[$_] } | Sort-Object { [int64]$_ })
+        if ($runGap.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($runGap.Count) frame(s) carry an llrawproc run with no llrawproc_dual_iso record of its own over all their decodes (video_mlv.c notes one after each llrawproc note) (first: frame $($runGap[0]) has $($allLlr[$runGap[0]]) llrawproc and $(if ($allDual.ContainsKey($runGap[0])) { $allDual[$runGap[0]] } else { 0 }) llrawproc_dual_iso record(s))") }
+    }
     # r2 (adversary A4 on a6f48506): per-frame SUMS lose the pairing (llrawproc 0 / dual-ISO 30 then llrawproc 31 / dual-ISO 0 summed to 31 / 30 and read every frame active). On a frame that
     # carries llrawproc, each dual-ISO record is the record right after an llrawproc record of that frame and fits inside that one run (the containment slack, in [decimal]); with the
     # per-frame counts above, every llrawproc run then has its own dual-ISO figure. (A frame with no llrawproc at all keeps the r1 rule: its dual-ISO leaf stands in for it in the sum groups.)

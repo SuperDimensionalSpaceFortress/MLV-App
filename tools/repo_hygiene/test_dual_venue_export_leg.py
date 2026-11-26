@@ -4817,6 +4817,33 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got, {"pipe": "older", "signal": "emits"})
 
+    # ---- r4 fix iteration 2: adversary 22d1a0a7 (adversary-22d1a0a7.json) A2, A3 (A1 is OPEN: a producer render-decode marker, successor card)
+    def test_r4_22d1a0a7_a2_a_block_opener_inside_a_line_comment_opens_nothing(self) -> None:
+        """A2: '// /*' then a live #define then '// */' read the define as commented out (the block-comment pass ran before the line-comment pass). A string that holds
+        '/*' opens nothing either, and a real block comment still hides a define."""
+        cases = {"line_opener": ('#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n// /* text\n#define MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED "y"\n// */\n', "emits"),
+                 "string_opener": ('#define MLV_STAGE_EXPORT_PIPE_WRITE "/*"\n#define MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED "y"\n#define Z "*/"\n', "emits"),
+                 "real_block": ('#define MLV_STAGE_EXPORT_PIPE_WRITE "x"\n/*\n#define MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED "y"\n*/\n', "older")}
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            ids = {name: ExportRenderPipeTimingTests.header_commit(repo, text) for name, (text, _) in cases.items()}
+            lines = "".join(f"$o['{name}'] = & $m {{ param($r, $id) Get-DvRenderPipeBuildClass -BuildId $id -RepoRoot $r -Macro 'MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED' }} '{repo}' '{sha}'\n"
+                            for name, sha in ids.items())
+            proc, got = run_pwsh_json("$m = Get-Module DualVenueRunner\n$o = [ordered]@{}\n" + lines + "$o | ConvertTo-Json -Compress")
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got, {name: want for name, (_, want) in cases.items()})
+
+    def test_r4_22d1a0a7_a3_a_start_up_run_without_its_dual_iso_record_is_refused(self) -> None:
+        """A3: a bare raw_uint16 + llrawproc of frame 30 before a 24-frame cut (0..23) was exempted as a start-up decode and read PASS: an incomplete capture. Every
+        llrawproc run carries its own llrawproc_dual_iso record over all decodes of the frame; the real start-up prefix (whole runs) still reads PASS."""
+        bare = "[mlv-stage-timing] frame=30 stage=raw_uint16 ms=9.000\n[mlv-stage-timing] frame=30 stage=llrawproc ms=31.000\n"
+        proc, got = evidence_cases([self.r4_cut(0, 24, bare), self.r4_cut(0, 24, self.r4_prefix("m16-1456"))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "frame 30 has 1 llrawproc and 0 llrawproc_dual_iso" in p for p in got[0]["problems"]), got[0]["problems"])
+        self.assertEqual(got[1]["problems"], [], got[1])
+        self.assertEqual(got[1]["outcome"], "PASS", got[1])
+
 
 if __name__ == "__main__":
     unittest.main()
