@@ -2386,13 +2386,16 @@ class EnvelopePreemptR1ResidueTests(_Probe):
                            # adversary 1ce472bc A3: finite sides with an Infinity delta / deltaPercent
                            ("DELTA_INFINITE", "('{\"presentedFps\":{\"baseline\":24,\"candidate\":25,\"delta\":1e400,\"deltaPercent\":1e400}}' | ConvertFrom-Json)"),
                            ("DELTA_PERCENT_INFINITE", "('{\"presentedFps\":{\"baseline\":24,\"candidate\":25,\"delta\":1,\"deltaPercent\":-1e400}}' | ConvertFrom-Json)"),
-                           ("DELTA_TEXT", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 24; candidate = 25; delta = 'one' } }"),
+                           # adversary 698fffb1 A4: singleton arrays unrolled to the numbers inside them
+                           ("FPS_SINGLETON_ARRAY", "('{\"presentedFps\":{\"baseline\":[30],\"candidate\":[60],\"delta\":[30],\"deltaPercent\":[100]}}' | ConvertFrom-Json)"),
+                           ("DELTA_SINGLETON_ARRAY", "('{\"presentedFps\":{\"baseline\":30,\"candidate\":60,\"delta\":[30]}}' | ConvertFrom-Json)"),
+                           ("DELTA_TEXT","[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 24; candidate = 25; delta = 'one' } }"),
                            ("MEASURED_WITH_DELTA", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 24; candidate = 25; delta = 1; deltaPercent = 4.17 } }"),
                            ("MEASURED", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = 55.5 } }")):
             body += (f"$a = Get-ProofSpeedClaimAuthority -OverallStatus 'QUOTABLE_PASS' -PlaybackSpeedVerdict $pass -SpeedCompare ({cmp})\n"
                      f"Write-Host ('{label}=' + $a.speed + '|' + $a.speedRefusal)\n")
         out = dict(line.split("=", 1) for line in self.ok(body).split())
-        for label in ("EMPTY", "NULL", "STAGE_ONLY", "FPS_TEXT", "FPS_ONE_SIDE", "FPS_INFINITE", "DELTA_INFINITE", "DELTA_PERCENT_INFINITE", "DELTA_TEXT"):
+        for label in ("EMPTY", "NULL", "STAGE_ONLY", "FPS_TEXT", "FPS_ONE_SIDE", "FPS_INFINITE", "DELTA_INFINITE", "DELTA_PERCENT_INFINITE", "FPS_SINGLETON_ARRAY", "DELTA_SINGLETON_ARRAY", "DELTA_TEXT"):
             self.assertEqual(out[label], "False|presented-fps-not-measured", label)
         self.assertEqual(out["MEASURED"], "True|")
         self.assertEqual(out["MEASURED_WITH_DELTA"], "True|")
@@ -2404,7 +2407,7 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         repo = self.tmp / "repo"
         (repo / "tools" / "profiling").mkdir(parents=True)
         fake = repo / "tools" / "profiling" / "summarize-local-cuda-proof.ps1"
-        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Invoke-ProofSummarizer"])
+        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Get-RealFilePath", "Invoke-ProofSummarizer"])
         md, js = self.tmp / "proof-report.md", self.tmp / "proof-report.json"
         body = funcs + "\n"
         for label, fake_body in (("REFUSES", "exit 1\n"),
@@ -2432,7 +2435,7 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         repo = self.tmp / "repo"
         (repo / "tools" / "profiling").mkdir(parents=True)
         fake = repo / "tools" / "profiling" / "summarize-local-cuda-proof.ps1"
-        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Invoke-ProofSummarizer"])
+        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Get-RealFilePath", "Invoke-ProofSummarizer"])
         proof = self.tmp / "proof"
         proof.mkdir()
         summary, md, js, seen = proof / "summary.json", proof / "summary.md", proof / "summary-report.json", proof / "seen.txt"
@@ -2444,15 +2447,29 @@ class EnvelopePreemptR1ResidueTests(_Probe):
                  f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
                  f"Write-Host ('OWN=' + $res + '|' + [IO.File]::ReadAllText('{md}') + '|' + [IO.File]::ReadAllText('{js}') + '|' + [IO.File]::ReadAllText('{summary}'))\n"
                  f"Write-Host ('LEFT=' + @(Get-ChildItem -LiteralPath '{proof}' -Filter '*.tmp').Count)\n")
+        # adversary 698fffb1 A1: a junction (a symlink off Windows) in front of the report path must not hide that the .json report IS the input summary
+        real, link = self.tmp / "real", self.tmp / "link"
+        long_md, long_js = proof / (("x" * 218) + ".md"), proof / (("x" * 218) + ".json")
+        body += (f"$null = New-Item -ItemType Directory -Path '{real}'; [IO.File]::WriteAllText('{real / 'summary.json'}', 'input')\n"
+                 f"$itemType = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) {{ 'Junction' }} else {{ 'SymbolicLink' }}\n"
+                 f"$null = New-Item -ItemType $itemType -Path '{link}' -Target '{real}'\n"
+                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{real / 'summary.json'}' -MarkdownReport '{link / 'summary.md'}' -JsonReport '{link / 'summary.json'}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
+                 f"Write-Host ('LINK=' + $res + '|' + [IO.File]::ReadAllText('{real / 'summary.json'}'))\n"
+                 # adversary 698fffb1 A8: reports whose basenames are at the filesystem's limit (243 and 246 characters) still stage and publish
+                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{long_md}' -JsonReport '{long_js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
+                 f"Write-Host ('LONG=' + $res + '|' + (Test-Path -LiteralPath '{long_md}') + '|' + (Test-Path -LiteralPath '{long_js}'))\n")
         out = self.ok(body).split()
         self.assertEqual(out[0], 'ALIAS=THREW|{"input":true}|False')
         self.assertEqual(out[1], "OWN=OK|fresh|fresh|{\"input\":true}")
         self.assertEqual(out[2], "LEFT=0")
+        self.assertEqual(out[3], "LINK=THREW|input")
+        self.assertEqual(out[4], "LONG=OK|True|True")
         names = [line.strip() for line in seen.read_text(encoding="utf-8").splitlines() if line.strip()]
-        self.assertEqual(len(names), 2)
+        self.assertEqual(len(names), 4)
         for name, final in zip(names, (md, js)):
             self.assertNotEqual(Path(name), final)
-            self.assertRegex(Path(name).name, r"^" + re.escape(final.name) + r"\.[0-9a-f]{32}\.tmp$")
+            self.assertEqual(Path(name).parent, final.parent)
+            self.assertRegex(Path(name).name, r"^[0-9a-f]{32}\.(md|json)\.tmp$")
         packager = (PROFILING / "package-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
         self.assertIn("$pwshExe = Join-Path $PSHOME $pwshLeaf", packager)
 
@@ -2466,6 +2483,8 @@ class EnvelopePreemptR1ResidueTests(_Probe):
             "VERIFIED": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json' })"),
             "NO_CHECKS": ("0", "@()"),
             "OTHER_FILE": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'summary.json' })"),
+            # adversary 698fffb1 A3: PowerShell's -eq is case-insensitive, so PROOF-REPORT.JSON (another file on a case-sensitive filesystem) matched the lowercase report the importer read
+            "OTHER_CASE": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'PROOF-REPORT.JSON' })"),
             "HASH_WRONG": ("1", "@([pscustomobject]@{ ok = $false; relativePath = 'proof-report.json' })"),
             "FAILED_IMPORT": ("1", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json' })"),
         }
@@ -2474,7 +2493,7 @@ class EnvelopePreemptR1ResidueTests(_Probe):
             body += (f"$failures = [System.Collections.Generic.List[string]]::new(); if ({failures} -gt 0) {{ $failures.Add('x') }}\n"
                      f"$fileChecks = {checks}\n{line}\nWrite-Host ('{label}=' + $speedHashBound)\n")
         out = dict(item.split("=", 1) for item in self.ok(body).split())
-        self.assertEqual(out, {"VERIFIED": "True", "NO_CHECKS": "False", "OTHER_FILE": "False", "HASH_WRONG": "False", "FAILED_IMPORT": "False"})
+        self.assertEqual(out, {"VERIFIED": "True", "NO_CHECKS": "False", "OTHER_FILE": "False", "OTHER_CASE": "False", "HASH_WRONG": "False", "FAILED_IMPORT": "False"})
 
     def test_p2_a5_the_packager_launches_its_summarizer_by_a_path_and_a_name_that_exist_on_linux(self) -> None:
         # hosted run 45786756378 (ubuntu shard 3/4): Invoke-ProofSummarizer joined "tools\profiling\summarize-local-cuda-proof.ps1" (one file name on Linux, so "Proof summarizer not
@@ -2499,7 +2518,7 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         self.assertLess(source.index(declared), source.index("for ($i = 0; $i -lt $rawItems.Count; $i++) {"))
         # adversary 1ce472bc A5: only the scalar string 'fps-ab' lets the arm decide; stage-attribution and a bad declared purpose reach their own refusals
         armDecides = ("$armDecides = $planPurposeDeclared -and ($doc.PSObject.Properties['purpose'].Value -is [string]) "
-                      "-and ([string]$doc.PSObject.Properties['purpose'].Value -ceq 'fps-ab')")
+                      "-and [string]::Equals([string]$doc.PSObject.Properties['purpose'].Value, 'fps-ab', [StringComparison]::Ordinal)")
         self.assertEqual(source.count(armDecides), 1)
         self.assertLess(source.index(armDecides), source.index("for ($i = 0; $i -lt $rawItems.Count; $i++) {"))
         self.assertIn("if ($armRead.readTimedOut -and $armDecides) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n ", source)

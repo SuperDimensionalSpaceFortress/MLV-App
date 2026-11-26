@@ -98,6 +98,30 @@ function Get-GitStatusLines {
     @(& git -C $Repo status --short --branch 2>$null | ForEach-Object { [string]$_ })
 }
 
+function Get-RealFilePath {
+    # The absolute path of a file with the first symbolic link or directory junction on its way (the file itself or any ancestor) resolved, so two spellings of one file compare equal.
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    $below = [System.Collections.Generic.List[string]]::new()
+    $current = $full
+    while ($true) {
+        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
+        if ($null -ne $item -and $null -ne $item.LinkTarget) {
+            $target = $item.ResolveLinkTarget($true)
+            if ($null -ne $target) {
+                $resolved = $target.FullName
+                for ($k = $below.Count - 1; $k -ge 0; $k--) { $resolved = Join-Path $resolved $below[$k] }
+                return [IO.Path]::GetFullPath($resolved)
+            }
+        }
+        $parent = [IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrEmpty($parent) -or $parent -eq $current) { break }
+        $below.Add([IO.Path]::GetFileName($current))
+        $current = $parent
+    }
+    $full
+}
+
 function Invoke-ProofSummarizer {
     param(
         [Parameter(Mandatory = $true)][string]$Repo,
@@ -119,9 +143,10 @@ function Invoke-ProofSummarizer {
     # (adversary 1ce472bc A1: a report path that is the input summary (a -ReportPath named like the summary, whose .json twin is the summary) or the other report would be deleted by the
     # cleanup below or overwritten by a child, so it is refused before anything is removed; a directory given as a report path is refused for the same reason)
     $comparison = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
-    $summaryFull = [IO.Path]::GetFullPath($Summary)
-    $markdownFull = [IO.Path]::GetFullPath($MarkdownReport)
-    $jsonFull = [IO.Path]::GetFullPath($JsonReport)
+    # (adversary 698fffb1 A1: compared by REAL path, so a directory junction or symlink in front of a report path cannot hide that it is the input summary)
+    $summaryFull = Get-RealFilePath $Summary
+    $markdownFull = Get-RealFilePath $MarkdownReport
+    $jsonFull = Get-RealFilePath $JsonReport
     foreach ($candidate in @($markdownFull, $jsonFull)) {
         if ([string]::Equals($candidate, $summaryFull, $comparison)) {
             throw "Proof report path $candidate is the input summary; refusing before anything is removed."
@@ -142,9 +167,10 @@ function Invoke-ProofSummarizer {
     }
     # (adversary 1ce472bc A7: each child writes a name only this run knows, and the report is published from it, so a report another packager wrote at the same path between this run's two
     # children can never be taken as this run's own)
+    # (adversary 698fffb1 A8: the temp name is a fixed-length name in the report's own directory, never the report's basename plus a suffix, so a report basename at the filesystem's limit still works)
     $token = [guid]::NewGuid().ToString("N")
-    $markdownTemp = "$MarkdownReport.$token.tmp"
-    $jsonTemp = "$JsonReport.$token.tmp"
+    $markdownTemp = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($MarkdownReport))) "$token.md.tmp"
+    $jsonTemp = Join-Path ([IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($JsonReport))) "$token.json.tmp"
     try {
         & $pwshExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
             -File $summaryScript `

@@ -210,7 +210,7 @@ if ($StrictQuotable -and $proofReportStatus -ne "QUOTABLE_PASS") {
 }
 # adversary 1ce472bc A8: a speed claim is quotable only from a report this import verified: no failure, and a manifest hash check that passed for the very proof-report.json that was read
 # (a manifest with no files, or one that does not list it, verified nothing)
-$speedHashBound = ($failures.Count -eq 0) -and (@($fileChecks | Where-Object { [bool]$_.ok -and ([string]$_.relativePath -eq "proof-report.json") }).Count -eq 1)
+$speedHashBound = ($failures.Count -eq 0) -and (@($fileChecks | Where-Object { [bool]$_.ok -and [string]::Equals([string]$_.relativePath, "proof-report.json", [StringComparison]::Ordinal) }).Count -eq 1)
 $proofDiagnostics = if ($proofReport) { @($proofReport.diagnostics) } else { @() }
 $proofDiagnosticSummary = if ($proofReport) { $proofReport.diagnosticSummary } else { $null }
 $proofActionPlan = if ($proofReport) { $proofReport.actionPlan } else { $null }

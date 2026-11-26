@@ -1660,7 +1660,7 @@ if ($legPlanMode) {
         $planPurposeDeclared = ($doc -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $doc.PSObject.Properties['purpose'])
         # (adversary 1ce472bc A5: the arm decides only for the scalar string 'fps-ab'; a 'stage-attribution' plan accepts any arm, and a declared purpose that is not a known scalar is BAD_PURPOSE, judged below
         # and never pre-empted by a stalled arm read)
-        $armDecides = $planPurposeDeclared -and ($doc.PSObject.Properties['purpose'].Value -is [string]) -and ([string]$doc.PSObject.Properties['purpose'].Value -ceq 'fps-ab')
+        $armDecides = $planPurposeDeclared -and ($doc.PSObject.Properties['purpose'].Value -is [string]) -and [string]::Equals([string]$doc.PSObject.Properties['purpose'].Value, 'fps-ab', [StringComparison]::Ordinal)
         $items = [System.Collections.Generic.List[object]]::new()
         for ($i = 0; $i -lt $rawItems.Count; $i++) {
             $it = $rawItems[$i]; $n = $i + 1

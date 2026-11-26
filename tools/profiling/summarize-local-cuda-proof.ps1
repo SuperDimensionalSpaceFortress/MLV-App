@@ -265,11 +265,13 @@ function Get-ProofSpeedClaimAuthority {
     $presentedFps = Get-Field $SpeedCompare "presentedFps"
     # (adversary 0e9672e5 A1: and FINITE; valid JSON 1e400 parses to +Infinity, which is no measurement)
     $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long]) -and [double]::IsFinite([double]$v) }
-    $fpsMeasured = ($null -ne $presentedFps) -and (& $isNumber (Get-Field $presentedFps "baseline")) -and (& $isNumber (Get-Field $presentedFps "candidate"))
+    # (adversary 698fffb1 A4: a leaf is read WHOLE, never through Get-Field's pipeline output, which unrolls a singleton array [30] into the number 30)
+    $leaf = { param($o, $n) if ($o -is [System.Collections.IDictionary]) { if ($o.Contains($n)) { , $o[$n] } else { $null } } elseif ($null -ne $o -and $null -ne $o.PSObject.Properties[$n]) { , $o.PSObject.Properties[$n].Value } else { $null } }
+    $fpsMeasured = ($null -ne $presentedFps) -and (& $isNumber (& $leaf $presentedFps "baseline")) -and (& $isNumber (& $leaf $presentedFps "candidate"))
     # (adversary 1ce472bc A3: the pair's published delta and deltaPercent are part of the measurement; a present one that is not a finite number (1e400 parses to Infinity) is no measurement either)
     if ($fpsMeasured) {
         foreach ($deltaName in @("delta", "deltaPercent")) {
-            $deltaValue = Get-Field $presentedFps $deltaName
+            $deltaValue = & $leaf $presentedFps $deltaName
             if ($null -ne $deltaValue -and -not (& $isNumber $deltaValue)) { $fpsMeasured = $false }
         }
     }
