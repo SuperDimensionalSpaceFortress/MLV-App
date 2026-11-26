@@ -20240,7 +20240,8 @@ class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
         # r4 (adversary A2 on 2e941c3a) appended the four r4 tail-credit inputs (paint_wait_escapes and the visual-capture begin binding)
         self.assertEqual(out["list"], ["conformRepeats", "conformPresented", "conformConflictingFields", "summaryConflictingFields",
                                        "prepReplacedBefore", "prepReplacedAfter", "prepStaleDrops", "prepGenerationDrops",
-                                       "conformPaintWaitEscapes", "visualCaptureBeginSession", "visualCaptureBeginUtc", "visualCaptureClipChanged"], out)
+                                       "conformPaintWaitEscapes", "visualCaptureBeginSession", "visualCaptureBeginUtc", "visualCaptureClipChanged",
+                                       "visualTailPrepDrops"], out)
         self.assertEqual((out["a"], out["b"], out["c"]), ("NOT_MEASURED", "NOT_MEASURED", "PASS"), out)
         # r4 (sol r3 finding 3): the comparison moved into Get-DvStoredPlaybackFieldProblems, which finds a stored field by any casing; the
         # behaviour is pinned by test_r3_sol_b3_a_case_variant_stored_field_is_refused_never_skipped
@@ -20363,7 +20364,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
     PB = {"conformLinePresent": True, "summarySession": "1", "conformSession": "1", "conformSourceFps": 11.906, "conformMaxJump": 1, "conformAudioSyncRequests": 0,
           "conformRepeats": 0, "conformPresented": 477, "sourceAdvanced": 480, "conformSourceAdvanced": 476, "conformFirstFrame": 1, "conformLastFrame": 477,
           "conformEngineTarget": 479, "conformBackward": 0, "prepReplacedBefore": 0, "prepReplacedAfter": 0, "prepStaleDrops": 0, "prepGenerationDrops": 0,
-          "conformPaintWaitEscapes": 0, "visualCaptureBeginSession": "1", "visualCaptureBeginUtc": BEGIN_UTC, "visualCaptureClipChanged": 0}
+          "conformPaintWaitEscapes": 0, "visualCaptureBeginSession": "1", "visualCaptureBeginUtc": BEGIN_UTC, "visualCaptureClipChanged": 0, "visualTailPrepDrops": 0}
     LEG = "m16-1243-everyframe-visual-unpaced-fullscreen-s1"
 
     @staticmethod
@@ -20764,15 +20765,15 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         with self.subTest(case="a kind and index recorded twice is ambiguous"):
             proc, res = run_pwsh_json(
                 "$d = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N')); $v = Join-Path $d 'visual'; [void](New-Item -ItemType Directory -Path $v)\n"
-                "$png = [Convert]::FromBase64String($env:DVE_PNG); [IO.File]::WriteAllBytes((Join-Path $v ($env:DVE_LEG + '-play-0.png')), $png)\n"
+                "$png = [Convert]::FromBase64String($env:DVE_PNG); [IO.File]::WriteAllBytes((Join-Path $v ($env:DVE_LEG + '-play-unbound-0.png')), $png)\n"
                 "$json = [Text.Encoding]::UTF8.GetBytes($env:DVE_APP); [IO.File]::WriteAllBytes((Join-Path $v 'app-visual.json'), $json)\n"
                 "$sha = Get-DvSha256OfBytes $png\n"
-                "$rec = @([pscustomobject]@{ kind = 'play'; index = 0; sha256 = $sha }, [pscustomobject]@{ kind = 'play'; index = 0; sha256 = $sha })\n"
+                "$rec = @([pscustomobject]@{ kind = 'play_unbound'; index = 0; sha256 = $sha }, [pscustomobject]@{ kind = 'play_unbound'; index = 0; sha256 = $sha })\n"
                 "$vis = Get-DvTailVisualEvidence -EvidenceDir $d -LegId $env:DVE_LEG -ExpectedSha256 (Get-DvSha256OfBytes $json) -RecordedFrames $rec\n"
                 "$one = Get-DvTailVisualEvidence -EvidenceDir $d -LegId $env:DVE_LEG -ExpectedSha256 (Get-DvSha256OfBytes $json) -RecordedFrames @($rec[0])\n"
                 "Remove-Item -LiteralPath $d -Recurse -Force\n"
                 "[ordered]@{ twice = $vis.frames[0].pngSha256; once = $one.frames[0].pngSha256 } | ConvertTo-Json -Compress",
-                DVE_PNG=__import__("base64").b64encode(self.png_bytes(0)).decode(), DVE_LEG=self.LEG, DVE_APP=json.dumps(self.app_json(self.play(0, kind="play"))))
+                DVE_PNG=__import__("base64").b64encode(self.png_bytes(0)).decode(), DVE_LEG=self.LEG, DVE_APP=json.dumps(self.app_json(self.play(0))))
             self.assertIsNotNone(res, proc.stdout + proc.stderr)
             self.assertIsNone(res["twice"], res)
             self.assertEqual(res["once"], hashlib.sha256(self.png_bytes(0)).hexdigest(), res)
@@ -20851,7 +20852,12 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                  "the clip changed during the tail": ({"visualCaptureClipChanged": 1}, self.app_json(self.play(0)), "TAIL_VISUAL_NOT_THIS_RUN"),
                  "the clip-changed count is unreadable": ({"visualCaptureClipChanged": None}, self.app_json(self.play(0)), "TAIL_VISUAL_NOT_THIS_RUN"),
                  "the capture carries no source_id": ({}, self.app_json(self.play(0, source_id=None)), "no play capture"),
-                 "the source_id is not the app's 16-hex form": ({}, self.app_json(self.play(0, source_id="1DF")), "no play capture")}
+                 "the source_id is not the app's 16-hex form": ({}, self.app_json(self.play(0, source_id="1DF")), "no play capture"),
+                 # r4 fix 2 (A6 on b6c53917): `$` matched before a final newline; the anchor is \z
+                 "the source_id carries a trailing newline": ({}, self.app_json(self.play(0, source_id="00000000000001df\n")), "no play capture"),
+                 # r4 fix 2 (A7 on b6c53917): a drop logged during the tail
+                 "a prepared result dropped during the tail": ({"visualTailPrepDrops": 1}, self.app_json(self.play(0)), "TAIL_CREDIT_PREP_DROPPED"),
+                 "the tail drop count is unreadable": ({"visualTailPrepDrops": None}, self.app_json(self.play(0)), "TAIL_CREDIT_PREP_DROPPED")}
         for name, (pb, app, why) in cases.items():
             with self.subTest(case=name):
                 out = self.metrics({**self.HELD, **pb}, app=app, criteria=self.BOTH)
@@ -20864,8 +20870,14 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         summary = conformed_summary_line()
         conform = ("playback_smoke.conform session=3 clip_fps=23.976 playback_fps=23.976 conform_active=0 conform_enabled=1 conform_env_override=0 "
                    "audio_sync_requests=0 paint_wait_escapes=2")
-        begin = "gui_smoke.visual_capture.begin measured_session=3 tail_ms=3000 play_frames=6 tail_begin_utc=2026-11-25T18:00:00.000Z"
-        clip = "gui_smoke.visual_capture.clip_changed refused_play_captures=1 capture_generation=4"
+        # r4 fix 2 (A1 on b6c53917): the app's own framing (logInteractionEvent: `interaction_trace event=<name>` and a Qt location suffix)
+        pre = "[2026-11-25T18:00:00.000Z] [INFO] [0xa] interaction_trace event="
+        loc = " (C:/build/platform/qt/MainWindow.cpp:1437)"
+        begin = pre + "gui_smoke.visual_capture.begin measured_session=3 tail_ms=3000 play_frames=6 tail_begin_utc=2026-11-25T18:00:00.000Z" + loc
+        clip = pre + "gui_smoke.visual_capture.clip_changed refused_play_captures=1 capture_generation=4" + loc
+        drop = pre + ("playback_prep.invalidate_generation reason=resize-keep-playing new_generation=4 dropped_pending=1 dropped_results=0 released_serials=0 "
+                      "cancelled_render=0 latest_serial=483 still_drawing=0") + loc
+        nodrop = drop.replace("dropped_pending=1", "dropped_pending=0")
 
         def derive(lines: list[str]) -> dict:
             log = "\n".join(lines) + "\n"
@@ -20875,17 +20887,24 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
                 "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
                 "$pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $env:DVE_LOG -LogSha256 $env:DVE_SHA -ExpectedClipId $env:DVE_CLIP\n"
-                "[ordered]@{ s = $pb.visualCaptureBeginSession; u = $pb.visualCaptureBeginUtc; c = $pb.visualCaptureClipChanged; e = $pb.conformPaintWaitEscapes } | ConvertTo-Json -Compress",
+                "[ordered]@{ s = $pb.visualCaptureBeginSession; u = $pb.visualCaptureBeginUtc; c = $pb.visualCaptureClipChanged; e = $pb.conformPaintWaitEscapes; d = $pb.visualTailPrepDrops } | ConvertTo-Json -Compress",
                 DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP="M16-1243")
             self.assertIsNotNone(out, proc.stdout + proc.stderr)
             return out
 
-        self.assertEqual(derive(["playback_smoke.measured_session id=3", conform, summary, begin]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 0, "e": 2})
-        self.assertEqual(derive(["playback_smoke.measured_session id=3", conform, summary, begin, clip]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 1, "e": 2})
-        two = derive(["playback_smoke.measured_session id=3", conform, summary, begin, begin.replace("18:00", "17:00")])
+        ms = "playback_smoke.measured_session id=3"
+        self.assertEqual(derive([ms, conform, summary, begin]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 0, "e": 2, "d": 0})
+        self.assertEqual(derive([ms, conform, summary, begin, clip]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 1, "e": 2, "d": 0})
+        # a drop before the begin record is the measured session's (its summary counters carry it); one after it is a tail drop
+        self.assertEqual(derive([ms, conform, summary, drop, begin, nodrop])["d"], 0)
+        self.assertEqual(derive([ms, conform, summary, begin, drop])["d"], 1)
+        two = derive([ms, conform, summary, begin, begin.replace("18:00", "17:00")])
         self.assertEqual((two["s"], two["u"]), (None, None), two)
-        none = derive(["playback_smoke.measured_session id=3", conform.replace(" paint_wait_escapes=2", ""), summary])
-        self.assertEqual(none, {"s": None, "u": None, "c": 0, "e": None})
+        none = derive([ms, conform.replace(" paint_wait_escapes=2", ""), summary])
+        self.assertEqual(none, {"s": None, "u": None, "c": 0, "e": None, "d": 0})
+        # a bare marker without the formatter's `interaction_trace event=` is not the app's record
+        bare = derive([ms, conform, summary, begin.replace("interaction_trace event=", "")])
+        self.assertEqual((bare["s"], bare["u"]), (None, None), bare)
 
     def test_r4_pass2_a2_the_r4_playback_fields_are_compared_when_stored(self) -> None:
         """r4 adversary pass on 2e941c3a, A2, its input: Derived {conformPaintWaitEscapes 1, visualCaptureBeginSession '3', visualCaptureBeginUtc
@@ -20895,8 +20914,13 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             "$d = [pscustomobject]@{ conformPaintWaitEscapes = 1; visualCaptureBeginSession = '3'; visualCaptureBeginUtc = '2026-11-25T18:00:00.000Z'; visualCaptureClipChanged = 1 }\n"
             "$s = [pscustomobject]@{ conformPaintWaitEscapes = 0; visualCaptureBeginSession = '999'; visualCaptureBeginUtc = '2000-01-01T00:00:00.000Z'; visualCaptureClipChanged = 0 }\n"
             "$same = '{\"conformPaintWaitEscapes\":1,\"visualCaptureBeginSession\":\"3\",\"visualCaptureBeginUtc\":\"2026-11-25T18:00:00.000Z\",\"visualCaptureClipChanged\":1}' | ConvertFrom-Json\n"
-            "[ordered]@{ lie = @(Get-DvStoredPlaybackFieldProblems -Stored $s -Derived $d); same = @(Get-DvStoredPlaybackFieldProblems -Stored $same -Derived $d) } | ConvertTo-Json -Compress -Depth 3")
+            # r4 fix 2 (A5 on b6c53917): a NUL-suffixed session and an integer the double comparison collapses are lies too
+            "$d2 = [pscustomobject]@{ conformPaintWaitEscapes = [int64]9007199254740992; visualCaptureBeginSession = '3' }\n"
+            "$s2 = [pscustomobject]@{ conformPaintWaitEscapes = [int64]9007199254740993; visualCaptureBeginSession = ('3' + [char]0) }\n"
+            "[ordered]@{ lie = @(Get-DvStoredPlaybackFieldProblems -Stored $s -Derived $d); same = @(Get-DvStoredPlaybackFieldProblems -Stored $same -Derived $d)"
+            "; exact = @(Get-DvStoredPlaybackFieldProblems -Stored $s2 -Derived $d2) } | ConvertTo-Json -Compress -Depth 3")
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(sorted(p.split(" ")[1] for p in out["exact"]), ["playback.conformPaintWaitEscapes", "playback.visualCaptureBeginSession"], out)
         self.assertEqual(sorted(p.split(" ")[1] for p in out["lie"]), ["playback.conformPaintWaitEscapes", "playback.visualCaptureBeginSession",
                                                                        "playback.visualCaptureBeginUtc", "playback.visualCaptureClipChanged"], out)
         self.assertEqual(out["same"], [], out)
@@ -20914,10 +20938,9 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 out = self.metrics(app=self.app_json(*rows), criteria=self.BOTH)
                 self.assert_no_credit(out, 2)
                 self.assertIn("TAIL_VISUAL_FILE_AMBIGUOUS", out["m"]["conformTailInFlightCreditNote"], out)
-        # the sibling (:4690): the collector copies a row's PNG only when the row names the app's own file for its kind and index
+        # r4 fix 2 (A2 on b6c53917): the collector does NOT skip such rows (skipping unforced rows let the freeze gate fall back to forced ones); OPEN sibling
         mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
-        collector = mod[mod.index("foreach ($f in @($appFrames)) {"):mod.index("$src = Join-Path $share $file")]
-        self.assertIn("if (-not [string]::Equals($file, $ownFile, [StringComparison]::Ordinal)) { continue }", collector)
+        self.assertNotIn("$ownFile", mod[mod.index("foreach ($f in @($appFrames)) {"):mod.index("$src = Join-Path $share $file")])
 
     def test_r4_a5_captures_out_of_paint_order_are_never_credited(self) -> None:
         """A5, its input: two in flight (last 477, target 479); index 0 shows 479 at 126 ms serial 484, index 1 shows 478 at 376 ms serial 485 (a backward
@@ -20987,6 +21010,20 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 self.assertFalse(res["isNull"], res)
                 self.assertIn("TAIL_VISUAL_UNREADABLE", res["refused"], res)
                 self.assertTrue(res["path"].endswith(target), res)
+        with self.subTest(case="r4 fix 2 (A3 on b6c53917): a locked FORCED play PNG cannot supply credit, so it is never read"):
+            forced_app = json.dumps(self.app_json(self.play(0, kind="play"))).encode("utf-8")
+            proc, res = run_pwsh_json(
+                "$d = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString('N')); $v = Join-Path $d 'visual'; [void](New-Item -ItemType Directory -Path $v)\n"
+                "$png = [Convert]::FromBase64String($env:DVE_PNG); [IO.File]::WriteAllBytes((Join-Path $v ($env:DVE_LEG + '-play-0.png')), $png)\n"
+                "$json = [Convert]::FromBase64String($env:DVE_APP); [IO.File]::WriteAllBytes((Join-Path $v 'app-visual.json'), $json)\n"
+                "$rec = @([pscustomobject]@{ kind = 'play'; index = 0; sha256 = (Get-DvSha256OfBytes $png) })\n"
+                "$hold = [IO.File]::Open((Join-Path $v ($env:DVE_LEG + '-play-0.png')), [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)\n"
+                "try { $vis = Get-DvTailVisualEvidence -EvidenceDir $d -LegId $env:DVE_LEG -ExpectedSha256 (Get-DvSha256OfBytes $json) -RecordedFrames $rec } finally { $hold.Dispose() }\n"
+                "Remove-Item -LiteralPath $d -Recurse -Force\n"
+                "[ordered]@{ isNull = ($null -eq $vis); refused = [string]$vis.refused } | ConvertTo-Json -Compress",
+                DVE_PNG=__import__("base64").b64encode(png).decode(), DVE_APP=__import__("base64").b64encode(forced_app).decode(), DVE_LEG=self.LEG)
+            self.assertIsNotNone(res, proc.stdout + proc.stderr)
+            self.assertEqual(res, {"isNull": False, "refused": ""}, res)
         mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         validator = mod[mod.index("$tailVisual = Get-DvTailVisualEvidence"):mod.index("$validatorCriteriaMetrics = Get-DvCriteriaMetrics")]
         self.assertIn("throw \"DVE_TAIL_VISUAL_UNREADABLE the post-close tail evidence '$tailUnreadable' could not be re-read", validator)

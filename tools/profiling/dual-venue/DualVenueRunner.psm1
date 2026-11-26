@@ -1436,11 +1436,21 @@ function Get-DvVisualCaptureBeginRecord {
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     $begin = [System.Collections.Generic.List[string]]::new()
     $clipChanged = 0L
+    $tailDrops = 0L
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $bodies = Get-DvLogRecordBodies -LogText $LogText   # (assigned, never @()-wrapped: it returns `, $array`, as Get-DvSmokeSummaryFields reads it)
+        # r4 adversary fix 2 (A1 on b6c53917): the app writes these through its interaction formatter (MainWindow.cpp logInteractionEvent), so the record body is
+        # `interaction_trace event=<name> ...`, the form the visual-state reader already selects
         foreach ($line in $bodies) {
-            if ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'gui_smoke\.visual_capture\.begin(\s|$)'), $script:DvCi)) { $begin.Add([string]$line) }
-            elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'gui_smoke\.visual_capture\.clip_changed(\s|$)'), $script:DvCi)) { $clipChanged++ }
+            if ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture\.begin(\s|$)'), $script:DvCi)) { $begin.Add([string]$line) }
+            elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture\.clip_changed(\s|$)'), $script:DvCi)) { $clipChanged++ }
+            elseif ($begin.Count -gt 0 -and [regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=playback_prep\.invalidate_generation(\s|$)'), $script:DvCi)) {
+                # r4 adversary fix 2 (A7 on b6c53917): a prepared result dropped AFTER the measured close (a resize during the tail) is logged after the summary,
+                # so its counters never reach the summary's prep_* fields; any such drop (or an unreadable count) after the begin record refuses the credit
+                $drop = ConvertFrom-DvRecordKeyValues -Record ([string]$line)
+                $pending = ConvertTo-DvInt64 $drop.fields['dropped_pending']; $results = ConvertTo-DvInt64 $drop.fields['dropped_results']
+                if ($null -eq $pending -or $null -eq $results -or $pending -ne 0 -or $results -ne 0) { $tailDrops++ }
+            }
         }
     }
     $session = $null; $utc = $null
@@ -1451,7 +1461,7 @@ function Get-DvVisualCaptureBeginRecord {
             if ($s -cmatch '^[0-9]+$' -and $u -ne '') { $session = $s; $utc = $u }
         }
     }
-    [pscustomobject]@{ session = $session; tailBeginUtc = $utc; clipChanged = $clipChanged }
+    [pscustomobject]@{ session = $session; tailBeginUtc = $utc; clipChanged = $clipChanged; tailPrepDrops = $tailDrops }
 }
 
 function Get-DvPlaybackEvidence {
@@ -1537,6 +1547,7 @@ function Get-DvPlaybackEvidence {
         visualCaptureBeginSession = $visualBegin.session
         visualCaptureBeginUtc = $visualBegin.tailBeginUtc
         visualCaptureClipChanged = $visualBegin.clipChanged
+        visualTailPrepDrops = $visualBegin.tailPrepDrops
         # r2 (sol r1 B2): the keys the measured conform line / summary line carry more than once with different values (left out above, so absent);
         # Get-DvCriteriaMetrics names them in its CouldNotCheck reasons and Get-DvPlaybackProblems refuses a summary that carries one.
         conformConflictingFields = @($conformConflicts)
@@ -3333,7 +3344,9 @@ $script:PlaybackComparedFields = @('sourceAdvanced', 'requiredSourceFrames', 'na
 # written before a field existed does not carry it and is not re-judged for it. The older conform fields are not compared (OPEN in PR #910).
 $script:PlaybackComparedFieldsWhenStored = @('conformRepeats', 'conformPresented', 'conformConflictingFields', 'summaryConflictingFields',
     'prepReplacedBefore', 'prepReplacedAfter', 'prepStaleDrops', 'prepGenerationDrops',   # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1: the tail-credit inputs
-    'conformPaintWaitEscapes', 'visualCaptureBeginSession', 'visualCaptureBeginUtc', 'visualCaptureClipChanged')   # r4 (adversary A2 on 2e941c3a): the r4 tail-credit inputs
+    'conformPaintWaitEscapes', 'visualCaptureBeginSession', 'visualCaptureBeginUtc', 'visualCaptureClipChanged', 'visualTailPrepDrops')   # r4 (adversary A2 on 2e941c3a): the r4 tail-credit inputs
+# r4 adversary fix 2 (A5 on b6c53917): the r4 fields compare EXACTLY (an integer as Int64, never through a double; a string ordinally, so "3" plus a NUL is not "3")
+$script:PlaybackComparedFieldsExact = @('conformPaintWaitEscapes', 'visualCaptureBeginSession', 'visualCaptureClipChanged', 'visualTailPrepDrops')
 
 function Get-DvStoredPlaybackFieldProblems {
     <#
@@ -3364,7 +3377,14 @@ function Get-DvStoredPlaybackFieldProblems {
             $storedValue = Get-DvProp $Stored $n; $derivedValue = Get-DvProp $Derived $f
             # r4: a receipt read back with ConvertFrom-Json holds an ISO time as a DateTime, so the begin time is compared as one round-trip UTC text
             if ($f -ceq 'visualCaptureBeginUtc') { $storedValue = ConvertTo-DvVisualUtcText $storedValue; $derivedValue = ConvertTo-DvVisualUtcText $derivedValue }
-            if (-not (Test-DvJsonEquivalent $storedValue $derivedValue)) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+            $same = $(if ($script:PlaybackComparedFieldsExact -ccontains $f -or $f -ceq 'visualCaptureBeginUtc') {
+                          $isInt = { param($x) ($x -is [int]) -or ($x -is [long]) }
+                          if ($null -eq $storedValue -or $null -eq $derivedValue) { $null -eq $storedValue -and $null -eq $derivedValue }
+                          elseif ((& $isInt $storedValue) -and (& $isInt $derivedValue)) { [int64]$storedValue -eq [int64]$derivedValue }
+                          elseif ($storedValue -is [string] -and $derivedValue -is [string]) { [string]::Equals($storedValue, $derivedValue, [StringComparison]::Ordinal) }
+                          else { $false }
+                      } else { Test-DvJsonEquivalent $storedValue $derivedValue })
+            if (-not $same) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
         }
     }
     # one string per problem on the pipeline (callers collect with @(...)); none when the stored block is sound
@@ -4723,10 +4743,6 @@ function Read-DvVisualCaptures {
         $kind = [string](Get-DvProp $f 'kind'); $index = [int](Get-DvProp $f 'index'); $file = [string](Get-DvProp $f 'file')
         if ($kind -cnotin @('play', 'play_unbound', 'stop_unbound', 'stop', 'paused_unbound', 'paused') -or $file -cnotmatch '^(play-\d+|play-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$') { continue }
         $isPlayKind = $kind -cin @('play', 'play_unbound')
-        # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r4 (adversary A3 on eabccd6c, sibling :4690): the file a row names is the app's own name for ITS kind and index
-        # (MainWindow.cpp), so a row naming another row's PNG (play-1.png on index 0, or a play row naming play-unbound-0.png) is not copied twice under two labels
-        $ownFile = $(if ($isPlayKind) { "$($kind.Replace('_', '-'))-$index.png" } else { "$($kind.Replace('_', '-')).png" })
-        if (-not [string]::Equals($file, $ownFile, [StringComparison]::Ordinal)) { continue }
         $legName = $(if ($isPlayKind) { "$LegId-$($kind.Replace('_', '-'))-$index.png" } else { "$LegId-$($kind.Replace('_', '-')).png" })
         $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null; viewportAvailable = $true
                              exposureLumaMean = $null; exposureNearBlackFraction = $null; exposureClippedFraction = $null; exposureLetterboxRowsDropped = $null
@@ -7707,7 +7723,8 @@ function Get-DvTailVisualEvidence {
             $tailOk = ($tail -is [int] -or $tail -is [long] -or $tail -is [double]) -and -not [double]::IsNaN([double]$tail) -and -not [double]::IsInfinity([double]$tail) -and [double]$tail -ge 0
             $png = Join-Path $dir "$LegId-$($kind.Replace('_', '-'))-$index.png"
             $pngSha = $null
-            if ((($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
+            # r4 adversary fix 2 (A3 on b6c53917): only a play_unbound PNG can supply credit, so only it is read (a locked forced play PNG is no tail evidence I/O)
+            if ([string]::Equals($kind, 'play_unbound', [StringComparison]::Ordinal) -and (($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
                 try { $pngBytes = [IO.File]::ReadAllBytes($png) } catch { return (& $unreadable $png $_) }   # r4 (A7): typed, never $null
                 $recordedSha = $null
                 [void]$recorded.TryGetValue("$kind|$([int64]$index)", [ref]$recordedSha)
@@ -7727,7 +7744,7 @@ function Get-DvTailVisualEvidence {
                                            displayFrame = $display; tailElapsedMs = $(if ($tailOk) { [double]$tail } else { $null }); pngSha256 = $pngSha; labelBound = $labelBound
                                            serial = $(if ($serialsOk) { [int64]$serial } else { $null })
                                            forcedPaintsBefore = $(if (($forced -is [int]) -or ($forced -is [long])) { [int64]$forced } else { $null })
-                                           sourceId = $(if ($sourceId -is [string] -and $sourceId -cmatch '^[0-9a-f]{16}$') { $sourceId } else { $null }) })
+                                           sourceId = $(if ($sourceId -is [string] -and $sourceId -cmatch '^[0-9a-f]{16}\z') { $sourceId } else { $null }) })
         }
         return [pscustomobject]@{ refused = $null; unreadablePath = $null; measuredSession = [string]$sessionNumber
                                   tailBeginUtc = $(if ($tailBegin -is [string] -or $tailBegin -is [datetime]) { ConvertTo-DvVisualUtcText $tailBegin } else { $null }); frames = @($frames) }
@@ -7792,6 +7809,9 @@ function Get-DvTailInFlightCredit {
     }
     $clipChanged = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'visualCaptureClipChanged') } else { $null })
     if ($null -eq $clipChanged -or $clipChanged -ne 0) { return (& $no "TAIL_VISUAL_NOT_THIS_RUN: the run log records the open clip changed during the visual tail (gui_smoke.visual_capture.clip_changed count=$clipChanged), so the tail may be another clip's") }
+    # r4 adversary fix 2 (A7 on b6c53917): a prepared result dropped during the tail (after the begin record) means the captured frame may be a reissue
+    $tailDrops = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'visualTailPrepDrops') } else { $null })
+    if ($null -eq $tailDrops -or $tailDrops -ne 0) { return (& $no "TAIL_CREDIT_PREP_DROPPED: the run log records $tailDrops playback_prep.invalidate_generation drop(s) after the visual-capture begin record (or no readable count), so a target the tail shows may be a reissue of a dropped one") }
     # r2 (fable r1 blocker, sol r1 findings 2, 4 and 5): each in-flight target (last painted + 1 .. Target) is credited only by a qualifying capture showing
     # EXACTLY that frame (a later frame proves nothing about it), and every such target shown is credited (478 at 126 ms and 479 at 376 ms are two).
     # r4 (adversary A1 on eabccd6c): a qualifying capture is UNFORCED (play_unbound: the app did not repaint before reading the label) and taken BEFORE any forced

@@ -213,7 +213,8 @@ the observer. A capture counts only when ALL hold: it is unforced (`play_unbound
 order (by `tail_elapsed_ms`, display frame and serial never decrease). The visual record is bound to this run: the hashed run log's
 one `gui_smoke.visual_capture.begin` record must carry the measured session and the same `tail_begin_utc` as visual.json, and the
 log carries no `gui_smoke.visual_capture.clip_changed` record. Any dropped or replaced prepared result (`prep_stale_drops`,
-`prep_generation_drops`, `prep_replaced_*` non-zero) or a non-zero or absent `paint_wait_escapes` refuses the credit. Typed
+`prep_generation_drops`, `prep_replaced_*` non-zero, or a `playback_prep.invalidate_generation` drop logged after the begin record)
+or a non-zero or absent `paint_wait_escapes` refuses the credit. Typed
 refusals: `TAIL_CREDIT_PREP_DROPPED`, `TAIL_CREDIT_PAINT_WAIT_ESCAPES`, `TAIL_VISUAL_NOT_THIS_RUN`, `TAIL_VISUAL_FILE_AMBIGUOUS`,
 `TAIL_CREDIT_PAINT_ORDER`, `TAIL_VISUAL_UNREADABLE` (the validator re-throws it as `DVE_EVIDENCE_VALIDATION_IO`). A credit the
 criteria were judged with must appear in the receipt's `outcomeDetail` (`OUTCOME_DETAIL_TAIL_CREDIT_ABSENT` otherwise). The
