@@ -1134,6 +1134,19 @@ class MatrixRowStrictPredicateTests(unittest.TestCase):
         baseline = (DV_DIR / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
         self.assertIn("hostLoadCollected = ($hl.collected -is [bool] -and $hl.collected)", baseline, "the baseline row keeps the standing's collected too")
 
+    def test_r3_a5_the_baselines_per_row_host_load_read_ends_at_the_runs_one_absolute_deadline(self) -> None:
+        # R2-NARROW-1 r3 (adversary-baf2e69a.json A5, Invoke-VenueBaseline.ps1:492), its input: MaxTotalSec 900, the CUDA chain returns clean at 885 s, and the per-row host-load read of its
+        # result.json stalls for 16 s. RED on 42b0c117: the read was a fresh default 20 s with no absolute end, so it ran to 902 s, past the run's cap, and the CPU chain was refused.
+        # The row read is the one thing the acceptance needs (the baseline counts a measured row only when its standing is quiet: a provisional or unknown row is never counted), so it stays;
+        # it now ends at the run's ONE deadline ($deadline, set once from MaxTotalSec): Get-VenueLegHostLoad -CallDeadlineUtc starts no read with under 1 s to that end (unknown,
+        # provisional, uncounted: the safe side), cuts the shared read budget to what is left of it and never acts on an answer seen after it (pinned in the tests above).
+        baseline = (DV_DIR / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
+        reads = [l for l in baseline.splitlines() if "Get-VenueLegHostLoad -ReceiptPath $hlReceipt" in l]
+        self.assertEqual(len(reads), 2, "both reading branches of the row's host-load standing: " + repr(reads))
+        for line in reads:
+            self.assertIn("-CallDeadlineUtc $deadline", line, "the row's host-load read is bounded by the run's absolute deadline: " + line)
+        self.assertEqual(baseline.count("$deadline = $startedUtc.AddSeconds($MaxTotalSec)"), 1, "the deadline is read once and never restarted")
+
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 class VenueChainImportResolvesTests(unittest.TestCase):

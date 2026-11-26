@@ -488,9 +488,11 @@ foreach ($b in $StandardBackends) {
             # default 20 s budget promoted such a row to quiet and counted it in measuredRows, so a row the chain refused reads unknown, provisional and uncollected: no read is made. A legacy row with neither member is unchanged.
             $chainRefusedHostLoad = ($leg.PSObject.Properties['class'] -and [string]::Equals([string]$leg.class, 'HOSTLOAD_PROVISIONAL', [StringComparison]::Ordinal)) -or
                 ($leg.PSObject.Properties['hostLoadProvisional'] -and -not ($leg.hostLoadProvisional -is [bool] -and -not $leg.hostLoadProvisional))
+            # R2-NARROW-1 r3 (adversary-baf2e69a.json A5): the two reading branches end at the run's ONE absolute deadline ($deadline, set once from MaxTotalSec): a row read cannot run on a fresh 20 s past the cap.
+            # Under 1 s to it nothing is read (unknown, provisional, uncounted: the safe side).
             $hl = $(if ($figRefused -or $chainRefusedHostLoad) { Get-VenueLegHostLoad -ReceiptPath '' -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' }
-                    elseif ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned -ExpectReceiptSha256 $hlExpectSha }
-                    else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' })
+                    elseif ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned -ExpectReceiptSha256 $hlExpectSha -CallDeadlineUtc $deadline }
+                    else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' -CallDeadlineUtc $deadline })
             $hlLine = Get-VenueReferenceHostLoadRefusal -LegId $(if ($hlReceipt) { [IO.Path]::GetFileNameWithoutExtension($hlReceipt) } else { [string]$planLeg.legId }) -Standing $hl
             if ($hlLine -and $legStatus -ceq 'RAN') { Out-Line $hlLine }
             $rows.Add([ordered]@{
