@@ -1346,7 +1346,9 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
                 ("zero-baseline", "0", "0", "baseline = 0; candidate = 0; delta = 0; deltaPercent = 0"),
                 ("sol-a1-legs-at-zero-compare-at-1e-7", "0", "0", "baseline = 0.0000001; candidate = 0.0000002; delta = 0.0000001; deltaPercent = 100"),
                 ("sol-a2-tie-with-a-one-micro-delta", "40", "40", "baseline = 40; candidate = 40; delta = -0.000001; deltaPercent = 0"),
-                ("sol-a2-percent-off-by-the-rounding-step", "40", "39.59976", "baseline = 40; candidate = 39.59976; delta = -0.40024; deltaPercent = -1")):
+                ("sol-a2-percent-off-by-the-rounding-step", "40", "39.59976", "baseline = 40; candidate = 39.59976; delta = -0.40024; deltaPercent = -1"),
+                ("sol2-a1-percent-off-by-the-rounding-step", "24", "23.759879", "baseline = 24; candidate = 23.759879; delta = -0.240121; deltaPercent = -1"),
+                ("sol2-a2-endpoints-near-the-legs", "50", "50", "baseline = 49.999975; candidate = 50.000025; delta = 0.00005; deltaPercent = 0")):
             text = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", candidate_fps=leg_cand, baseline_fps=leg_base, presented_compare=compare))
             self.assertIn("fps-verdict-refused:compare-not-judged-pair", text, label)
             self.assertNotIn("presented FPS: CPU", text, label)
@@ -2704,11 +2706,18 @@ class EnvelopePreemptR1ResidueTests(_Probe):
             "Write-Host ('sol-a2-percent=' + (T 40 39.59976 @{ baseline = 40; candidate = 39.59976; delta = -0.40024; deltaPercent = -1 }))\n"
             "Write-Host ('sol-a2-percent-producer-rounded=' + (T 40 39.59976 @{ baseline = 40; candidate = 39.59976; delta = -0.40024; deltaPercent = -1.001 }))\n"
             "Write-Host ('endpoint-off-by-ten-ppm=' + (T 40 40 @{ baseline = 40.0004; candidate = 40; delta = -0.0004; deltaPercent = -0.001 }))\n"
+            # sol 5add23cf A1: the producer's own formula gives -1.001 for 24 -> 23.759879 (a rounding step, not a tolerance, separates it from -1); a percent beside a 1e-7 baseline, which the producer never publishes
+            "Write-Host ('sol2-a1-percent=' + (T 24 23.759879 @{ baseline = 24; candidate = 23.759879; delta = -0.240121; deltaPercent = -1 }))\n"
+            "Write-Host ('sol2-a1-percent-producer=' + (T 24 23.759879 @{ baseline = 24; candidate = 23.759879; delta = -0.240121; deltaPercent = -1.001 }))\n"
+            "Write-Host ('sol2-a1-tiny-baseline=' + (T 0.0000001 0.0000002 @{ baseline = 0.0000001; candidate = 0.0000002; delta = 0; deltaPercent = 100 }))\n"
+            # sol 5add23cf A2: two legs at 50 fps, a compare whose endpoints are 49.999975 / 50.000025 (a tie published as a +0.00005 gain)
+            "Write-Host ('sol2-a2-tie=' + (T 50 50 @{ baseline = 49.999975; candidate = 50.000025; delta = 0.00005; deltaPercent = 0 }))\n"
         )
         got = dict(line.split("=", 1) for line in self.ok(body).split())
         self.assertEqual(got, {"adversary": "REFUSED", "rounded": "OK", "exact": "OK", "percent-only": "OK", "wrong-percent-only": "REFUSED", "wrong-delta-only": "REFUSED",
                                "inf-delta": "REFUSED", "text-percent": "REFUSED", "zero-baseline": "REFUSED", "negative-baseline": "REFUSED",
-                               "sol-a1": "REFUSED", "sol-a2-tie": "REFUSED", "sol-a2-percent": "REFUSED", "sol-a2-percent-producer-rounded": "OK", "endpoint-off-by-ten-ppm": "REFUSED"})
+                               "sol-a1": "REFUSED", "sol-a2-tie": "REFUSED", "sol-a2-percent": "REFUSED", "sol-a2-percent-producer-rounded": "OK", "endpoint-off-by-ten-ppm": "REFUSED",
+                               "sol2-a1-percent": "REFUSED", "sol2-a1-percent-producer": "OK", "sol2-a1-tiny-baseline": "REFUSED", "sol2-a2-tie": "REFUSED"})
 
     def test_r2_adversary_698fffb1_a2_a_packager_publishes_and_reads_only_its_own_reports(self) -> None:
         # adversary 698fffb1 A2: two packagers on one RunRoot share the final report names, so the packager re-read the published JSON and took another run's report as its own. It now keeps its own
