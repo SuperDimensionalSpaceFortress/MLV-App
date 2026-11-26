@@ -1713,10 +1713,7 @@ if ($legPlanMode) {
             # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: and the cached artifacts the manifest's digests name must exist and hash to them (the leg job throws on either after the lease opened)
             if ($st.artifactProblem) { $ap = $st.artifactProblem -split ' ', 2; Stop-PlanRefused $ap[0] $it.item "the staged build for ${short}: $($ap[1])" }
         }
-        # ENVELOPE-PREEMPT-RESIDUE-1 r1 (+ adversary r1 A1): the raw shape rules the parse-level read above deferred (r15 A1: an array under a receipt-envelope name; the depth-256 cap), run only
-        # after EVERY per-item refusal (the shape and field checks, the purpose check and each item's build-staging refusals), so each of those keeps its merge-base code and item number.
-        # Still before any claim or lease; a bare-array plan root is allowed (the reader above shape-checks its entries).
-        try { Assert-FpsJsonNoRepeatedKey $planText $planPath -AllowArrayRoot } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' has a shape the raw JSON check refuses: $($_.Exception.Message)" }
+        # (ENVELOPE-PREEMPT-RESIDUE-1 r1: the deferred raw shape check runs after every per-item preflight refusal, below the input identity guard.)
         $ordered =$(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
         $spread = $null
         if ($PlanOrder -ceq 'ThermalSpread') {
@@ -1806,6 +1803,10 @@ foreach ($g in $script:guardedInputs) {
         Stop-InputIsOutput ([pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = $code; path = $g.path; why = "$label '$($g.path)' could not be identified as it was accepted (no destination could be compared with it)" })
     }
 }
+# ENVELOPE-PREEMPT-RESIDUE-1 r1 (+ adversary r1 A1, r1 pass 2 A1): the raw shape rules the plan's parse-level read deferred (r15 A1: an array under a receipt-envelope name; the depth-256 cap)
+# run only after EVERY per-item preflight refusal (shape and field checks, purpose, build staging, OUTPUT_NAME_TOO_LONG, the input identity guard), so each keeps its merge-base code and item
+# number. Still before any claim or lease; a bare-array plan root is allowed (the plan reader shape-checks its entries itself).
+if ($legPlanMode) { try { Assert-FpsJsonNoRepeatedKey $planText $planPath -AllowArrayRoot } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' has a shape the raw JSON check refuses: $($_.Exception.Message)" } }
 if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }
 # r5 (sol r4 B1, key3 H-B): -RunDir's physical path and file identity as the preflight found them, read ONCE here, before any claim. A guard that gave up on a location read
 # (locationUnknown) may have given up on -RunDir itself, so Test-OpenOutputAlias then never reads -RunDir again unbounded (a stalled UNC or junction would hold it). r7 (sol r6 B2):

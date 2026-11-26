@@ -6516,6 +6516,18 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
         self.assertFalse(self.claim_path.exists(), "no claim was written")
 
+    def test_envelope_preempt_residue_an_output_name_refusal_beside_an_envelope_array_keeps_its_item(self) -> None:
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 (adversary r1 pass 2 A1): OUTPUT_NAME_TOO_LONG is a per-item preflight refusal outside the plan block; the deferred raw shape check runs after it.
+        spec = self._long_name_spec(205)
+        doc = {"legs": [self.item(spec, "A" * 32, self.commit_a)], "proof": []}
+        p = self.case / "plan.json"
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        r = self.run_plan(p)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=OUTPUT_NAME_TOO_LONG item=1 ", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+
     def test_r11_a2_the_scalar_form_refuses_a_generated_output_name_over_the_limit_too(self) -> None:
         spec = self._long_name_spec(220)   # no -Backend: the leg name ends in "-spec", and quiet-01-<220>-spec-b9999-a999999.out.txt is 256 characters
         r = self.run_batch([spec])
