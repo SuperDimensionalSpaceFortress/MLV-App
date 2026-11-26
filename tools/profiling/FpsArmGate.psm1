@@ -381,12 +381,14 @@ function Get-FpsCompareBindingProblem {
         $compared = & $leaf $metric $side[0]
         if (-not (& $isNumber $own)) { return "the judged $($side[0]) leg records no finite presentedFps, so the compare's $($side[0]) cannot be bound to it" }
         if (-not (& $isNumber $compared)) { return "the compare's presentedFps $($side[0]) is not a finite number" }
-        if ([Math]::Abs([double]$compared - [double]$own) -gt (0.000001 * [Math]::Max(1.0, [Math]::Abs([double]$own)))) {
+        # r2 (sol c29f8dc1 A1): relative only. The producer copies the leg's number into the compare unrounded, so no absolute slack is owed: a floor of 1e-6 let a leg at 0 fps bind to a compare of 1e-7 / 2e-7 (a +100 % gain).
+        if ([Math]::Abs([double]$compared - [double]$own) -gt (0.000001 * [Math]::Abs([double]$own))) {
             return "the compare's presentedFps $($side[0]) is $compared but the judged $($side[0]) leg measured $own"
         }
     }
     # R2-RESIDUE-1 r2 (luna r1b A1): the published delta and deltaPercent must follow from the two bound endpoints. Both legs at 40 fps with delta 40 / deltaPercent 100 bound on the endpoints alone
-    # and published a gain that no leg measured. The producer (run-release-cuda-playback-ab.ps1 New-MetricDelta) rounds delta to 6 places and deltaPercent to 3, so those are the tolerances.
+    # and published a gain that no leg measured. The producer (run-release-cuda-playback-ab.ps1 New-MetricDelta) rounds delta to 6 places and deltaPercent to 3, so the most a producer-rounded value can
+    # sit from the exact one is half a unit in the last place (5e-7, 5e-4); the tolerances are that plus float slack, no more (sol c29f8dc1 A2: 2e-6 and 0.0011 accepted delta -0.000001 for a tie and -1 for -1.001).
     # A present delta or deltaPercent that is not a finite number is refused; an absent one is left to the reader's own null check.
     $base = [double](& $leaf $metric "baseline")
     $cand = [double](& $leaf $metric "candidate")
@@ -394,13 +396,13 @@ function Get-FpsCompareBindingProblem {
     $publishedDelta = & $leaf $metric "delta"
     if ($null -ne $publishedDelta) {
         if (-not (& $isNumber $publishedDelta)) { return "the compare's presentedFps delta is not a finite number" }
-        if ([Math]::Abs([double]$publishedDelta - ($cand - $base)) -gt 0.000002) { return "the compare's presentedFps delta is $publishedDelta but candidate $cand minus baseline $base is $($cand - $base)" }
+        if ([Math]::Abs([double]$publishedDelta - ($cand - $base)) -gt 0.00000051) { return "the compare's presentedFps delta is $publishedDelta but candidate $cand minus baseline $base is $($cand - $base)" }
     }
     $publishedPercent = & $leaf $metric "deltaPercent"
     if ($null -ne $publishedPercent) {
         if (-not (& $isNumber $publishedPercent)) { return "the compare's presentedFps deltaPercent is not a finite number" }
         $expectedPercent = 100.0 * ($cand - $base) / $base
-        if ([Math]::Abs([double]$publishedPercent - $expectedPercent) -gt 0.0011) { return "the compare's presentedFps deltaPercent is $publishedPercent but 100 * (candidate $cand - baseline $base) / baseline is $expectedPercent" }
+        if ([Math]::Abs([double]$publishedPercent - $expectedPercent) -gt 0.00051) { return "the compare's presentedFps deltaPercent is $publishedPercent but 100 * (candidate $cand - baseline $base) / baseline is $expectedPercent" }
     }
     $null
 }

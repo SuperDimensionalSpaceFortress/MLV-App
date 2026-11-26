@@ -131,11 +131,16 @@ $manifest = $null
 $summary = $null
 $proofReport = $null
 $proofReportRaw = $null
+$proofReportJudgedSha256 = $null
 if ($failures.Count -eq 0) {
     try {
         $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -Depth 100
         $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json -Depth 100
-        $proofReportRaw = Get-Content -LiteralPath $proofReportJsonPath -Raw
+        # (sol c29f8dc1 A3, importer sibling: the report is read ONCE, as bytes, and the hash of those very bytes is kept, so the manifest check below can be bound to the report that was judged and not to
+        # whatever is at the path when the file is hashed later)
+        $proofReportBytes = [System.IO.File]::ReadAllBytes($proofReportJsonPath)
+        $proofReportJudgedSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($proofReportBytes))
+        $proofReportRaw = [System.Text.UTF8Encoding]::new($false).GetString($proofReportBytes).TrimStart([char]0xFEFF)
         $proofReport = $proofReportRaw | ConvertFrom-Json -Depth 100
     }
     catch {
@@ -210,7 +215,8 @@ if ($StrictQuotable -and $proofReportStatus -ne "QUOTABLE_PASS") {
 }
 # adversary 1ce472bc A8: a speed claim is quotable only from a report this import verified: no failure, and a manifest hash check that passed for the very proof-report.json that was read
 # (a manifest with no files, or one that does not list it, verified nothing)
-$speedHashBound = ($failures.Count -eq 0) -and (@($fileChecks | Where-Object { [bool]$_.ok -and [string]::Equals([string]$_.relativePath, "proof-report.json", [StringComparison]::Ordinal) }).Count -eq 1)
+# (sol c29f8dc1 A3: and the hash that check verified is the hash of the bytes that were parsed: a report replaced between the read and the hash makes the two differ, and no speed claim is bound)
+$speedHashBound = ($failures.Count -eq 0) -and (-not [string]::IsNullOrEmpty([string]$proofReportJudgedSha256)) -and (@($fileChecks | Where-Object { [bool]$_.ok -and [string]::Equals([string]$_.relativePath, "proof-report.json", [StringComparison]::Ordinal) -and [string]::Equals([string]$_.actualSha256, [string]$proofReportJudgedSha256, [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1)
 $proofDiagnostics = if ($proofReport) { @($proofReport.diagnostics) } else { @() }
 $proofDiagnosticSummary = if ($proofReport) { $proofReport.diagnosticSummary } else { $null }
 $proofActionPlan = if ($proofReport) { $proofReport.actionPlan } else { $null }

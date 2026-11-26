@@ -1337,13 +1337,17 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
 
     def test_r2_residue_r2_luna_r1b_a1_the_published_delta_must_follow_from_the_bound_endpoints(self) -> None:
         # luna r1b A1 (input verbatim): both legs presentedFps=40, compare {baseline:40, candidate:40, delta:40, deltaPercent:100}. The endpoints bind, so da6248b1 published a +100 % gain no leg measured.
-        for label, compare in (
-                ("adversary", "baseline = 40; candidate = 40; delta = 40; deltaPercent = 100"),
-                ("percent-only", "baseline = 40; candidate = 40; delta = 0; deltaPercent = 100"),
-                ("delta-only", "baseline = 40; candidate = 40; delta = 40; deltaPercent = 0"),
-                ("delta-not-finite", "baseline = 40; candidate = 40; delta = [double]::NaN; deltaPercent = 0"),
-                ("zero-baseline", "baseline = 0; candidate = 0; delta = 0; deltaPercent = 0")):
-            text = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", candidate_fps=compare.split("candidate = ")[1].split(";")[0], baseline_fps=compare.split("baseline = ")[1].split(";")[0], presented_compare=compare))
+        # (label, the leg's own baseline fps, its candidate fps, the compare); the second and third entries of the last group are sol c29f8dc1 A1 / A2 verbatim
+        for label, leg_base, leg_cand, compare in (
+                ("adversary", "40", "40", "baseline = 40; candidate = 40; delta = 40; deltaPercent = 100"),
+                ("percent-only", "40", "40", "baseline = 40; candidate = 40; delta = 0; deltaPercent = 100"),
+                ("delta-only", "40", "40", "baseline = 40; candidate = 40; delta = 40; deltaPercent = 0"),
+                ("delta-not-finite", "40", "40", "baseline = 40; candidate = 40; delta = [double]::NaN; deltaPercent = 0"),
+                ("zero-baseline", "0", "0", "baseline = 0; candidate = 0; delta = 0; deltaPercent = 0"),
+                ("sol-a1-legs-at-zero-compare-at-1e-7", "0", "0", "baseline = 0.0000001; candidate = 0.0000002; delta = 0.0000001; deltaPercent = 100"),
+                ("sol-a2-tie-with-a-one-micro-delta", "40", "40", "baseline = 40; candidate = 40; delta = -0.000001; deltaPercent = 0"),
+                ("sol-a2-percent-off-by-the-rounding-step", "40", "39.59976", "baseline = 40; candidate = 39.59976; delta = -0.40024; deltaPercent = -1")):
+            text = "\n".join(self.run_summarizer_block("LIGHT", "LIGHT", candidate_fps=leg_cand, baseline_fps=leg_base, presented_compare=compare))
             self.assertIn("fps-verdict-refused:compare-not-judged-pair", text, label)
             self.assertNotIn("presented FPS: CPU", text, label)
         # control: the producer's own rounding (delta to 6 places, deltaPercent to 3) is not a refusal
@@ -2525,21 +2529,26 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         match = re.search(r"(?m)^\$speedHashBound = .*$", text)
         self.assertIsNotNone(match)
         line = match.group(0)
+        # sol c29f8dc1 A3 (importer sibling): the hash the manifest check verified (actualSha256) must be the hash of the bytes that were parsed ($proofReportJudgedSha256); a report replaced between the
+        # read and the hash verifies a different file than the one judged. HASH_OF_OTHER_BYTES / NOTHING_JUDGED fail on c29f8dc1, which bound the check to the path alone.
         cases = {
-            "VERIFIED": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json' })"),
-            "NO_CHECKS": ("0", "@()"),
-            "OTHER_FILE": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'summary.json' })"),
+            "VERIFIED": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json'; actualSha256 = 'ab12' })", "'AB12'"),
+            "NO_CHECKS": ("0", "@()", "'AB12'"),
+            "OTHER_FILE": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'summary.json'; actualSha256 = 'ab12' })", "'AB12'"),
             # adversary 698fffb1 A3: PowerShell's -eq is case-insensitive, so PROOF-REPORT.JSON (another file on a case-sensitive filesystem) matched the lowercase report the importer read
-            "OTHER_CASE": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'PROOF-REPORT.JSON' })"),
-            "HASH_WRONG": ("1", "@([pscustomobject]@{ ok = $false; relativePath = 'proof-report.json' })"),
-            "FAILED_IMPORT": ("1", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json' })"),
+            "OTHER_CASE": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'PROOF-REPORT.JSON'; actualSha256 = 'ab12' })", "'AB12'"),
+            "HASH_WRONG": ("1", "@([pscustomobject]@{ ok = $false; relativePath = 'proof-report.json'; actualSha256 = 'ab12' })", "'AB12'"),
+            "FAILED_IMPORT": ("1", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json'; actualSha256 = 'ab12' })", "'AB12'"),
+            "HASH_OF_OTHER_BYTES": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json'; actualSha256 = 'ff00' })", "'AB12'"),
+            "NOTHING_JUDGED": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json'; actualSha256 = 'ab12' })", "$null"),
         }
         body = ""
-        for label, (failures, checks) in cases.items():
+        for label, (failures, checks, judged) in cases.items():
             body += (f"$failures = [System.Collections.Generic.List[string]]::new(); if ({failures} -gt 0) {{ $failures.Add('x') }}\n"
-                     f"$fileChecks = {checks}\n{line}\nWrite-Host ('{label}=' + $speedHashBound)\n")
+                     f"$fileChecks = {checks}\n$proofReportJudgedSha256 = {judged}\n{line}\nWrite-Host ('{label}=' + $speedHashBound)\n")
         out = dict(item.split("=", 1) for item in self.ok(body).split())
-        self.assertEqual(out, {"VERIFIED": "True", "NO_CHECKS": "False", "OTHER_FILE": "False", "OTHER_CASE": "False", "HASH_WRONG": "False", "FAILED_IMPORT": "False"})
+        self.assertEqual(out, {"VERIFIED": "True", "NO_CHECKS": "False", "OTHER_FILE": "False", "OTHER_CASE": "False", "HASH_WRONG": "False", "FAILED_IMPORT": "False",
+                               "HASH_OF_OTHER_BYTES": "False", "NOTHING_JUDGED": "False"})
 
     def test_p2_a5_the_packager_launches_its_summarizer_by_a_path_and_a_name_that_exist_on_linux(self) -> None:
         # hosted run 45786756378 (ubuntu shard 3/4): Invoke-ProofSummarizer joined "tools\profiling\summarize-local-cuda-proof.ps1" (one file name on Linux, so "Proof summarizer not
@@ -2688,10 +2697,18 @@ class EnvelopePreemptR1ResidueTests(_Probe):
             "Write-Host ('text-percent=' + (T 10 20 @{ baseline = 10; candidate = 20; delta = 10; deltaPercent = 'x' }))\n"
             "Write-Host ('zero-baseline=' + (T 0 5 @{ baseline = 0; candidate = 5; delta = 5; deltaPercent = 100 }))\n"
             "Write-Host ('negative-baseline=' + (T -5 5 @{ baseline = -5; candidate = 5; delta = 10; deltaPercent = -200 }))\n"
+            # sol c29f8dc1 A1: legs at 0 fps, a compare of 1e-7 / 2e-7 (self-consistent, +100 %) must not bind to them
+            "Write-Host ('sol-a1=' + (T 0 0 @{ baseline = 0.0000001; candidate = 0.0000002; delta = 0.0000001; deltaPercent = 100 }))\n"
+            # sol c29f8dc1 A2: a tie with a one-micro delta, and a percent one rounding step off the producer's -1.001
+            "Write-Host ('sol-a2-tie=' + (T 40 40 @{ baseline = 40; candidate = 40; delta = -0.000001; deltaPercent = 0 }))\n"
+            "Write-Host ('sol-a2-percent=' + (T 40 39.59976 @{ baseline = 40; candidate = 39.59976; delta = -0.40024; deltaPercent = -1 }))\n"
+            "Write-Host ('sol-a2-percent-producer-rounded=' + (T 40 39.59976 @{ baseline = 40; candidate = 39.59976; delta = -0.40024; deltaPercent = -1.001 }))\n"
+            "Write-Host ('endpoint-off-by-ten-ppm=' + (T 40 40 @{ baseline = 40.0004; candidate = 40; delta = -0.0004; deltaPercent = -0.001 }))\n"
         )
         got = dict(line.split("=", 1) for line in self.ok(body).split())
         self.assertEqual(got, {"adversary": "REFUSED", "rounded": "OK", "exact": "OK", "percent-only": "OK", "wrong-percent-only": "REFUSED", "wrong-delta-only": "REFUSED",
-                               "inf-delta": "REFUSED", "text-percent": "REFUSED", "zero-baseline": "REFUSED", "negative-baseline": "REFUSED"})
+                               "inf-delta": "REFUSED", "text-percent": "REFUSED", "zero-baseline": "REFUSED", "negative-baseline": "REFUSED",
+                               "sol-a1": "REFUSED", "sol-a2-tie": "REFUSED", "sol-a2-percent": "REFUSED", "sol-a2-percent-producer-rounded": "OK", "endpoint-off-by-ten-ppm": "REFUSED"})
 
     def test_r2_adversary_698fffb1_a2_a_packager_publishes_and_reads_only_its_own_reports(self) -> None:
         # adversary 698fffb1 A2: two packagers on one RunRoot share the final report names, so the packager re-read the published JSON and took another run's report as its own. It now keeps its own
@@ -2730,6 +2747,65 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         packager = (PROFILING / "package-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
         self.assertIn("$proofReportRaw = $summarizerResult.jsonText", packager)
         self.assertNotRegex(packager, r"\$proofReportRaw = Get-Content")
+
+    def test_r2_residue_r2_sol_c29f8dc1_a4_a_failed_publication_rolls_back_only_its_own_markdown(self) -> None:
+        # sol c29f8dc1 A4: A moved its Markdown, a rival published its own pair, A's JSON move then failed, and A's catch deleted the rival's Markdown (a leaf-existence check only). The rollback removes the
+        # file only while it is still this run's bytes.
+        repo = self.tmp / "repo"
+        (repo / "tools" / "profiling").mkdir(parents=True)
+        fake = repo / "tools" / "profiling" / "summarize-local-cuda-proof.ps1"
+        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Get-RealFilePath", "Invoke-ProofSummarizer"])
+        proof = self.tmp / "proof"
+        proof.mkdir()
+        summary, md, js = proof / "summary.json", proof / "proof-report.md", proof / "proof-report.json"
+        shadow_rival = (f"function Move-Item {{ param([string]$LiteralPath, [string]$Destination, [switch]$Force); if ($Destination -like '*.json') {{ [IO.File]::WriteAllText('{md}', 'md-B'); throw 'sharing violation' }}; "
+                        "Microsoft.PowerShell.Management\\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force }\n")
+        body = funcs + "\n"
+        body += (f"[IO.File]::WriteAllText('{summary}', '{{\"input\":true}}')\n"
+                 f"[IO.File]::WriteAllText('{fake}', @'\nparam($RepoRoot, $SummaryPath, $Output, [switch]$Json)\nif ($Json) {{ [IO.File]::WriteAllText($Output, '{{\"who\":\"A\"}}') }} else {{ [IO.File]::WriteAllText($Output, 'md-A') }}\nexit 0\n'@)\n"
+                 + shadow_rival +
+                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
+                 f"Write-Host ('RIVAL=' + $res + '|' + (Test-Path -LiteralPath '{md}') + '|' + $(if (Test-Path -LiteralPath '{md}') {{ [IO.File]::ReadAllText('{md}') }} else {{ 'GONE' }}))\n")
+        self.assertEqual(self.ok(body).split(), ["RIVAL=THREW|True|md-B"])
+        packager = (PROFILING / "package-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
+        self.assertNotRegex(packager, r"Remove-Item -LiteralPath \$MarkdownReport -Force -ErrorAction SilentlyContinue")
+
+    def test_r2_residue_r2_sol_c29f8dc1_a3_the_manifest_and_archive_carry_only_the_reports_this_run_wrote(self) -> None:
+        # sol c29f8dc1 A3: B replaced both reports after A's publication check and before A's manifest read, so A judged its own report but hashed and archived B's. The packager's report artifacts are
+        # bound to the hashes it wrote, and the reports are re-checked right before and right after the archive.
+        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Get-FileSha256", "Get-FileArtifact", "Assert-OwnedProofReports", "Get-OwnedReportArtifact"])
+        md, js = self.tmp / "proof-report.md", self.tmp / "proof-report.json"
+        body = funcs + (
+            f"[IO.File]::WriteAllText('{md}', 'md-A'); [IO.File]::WriteAllText('{js}', '{{\"who\":\"A\"}}')\n"
+            f"$own = [pscustomobject]@{{ markdownSha256 = (Get-FileHash -LiteralPath '{md}' -Algorithm SHA256).Hash.ToLowerInvariant(); jsonSha256 = (Get-FileHash -LiteralPath '{js}' -Algorithm SHA256).Hash.ToLowerInvariant() }}\n"
+            "function Try-It($block) { try { & $block; 'OK' } catch { 'THREW' } }\n"
+            f"Write-Host ('ASSERT-OWN=' + (Try-It {{ Assert-OwnedProofReports -MarkdownReport '{md}' -JsonReport '{js}' -Result $own }}))\n"
+            f"Write-Host ('ARTIFACT-OWN=' + (Try-It {{ $null = Get-OwnedReportArtifact -Path '{js}' -OwnedSha256 $own.jsonSha256 }}))\n"
+            f"Write-Host ('ARTIFACT-OWN-UPPER=' + (Try-It {{ $null = Get-OwnedReportArtifact -Path '{js}' -OwnedSha256 $own.jsonSha256.ToUpperInvariant() }}))\n"
+            f"[IO.File]::WriteAllText('{js}', '{{\"who\":\"B\"}}')\n"
+            f"Write-Host ('ASSERT-JSON-REPLACED=' + (Try-It {{ Assert-OwnedProofReports -MarkdownReport '{md}' -JsonReport '{js}' -Result $own }}))\n"
+            f"Write-Host ('ARTIFACT-JSON-REPLACED=' + (Try-It {{ $null = Get-OwnedReportArtifact -Path '{js}' -OwnedSha256 $own.jsonSha256 }}))\n"
+            f"Write-Host ('ARTIFACT-NO-OWNED-HASH=' + (Try-It {{ $null = Get-OwnedReportArtifact -Path '{md}' -OwnedSha256 '' }}))\n"
+            f"Remove-Item -LiteralPath '{md}' -Force\n"
+            f"Write-Host ('ASSERT-MD-GONE=' + (Try-It {{ Assert-OwnedProofReports -MarkdownReport '{md}' -JsonReport '{js}' -Result $own }}))\n")
+        got = dict(item.split("=", 1) for item in self.ok(body).split())
+        self.assertEqual(got, {"ASSERT-OWN": "OK", "ARTIFACT-OWN": "OK", "ARTIFACT-OWN-UPPER": "OK", "ASSERT-JSON-REPLACED": "THREW", "ARTIFACT-JSON-REPLACED": "THREW",
+                               "ARTIFACT-NO-OWNED-HASH": "THREW", "ASSERT-MD-GONE": "THREW"})
+        packager = (PROFILING / "package-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
+        self.assertIn("markdown = Get-OwnedReportArtifact -Path $ReportPath -OwnedSha256 $summarizerResult.markdownSha256", packager)
+        self.assertIn("json = Get-OwnedReportArtifact -Path $jsonReportPath -OwnedSha256 $summarizerResult.jsonSha256", packager)
+        self.assertNotIn("markdown = Get-FileArtifact -Path $ReportPath", packager)
+        call = "Assert-OwnedProofReports -MarkdownReport $ReportPath -JsonReport $jsonReportPath -Result $summarizerResult"
+        self.assertEqual(packager.count(call), 3)
+        archive = packager.index("Compress-Archive -Path")
+        self.assertLess(packager.index(call), packager.index("Write-JsonFile -Value ([pscustomobject]$manifest) -Path $manifestPath\n\nif ($DryRun)"))
+        before_archive = packager.rindex(call, 0, archive)
+        after_archive = packager.index(call, archive)
+        self.assertLess(before_archive, archive)
+        self.assertLess(archive, after_archive)
+        importer = (PROFILING / "import-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
+        self.assertIn("$proofReportJudgedSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($proofReportBytes))", importer)
+        self.assertNotRegex(importer, r"\$proofReportRaw = Get-Content")
 
 
 if __name__ == "__main__":

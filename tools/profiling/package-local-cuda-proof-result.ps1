@@ -209,8 +209,20 @@ function Invoke-ProofSummarizer {
             Move-Item -LiteralPath $jsonTemp -Destination $JsonReport -Force
         }
         catch {
-            if (Test-Path -LiteralPath $MarkdownReport -PathType Leaf) { Remove-Item -LiteralPath $MarkdownReport -Force -ErrorAction SilentlyContinue }
-            throw
+            # (sol c29f8dc1 A4: the rollback removes the Markdown report only while it is still THIS run's bytes: a rival packager that published its own pair in between keeps its report, and a removal
+            # that fails is said in the error, never swallowed)
+            $moveError = $_
+            $rollbackNote = ""
+            try {
+                if (Test-Path -LiteralPath $MarkdownReport -PathType Leaf) {
+                    $publishedNow = (Get-FileHash -LiteralPath $MarkdownReport -Algorithm SHA256).Hash
+                    if ([string]::Equals($publishedNow, $markdownSha256, [StringComparison]::OrdinalIgnoreCase)) { Remove-Item -LiteralPath $MarkdownReport -Force -ErrorAction Stop }
+                }
+            }
+            catch {
+                $rollbackNote = " (the Markdown report this run published could not be rolled back: $($_.Exception.Message))"
+            }
+            throw [System.InvalidOperationException]::new("Publishing the JSON proof report failed: $($moveError.Exception.Message)$rollbackNote", $moveError.Exception)
         }
         foreach ($published in @(@($MarkdownReport, $markdownSha256), @($JsonReport, $jsonSha256))) {
             $publishedSha256 = if (Test-Path -LiteralPath $published[0] -PathType Leaf) { (Get-FileHash -LiteralPath $published[0] -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' }
@@ -233,6 +245,35 @@ function Invoke-ProofSummarizer {
         markdownSha256 = $markdownSha256
         jsonSha256 = $jsonSha256
     }
+}
+
+function Assert-OwnedProofReports {
+    # R2-RESIDUE-1 r2 (sol c29f8dc1 A3): the two reports at their shared final paths are still the bytes THIS run wrote (the hashes Invoke-ProofSummarizer returned). A rival packager on the same
+    # RunRoot can replace them after the publication check, so the manifest and the archive must not take whatever is there now for this run's own.
+    param(
+        [Parameter(Mandatory = $true)][string]$MarkdownReport,
+        [Parameter(Mandatory = $true)][string]$JsonReport,
+        [Parameter(Mandatory = $true)]$Result
+    )
+    foreach ($owned in @(@($MarkdownReport, [string]$Result.markdownSha256), @($JsonReport, [string]$Result.jsonSha256))) {
+        $actual = if (Test-Path -LiteralPath $owned[0] -PathType Leaf) { (Get-FileHash -LiteralPath $owned[0] -Algorithm SHA256).Hash } else { '' }
+        if ([string]::IsNullOrEmpty($owned[1]) -or [string]::IsNullOrEmpty($actual) -or -not [string]::Equals($actual, $owned[1], [StringComparison]::OrdinalIgnoreCase)) {
+            throw "The proof report $($owned[0]) is not the report this run wrote (replaced by another process, or removed); refusing to package a report this run did not write."
+        }
+    }
+}
+
+function Get-OwnedReportArtifact {
+    # the manifest's own entry for one report: its sha256 must be the hash this run wrote, so the manifest never records another run's report as this one's (sol c29f8dc1 A3)
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$OwnedSha256
+    )
+    $artifact = Get-FileArtifact -Path $Path
+    if ([string]::IsNullOrEmpty($OwnedSha256) -or [string]::IsNullOrEmpty([string]$artifact.sha256) -or -not [string]::Equals([string]$artifact.sha256, $OwnedSha256, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "The proof report $Path is not the report this run wrote (replaced by another process, or removed); refusing to package a report this run did not write."
+    }
+    $artifact
 }
 
 function Convert-ToInt64 {
@@ -336,8 +377,8 @@ $manifest = [ordered]@{
         capturedAtUtc = $summary.capturedAtUtc
     }
     proofReport = [ordered]@{
-        markdown = Get-FileArtifact -Path $ReportPath
-        json = Get-FileArtifact -Path $jsonReportPath
+        markdown = Get-OwnedReportArtifact -Path $ReportPath -OwnedSha256 $summarizerResult.markdownSha256
+        json = Get-OwnedReportArtifact -Path $jsonReportPath -OwnedSha256 $summarizerResult.jsonSha256
         status = $proofReport.status
         # r15 (adversary r14 pass 18 A6): speed authority is the report's claimAuthority.speed (exactly $true), never the support status; a report without it grants none
         # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6): one predicate with the importer (Test-FpsProofReportSpeedQuotable): the PASS playbackSpeed section, no singleton arrays, no repeated key
@@ -411,6 +452,8 @@ Write-JsonFile -Value ([pscustomobject]$manifest) -Path $manifestPath
 $manifest["files"] = @(Get-ArtifactFileEntries -Root $runRootResolved | Where-Object {
     $_.relativePath -ne "local-cuda-proof-packet-manifest.json"
 })
+# (sol c29f8dc1 A3: the file listing above hashed the shared report paths a second time; they must still be this run's own bytes before the manifest is written)
+Assert-OwnedProofReports -MarkdownReport $ReportPath -JsonReport $jsonReportPath -Result $summarizerResult
 Write-JsonFile -Value ([pscustomobject]$manifest) -Path $manifestPath
 
 if ($DryRun) {
@@ -433,7 +476,16 @@ if (Test-Path -LiteralPath $packetFullPath -PathType Leaf) {
 $manifest["status"] = "created"
 $manifest["outputs"]["packet"] = $packetFullPath
 Write-JsonFile -Value ([pscustomobject]$manifest) -Path $manifestPath
+# (sol c29f8dc1 A3: the archive takes the run root as it is, so the reports are checked as this run's own right before it and right after it; a packet built over another run's report is removed, never kept)
+Assert-OwnedProofReports -MarkdownReport $ReportPath -JsonReport $jsonReportPath -Result $summarizerResult
 Compress-Archive -Path (Join-Path $runRootResolved "*") -DestinationPath $packetFullPath -Force
+try {
+    Assert-OwnedProofReports -MarkdownReport $ReportPath -JsonReport $jsonReportPath -Result $summarizerResult
+}
+catch {
+    Remove-Item -LiteralPath $packetFullPath -Force -ErrorAction SilentlyContinue
+    throw
+}
 $packetArtifact = Get-FileArtifact -Path $packetFullPath
 $manifest["outputs"]["packet"] = $packetArtifact.path
 $manifest["packet"] = $packetArtifact
