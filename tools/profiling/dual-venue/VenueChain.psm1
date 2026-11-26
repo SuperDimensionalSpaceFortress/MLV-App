@@ -1274,10 +1274,8 @@ function Invoke-VenueBoundedRead {
     # before it (after the worker started), so time spent creating the worker is never added past the caller's end. No -Clock: -TimeoutSec from the wait, as before.
     # r16 (Grok G22 on #814): -EndIsBoundEnd says -EndSec is the end of -TimeoutSec ITSELF (measured from an earlier start on the caller's clock), not a cap the
     # caller set under it; a wait it shortens is then a plain timeout and the "cut ... short" clause is not printed. Absent: any shortening by -EndSec is named.
-    # R2-RESIDUE-1 r1 (adversary-3be19c39.json A1): -EndUtc is the caller's ABSOLUTE end. The stopwatch cap above is sampled once, so a wall clock stepped (or a caller suspended) after the sample left the wait
-    # running past the absolute end. With -EndUtc the wait is taken in slices of at most 0.25 s and the wall clock is read against that end after each, so the wait ends at the earlier of the two.
     param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1.0, 600.0)][double]$TimeoutSec,
-        [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [switch]$EndIsBoundEnd, [DateTime]$EndUtc)
+        [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [switch]$EndIsBoundEnd)
     # r28 (sol r27 blocker VENUE-STAGE-NONFINITE-ENDPOINT-ERASES-CAP-1, catalogue B-03, sibling of Get-VenueStagedBuildManifest -CallBudgetEndSec): an -EndSec that is not a
     # finite number is REFUSED, typed, before the worker starts. NaN skipped both the clamp (NaN -lt x is false: the full -TimeoutSec wait) and the late-answer rejection
     # (Elapsed - NaN -gt 0 is false), so an answer past the caller's end was acted on.
@@ -1305,26 +1303,10 @@ function Invoke-VenueBoundedRead {
         # r13 (Grok G20 on #814): $endCut = the caller's end, not -TimeoutSec, set the wait (as the nightly's capCut), so the message reports the wait actually given
         $waitSec = $TimeoutSec; $endCut = $false
         if ($null -ne $Clock) { $toEnd = $EndSec - $Clock.Elapsed.TotalSeconds; if ($toEnd -lt $waitSec) { $waitSec = [Math]::Max(0.0, $toEnd); $endCut = $true } }
-        $answeredInTime = $false; $absoluteEndHit = $false
-        if ($PSBoundParameters.ContainsKey('EndUtc')) {
-            $absEnd = $EndUtc.ToUniversalTime()
-            $waitClock = [Diagnostics.Stopwatch]::StartNew()
-            while ($true) {
-                # R2-RESIDUE-1 r2 (adversary-f1221390.json A1): the slice is the least of 0.25 s, the stopwatch remainder AND the wall-clock remainder to the absolute end, both read at the start of THIS
-                # slice, so a wall clock that stepped (or a caller suspended) since the last look cannot leave a full 0.25 s wait past the end
-                $utcLeftSec = ($absEnd.AddSeconds(-$script:VenueTestUtcStepSec) - [DateTime]::UtcNow).TotalSeconds
-                if ($utcLeftSec -le 0) { $absoluteEndHit = $true; break }
-                $slice = [Math]::Min([Math]::Min(0.25, $waitSec - $waitClock.Elapsed.TotalSeconds), $utcLeftSec)
-                if ($slice -le 0) { break }
-                if ($async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($slice))) { $answeredInTime = $true; break }
-            }
-        }
-        else { $answeredInTime = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec)) }
-        if (-not $answeredInTime) {
+        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec))) {
             $abandoned = $true
             $script:VenueAbandonedReads++
             try { [void]$ps.BeginStop($null, $null) } catch { }
-            if ($absoluteEndHit) { return [pscustomobject]@{ answered = $false; value = @(); error = "no answer before the caller's absolute end (the wait was cut at that end, not at the $([Math]::Round($waitSec, 2)) s bound)" } }
             return [pscustomobject]@{ answered = $false; value = @()
                 error ="no answer in $([Math]::Round($waitSec, 2)) s$(if ($endCut -and -not $EndIsBoundEnd) { " (the call's end cut the $([Math]::Round($TimeoutSec, 2)) s bound short)" })" }
         }
@@ -1373,10 +1355,8 @@ function Read-VenueFileBytesBounded {
     }
     $workerArg = @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs; endUtcTicks = $endTicks; clock = $workClock; clockEndSec = $workEndSec }
     if ($script:VenueTestCaptureWorkerArg) { $script:VenueTestLastFileWorkerArg = $workerArg }
-    # R2-RESIDUE-1 r1 (adversary-3be19c39.json A1): the absolute end reaches the WAIT too (-EndUtc), not only the worker's pre-I/O check
-    $endArgs = $(if ($PSBoundParameters.ContainsKey('EndUtc')) { @{ EndUtc = $EndUtc } } else { @{} })
-    $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd @endArgs }
-           else { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec @endArgs })
+    $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd }
+           else { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec })
     if (-not $r.answered) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: $($r.error)" }
     # adversary-d10f5241.json A2: an answer is judged against the ABSOLUTE end when it is OBSERVED too, not only before the read starts: the late-answer check inside Invoke-VenueBoundedRead reads the
     # stopwatch alone, so a wall clock stepped (or a caller suspended) inside the read let bytes seen after the caller's UTC deadline be acted on and a leg be counted

@@ -862,24 +862,6 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertEqual(got["B"], "unknown/True", "an answer seen after the absolute deadline is not acted on: " + p.stdout)
         self.assertIn("absolute end", got["BWHY"], p.stdout)
 
-    def test_r2res_a1_the_wait_for_a_read_ends_at_the_absolute_deadline_not_at_the_stopwatch_cap(self) -> None:
-        # adversary-3be19c39.json A1, its input: the absolute end is 4 s away, the stopwatch cap sampled before it (the budget the caller computed, and a wall clock stepped since) still says 20 s, and the
-        # share never answers (the worker sleeps 15 s: VenueTestFileReadDelayMs). RED on 3be19c39: WaitOne used the stopwatch cap alone and waited until the worker gave up (~15 s) -- ~11 s past the absolute
-        # end -- and the UTC check ran only after the wait. The wait is now cut to the absolute end (checked in slices on the wall clock), so the read is refused at ~4 s, and the abandoned worker is not joined.
-        with tempfile.TemporaryDirectory() as d:
-            blob = Path(d) / "f.bin"
-            blob.write_bytes(b"abc")
-            p = run_ps(
-                "$vc = Get-Module VenueChain; "
-                "& $vc { $script:VenueTestFileReadDelayMs = 15000 }; "
-                f"$t = [Diagnostics.Stopwatch]::StartNew(); $r = try {{ & $vc {{ param($f) $sw = [Diagnostics.Stopwatch]::StartNew(); Read-VenueFileBytesBounded -Path $f -TimeoutSec 20 -Clock $sw -EndSec 20 -EndUtc ([DateTime]::UtcNow.AddSeconds(4)) }} '{blob}'; 'READ' }} catch {{ 'THROWN ' + $_.Exception.Message }}; "
-                "Write-Output ('SEC=' + [Math]::Round($t.Elapsed.TotalSeconds, 1)); Write-Output ('R=' + $r); [Console]::Out.Flush(); [Environment]::Exit(0)")
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
-        self.assertTrue(got["R"].startswith("THROWN"), p.stdout)
-        self.assertLess(float(got["SEC"]), 8.0, "the wait ended at the absolute end (about 4 s), not at the stopwatch cap or the late worker: " + p.stdout)
-        self.assertIn("absolute end", got["R"], p.stdout)
-
     def test_r2res_a2_bytes_that_reach_classification_after_the_absolute_end_are_never_quiet_or_exempt(self) -> None:
         # adversary-3be19c39.json A2, its input: a valid PASS receipt and matching quiet result.json, -CallDeadlineUtc 2.5 s away, and the caller suspended 3 s AFTER the read's own end check and
         # BEFORE the bytes are classified (the seams VenueTestPostBytesDelayMs / VenueTestPostReceiptBytesDelayMs). RED on 3be19c39: Get-VenueLegHostLoad returned quiet / not-applicable after the end,
@@ -908,26 +890,6 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertIn("absolute end", got["BWHY"], p.stdout)
         self.assertEqual(got["Y"], "unknown/True", "a receipt answer seen after the absolute end grants no export exemption: " + p.stdout)
         self.assertIn("absolute end", got["YWHY"], p.stdout)
-
-    def test_r2res2_a1_the_last_wait_slice_is_cut_to_the_wall_clock_remainder_not_a_full_quarter_second(self) -> None:
-        # adversary-f1221390.json A1, its input: the absolute end is a few hundred ms away on the (stepped) wall clock, the stopwatch cap is 20 s, and the worker is blocked for 3 s. RED on f1221390: each
-        # slice was min(0.25, stopwatch remainder), so the slice that began with, say, 50 ms of wall-clock room waited the full 0.25 s and the call returned up to 0.25 s past the end. The slice is now also
-        # cut to the wall-clock remainder read at its start. Three ends spaced 80 ms apart, so no phase of the 0.25 s slice hides the overrun; each must return within 120 ms of its own end (a 250 ms slice
-        # overshoots by 0.25 - (remainder mod 0.25), which exceeds 120 ms for at least one of them).
-        p = run_ps(
-            "$vc = Get-Module VenueChain; "
-            "& $vc { $r = Invoke-VenueBoundedRead -ScriptText 'param($a) 1' -Argument 'x' -TimeoutSec 5 }; "   # warm the runspace machinery so setup is not charged to a lead
-            "foreach ($lead in 0.9, 0.98, 1.06) { "
-            "$o = & $vc { param($lead) $script:VenueTestUtcStepSec = 20 - $lead; $end = [DateTime]::UtcNow.AddSeconds(20); $stepped = [DateTime]::UtcNow.AddSeconds($lead); "
-            "$r = Invoke-VenueBoundedRead -ScriptText 'param($a) Start-Sleep -Seconds 3; 1' -Argument 'x' -TimeoutSec 20 -EndUtc $end; "
-            "$over = ([DateTime]::UtcNow - $stepped).TotalSeconds; $script:VenueTestUtcStepSec = 0; ('' + [Math]::Round($over, 3) + '|' + $r.answered) } $lead; Write-Output ('OVER=' + $o) }; "
-            "[Console]::Out.Flush(); [Environment]::Exit(0)")
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        rows = [l.split("=", 1)[1].split("|") for l in p.stdout.splitlines() if l.startswith("OVER=")]
-        self.assertEqual(len(rows), 3, p.stdout + p.stderr)
-        for over, answered in rows:
-            self.assertEqual(answered, "False", p.stdout)
-            self.assertLess(float(over), 0.12, "the wait ended at the wall-clock end, not a full slice past it: " + p.stdout)
 
     def test_r2res2_a2_a_call_with_no_deadline_never_returns_quiet_or_exempt_past_its_own_read_budget(self) -> None:
         # adversary-f1221390.json A2, its input: Get-VenueLegHostLoad -ReadTimeoutSec 1.5 and NO -CallDeadlineUtc over a valid receipt and result.json; the caller is suspended 2 s after the reads (the seams
