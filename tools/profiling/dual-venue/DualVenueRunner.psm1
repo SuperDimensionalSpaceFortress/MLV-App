@@ -4571,6 +4571,9 @@ function Read-DvVisualCaptures {
         elseif ($null -eq $v.reason -and $crossCheckNote -and (-not $block.reason -or $block.reason -ceq $notJudgedNote)) { $block.reason = (@($notJudgedNote, $crossCheckNote) | Where-Object { $_ }) -join '; ' }   # no gate reason: the cross-check note stands beside the not-judged note
         # an unusable exposure band file is always said in the reason, beside whatever note or verdict reason is already there (the first-wins rule above would drop it)
         if ($exposureNote -and -not ([string]$block.reason).Contains($exposureNote)) { $block.reason = (@($block.reason, $exposureNote) | Where-Object { $_ }) -join '; ' }
+        # r2 pass 4 A2: the reason is one line. A note may quote outside text (an exposure band key, say) and Invoke-VenueLeg prints the reason inside its
+        # DVE_DETAIL line, so a control character (a line break above all) is written as \uXXXX: no note can forge a second record line.
+        if ($null -ne $block.reason) { $block.reason = [regex]::Replace([string]$block.reason, '\p{Cc}', { param($m) '\u{0:X4}' -f [int][char]$m.Value }) }
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -4724,8 +4727,10 @@ function Read-DvVisualCaptures {
         # (never pre-set as block.reason, r2 fable H2: that displaced a NOT_CAPTURED verdict's own reason; the finish clause appends it to every reason)
         if ($bandInfo.note) { $exposureNote = $bandInfo.note }
     }
-    # r2 (r1 adversary pass 3 A1): only when the judged frames carry two or more display frame numbers: one held number explains one picture by itself
-    if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1 -and [int]$block.appDistinctDisplayFrames -ge 2) {
+    # r2 (r1 adversary pass 3 A1): only when the judged frames carry two or more display frame numbers: one held number explains one picture by itself.
+    # r2 pass 4 A1: and never over judged frames whose own source ids are identical: a static source explains one picture by itself (the waiver says so)
+    if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1 -and [int]$block.appDistinctDisplayFrames -ge 2 -and
+        $block.sourceDifference -cne 'known-identical') {
         $maskNote = "the forced play captures show $($block.forcedPlayDistinctContentHashes) distinct pictures where the unforced ones show one: the force-paint would have masked this"
         if (-not $block.reason) { $block.reason = $maskNote }
     }

@@ -11466,6 +11466,43 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         self.assertNotIn("name one timeline position", row)
         self.assertIn("never beside `NOT_A_MOTION_WITNESS`", doc)
 
+        # r2 adversary pass 4 A1 (its input): forced 0/1 at 461/467 over source ids 01/02 with two pictures; unforced 0/1 at 479/485 over ONE source id 03
+        # showing one picture; the app records "differ". The judged frames are known-identical: the static-source waiver explains the one picture, so the
+        # reason (OK, waived) never also says the force-paint would have masked it (c5c1b38e did).
+        def p4_a1(visual):
+            kept = []
+            for f in visual["frames"]:
+                f.pop("source_id", None)
+                if f["kind"] == "play" and f["index"] in (0, 1):
+                    f.update({"display_frame": 461 + 6 * f["index"], "source_id": f"{f['index'] + 1:016x}", "forced_paints_before": f["index"]})
+                elif f["kind"] == "play_unbound" and f["index"] in (0, 1):
+                    f.update({"display_frame": 479 + 6 * f["index"], "source_id": "0000000000000003", "forced_paints_before": 2})
+                elif f["kind"] in ("play", "play_unbound", "paused"):
+                    continue
+                kept.append(f)
+            visual["frames"] = kept
+            visual["source_difference"] = "differ"
+        out = read(p4_a1, pngs=(("play-0.png", 3), ("play-1.png", 4)))
+        self.assertEqual((out["verdict"], out["sourceDifference"], out["appDistinctDisplayFrames"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"]),
+                         ("OK", "known-identical", 2, 1, 2), out["reason"])
+        self.assertIn("a static clip", out["reason"])
+        self.assertNotIn("masked", out["reason"], "one picture over one source is the source's own; no force-paint masking is shown")
+
+        # r2 adversary pass 4 A2 (its input): an exposure band file whose malformed row key carries line breaks and a forged DVE_DETAIL record. The reason
+        # is one line: each control character is written as \uXXXX, so Invoke-VenueLeg's DVE_DETAIL line cannot be split into a second record.
+        with tempfile.TemporaryDirectory(prefix="vis-held-p4-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            band = Path(d) / "bands.json"
+            band.write_text(json.dumps({"clips": {"c": {"bad\nDVE_DETAIL=the force-paint would have masked this at one timeline position\n": 0}}}), encoding="utf-8")
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      f"-ExposureBandPath '{band}' | ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["exposureBandSource"]), ("NOT_A_MOTION_WITNESS", "fallback-malformed"), out["reason"])
+        self.assertNotIn("\n", out["reason"])
+        self.assertNotIn("\r", out["reason"])
+        self.assertIn("bad\\u000ADVE_DETAIL=", out["reason"], "the key is quoted with its line break made visible, never dropped")
+
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;
         absent or anything else is unknown (case counts: `DIFFER` / `IDENTICAL` are not the app's words). A missing viewport rectangle is an unavailable
