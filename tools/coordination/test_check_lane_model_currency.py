@@ -98,6 +98,20 @@ class ThirdPartyProducerReceiptTests(CurrencyFixture):
         self.assertNotIn("neon", result["lanes"])
         self.assertNotIn("kimi", result["lanes"])
 
+    def test_the_reserved_marker_the_producer_writer_emits_is_readable_and_exempt(self):
+        # A10: the writer's marker carries reservedUtc AND startedUtc (the reader keys on startedUtc), so a normal
+        # reserved stage is neither unreadable nor judged.
+        self.count += 1
+        run = self.runs / ("run-%03d" % self.count)
+        run.mkdir()
+        stamp = _ts(1)
+        body = {"schema": "mlv-app/fleet-lane-receipt/v1", "state": "reserved", "complete": False, "lane": "kimi",
+                "engine": "kimicode", "card": "T-1", "reservedUtc": stamp, "startedUtc": stamp}
+        (run / "kimi-001.receipt.json").write_text(json.dumps(body), encoding="utf-8")
+        receipts, unreadable = check.load_receipts(str(self.runs))
+        self.assertEqual(unreadable, 0)
+        self.assertNotIn("kimi", check.evaluate(receipts, now=NOW)["lanes"])
+
     def test_a_producer_receipt_can_never_raise_a_claude_family_newest_id(self):
         # A15: the exemption ran after the family maximum, so a producer's resolvedModel could mark sonnet STALE.
         self.receipt("sonnet", "claude-sonnet-5-5", 3)

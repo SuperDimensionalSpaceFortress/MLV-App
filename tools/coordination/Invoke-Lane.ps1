@@ -2252,7 +2252,9 @@ if (Test-ThirdPartyProducerEngine $cfg.engine) {
         -LedgerWriter { param($row) Add-DispatchLedgerRow -Path $DispatchLedgerPath -Row $row } `
         -SnapshotDirty { Get-TrackedDirtyContentIdentity -WorkDir $WorkDir } `
         -ReadHead { $h = Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('rev-parse', 'HEAD'); if (-not $h.ok) { throw $h.error }; $h.stdout } `
+        -GitAncestor { param($a, $b) $m = Invoke-GitCaptureUtf8 -WorkDir $WorkDir -GitArgs @('merge-base', '--is-ancestor', [string]$a, [string]$b); [bool]$m.ok } `
         -AfterGit { $s = Stop-LaneWorktreeFsmonitor -WorkDir $WorkDir; [ordered]@{ action = [string]$s.action; reason = $s.reason } } `
+        -BulkManifestPath (Join-Path $RunDir 'scratch-paths.txt') `
         -BulkScratchCleanup {
             if (Test-Path -LiteralPath (Join-Path $RunDir 'scratch-paths.txt') -PathType Leaf) {
                 . (Join-Path $PSScriptRoot 'Remove-LaneBulkScratch.ps1')

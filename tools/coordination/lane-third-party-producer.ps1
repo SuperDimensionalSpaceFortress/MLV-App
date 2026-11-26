@@ -30,7 +30,7 @@ $THIRD_PARTY_MAX_COMMAND_LINE = 32000
 # agy exits 0 on a soft-deny and prints a notice on stderr that "names the tool and explains how to allow it"
 # (docs/cli/headless). The exact text is not published, so the notice is recognised STRUCTURALLY: a line that
 # names a tool-ish word AND a deny-ish word. Over-matching fails closed (refused, never complete).
-$AGY_SOFT_DENY_DENY_RE = '(?i)\b(denied|blocked|declined|rejected|disallowed|auto-?denied|not\s+(?:been\s+)?(?:allowed|approved|permitted|granted|authori[sz]ed)|(?:requires?|needs?|awaiting|pending|lacks?)\b[^\r\n]{0,40}\b(?:approval|permission|authori[sz]ation|consent)|(?:approval|permission|authori[sz]ation)\b[^\r\n]{0,20}\b(?:required|needed|denied)|permission\s+(?:denied|required)|skipp?ed\b[^\r\n]{0,30}\b(?:permission|approval))'
+$AGY_SOFT_DENY_DENY_RE = '(?i)\b(denied|blocked|declined|rejected|refus(?:ed|al|es)|forbidden|prohibited|unauthori[sz]ed|disallowed|auto-?denied|not\s+(?:been\s+)?(?:allowed|approved|permitted|granted|authori[sz]ed)|(?:requires?|needs?|awaiting|pending|lacks?)\b[^\r\n]{0,40}\b(?:approval|permission|authori[sz]ation|consent)|(?:approval|permission|authori[sz]ation)\b[^\r\n]{0,20}\b(?:required|needed|denied)|permission\s+(?:denied|required)|skipp?ed\b[^\r\n]{0,30}\b(?:permission|approval))'
 $AGY_SOFT_DENY_TOOL_RE = '(?i)\b(tool|command|write_file|read_file|read_url|edit_file|action|permission|permissions\.allow)\b'
 
 function Test-ThirdPartyProducerEngine([string]$Engine) {
@@ -65,8 +65,10 @@ function Get-ThirdPartyProducerPromptArg([string]$Prompt) {
 # (quote an argument holding whitespace or a quote; escape each quote; double the backslashes before a quote or the
 # closing quote). A prompt of 20,000 quote characters is 20,000 characters but over 40,000 serialized.
 function Get-ProducerCommandLineLength([string]$Exe, [string[]]$Argv) {
-    $total = 0
-    foreach ($a in (@($Exe) + @($Argv))) {
+    # The program is ALWAYS quoted by CreateProcess's command line ("exe" arg arg), whatever the path holds; arguments
+    # are separated by one space, with none after the last.
+    $total = ([string]$Exe).Length + 2
+    foreach ($a in @($Argv)) {
         $s = [string]$a
         $needsQuote = ($s.Length -eq 0) -or ($s -match '[\s"]')
         if (-not $needsQuote) { $total += $s.Length + 1; continue }
@@ -139,9 +141,11 @@ function Get-ThirdPartyProducerArgv {
 function ConvertFrom-ProducerJsonElement($El) {
     switch ($El.ValueKind.ToString()) {
         'Object' {
-            $d = [ordered]@{}
+            # Ordinal keys: an [ordered] dictionary compares string keys case-INSENSITIVELY, so {"STATUS":..} would have
+            # answered a lookup of `status`. Wire field names are exact.
+            $d = [System.Collections.Generic.Dictionary[string, object]]::new([System.StringComparer]::Ordinal)
             foreach ($p in $El.EnumerateObject()) {
-                if ($d.Contains($p.Name)) { throw "duplicate-key: $($p.Name)" }
+                if ($d.ContainsKey($p.Name)) { throw "duplicate-key: $($p.Name)" }
                 $d[$p.Name] = (ConvertFrom-ProducerJsonElement $p.Value)
             }
             return , $d
@@ -173,27 +177,27 @@ function ConvertFrom-ProducerJsonText([string]$Text) {
 # The value of one key of a parsed object, exactly as parsed ($null when absent). The leading comma keeps a
 # one-element array an array instead of letting the pipeline unroll it to its element.
 function Get-ProducerJsonProp($Object, [string]$Name) {
-    if ($Object -is [System.Collections.IDictionary] -and $Object.Contains($Name)) { return , $Object[$Name] }
+    if ($Object -is [System.Collections.Generic.Dictionary[string, object]] -and $Object.ContainsKey($Name)) { return , $Object[$Name] }
     return $null
 }
 
+# agy --output-format json prints ONE JSON object. Stdout is that object and nothing else: a rejected array, trailing
+# text or a second value is never "repaired" by looking for an object line inside it (that read an array's inner
+# element, or an object followed by `null`, as a clean result).
 function Get-AgyJsonResult([string]$Text) {
-    $o = ConvertFrom-ProducerJsonText -Text $Text
-    if ($null -ne $o) { return , $o }
-    $lines = @($Text -split "`r?`n" | Where-Object { $_.TrimStart().StartsWith('{') })
-    if ($lines.Count -gt 0) {
-        $o = ConvertFrom-ProducerJsonText -Text $lines[$lines.Count - 1]
-        if ($null -ne $o) { return , $o }
-    }
-    return $null
+    return , (ConvertFrom-ProducerJsonText -Text $Text)
 }
 
+# A notice may wrap, so the tool word and the deny word are looked for in a window of up to 3 consecutive non-blank
+# stderr lines, not only on one line.
 function Get-AgySoftDenyLine([string]$StderrText) {
     if ([string]::IsNullOrWhiteSpace($StderrText)) { return $null }
-    foreach ($line in ($StderrText -split "`r?`n")) {
-        if ($line -match $AGY_SOFT_DENY_DENY_RE -and $line -match $AGY_SOFT_DENY_TOOL_RE) {
-            $t = $line.Trim()
-            return $(if ($t.Length -gt 300) { $t.Substring(0, 300) } else { $t })
+    $lines = @($StderrText -split "`r?`n" | Where-Object { $_.Trim() -ne '' })
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $last = [math]::Min($i + 2, $lines.Count - 1)
+        $window = (@($lines[$i..$last]) | ForEach-Object { $_.Trim() }) -join ' '
+        if ($window -match $AGY_SOFT_DENY_DENY_RE -and $window -match $AGY_SOFT_DENY_TOOL_RE) {
+            return $(if ($window.Length -gt 300) { $window.Substring(0, 300) } else { $window })
         }
     }
     return $null
@@ -314,7 +318,9 @@ function Get-ThirdPartyProducerOutcome {
                 $err = Get-ProducerJsonProp $e 'error'
                 $isErr = Get-ProducerJsonProp $e 'is_error'
                 $errPresent = ($null -ne $err) -and (($err -isnot [string]) -or ($err -ne ''))
-                if (($type -is [string] -and $type -match '(?i)^error$') -or $errPresent -or ($isErr -is [bool] -and $isErr)) {
+                # `is_error` present and anything but the boolean false (a string "true", 1, ...) is an error indicator.
+                $isErrPresent = ($null -ne $isErr) -and -not ($isErr -is [bool] -and -not $isErr)
+                if (($type -is [string] -and $type -match '(?i)^error$') -or $errPresent -or $isErrPresent) {
                     $o.error = if ($err -is [string]) { $err } else { 'error event' }
                     $o.reason = 'stream-error-event'; return $o
                 }
@@ -374,12 +380,19 @@ function Invoke-ThirdPartyProducerProcess {
         [Parameter(Mandatory = $true)][string[]]$Argv,
         [Parameter(Mandatory = $true)][string]$WorkDir,
         [Parameter(Mandatory = $true)][double]$TimeoutSec,
-        [int]$KillGraceSec = 0,
+        # The lane's own stopwatch (started at reservation). Every wait is what is LEFT of -TimeoutSec on THIS clock,
+        # measured again after the child exists, and a child that finishes after the deadline is a timeout whatever it
+        # printed. Absent (a standalone call) a clock starts here.
+        [System.Diagnostics.Stopwatch]$Clock = $null,
         [hashtable]$EnvSet = @{},
         [string[]]$EnvRemove = @(),
-        [int]$DrainGraceMs = 10000
+        [ValidateRange(1, 600000)][int]$DrainGraceMs = 10000
     )
-    if ($TimeoutSec -le 0) { throw "producer-timeout-invalid: $TimeoutSec seconds left; the child is not started" }
+    # `-not (x -gt 0)` also refuses NaN, which passes `x -le 0`.
+    if (-not ($TimeoutSec -gt 0) -or [double]::IsInfinity($TimeoutSec)) { throw "producer-timeout-invalid: $TimeoutSec seconds; the child is not started" }
+    if ($null -eq $Clock) { $Clock = [System.Diagnostics.Stopwatch]::StartNew() }
+    $budgetMs = [math]::Min(2147483000.0, $TimeoutSec * 1000.0)
+    if ($Clock.Elapsed.TotalMilliseconds -ge $budgetMs) { throw [System.TimeoutException]::new('launch-budget-exhausted') }
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $Exe
     foreach ($a in $Argv) { [void]$psi.ArgumentList.Add([string]$a) }
@@ -398,7 +411,7 @@ function Invoke-ThirdPartyProducerProcess {
     $procId = $proc.Id
     $outBuf = [System.IO.MemoryStream]::new()
     $errBuf = [System.IO.MemoryStream]::new()
-    $timedOut = $false; $killOutcome = $null; $exitCode = -999
+    $timedOut = $false; $killOutcome = $null; $exitCode = -999; $finishedAfterDeadline = $false
     $outStream = $null; $errStream = $null; $outTask = $null; $errTask = $null
     try {
         $outStream = $proc.StandardOutput.BaseStream
@@ -406,12 +419,15 @@ function Invoke-ThirdPartyProducerProcess {
         $outTask = $outStream.CopyToAsync($outBuf)
         $errTask = $errStream.CopyToAsync($errBuf)
         try { $proc.StandardInput.Close() } catch { }
-        $limitMs = [math]::Min(2147483647.0, ([double]$TimeoutSec + [double]$KillGraceSec) * 1000.0)
-        if (-not $proc.WaitForExit([int][math]::Max(1.0, [math]::Ceiling($limitMs)))) {
+        # What is left NOW, after Process.Start and the pipe setup spent some of it (not the remainder measured before them).
+        $leftMs = $budgetMs - $Clock.Elapsed.TotalMilliseconds
+        if ($leftMs -le 0 -or -not $proc.WaitForExit([int][math]::Min(2147483647.0, [math]::Max(1.0, [math]::Ceiling($leftMs))))) {
             $timedOut = $true
             $killOutcome = Stop-ProducerProcessTree -Proc $proc -LimitMs 15000
         }
         $exitCode = if ($timedOut) { -1 } else { $proc.ExitCode }
+        # A child that exited, but only after the deadline, did not finish inside the lane's budget: its result is not used.
+        if (-not $timedOut -and $Clock.Elapsed.TotalMilliseconds -gt $budgetMs) { $timedOut = $true; $exitCode = -1; $finishedAfterDeadline = $true }
     } catch {
         # Anything that threw with a child alive must not leave it running.
         try { $null = Stop-ProducerProcessTree -Proc $proc -LimitMs 5000 } catch { }
@@ -429,6 +445,7 @@ function Invoke-ThirdPartyProducerProcess {
     $rootExited = try { [bool]$proc.HasExited } catch { $false }
     return [pscustomobject]@{
         pid = $procId; exitCode = $exitCode; timedOut = $timedOut; killOutcome = $killOutcome; rootExited = $rootExited
+        finishedAfterDeadline = $finishedAfterDeadline
         stdout = (ConvertFrom-ProducerBuffer $outBuf)
         stderr = (ConvertFrom-ProducerBuffer $errBuf)
         drainTimedOut = $drainTimedOut; drainFaulted = $drainFaulted
@@ -489,8 +506,14 @@ function Invoke-ThirdPartyProducerLane {
         [scriptblock]$LedgerWriter = $null,
         [scriptblock]$SnapshotDirty = $null,
         [scriptblock]$ReadHead = $null,
+        # param($baseSha, $head) -> $true only when $head descends from $baseSha (git merge-base --is-ancestor).
+        [scriptblock]$GitAncestor = $null,
         [scriptblock]$AfterGit = $null,
         [scriptblock]$BulkScratchCleanup = $null,
+        # The run dir's scratch-paths.txt. The cleanup runs only for a manifest THIS lane wrote or appended to: that file
+        # is shared by every lane that uses the run dir, and an earlier lane's keep decision (-KeepBulkScratch) must not be
+        # overridden by a later lane that registered nothing.
+        [string]$BulkManifestPath = '',
         # Test seam only: a fixture executable replaces the real CLI. NEVER set by Invoke-Lane.ps1.
         [string]$ExeForTest = ''
     )
@@ -507,12 +530,16 @@ function Invoke-ThirdPartyProducerLane {
     $rcptPath = "$base.receipt.json"; $promptPath = "$base.prompt.txt"; $outPath = "$base.out.txt"
     $errPath = "$base.err.txt"; $lastPath = "$base.last.txt"; $settingsPath = "$base.agy-settings.json"
     $utf8 = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText($rcptPath, (([ordered]@{
-        schema = 'mlv-app/fleet-lane-receipt/v1'; state = 'reserved'; complete = $false; lane = $Lane; engine = [string]$Cfg.engine; card = $Card
-        reservedUtc = (Get-Date).ToUniversalTime().ToString('o')
-    }) | ConvertTo-Json -Depth 4), $utf8)
-
     $startedUtc = (Get-Date).ToUniversalTime()
+    # The marker is cosmetic (the slot file already exists, empty); a reader that holds the slot open must not turn the
+    # reservation into a throw with no terminal receipt, so a failed write is skipped and the final publish writes it.
+    # `startedUtc` is the same instant as `reservedUtc`: the currency reader keys receipts on it.
+    try {
+        [System.IO.File]::WriteAllText($rcptPath, (([ordered]@{
+            schema = 'mlv-app/fleet-lane-receipt/v1'; state = 'reserved'; complete = $false; lane = $Lane; engine = [string]$Cfg.engine; card = $Card
+            reservedUtc = $startedUtc.ToString('o'); startedUtc = $startedUtc.ToString('o')
+        }) | ConvertTo-Json -Depth 4), $utf8)
+    } catch { }
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     $engine = [string]$Cfg.engine
     $model = [string]$Cfg.model
@@ -524,11 +551,6 @@ function Invoke-ThirdPartyProducerLane {
     $dirtyCheck = 'not-applicable'; $dirtyCheckReason = $null; $initialDirty = $null; $initialDirtyReason = $null
     $effortNote = $null; $artifactErrors = @()
     try {
-        # Owner rule: every lane runs at high effort. The table row is high; an override is refused here too.
-        if ([string]$Cfg.effort -ne 'high') { throw "lane-effort-must-be-high: a producer lane may only run at 'high' effort (owner ruling 2026-09-26); refusing effort '$($Cfg.effort)' for lane '$Lane'." }
-        # The lane has write authority and no Claude hook governs it, so the caller must have asked for it.
-        if (-not $AllowEdits) { throw "producer-allow-edits-required: -Lane $Lane is a write-capable producer; run it with -AllowEdits (and its -AllowedTools) or not at all" }
-        if ($TimeoutSec -lt 1) { throw "producer-timeout-invalid: -TimeoutSec $TimeoutSec (a producer lane needs a budget of at least 1 second)" }
         $dispatchState = if ($DispatchReservationId) { 'linked' } else { 'reserved' }
         $dispatchId = if ($DispatchReservationId) { $DispatchReservationId } else { [guid]::NewGuid().ToString() }
         if ($null -ne $LedgerWriter) {
@@ -540,6 +562,13 @@ function Invoke-ThirdPartyProducerLane {
                 })
             } catch { throw "dispatch-ledger-write-failed: $($_.Exception.Message)" }
         }
+        # AFTER the ledger row, so a receipt that records one of these deliberate pre-provider refusals is never an
+        # unreserved launch to the product-ratio coverage reader (which exempts only dispatch-ledger-write-failed).
+        # Owner rule: every lane runs at high effort. The table row is high; an override is refused here too.
+        if ([string]$Cfg.effort -ne 'high') { throw "lane-effort-must-be-high: a producer lane may only run at 'high' effort (owner ruling 2026-09-26); refusing effort '$($Cfg.effort)' for lane '$Lane'." }
+        # The lane has write authority and no Claude hook governs it, so the caller must have asked for it.
+        if (-not $AllowEdits) { throw "producer-allow-edits-required: -Lane $Lane is a write-capable producer; run it with -AllowEdits (and its -AllowedTools) or not at all" }
+        if ($TimeoutSec -lt 1) { throw "producer-timeout-invalid: -TimeoutSec $TimeoutSec (a producer lane needs a budget of at least 1 second)" }
         [System.IO.File]::WriteAllText($promptPath, $Prompt, $utf8)
         $exe = if ($ExeForTest) { $ExeForTest } else { Resolve-ThirdPartyProducerExe -Engine $engine }
         $exeInfo = [ordered]@{ path = $exe; version = $null }
@@ -593,10 +622,9 @@ function Invoke-ThirdPartyProducerLane {
         }
         if ($LanePromptPath) { $envSet['MLV_LANE_PROMPT'] = $LanePromptPath }
         $envRemove = @('MLV_DISPATCH_RESERVATION_ID'); if (-not $LanePromptPath) { $envRemove += 'MLV_LANE_PROMPT' }
-        $grace = if ($engine -eq 'antigravity') { 15 } else { 0 }
-        $remainingSec = $TimeoutSec - $sw.Elapsed.TotalSeconds
-        if ($remainingSec -le 0) { throw [System.TimeoutException]::new('launch-budget-exhausted') }
-        $run = Invoke-ThirdPartyProducerProcess -Exe $exe -Argv $argv -WorkDir $WorkDir -TimeoutSec $remainingSec -KillGraceSec $grace -EnvSet $envSet -EnvRemove $envRemove
+        # No grace beyond the budget: the child gets what is LEFT of the lane's own clock, and the runner re-measures it
+        # after the child exists. (agy's --print-timeout is the remaining seconds, rounded up, so it never outlives it.)
+        $run = Invoke-ThirdPartyProducerProcess -Exe $exe -Argv $argv -WorkDir $WorkDir -TimeoutSec $TimeoutSec -Clock $sw -EnvSet $envSet -EnvRemove $envRemove
         $exitCode = [int]$run.exitCode; $timedOut = [bool]$run.timedOut
         $stdout = [string]$run.stdout; $stderrText = [string]$run.stderr
         $outcome = Get-ThirdPartyProducerOutcome -Engine $engine -ExitCode $exitCode -TimedOut $timedOut -Stdout $stdout -Stderr $stderrText -OutputIncomplete ([bool]$run.outputIncomplete)
@@ -624,8 +652,15 @@ function Invoke-ThirdPartyProducerLane {
         }
     }
     # Bulk scratch the lane registered outside the scratch root (the same cleanup the claude/codex path runs). Never throws.
+    # Only a manifest written by THIS lane (modified since it started) is cleaned: the file is shared per run dir.
     if ($null -ne $BulkScratchCleanup) {
-        try { $bulkScratch = & $BulkScratchCleanup } catch { $bulkScratch = [ordered]@{ entries = @(); error = "cannot-determine: $($_.Exception.Message)" } }
+        try {
+            $ownManifest = $true
+            if ($BulkManifestPath) {
+                $ownManifest = (Test-Path -LiteralPath $BulkManifestPath -PathType Leaf) -and ((Get-Item -LiteralPath $BulkManifestPath).LastWriteTimeUtc -ge $startedUtc)
+            }
+            $bulkScratch = if ($ownManifest) { & $BulkScratchCleanup } else { [ordered]@{ entries = @(); error = $null; skipped = 'no manifest written by this lane (an earlier lane in the same run dir owns scratch-paths.txt)' } }
+        } catch { $bulkScratch = [ordered]@{ entries = @(); error = "cannot-determine: $($_.Exception.Message)" } }
     }
     # Work evidence: an implementer that edited tracked files and committed nothing has not finished (same rule as the
     # claude path's dirty-worktree-no-commit). Only when git could be read both times.
@@ -635,19 +670,28 @@ function Invoke-ThirdPartyProducerLane {
         elseif (-not $BaseSha -or $null -eq $SnapshotDirty -or $null -eq $ReadHead) { $dirtyCheck = 'not-applicable'; $dirtyCheckReason = 'no base sha or no git readers supplied' }
         else {
             try {
-                $headAfter = [string](& $ReadHead)
-                if ($headAfter.Trim() -ne $BaseSha) { $dirtyCheck = 'not-applicable'; $dirtyCheckReason = 'HEAD moved: a commit landed' }
+                # An implementer is judged on what it LEFT: tracked dirt it introduced fails the lane whether or not HEAD
+                # moved (a producer that commits part of its work and leaves the rest edited has not finished), and a HEAD
+                # that is not a descendant of the base (a checkout of an existing commit) is not "a commit landed".
+                $headAfter = ([string](& $ReadHead)).Trim()
+                $headProblem = $null
+                if ($headAfter -ne $BaseSha) {
+                    $descends = if ($null -ne $GitAncestor) { [bool](& $GitAncestor $BaseSha $headAfter) } else { $false }
+                    if (-not $descends) { $headProblem = "HEAD $headAfter is not a descendant of the base $BaseSha" }
+                }
+                $post = & $SnapshotDirty
+                if (-not $post.ok) { $dirtyCheck = 'unavailable'; $dirtyCheckReason = "post-exit snapshot: $($post.reason)" }
                 else {
-                    $post = & $SnapshotDirty
-                    if (-not $post.ok) { $dirtyCheck = 'unavailable'; $dirtyCheckReason = "post-exit snapshot: $($post.reason)" }
-                    else {
-                        $introduced = @($post.map.Keys | Where-Object { -not $initialDirty.Contains($_) -or $initialDirty[$_] -ne $post.map[$_] })
-                        if ($introduced.Count -gt 0) {
-                            $dirtyCheck = 'dirty'; $dirtyCheckReason = "lane-introduced tracked dirt: $($introduced -join ', ')"
-                            $complete = $false; $outcome.complete = $false; $outcome.state = 'ended-incomplete'
-                            $outcome.reason = if ($outcome.reason) { "$($outcome.reason) | dirty-worktree-no-commit" } else { 'dirty-worktree-no-commit' }
-                        } else { $dirtyCheck = 'clean' }
-                    }
+                    $introduced = @($post.map.Keys | Where-Object { -not $initialDirty.Contains($_) -or $initialDirty[$_] -ne $post.map[$_] })
+                    if ($introduced.Count -gt 0) {
+                        $dirtyCheck = 'dirty'; $dirtyCheckReason = "lane-introduced tracked dirt: $($introduced -join ', ')"
+                        $complete = $false; $outcome.complete = $false; $outcome.state = 'ended-incomplete'
+                        $outcome.reason = if ($outcome.reason) { "$($outcome.reason) | dirty-worktree-no-commit" } else { 'dirty-worktree-no-commit' }
+                    } elseif ($headProblem) {
+                        $dirtyCheck = 'head-not-descended'; $dirtyCheckReason = $headProblem
+                        $complete = $false; $outcome.complete = $false; $outcome.state = 'ended-incomplete'
+                        $outcome.reason = if ($outcome.reason) { "$($outcome.reason) | head-not-descended" } else { 'head-not-descended' }
+                    } else { $dirtyCheck = 'clean' }
                 }
             } catch { $dirtyCheck = 'unavailable'; $dirtyCheckReason = "cannot-determine: $($_.Exception.Message)" }
         }
@@ -667,7 +711,9 @@ function Invoke-ThirdPartyProducerLane {
     }
     $providerRefusal = if ($null -ne $outcome) { $outcome.providerRefusal } else { $null }
     $rootExited = if ($null -ne $run) { [bool]$run.rootExited } else { $false }
-    $processEnded = ($exitCode -ne -999) -and ($null -eq $run -or $rootExited)
+    # Observed, never assumed: true only when a child existed and its root was seen to exit. A run that never started
+    # (budget spent in setup, a refusal) has no process to have ended.
+    $processEnded = ($null -ne $run) -and $rootExited
     $state = if ($null -ne $failure) { 'failed' }
              elseif ($null -ne $providerRefusal) { 'refused' }
              elseif ($complete) { 'complete' }
@@ -721,7 +767,15 @@ function Invoke-ThirdPartyProducerLane {
             usage = $usage; durationSeconds = $(if ($null -ne $outcome) { $outcome.durationSeconds } else { $null })
         }
     }
-    Write-ProducerFileAtomic -Path $rcptPath -Content ($receipt | ConvertTo-Json -Depth 8)
+    # A reader that holds the receipt open past the replace's 2 s retry must not erase the typed exit or the result: the
+    # terminal receipt is then written beside the slot (a path nobody holds) and the exit code is still returned.
+    try {
+        Write-ProducerFileAtomic -Path $rcptPath -Content ($receipt | ConvertTo-Json -Depth 8)
+    } catch {
+        $receipt['publishError'] = "producer-receipt-publish-failed: $($_.Exception.Message)"
+        $receipt['receiptPath'] = "$base.receipt.terminal.json"
+        try { [System.IO.File]::WriteAllText("$base.receipt.terminal.json", ($receipt | ConvertTo-Json -Depth 8), $utf8) } catch { $receipt['publishError'] += " | terminal copy also failed: $($_.Exception.Message)" }
+    }
     # Exit code: 125 refused, 124 timed out, 127 never ran; a run that is NOT complete never exits 0.
     $propagated = if ($null -ne $providerRefusal) { 125 }
                   elseif ($timedOut) { 124 }

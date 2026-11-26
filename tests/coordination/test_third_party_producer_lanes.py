@@ -163,7 +163,7 @@ def test_the_serialized_command_line_is_bounded_not_just_the_prompt_characters(t
     # A10: 20,000 quote characters pass the 28,000-character check but serialize to over 40,000.
     n = pwsh_json("Get-ProducerCommandLineLength -Exe 'C:\\x\\agy.exe' -Argv @('-p', ('\"' * 20000), '--model', 'm') | ConvertTo-Json")
     assert n > 40000
-    assert pwsh_json("Get-ProducerCommandLineLength -Exe 'C:\\x\\agy.exe' -Argv @('-p', 'hi there') | ConvertTo-Json") == len('C:\\x\\agy.exe -p "hi there" ')
+    assert pwsh_json("Get-ProducerCommandLineLength -Exe 'C:\\x\\agy.exe' -Argv @('-p', 'hi there') | ConvertTo-Json") == len('"C:\\x\\agy.exe" -p "hi there"')  # A11: the program is always quoted; no trailing separator
     res, r = run_lane(tmp_path, "kimicode", make_cli(tmp_path, stdout=KIMI_STREAM), prompt_expr="('\"' * 20000)")
     assert r["failure"].startswith("producer-command-line-too-long") and res["state"] == "failed"
     assert not (tmp_path / "cli" / "started.txt").exists(), "no child may start for an over-long command line"
@@ -210,6 +210,9 @@ def test_every_agy_status_other_than_success_is_not_complete(status):
     '{"status":"SUCCESS","status":"ERROR","response":"OK"}',   # a duplicate key
     '{"status":"SUCCESS","response":{"text":"OK"}}',     # response is not a string
     '"SUCCESS"',
+    '[\n{"status":"SUCCESS","response":"OK"}\n]',        # A3: a pretty-printed array whose inner line looked like a result
+    '{"status":"SUCCESS","response":"OK"}\nnull',         # A3: a second value after the object
+    '{"STATUS":"SUCCESS","RESPONSE":"OK"}',               # A5: field names are exact, not case-folded aliases
 ])
 def test_agy_completion_needs_an_object_with_a_string_status_SUCCESS_and_a_string_response(stdout):
     # A7
@@ -239,6 +242,9 @@ def test_agy_soft_deny_on_stderr_is_refused_never_complete_even_with_status_succ
     "info: write_file blocked by policy",
     "tool write_file was rejected: approval is required",
     "WARNING: action write_file skipped, permission not granted",
+    "warning: tool call write_file(C:/w/a.txt)\nwas denied by policy",       # A4: the notice wraps across lines
+    "warning: tool read_file was refused; add it to permissions.allow",   # A4: 'refused'
+    "error: write_file is forbidden in this workspace",
 ])
 def test_agy_soft_deny_notices_are_recognised_in_more_than_one_wording(stderr):
     o = outcome("antigravity", 0, AGY_SUCCESS, stderr + "\n")
@@ -308,6 +314,9 @@ def test_kimi_exit_4_is_refused_session_held():
     ('{"role":"assistant","content":["OK"]}', "no-assistant-answer"),                  # A7: a one-element content array
     ('{"role":"assistant","content":"OK"}\n{"type":"error","error":"rate limited"}', "stream-error-event"),
     ('{"role":"assistant","content":"OK"}\n{"role":"meta","error":"x"}', "stream-error-event"),
+    ('{"ROLE":"assistant","CONTENT":"OK"}', "no-assistant-answer"),                    # A5: exact field names
+    ('{"role":"assistant","content":"OK"}\n{"is_error":"true"}', "stream-error-event"),  # A5: a malformed error indicator
+    ('{"role":"assistant","content":"OK"}\n{"is_error":1}', "stream-error-event"),
 ])
 def test_kimi_needs_a_clean_object_stream_with_an_assistant_answer_and_no_error_event(stdout, reason):
     o = outcome("kimicode", 0, stdout)
@@ -315,12 +324,16 @@ def test_kimi_needs_a_clean_object_stream_with_an_assistant_answer_and_no_error_
 
 
 # ------------------------------------------------------------------ the real lane function against a stand-in CLI
-def make_cli(tmp_path, stdout="", stderr="", code=0, hang=False, background=False):
+def make_cli(tmp_path, stdout="", stderr="", code=0, hang=False, background=False, touch=None, slow=False):
     d = tmp_path / "cli"
     d.mkdir(exist_ok=True)
     (d / "stdout.txt").write_text(stdout, encoding="utf-8")
     (d / "stderr.txt").write_text(stderr, encoding="utf-8")
     lines = ["@echo off", 'echo started> "%~dp0started.txt"']
+    if touch:
+        lines.append('echo x> "%s"' % touch)
+    if slow:
+        lines.append("ping -n 3 127.0.0.1 >nul")
     if background:
         lines.append("start \"\" /b ping -n 25 127.0.0.1")
     if hang:
@@ -331,21 +344,22 @@ def make_cli(tmp_path, stdout="", stderr="", code=0, hang=False, background=Fals
     return cli
 
 
-def run_lane(tmp_path, engine, cli, timeout=60, extra="", prompt_expr="'say ok'", prelude="", wt_name="wt", run_name="run", walker=False):
+def run_lane(tmp_path, engine, cli, timeout=60, extra="", prompt_expr="'say ok'", prelude="", wt_name="wt", run_name="run", walker=False,
+             effort="high", receipt_name="receipt.json"):
     wt = tmp_path / wt_name
     run = tmp_path / run_name
     wt.mkdir(exist_ok=True)
     run.mkdir(exist_ok=True)
-    cfg = ("@{ engine = 'antigravity'; model = 'gemini-4-neon-high'; effort = 'high'; role = 'trial-implementer' }"
+    cfg = ("@{ engine = 'antigravity'; model = 'gemini-4-neon-high'; effort = '%s'; role = 'trial-implementer' }" % effort
            if engine == "antigravity" else
-           "@{ engine = 'kimicode'; model = 'kimi-code/k3.1-pro'; effort = 'high'; role = 'trial-implementer' }")
+           "@{ engine = 'kimicode'; model = 'kimi-code/k3.1-pro'; effort = '%s'; role = 'trial-implementer' }" % effort)
     lane = "neon" if engine == "antigravity" else "kimi"
     allow = "" if "-AllowEdits" in extra else "-AllowEdits $true"
     script = ("%s$r = Invoke-ThirdPartyProducerLane -Lane %s -Cfg %s -Prompt %s -WorkDir $env:T_WT -RunDir $env:T_RUN "
               "-TimeoutSec %d -Card T-1 -ExeForTest $env:T_CLI %s %s; "
               "[ordered]@{ exit = $r.ExitCode; state = $r.Receipt.state } | ConvertTo-Json -Compress") % (prelude, lane, cfg, prompt_expr, timeout, allow, extra)
     res = pwsh_json(script, {"T_WT": str(wt), "T_RUN": str(run), "T_CLI": str(cli)}, walker=walker)
-    receipt = json.loads((run / ("%s-001.receipt.json" % lane)).read_text(encoding="utf-8"))
+    receipt = json.loads((run / ("%s-001.%s" % (lane, receipt_name))).read_text(encoding="utf-8"))
     return res, receipt
 
 
@@ -444,7 +458,10 @@ def test_a_child_that_outlives_the_drain_makes_the_run_incomplete_never_a_clean_
         "$o = Get-ThirdPartyProducerOutcome -Engine antigravity -ExitCode $r.exitCode -Stdout $r.stdout -Stderr $r.stderr -OutputIncomplete $r.outputIncomplete; "
         "[ordered]@{ drainTimedOut = $r.drainTimedOut; incomplete = $r.outputIncomplete; complete = $o.complete; reason = $o.reason } | ConvertTo-Json -Compress",
         {"T_CLI": str(cli), "T_WT": str(tmp_path)})
-    assert out == {"drainTimedOut": True, "incomplete": True, "complete": False, "reason": "output-incomplete"}
+    # the descendant's own output shares the pipe, so strict parsing may reject the stream before the drain flag is even
+    # consulted; either way the run is not complete (the pure test above pins output-incomplete for a clean prefix)
+    assert out["drainTimedOut"] is True and out["incomplete"] is True and out["complete"] is False
+    assert out["reason"] in ("output-incomplete", "json-unparseable")
 
 
 def test_a_producer_lane_without_allow_edits_starts_no_child(tmp_path):
@@ -461,6 +478,98 @@ def test_the_lane_budget_is_one_stopwatch_setup_spends_it_and_a_spent_budget_sta
     res, r = run_lane(tmp_path, "antigravity", cli, timeout=1, extra="-LedgerWriter { param($row) Start-Sleep -Seconds 2 }")
     assert res == {"exit": 124, "state": "ended-incomplete"} and r["timedOut"] is True and r["complete"] is False
     assert not (tmp_path / "cli" / "started.txt").exists(), "a spent budget must not start the provider"
+    # A2: no child existed, so no process can be reported as ended.
+    assert r["processEnded"] is False
+
+
+def test_the_runner_measures_what_is_left_on_the_lane_clock_after_the_child_exists(tmp_path):
+    # A1: the stale remainder (and, for neon, a fixed +15 s) was waited after Process.Start; a result after the deadline completed.
+    cli = make_cli(tmp_path, stdout=AGY_SUCCESS, slow=True)
+    script = ("$c = [System.Diagnostics.Stopwatch]::StartNew(); Start-Sleep -Milliseconds 1300; "
+              "$out = try { Invoke-ThirdPartyProducerProcess -Exe $env:T_CLI -Argv @('-p','x') -WorkDir $env:T_WT -TimeoutSec 1 -Clock $c | Out-Null; 'ran' } "
+              "catch [System.TimeoutException] { 'timeout:' + $_.Exception.Message }; $out | ConvertTo-Json")
+    assert pwsh_json(script, {"T_CLI": str(cli), "T_WT": str(tmp_path)}) == "timeout:launch-budget-exhausted"
+    assert not (tmp_path / "cli" / "started.txt").exists()
+    # 0.7 s of the 1 s budget already spent on the lane clock; the child needs ~2 s, so it is killed after ~0.3 s, not 1 s.
+    script = ("$c = [System.Diagnostics.Stopwatch]::StartNew(); Start-Sleep -Milliseconds 700; "
+              "$r = Invoke-ThirdPartyProducerProcess -Exe $env:T_CLI -Argv @('-p','x') -WorkDir $env:T_WT -TimeoutSec 1 -Clock $c; "
+              "[ordered]@{ timedOut = $r.timedOut; exit = $r.exitCode; late = $r.finishedAfterDeadline } | ConvertTo-Json -Compress")
+    assert pwsh_json(script, {"T_CLI": str(cli), "T_WT": str(tmp_path)}, walker=True) == {"timedOut": True, "exit": -1, "late": False}
+
+
+def test_a_nan_budget_and_a_nonpositive_drain_are_refused_by_the_standalone_runner(tmp_path):
+    # A13
+    cli = make_cli(tmp_path, stdout=AGY_SUCCESS)
+    done = pwsh("Invoke-ThirdPartyProducerProcess -Exe $env:T_CLI -Argv @('-p','x') -WorkDir $env:T_WT -TimeoutSec ([double]::NaN)",
+                {"T_CLI": str(cli), "T_WT": str(tmp_path)})
+    assert done.returncode != 0 and "producer-timeout-invalid" in done.stdout + done.stderr
+    done = pwsh("Invoke-ThirdPartyProducerProcess -Exe $env:T_CLI -Argv @('-p','x') -WorkDir $env:T_WT -TimeoutSec 5 -DrainGraceMs -1",
+                {"T_CLI": str(cli), "T_WT": str(tmp_path)})
+    assert done.returncode != 0
+    assert not (tmp_path / "cli" / "started.txt").exists(), "neither refusal may start the child"
+
+
+def test_deliberate_pre_provider_refusals_still_follow_a_ledger_row(tmp_path):
+    # A9: a refusal (here -ReasoningEffort medium reaching the helper) with no ledger row reads as an unreserved launch.
+    ledger = tmp_path / "ledger.txt"
+    cli = make_cli(tmp_path, stdout=AGY_SUCCESS)
+    res, r = run_lane(tmp_path, "antigravity", cli, effort="medium", prelude="$env:T_LED = '%s'; " % ledger,
+                      extra="-LedgerWriter { param($row) 'row' | Out-File -LiteralPath $env:T_LED }")
+    assert res["state"] == "failed" and r["failure"].startswith("lane-effort-must-be-high")
+    assert ledger.exists(), "the ledger row is written BEFORE the effort refusal"
+    sub = tmp_path / "noedit"
+    sub.mkdir()
+    ledger2 = sub / "ledger.txt"
+    res, r = run_lane(sub, "antigravity", make_cli(sub, stdout=AGY_SUCCESS), prelude="$env:T_LED = '%s'; " % ledger2,
+                      extra="-AllowEdits $false -LedgerWriter { param($row) 'row' | Out-File -LiteralPath $env:T_LED }")
+    assert r["failure"].startswith("producer-allow-edits-required") and ledger2.exists()
+
+
+def test_a_manifest_this_lane_did_not_write_is_not_cleaned_up(tmp_path):
+    # A6: scratch-paths.txt is shared by every lane in a run dir; a later lane that registered nothing must not clean
+    # (or override the keep decision of) an earlier lane's paths.
+    manifest = tmp_path / "scratch-paths.txt"
+    manifest.write_text("C:\\mlvtmp\\audit-a\n", encoding="utf-8")
+    os.utime(manifest, (1_700_000_000, 1_700_000_000))
+    cleanup = "-BulkManifestPath $env:T_MAN -BulkScratchCleanup { [ordered]@{ entries = @('cleaned'); error = $null } }"
+    cli = make_cli(tmp_path, stdout=KIMI_STREAM)
+    _, r = run_lane(tmp_path, "kimicode", cli, run_name="stale", extra=cleanup, prelude="$env:T_MAN = '%s'; " % manifest)
+    assert r["bulkScratch"]["entries"] == [] and "no manifest written by this lane" in r["bulkScratch"]["skipped"]
+    sub = tmp_path / "fresh"
+    sub.mkdir()
+    cli = make_cli(sub, stdout=KIMI_STREAM, touch=str(manifest))
+    _, r = run_lane(sub, "kimicode", cli, run_name="fresh", extra=cleanup, prelude="$env:T_MAN = '%s'; " % manifest)
+    assert r["bulkScratch"]["entries"] == ["cleaned"]
+
+
+def test_a_receipt_that_cannot_be_published_is_written_beside_the_slot_and_the_typed_exit_survives(tmp_path):
+    # A8: the replace threw after its 2 s retry and the typed exit and the result were lost, leaving a reserved marker.
+    override = "function Write-ProducerFileAtomic { param($Path, $Content) throw 'sharing violation held by a reader' }; "
+    res, r = run_lane(tmp_path, "antigravity", make_cli(tmp_path, stdout=AGY_SUCCESS, stderr=AGY_SOFT_DENY_STDERR), prelude=override,
+                      receipt_name="receipt.terminal.json")
+    assert res == {"exit": 125, "state": "refused"}, "the typed exit survives a receipt I/O problem"
+    assert r["publishError"].startswith("producer-receipt-publish-failed") and r["providerRefusal"]["kind"] == "tool-soft-deny"
+    assert r["receiptPath"].endswith("neon-001.receipt.terminal.json")
+
+
+def test_head_moved_to_a_commit_that_is_not_a_descendant_is_not_complete(tmp_path):
+    # A7: switching to an existing parent commit was read as "a commit landed", and uncommitted edits went unseen.
+    cli = make_cli(tmp_path, stdout=AGY_SUCCESS)
+    clean = "-SnapshotDirty { @{ ok = $true; map = [ordered]@{}; reason = $null } }"
+    res, r = run_lane(tmp_path, "antigravity", cli, extra="-BaseSha 'abc' -ReadHead { 'def' } -GitAncestor { param($a, $b) $false } " + clean)
+    assert r["dirtyCheck"] == "head-not-descended" and r["complete"] is False and res["state"] == "ended-incomplete"
+    sub = tmp_path / "ok"
+    sub.mkdir()
+    res, r = run_lane(sub, "antigravity", make_cli(sub, stdout=AGY_SUCCESS),
+                      extra="-BaseSha 'abc' -ReadHead { 'def' } -GitAncestor { param($a, $b) $true } " + clean)
+    assert r["dirtyCheck"] == "clean" and r["complete"] is True, "a real descendant commit with a clean tree completes"
+    sub = tmp_path / "left"
+    sub.mkdir()
+    left = ("-BaseSha 'abc' -ReadHead { 'def' } -GitAncestor { param($a, $b) $true } "
+            "-SnapshotDirty { $script:n = 1 + $(if (Test-Path variable:script:n) { $script:n } else { 0 }); "
+            "@{ ok = $true; map = $(if ($script:n -eq 1) { [ordered]@{} } else { [ordered]@{ 'a.txt' = 'h' } }); reason = $null } }")
+    res, r = run_lane(sub, "antigravity", make_cli(sub, stdout=AGY_SUCCESS), extra=left)
+    assert r["dirtyCheck"] == "dirty" and r["complete"] is False, "committing part and leaving the rest edited is not finished"
 
 
 def test_the_helper_refuses_a_zero_or_negative_budget_before_any_child(tmp_path):
