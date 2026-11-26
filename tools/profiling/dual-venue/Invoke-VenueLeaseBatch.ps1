@@ -1643,7 +1643,7 @@ if ($legPlanMode) {
         # the same rule as a location the guard gave up on (RunOutputAliased); stderr carries the typed line. The code stays LEG_PLAN_UNREADABLE.
         if ($planRead.state -ceq 'TIMEOUT') { $script:RunOutputAliased = $true; Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' could not be read within the time left before -DeadlineUtc" }
         # r14 (sol r13 B4): a plan that repeats a key (a `purpose` written twice) is LEG_PLAN_UNREADABLE, never the last value the parser kept
-        $doc = try { if ($planRead.state -cne 'OK') { throw [string]$planRead.error }; $planText = [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$planRead.bytes), $true).ReadToEnd(); Assert-FpsJsonNoRepeatedKey $planText $planPath; $planText | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
+        $doc = try { if ($planRead.state -cne 'OK') { throw [string]$planRead.error }; $planText = [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$planRead.bytes), $true).ReadToEnd(); Assert-FpsJsonNoRepeatedKey $planText $planPath -AllowArrayRoot; $planText | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
         # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
         $rawItems = $null
         if ($doc -is [array]) { $rawItems = $doc }

@@ -155,6 +155,26 @@ class ArmClassifierTests(_Probe):
         expected = [f"{label}={'NONE' if label.startswith('OK') else 'PROBLEM'}" for label in cases] + ["ASSERT=FPS_JSON_REPEATED_KEY"]
         self.assertEqual(out, expected)
 
+    def test_a1_item_shape_residue_allow_array_root_admits_a_list_root_and_nothing_else(self) -> None:
+        # A1-ITEM-SHAPE-RESIDUE-1 r1: the venue lease batch's leg plan is legitimately a bare array whose entries that reader shape-checks itself (BAD_ITEM_SHAPE item=<n>), so its raw check passes
+        # -AllowArrayRoot. The switch lifts ONLY the root-must-be-an-object rule: a repeated key, an envelope array, a scalar root and unparsable text are still problems, and the default stays strict.
+        cases = {
+            "DEFAULT_LIST": ("[{\"a\":1},null]", ""),
+            "LIST_NULL": ("[{\"a\":1},null]", " -AllowArrayRoot"),
+            "LIST_ONLY_NULL": ("[null]", " -AllowArrayRoot"),
+            "LIST_DUP": ("[{\"k\":1,\"k\":2}]", " -AllowArrayRoot"),
+            "LIST_ENVELOPE": ("[{\"proof\":[{}]}]", " -AllowArrayRoot"),
+            "SCALAR": ("\"x\"", " -AllowArrayRoot"),
+            "BAD": ("[oops", " -AllowArrayRoot"),
+            "OBJECT": ("{\"legs\":[null]}", " -AllowArrayRoot"),
+        }
+        body = "".join(f"$p = Get-FpsJsonRepeatedKeyProblem '{text}'{flag}\nWrite-Host ('{label}=' + $(if ($null -eq $p) {{ 'NONE' }} else {{ 'PROBLEM' }}))\n" for label, (text, flag) in cases.items())
+        body += "try { Assert-FpsJsonNoRepeatedKey '[null]' 'plan.json' -AllowArrayRoot; Write-Host 'ASSERT_OK=NONE' } catch { Write-Host 'ASSERT_OK=THREW' }\n"
+        body += "try { Assert-FpsJsonNoRepeatedKey '[null]' 'plan.json'; Write-Host 'ASSERT_STRICT=NONE' } catch { Write-Host 'ASSERT_STRICT=THREW' }\n"
+        out = self.ok(body).split()
+        self.assertEqual(out, ["DEFAULT_LIST=PROBLEM", "LIST_NULL=NONE", "LIST_ONLY_NULL=NONE", "LIST_DUP=PROBLEM", "LIST_ENVELOPE=PROBLEM", "SCALAR=PROBLEM", "BAD=PROBLEM", "OBJECT=NONE",
+                               "ASSERT_OK=NONE", "ASSERT_STRICT=THREW"])
+
     def test_r15_a1_the_readers_refuse_a_wrapped_record_before_the_parser_unwraps_it(self) -> None:
         # r15 (adversary r14 pass 18 A1 and siblings): compare-release-gui-smoke-ab.ps1 Read-SmokeJson and compare-machine-perf.ps1 Read-JsonRecords (whole document and JSONL line) refuse
         # a singleton-array root; the same record unwrapped is read.

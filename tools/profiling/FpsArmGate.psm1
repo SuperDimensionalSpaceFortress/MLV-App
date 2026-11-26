@@ -537,7 +537,7 @@ function Get-FpsJsonRepeatedKeyProblem {
     "<path> repeats the key '<name>'" for the first object that names a key twice (names compared ignoring case, as the Windows environment and ConvertTo-FpsEnvMap do), else $null. Text
     the strict reader cannot parse is a problem too (fail closed): it cannot be shown free of repeats.
     #>
-    param([AllowNull()][string]$Text)
+    param([AllowNull()][string]$Text, [switch]$AllowArrayRoot)
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $options = [System.Text.Json.JsonDocumentOptions]::new()
     $options.AllowTrailingCommas = $true
@@ -550,7 +550,11 @@ function Get-FpsJsonRepeatedKeyProblem {
         # straight through an array, so [ { ...valid LIGHT record... } ] (or "proof": [ { ... } ]) reached the gate as the record inside it. Every judged record, smoke result, summary
         # and plan is a JSON OBJECT, and every envelope the readers walk by member access is an object by contract: a root that is not an object, or an envelope key holding an
         # array, is a shape problem here (this is the one raw check every judged reader already calls before it parses), never a record the parser silently unwraps.
-        if ($doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return "`$ is a JSON $($doc.RootElement.ValueKind), not an object (a judged record is one JSON object; an array root is unwrapped by the parser)" }
+        # A1-ITEM-SHAPE-RESIDUE-1 r1: -AllowArrayRoot is for a reader whose document legitimately IS a list and which shape-checks every entry itself (the venue lease batch's leg plan: a bare array of
+        # items is a valid plan, and a null or non-object entry must reach that reader's own BAD_ITEM_SHAPE item=<n>, not a generic unreadable refusal here). Repeated keys and the envelope-array
+        # rule below still apply to the whole text, and a scalar root is still refused.
+        $rootIsAllowedList = $AllowArrayRoot -and $doc.RootElement.ValueKind -eq [System.Text.Json.JsonValueKind]::Array
+        if (-not $rootIsAllowedList -and $doc.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return "`$ is a JSON $($doc.RootElement.ValueKind), not an object (a judged record is one JSON object; an array root is unwrapped by the parser)" }
         $pending = [System.Collections.Generic.Stack[object]]::new()
         $pending.Push(@('$', $doc.RootElement))
         while ($pending.Count -gt 0) {
@@ -583,8 +587,8 @@ function Get-FpsJsonRepeatedKeyProblem {
 function Assert-FpsJsonNoRepeatedKey {
     # Throws "FPS_JSON_REPEATED_KEY: <problem> (<label>)" when Get-FpsJsonRepeatedKeyProblem finds one; every reader that parses a record, a smoke result or a plan the arm gate judges calls this on
     # the raw text first, so its own error path (a typed refusal, an UNKNOWN arm or a failed read) handles the repeat instead of a parser picking one value.
-    param([AllowNull()][string]$Text, [string]$Label = 'JSON')
-    $problem = Get-FpsJsonRepeatedKeyProblem $Text
+    param([AllowNull()][string]$Text, [string]$Label = 'JSON', [switch]$AllowArrayRoot)
+    $problem = Get-FpsJsonRepeatedKeyProblem $Text -AllowArrayRoot:$AllowArrayRoot
     if ($null -ne $problem) { throw "FPS_JSON_REPEATED_KEY: $problem ($Label)" }
 }
 
