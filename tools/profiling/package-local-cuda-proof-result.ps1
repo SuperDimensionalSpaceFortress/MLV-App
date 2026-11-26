@@ -109,42 +109,76 @@ function Invoke-ProofSummarizer {
     # ENVELOPE-PREEMPT-R1-RESIDUE-1 r2 (hosted run 45786756378, Linux): a backslash is a file-name character on Linux, so the repo-relative path is joined with forward slashes (also valid on
     # Windows), and the child is `pwsh.exe` only where the directory separator is a backslash.
     $summaryScript = Join-Path $Repo "tools/profiling/summarize-local-cuda-proof.ps1"
-    $pwshExe = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) { "pwsh.exe" } else { "pwsh" }
+    # (adversary 1ce472bc A2: the child is the running PowerShell's own binary under $PSHOME, so a pwsh that is not on PATH still launches; the bare name is the last resort)
+    $pwshLeaf = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) { "pwsh.exe" } else { "pwsh" }
+    $pwshExe = Join-Path $PSHOME $pwshLeaf
+    if (!(Test-Path -LiteralPath $pwshExe -PathType Leaf)) { $pwshExe = $pwshLeaf }
     if (!(Test-Path -LiteralPath $summaryScript -PathType Leaf)) {
         throw "Proof summarizer not found: $summaryScript"
+    }
+    # (adversary 1ce472bc A1: a report path that is the input summary (a -ReportPath named like the summary, whose .json twin is the summary) or the other report would be deleted by the
+    # cleanup below or overwritten by a child, so it is refused before anything is removed; a directory given as a report path is refused for the same reason)
+    $comparison = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+    $summaryFull = [IO.Path]::GetFullPath($Summary)
+    $markdownFull = [IO.Path]::GetFullPath($MarkdownReport)
+    $jsonFull = [IO.Path]::GetFullPath($JsonReport)
+    foreach ($candidate in @($markdownFull, $jsonFull)) {
+        if ([string]::Equals($candidate, $summaryFull, $comparison)) {
+            throw "Proof report path $candidate is the input summary; refusing before anything is removed."
+        }
+    }
+    if ([string]::Equals($markdownFull, $jsonFull, $comparison)) {
+        throw "The Markdown and JSON proof reports share the path $markdownFull; refusing."
+    }
+    foreach ($candidate in @($markdownFull, $jsonFull)) {
+        if (Test-Path -LiteralPath $candidate -PathType Container) {
+            throw "Proof report path $candidate is a directory; refusing."
+        }
     }
     # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 8747fced A5): exit 1 also means the summarizer refused its input before writing (a repeated key), so a report an EARLIER run left here would be
     # packaged as this summary's. Both reports are removed first, and each must exist after its run.
     foreach ($stale in @($MarkdownReport, $JsonReport)) {
-        # (adversary 0e9672e5 A2: a FILE only; a directory given as the report path is left for the summarizer's own write to refuse)
         if (Test-Path -LiteralPath $stale -PathType Leaf) { Remove-Item -LiteralPath $stale -Force }
     }
+    # (adversary 1ce472bc A7: each child writes a name only this run knows, and the report is published from it, so a report another packager wrote at the same path between this run's two
+    # children can never be taken as this run's own)
+    $token = [guid]::NewGuid().ToString("N")
+    $markdownTemp = "$MarkdownReport.$token.tmp"
+    $jsonTemp = "$JsonReport.$token.tmp"
+    try {
+        & $pwshExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+            -File $summaryScript `
+            -RepoRoot $Repo `
+            -SummaryPath $Summary `
+            -Output $markdownTemp | Out-Null
+        $markdownExit = $LASTEXITCODE
+        if ($markdownExit -notin @(0, 1)) {
+            throw "Markdown proof report generation exited with code $markdownExit."
+        }
+        if (!(Test-Path -LiteralPath $markdownTemp -PathType Leaf)) {
+            throw "Markdown proof report generation exited with code $markdownExit and wrote no report at $MarkdownReport (the summary was refused)."
+        }
 
-    & $pwshExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-        -File $summaryScript `
-        -RepoRoot $Repo `
-        -SummaryPath $Summary `
-        -Output $MarkdownReport | Out-Null
-    $markdownExit = $LASTEXITCODE
-    if ($markdownExit -notin @(0, 1)) {
-        throw "Markdown proof report generation exited with code $markdownExit."
+        & $pwshExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+            -File $summaryScript `
+            -RepoRoot $Repo `
+            -SummaryPath $Summary `
+            -Output $jsonTemp `
+            -Json | Out-Null
+        $jsonExit = $LASTEXITCODE
+        if ($jsonExit -notin @(0, 1)) {
+            throw "JSON proof report generation exited with code $jsonExit."
+        }
+        if (!(Test-Path -LiteralPath $jsonTemp -PathType Leaf)) {
+            throw "JSON proof report generation exited with code $jsonExit and wrote no report at $JsonReport (the summary was refused)."
+        }
+        Move-Item -LiteralPath $markdownTemp -Destination $MarkdownReport -Force
+        Move-Item -LiteralPath $jsonTemp -Destination $JsonReport -Force
     }
-    if (!(Test-Path -LiteralPath $MarkdownReport -PathType Leaf)) {
-        throw "Markdown proof report generation exited with code $markdownExit and wrote no report at $MarkdownReport (the summary was refused)."
-    }
-
-    & $pwshExe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
-        -File $summaryScript `
-        -RepoRoot $Repo `
-        -SummaryPath $Summary `
-        -Output $JsonReport `
-        -Json | Out-Null
-    $jsonExit = $LASTEXITCODE
-    if ($jsonExit -notin @(0, 1)) {
-        throw "JSON proof report generation exited with code $jsonExit."
-    }
-    if (!(Test-Path -LiteralPath $JsonReport -PathType Leaf)) {
-        throw "JSON proof report generation exited with code $jsonExit and wrote no report at $JsonReport (the summary was refused)."
+    finally {
+        foreach ($leftover in @($markdownTemp, $jsonTemp)) {
+            if (Test-Path -LiteralPath $leftover -PathType Leaf) { Remove-Item -LiteralPath $leftover -Force -ErrorAction SilentlyContinue }
+        }
     }
 
     [pscustomobject]@{

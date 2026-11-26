@@ -208,6 +208,9 @@ $proofReportStatus = if ($proofReport) { [string]$proofReport.status } else { $n
 if ($StrictQuotable -and $proofReportStatus -ne "QUOTABLE_PASS") {
     Add-Message $failures "Strict quotable import required QUOTABLE_PASS; packet proof report status was '$proofReportStatus'."
 }
+# adversary 1ce472bc A8: a speed claim is quotable only from a report this import verified: no failure, and a manifest hash check that passed for the very proof-report.json that was read
+# (a manifest with no files, or one that does not list it, verified nothing)
+$speedHashBound = ($failures.Count -eq 0) -and (@($fileChecks | Where-Object { [bool]$_.ok -and ([string]$_.relativePath -eq "proof-report.json") }).Count -eq 1)
 $proofDiagnostics = if ($proofReport) { @($proofReport.diagnostics) } else { @() }
 $proofDiagnosticSummary = if ($proofReport) { $proofReport.diagnosticSummary } else { $null }
 $proofActionPlan = if ($proofReport) { $proofReport.actionPlan } else { $null }
@@ -235,7 +238,8 @@ $result = [ordered]@{
             status = $proofReport.status
             # r15 (adversary r14 pass 18 A6): speed authority is the report's claimAuthority.speed (exactly $true), never the support status; a report without it grants none
             # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6): one predicate with the packager (Test-FpsProofReportSpeedQuotable): the PASS playbackSpeed section, no singleton arrays, no repeated key
-            speedQuotable = (Test-FpsProofReportSpeedQuotable -Report $proofReport -RawText $proofReportRaw)
+            speedQuotable = ($speedHashBound -and (Test-FpsProofReportSpeedQuotable -Report $proofReport -RawText $proofReportRaw))
+            speedHashBound = $speedHashBound
             claimAuthority = $proofReport.claimAuthority
             topLevelStatus = $proofReport.topLevelStatus
             blockers = @($proofReport.blockers)

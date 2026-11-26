@@ -1658,6 +1658,9 @@ if ($legPlanMode) {
         $planDir = Split-Path -Parent $planPath
         # (read here, before the item loop, because the arm read's timeout refusal applies only to a plan that declares a purpose; the purpose itself is judged after the loop)
         $planPurposeDeclared = ($doc -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $doc.PSObject.Properties['purpose'])
+        # (adversary 1ce472bc A5: the arm decides only for the scalar string 'fps-ab'; a 'stage-attribution' plan accepts any arm, and a declared purpose that is not a known scalar is BAD_PURPOSE, judged below
+        # and never pre-empted by a stalled arm read)
+        $armDecides = $planPurposeDeclared -and ($doc.PSObject.Properties['purpose'].Value -is [string]) -and ([string]$doc.PSObject.Properties['purpose'].Value -ceq 'fps-ab')
         $items = [System.Collections.Generic.List[object]]::new()
         for ($i = 0; $i -lt $rawItems.Count; $i++) {
             $it = $rawItems[$i]; $n = $i + 1
@@ -1682,7 +1685,7 @@ if ($legPlanMode) {
             $armRead = Get-LegSpecTelemetryArm $path
             # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A1): the arm only decides anything for a plan that declares a purpose. A purpose-free plan records the arm (UNKNOWN when its read got no
             # answer) and goes on to the base's own reads, so a stalled arm read never pre-empts its staging refusal (BUILD_NOT_STAGED item=<n>).
-            if ($armRead.readTimedOut -and $planPurposeDeclared) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n "'$path' cannot be run: the leg spec could not be read for its telemetry arm within the time left before -DeadlineUtc; no claim or lease is taken on it" }   # r6 (adversary pass 5 A5)
+            if ($armRead.readTimedOut -and $armDecides) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n "'$path' cannot be run: the leg spec could not be read for its telemetry arm within the time left before -DeadlineUtc; no claim or lease is taken on it" }   # r6 (adversary pass 5 A5)
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
                     telemetryArm = $armRead.arm })
         }

@@ -578,7 +578,16 @@ function Test-FpsCachedAnalysisBound {
         $j = Get-FaProp (Get-FaProp $Compare $pair[1]) $pair[2]
         if ($null -eq $c -and $null -eq $j) { continue }
         if (-not (& $isNumber $c) -or -not (& $isNumber $j)) { return $false }
+        # (adversary 1ce472bc A4: exact on integers too: [double] collapses 9007199254740993 and 9007199254740992, so two integers compare as integers, and an integer past 2^53 is no double's equal)
+        $bothIntegral = ($c -is [int] -or $c -is [long] -or $c -is [int16] -or $c -is [byte]) -and ($j -is [int] -or $j -is [long] -or $j -is [int16] -or $j -is [byte])
+        if ($bothIntegral) {
+            if ([long]$c -ne [long]$j) { return $false }
+            continue
+        }
         if (([double]$c) -ne ([double]$j)) { return $false }
+        foreach ($side in @($c, $j)) {
+            if (($side -is [int] -or $side -is [long]) -and [Math]::Abs([double]$side) -ge 9007199254740992) { return $false }
+        }
     }
     $true
 }

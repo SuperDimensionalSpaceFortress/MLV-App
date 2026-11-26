@@ -266,6 +266,13 @@ function Get-ProofSpeedClaimAuthority {
     # (adversary 0e9672e5 A1: and FINITE; valid JSON 1e400 parses to +Infinity, which is no measurement)
     $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long]) -and [double]::IsFinite([double]$v) }
     $fpsMeasured = ($null -ne $presentedFps) -and (& $isNumber (Get-Field $presentedFps "baseline")) -and (& $isNumber (Get-Field $presentedFps "candidate"))
+    # (adversary 1ce472bc A3: the pair's published delta and deltaPercent are part of the measurement; a present one that is not a finite number (1e400 parses to Infinity) is no measurement either)
+    if ($fpsMeasured) {
+        foreach ($deltaName in @("delta", "deltaPercent")) {
+            $deltaValue = Get-Field $presentedFps $deltaName
+            if ($null -ne $deltaValue -and -not (& $isNumber $deltaValue)) { $fpsMeasured = $false }
+        }
+    }
     $speed = ($OverallStatus -ceq "QUOTABLE_PASS") -and ($sectionStatus -is [string]) -and ($sectionStatus -ceq "PASS") -and $fpsMeasured
     $reason = if ($speed) { "" } elseif ($OverallStatus -cne "QUOTABLE_PASS") { "packet-not-quotable" } elseif (($sectionStatus -is [string]) -and ($sectionStatus -ceq "PASS")) { "presented-fps-not-measured" } else { "playback-speed-section-$(if ($sectionStatus -is [string] -and $sectionStatus) { $sectionStatus } else { 'missing' })" }
     [pscustomobject]@{

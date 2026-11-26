@@ -1389,7 +1389,9 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
             text = (PROFILING / name).read_text(encoding="utf-8")
             with self.subTest(name):
                 # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6): both read the one module predicate over the parsed report AND its raw text
-                self.assertIn("speedQuotable = (Test-FpsProofReportSpeedQuotable -Report $proofReport -RawText $proofReportRaw)", text)
+                # (adversary 1ce472bc A8: the importer also binds it to a verified proof-report.json hash)
+                predicate = "Test-FpsProofReportSpeedQuotable -Report $proofReport -RawText $proofReportRaw)"
+                self.assertIn(("speedQuotable = ($speedHashBound -and (" if name.startswith("import") else "speedQuotable = (") + predicate, text)
                 self.assertIn('Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force', text)
                 self.assertNotIn("support or speed only from proofReport.status=QUOTABLE_PASS", text)
                 self.assertNotIn("support or speed remains quotable only when proofReport.status is QUOTABLE_PASS", text)
@@ -2335,8 +2337,14 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         # adversary 0e9672e5 A1 (sibling): two different overflowing JSON numbers both parse to +Infinity and compared equal
         body += ("$inf = '{\"analysis\":{\"comparisonBasis\":\"candidateSpeed\",\"evidence\":{\"presentedFpsDeltaPercent\":1e400}},\"compare\":{\"presentedFps\":{\"deltaPercent\":1e500}}}' | ConvertFrom-Json\n"
                  "Write-Host ('INFINITE=' + (Test-FpsCachedAnalysisBound -Analysis $inf.analysis -Compare $inf.compare -ComparisonBasis 'candidateSpeed'))\n")
+        # adversary 1ce472bc A4: two different integers past 2^53 collapse to one double
+        for label, cached, judged in (("BIGINT_DIFFERENT", "9007199254740993", "9007199254740992"), ("BIGINT_SAME", "9007199254740993", "9007199254740993"),
+                                      ("BIGINT_VS_DOUBLE", "9007199254740993", "9007199254740992.0")):
+            body += (f"$big = '{{\"analysis\":{{\"comparisonBasis\":\"candidateSpeed\",\"evidence\":{{\"presentedFpsDeltaPercent\":{cached}}}}},\"compare\":{{\"presentedFps\":{{\"deltaPercent\":{judged}}}}}}}' | ConvertFrom-Json\n"
+                     f"Write-Host ('{label}=' + (Test-FpsCachedAnalysisBound -Analysis $big.analysis -Compare $big.compare -ComparisonBasis 'candidateSpeed'))\n")
         out = dict(line.split("=", 1) for line in self.ok(body).split())
-        self.assertEqual(out, {"TOLERANCE": "False", "STAGE": "False", "CANDIDATE_MS": "False", "EXACT": "True", "INFINITE": "False"})
+        self.assertEqual(out, {"TOLERANCE": "False", "STAGE": "False", "CANDIDATE_MS": "False", "EXACT": "True", "INFINITE": "False",
+                               "BIGINT_DIFFERENT": "False", "BIGINT_SAME": "True", "BIGINT_VS_DOUBLE": "False"})
 
     def test_p3_a6_speed_authority_needs_a_pass_section_one_authority_object_and_no_repeated_key(self) -> None:
         # adversary 835a5faf A6 / 8747fced A6: package and import granted speedQuotable from status + claimAuthority.speed alone: a REFUSED playbackSpeed section, singleton arrays and a
@@ -2375,13 +2383,19 @@ class EnvelopePreemptR1ResidueTests(_Probe):
                            ("FPS_ONE_SIDE", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = $null } }"),
                            # adversary 0e9672e5 A1: valid JSON 1e400 parses to +Infinity, which passed the numeric-type check
                            ("FPS_INFINITE", "('{\"presentedFps\":{\"baseline\":1e400,\"candidate\":55}}' | ConvertFrom-Json)"),
+                           # adversary 1ce472bc A3: finite sides with an Infinity delta / deltaPercent
+                           ("DELTA_INFINITE", "('{\"presentedFps\":{\"baseline\":24,\"candidate\":25,\"delta\":1e400,\"deltaPercent\":1e400}}' | ConvertFrom-Json)"),
+                           ("DELTA_PERCENT_INFINITE", "('{\"presentedFps\":{\"baseline\":24,\"candidate\":25,\"delta\":1,\"deltaPercent\":-1e400}}' | ConvertFrom-Json)"),
+                           ("DELTA_TEXT", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 24; candidate = 25; delta = 'one' } }"),
+                           ("MEASURED_WITH_DELTA", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 24; candidate = 25; delta = 1; deltaPercent = 4.17 } }"),
                            ("MEASURED", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = 55.5 } }")):
             body += (f"$a = Get-ProofSpeedClaimAuthority -OverallStatus 'QUOTABLE_PASS' -PlaybackSpeedVerdict $pass -SpeedCompare ({cmp})\n"
                      f"Write-Host ('{label}=' + $a.speed + '|' + $a.speedRefusal)\n")
         out = dict(line.split("=", 1) for line in self.ok(body).split())
-        for label in ("EMPTY", "NULL", "STAGE_ONLY", "FPS_TEXT", "FPS_ONE_SIDE", "FPS_INFINITE"):
+        for label in ("EMPTY", "NULL", "STAGE_ONLY", "FPS_TEXT", "FPS_ONE_SIDE", "FPS_INFINITE", "DELTA_INFINITE", "DELTA_PERCENT_INFINITE", "DELTA_TEXT"):
             self.assertEqual(out[label], "False|presented-fps-not-measured", label)
         self.assertEqual(out["MEASURED"], "True|")
+        self.assertEqual(out["MEASURED_WITH_DELTA"], "True|")
         self.assertIn("-PlaybackSpeedVerdict $playbackAbVerdict -SpeedCompare $playbackAbSpeedCompare", SUMMARIZER_SCRIPT.read_text(encoding="utf-8"))
 
     def test_p2_a5_packaging_never_reuses_a_report_an_earlier_run_left(self) -> None:
@@ -2412,6 +2426,56 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         thrown = {key: out.pop(key) for key in [k for k in out if k.startswith("MSG_")]}
         self.assertEqual(out, {"REFUSES": "THREW|none", "WRITES": "OK|fresh", "DIR": "THREW|True"}, thrown)
 
+    def test_r2_adversary_1ce472bc_a1_a7_the_packager_keeps_its_input_and_publishes_only_its_own_reports(self) -> None:
+        # adversary 1ce472bc A1: -ReportPath next to the summary and named like it made the .json twin the summary, and the stale-report cleanup deleted the input before the first child read it.
+        # A7: a report another packager wrote at the same path between this run's two children was taken as this run's own, so each child now writes a name only this run knows.
+        repo = self.tmp / "repo"
+        (repo / "tools" / "profiling").mkdir(parents=True)
+        fake = repo / "tools" / "profiling" / "summarize-local-cuda-proof.ps1"
+        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Invoke-ProofSummarizer"])
+        proof = self.tmp / "proof"
+        proof.mkdir()
+        summary, md, js, seen = proof / "summary.json", proof / "summary.md", proof / "summary-report.json", proof / "seen.txt"
+        body = funcs + "\n"
+        body += (f"[IO.File]::WriteAllText('{summary}', '{{\"input\":true}}')\n"
+                 f"[IO.File]::WriteAllText('{fake}', @'\nparam($RepoRoot, $SummaryPath, $Output, [switch]$Json)\n[IO.File]::AppendAllText('{seen}', $Output + \"`n\")\n[IO.File]::WriteAllText($Output, 'fresh')\nexit 0\n'@)\n"
+                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{md}' -JsonReport '{summary}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
+                 f"Write-Host ('ALIAS=' + $res + '|' + [IO.File]::ReadAllText('{summary}') + '|' + (Test-Path -LiteralPath '{seen}'))\n"
+                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
+                 f"Write-Host ('OWN=' + $res + '|' + [IO.File]::ReadAllText('{md}') + '|' + [IO.File]::ReadAllText('{js}') + '|' + [IO.File]::ReadAllText('{summary}'))\n"
+                 f"Write-Host ('LEFT=' + @(Get-ChildItem -LiteralPath '{proof}' -Filter '*.tmp').Count)\n")
+        out = self.ok(body).split()
+        self.assertEqual(out[0], 'ALIAS=THREW|{"input":true}|False')
+        self.assertEqual(out[1], "OWN=OK|fresh|fresh|{\"input\":true}")
+        self.assertEqual(out[2], "LEFT=0")
+        names = [line.strip() for line in seen.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(names), 2)
+        for name, final in zip(names, (md, js)):
+            self.assertNotEqual(Path(name), final)
+            self.assertRegex(Path(name).name, r"^" + re.escape(final.name) + r"\.[0-9a-f]{32}\.tmp$")
+        packager = (PROFILING / "package-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
+        self.assertIn("$pwshExe = Join-Path $PSHOME $pwshLeaf", packager)
+
+    def test_r2_adversary_1ce472bc_a8_an_imported_speed_claim_needs_a_verified_proof_report_hash(self) -> None:
+        # adversary 1ce472bc A8: a packet whose manifest listed no files (zero hash checks) published speedQuotable=true; the importer's own line now runs against each shape of file checks
+        text = (PROFILING / "import-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
+        match = re.search(r"(?m)^\$speedHashBound = .*$", text)
+        self.assertIsNotNone(match)
+        line = match.group(0)
+        cases = {
+            "VERIFIED": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json' })"),
+            "NO_CHECKS": ("0", "@()"),
+            "OTHER_FILE": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'summary.json' })"),
+            "HASH_WRONG": ("1", "@([pscustomobject]@{ ok = $false; relativePath = 'proof-report.json' })"),
+            "FAILED_IMPORT": ("1", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json' })"),
+        }
+        body = ""
+        for label, (failures, checks) in cases.items():
+            body += (f"$failures = [System.Collections.Generic.List[string]]::new(); if ({failures} -gt 0) {{ $failures.Add('x') }}\n"
+                     f"$fileChecks = {checks}\n{line}\nWrite-Host ('{label}=' + $speedHashBound)\n")
+        out = dict(item.split("=", 1) for item in self.ok(body).split())
+        self.assertEqual(out, {"VERIFIED": "True", "NO_CHECKS": "False", "OTHER_FILE": "False", "HASH_WRONG": "False", "FAILED_IMPORT": "False"})
+
     def test_p2_a5_the_packager_launches_its_summarizer_by_a_path_and_a_name_that_exist_on_linux(self) -> None:
         # hosted run 45786756378 (ubuntu shard 3/4): Invoke-ProofSummarizer joined "tools\profiling\summarize-local-cuda-proof.ps1" (one file name on Linux, so "Proof summarizer not
         # found") and launched `pwsh.exe` (no such command on Linux). A static pin so the Windows shards catch the same shape: no backslash in a repo-relative path of the three CUDA-proof
@@ -2433,7 +2497,13 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         declared = "$planPurposeDeclared = ($doc -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $doc.PSObject.Properties['purpose'])"
         self.assertEqual(source.count(declared), 1)
         self.assertLess(source.index(declared), source.index("for ($i = 0; $i -lt $rawItems.Count; $i++) {"))
-        self.assertIn("if ($armRead.readTimedOut -and $planPurposeDeclared) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n ", source)
+        # adversary 1ce472bc A5: only the scalar string 'fps-ab' lets the arm decide; stage-attribution and a bad declared purpose reach their own refusals
+        armDecides = ("$armDecides = $planPurposeDeclared -and ($doc.PSObject.Properties['purpose'].Value -is [string]) "
+                      "-and ([string]$doc.PSObject.Properties['purpose'].Value -ceq 'fps-ab')")
+        self.assertEqual(source.count(armDecides), 1)
+        self.assertLess(source.index(armDecides), source.index("for ($i = 0; $i -lt $rawItems.Count; $i++) {"))
+        self.assertIn("if ($armRead.readTimedOut -and $armDecides) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n ", source)
+        self.assertNotIn("if ($armRead.readTimedOut -and $planPurposeDeclared)", source)
         self.assertNotIn("if ($armRead.readTimedOut) { Stop-PlanRefused", source)
 
     def test_p2_a7_the_smoke_receipt_records_no_inherited_value_the_child_never_gets(self) -> None:
