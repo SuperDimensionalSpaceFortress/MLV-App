@@ -1358,26 +1358,34 @@ if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]
 $json = $result | ConvertTo-Json -Depth 24
 if (-not [string]::IsNullOrWhiteSpace($Output)) {
     $outputDir = Split-Path -Parent $resolvedOutput
-    # adversary-b3d61554.json A3: a refusal after this point leaves nothing behind that this call created (the empty report and, when it made it, its empty folder)
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R3-MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A2 and A7): the report is NEVER written through a handle on the path it names. The old
+    # code opened that path (OpenOrCreate), judged its identity, then SetLength(0)/Write on the same open handle, so an input path swapped for a link to the report
+    # between the last identity check and the write was truncated and rewritten, and a refused or half-finished write left a partial report (or the folder this call
+    # made). Now the bytes go to a NEW file (CreateNew: it can alias nothing) beside the report, and only a complete one is moved over the report name: a rename replaces
+    # the directory entry and never touches the inode any other name (an input, a link, a symlink target) still points at. Any refusal or failure removes that
+    # temporary file and, when this call created it, the empty folder; the report that was there before is left exactly as it was.
     $createdDir = $false
-    if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
-        $createdDir = -not (Test-Path -LiteralPath $outputDir -PathType Container)
-        New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-    }
-    $createdOutput = -not (Test-Path -LiteralPath $resolvedOutput -PathType Leaf)
+    $tempOutput = $null
     $wroteOutput = $false
-    # adversary-c2bbe5f8.json A2: the report is written through the SAME handle whose identity is checked (opened without truncation, no sharing), so a
-    # hard link to an input swapped in after the earlier check is refused here and never truncated or written
     $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json + [Environment]::NewLine)
-    $outStream = [IO.FileStream]::new($resolvedOutput, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
     try {
-        $outIdentity = Get-SmokeFileIdentity -Stream $outStream -ResolvedPath $resolvedOutput
-        foreach ($inputIdentity in @($beforeSource.identity, $afterSource.identity)) {
-            if ($null -eq $inputIdentity -or [string]::Equals([string]$inputIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
+        if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
+            $createdDir = -not (Test-Path -LiteralPath $outputDir -PathType Container)
+            New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
         }
-        # adversary-7efea617.json A1: the identities above were read when the inputs were first opened, and both input handles are long closed. An input path
-        # swapped for a hard link to the report since then (a second process, between the early check and this write) is the report. So the CURRENT file each
-        # input path names is opened again here, through a fresh handle, and judged by the same identity; one that cannot be read is refused, nothing truncated.
+        # a report that already exists is judged by its handle identity (read-only, nothing truncated); an input that IS it is refused before anything is written
+        $outIdentity = $null
+        if (Test-Path -LiteralPath $resolvedOutput -PathType Leaf) {
+            $outStream = [IO.FileStream]::new($resolvedOutput, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+            try { $outIdentity = Get-SmokeFileIdentity -Stream $outStream -ResolvedPath $resolvedOutput } finally { $outStream.Dispose() }
+        }
+        if ($null -ne $outIdentity) {
+            foreach ($inputIdentity in @($beforeSource.identity, $afterSource.identity)) {
+                if ($null -eq $inputIdentity -or [string]::Equals([string]$inputIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
+            }
+        }
+        # adversary-7efea617.json A1: the identities above were read when the inputs were first opened. An input path swapped for a hard link to the report since then is
+        # the report, so the CURRENT file each input path names is read again here through a fresh handle; one that cannot be read is refused, nothing written.
         foreach ($currentLeg in @([pscustomobject]@{ Name = 'before'; Path = $beforeJsonPath }, [pscustomobject]@{ Name = 'after'; Path = $afterJsonPath })) {
             $currentStream = $null
             try {
@@ -1386,18 +1394,24 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
             }
             catch { throw "Output refused: the current file identity of the $($currentLeg.Name) smoke JSON could not be read at the write ($($_.Exception.Message -replace '\s+', ' ')); nothing was written." }
             finally { if ($null -ne $currentStream) { $currentStream.Dispose() } }
-            if ([string]::Equals([string]$currentIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
+            if ($null -ne $outIdentity -and [string]::Equals([string]$currentIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
         }
-        $outStream.SetLength(0)
-        $outStream.Write($outBytes, 0, $outBytes.Length)
+        $tempOutput = Join-Path $outputDir ('.' + [IO.Path]::GetFileName($resolvedOutput) + '.' + [Guid]::NewGuid().ToString('N') + '.tmp')
+        $tempStream = [IO.FileStream]::new($tempOutput, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $tempStream.Write($outBytes, 0, $outBytes.Length)
+            $tempStream.Flush($true)
+        }
+        finally { $tempStream.Dispose() }
+        [IO.File]::Move($tempOutput, $resolvedOutput, $true)
+        $tempOutput = $null
         $wroteOutput = $true
     }
     finally {
-        $outStream.Dispose()
-        if (-not $wroteOutput -and $createdOutput) {
-            # only a still-empty report is removed (a file another process filled in the meantime is never ours to delete), then its folder when this call made it and it is empty
-            try { if ((Get-Item -LiteralPath $resolvedOutput -Force -ErrorAction Stop).Length -eq 0) { Remove-Item -LiteralPath $resolvedOutput -Force -ErrorAction Stop } } catch { }
-            if ($createdDir) { try { if (@(Get-ChildItem -LiteralPath $outputDir -Force -ErrorAction Stop).Count -eq 0) { Remove-Item -LiteralPath $outputDir -Force -ErrorAction Stop } } catch { } }
+        if ($null -ne $tempOutput) { try { Remove-Item -LiteralPath $tempOutput -Force -ErrorAction Stop } catch { } }
+        if (-not $wroteOutput -and $createdDir) {
+            # the folder this call made is removed only while it is empty (a file another process put there is never ours to delete)
+            try { if (@(Get-ChildItem -LiteralPath $outputDir -Force -ErrorAction Stop).Count -eq 0) { Remove-Item -LiteralPath $outputDir -Force -ErrorAction Stop } } catch { }
         }
     }
 }

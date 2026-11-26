@@ -3786,6 +3786,26 @@ def _flat_pwsh_text(text: str) -> str:
 QUIET_SMOKE = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
 
 
+def _extract_report_write_block(cmp_source: str) -> str:
+    """The comparator's report-write block as it runs (MERGE-RESIDUE-1 r1): from the folder bookkeeping to the end of the cleanup `finally`."""
+    return _extract_block(cmp_source, "    $createdDir = $false\n    $tempOutput = $null", "try { if (@(Get-ChildItem", trailing_lines=2)
+
+
+def _report_write_probe(tmp: str, before: Path, after: Path, report: Path, outdir: Path, pre_block: str = "") -> Path:
+    """A script that sets the write block's inputs, runs `pre_block` (a swap or a fault), then the extracted block as it is, and prints RESULT=WRITTEN or RESULT=REFUSED <message>."""
+    block = _extract_report_write_block(COMPARE_SCRIPT.read_text(encoding="utf-8"))
+    script = Path(tmp) / "write-probe.ps1"
+    script.write_text(
+        "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity"]) +
+        f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $outputDir = '{outdir}'; $json = '{{\"report\":true}}'\n"
+        "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
+        "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
+        + pre_block + "\n"
+        "try {\n" + block + "\nWrite-Output 'RESULT=WRITTEN' } catch { Write-Output ('RESULT=REFUSED ' + $_.Exception.Message) }\n",
+        encoding="utf-8")
+    return script
+
+
 @requires_pwsh
 class ResidueR2CudaAbReadSmokeSummaryTests(_ProbeCase):
     """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2: adversary-07b6a932.json A8 and A9, each fed its own `input`, through the real Read-SmokeSummary."""
@@ -3895,7 +3915,9 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         # A3 (a manifest with a null or no artifact is refused), A5 (an unreadable result or summary is a recorded refusal), A8 (identity from the open fd).
         cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("'Screenshot delta exceeded threshold (figures withheld: the verdict is INCONCLUSIVE).'", cmp)
-        self.assertIn("$outStream = [IO.FileStream]::new($resolvedOutput, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)", cmp)
+        # MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A2/A7) replaces the in-place write: the report is never opened for write (the old pin required that handle)
+        self.assertNotIn("[IO.FileMode]::OpenOrCreate", cmp)
+        self.assertIn("[IO.File]::Move($tempOutput, $resolvedOutput, $true)", cmp)
         self.assertNotIn("Set-Content -LiteralPath $resolvedOutput", cmp)
         self.assertIn('$fdPath = "/proc/$PID/fd/$fd"', cmp)
         p3 = P3_VALIDATION_SCRIPT.read_text(encoding="utf-8")
@@ -4050,7 +4072,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         # existing report. RED: the write compared the report with the two HISTORICAL identities (read when the inputs were first opened), so it truncated and wrote
         # the inode before.json now names. The write block runs here as extracted, after the swap; the current files are re-read through fresh handles.
         cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
-        block = _extract_block(cmp, "    $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json", "if ($createdDir) { try { if (@(Get-ChildItem", trailing_lines=2)
+        block = _extract_report_write_block(cmp)
         with tempfile.TemporaryDirectory(prefix="residue-r3-a1b-") as tmp:
             before, after, report = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "report.json"
             for p in (before, after, report):
@@ -4058,7 +4080,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             script = Path(tmp) / "write.ps1"
             script.write_text(
                 "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity"]) +
-                f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $json = '{{\"report\":true}}'\n"
+                f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $outputDir = '{tmp}'; $json = '{{\"report\":true}}'\n"
                 "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
                 "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
                 f"Remove-Item -LiteralPath '{before}'; New-Item -ItemType HardLink -Path '{before}' -Target '{report}' | Out-Null\n"
@@ -4093,7 +4115,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         # adversary-b3d61554.json A3, its input: a report path whose folder is absent, and a smoke input that is gone at the write-time identity re-read. RED: the
         # report was opened with OpenOrCreate, the refusal said "nothing was written", and a zero-byte report (and its new folder) stayed behind.
         cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
-        block = _extract_block(cmp, "    $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json", "if ($createdDir) { try { if (@(Get-ChildItem", trailing_lines=2)
+        block = _extract_report_write_block(cmp)
         with tempfile.TemporaryDirectory(prefix="residue-r2-a3-") as tmp:
             before, after = Path(tmp) / "before.json", Path(tmp) / "after.json"
             outdir = Path(tmp) / "reports"
@@ -4107,13 +4129,76 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
                 "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
                 "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
                 f"Remove-Item -LiteralPath '{before}'\n"
-                "New-Item -ItemType Directory -Force -Path $outputDir | Out-Null; $createdDir = $true; $createdOutput = $true; $wroteOutput = $false\n"
                 "try {\n" + block + "\nWrite-Output 'RESULT=WRITTEN' } catch { Write-Output ('RESULT=REFUSED ' + $_.Exception.Message) }\n",
                 encoding="utf-8")
             proc = _run_ps_file(script)
             self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
             self.assertFalse(report.exists(), "the empty report this call created is removed\n" + proc.stdout + proc.stderr)
             self.assertFalse(outdir.exists(), "the empty folder this call created is removed\n" + proc.stdout + proc.stderr)
+
+    @requires_pwsh
+    def test_mr1_a2_the_report_replaces_its_name_and_never_rewrites_a_file_another_name_still_holds(self) -> None:
+        # adversary-55dcf49e.json A2, its input class: after the last identity check a name other than the report names the report's file (an input path swapped for
+        # a link to it). RED on 55dcf49e: the report was opened on its own path and SetLength(0)/Write ran on that inode, so every other name for it (keep.json, here a
+        # hard link no identity check names) was truncated and rewritten. Now the report is a new file moved over the report NAME: keep.json keeps its bytes.
+        with tempfile.TemporaryDirectory(prefix="mr1-a2-") as tmp:
+            before, after, report, keep = (Path(tmp) / n for n in ("before.json", "after.json", "report.json", "keep.json"))
+            for p in (before, after, report):
+                p.write_text("{}", encoding="utf-8", newline="")
+            os.link(report, keep)
+            proc = _run_ps_file(_report_write_probe(tmp, before, after, report, Path(tmp)))
+            self.assertIn("RESULT=WRITTEN", proc.stdout, proc.stdout + proc.stderr)
+            self.assertIn('"report":true', report.read_text(encoding="utf-8"))
+            self.assertEqual(keep.read_text(encoding="utf-8"), "{}", "the file the other name holds is not truncated or rewritten")
+            for p in (before, after):
+                self.assertEqual(p.read_text(encoding="utf-8"), "{}")
+            self.assertEqual(sorted(x.name for x in Path(tmp).iterdir() if x.name.endswith(".tmp")), [], "no temporary file is left behind")
+        cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        block = _extract_report_write_block(cmp)
+        for banned in ("OpenOrCreate", "SetLength", "FileMode]::Create,", "FileMode]::Truncate", "Set-Content", "Out-File"):
+            self.assertNotIn(banned, block, "the report name is never opened for write")
+        self.assertIn("[IO.FileMode]::CreateNew", block)
+
+    @requires_pwsh
+    def test_mr1_a7_a_report_path_that_cannot_be_replaced_leaves_nothing_this_call_made(self) -> None:
+        # adversary-55dcf49e.json A7 (the move-fails variant; the partial-write variant cannot leave a prefix any more because only a complete temporary file is moved):
+        # the report name is a folder. The refusal leaves that folder and the inputs as they were and no temporary file.
+        with tempfile.TemporaryDirectory(prefix="mr1-a7-") as tmp:
+            before, after, report = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "report.json"
+            for p in (before, after):
+                p.write_text("{}", encoding="utf-8", newline="")
+            report.mkdir()
+            proc = _run_ps_file(_report_write_probe(tmp, before, after, report, Path(tmp)))
+            self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
+            self.assertTrue(report.is_dir() and not list(report.iterdir()))
+            self.assertEqual(sorted(x.name for x in Path(tmp).iterdir() if x.name.endswith(".tmp")), [], "the temporary file is removed")
+
+    @requires_windows_pwsh
+    def test_mr1_a7_a_folder_this_call_created_is_removed_when_the_report_cannot_be_started(self) -> None:
+        # adversary-55dcf49e.json A7, its first input: -Output C:\evidence\new\report.json, `new` absent, the folder's inherited ACL denies adding a file. RED on 55dcf49e: the
+        # mkdir succeeded, the open threw BEFORE the try/finally began, and the empty `new` folder stayed. Now every step after the mkdir is inside the cleanup.
+        user = subprocess.run(["whoami"], capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=60).stdout.strip()
+        self.assertTrue(user)
+        with tempfile.TemporaryDirectory(prefix="mr1-a7acl-") as tmp:
+            before, after = Path(tmp) / "before.json", Path(tmp) / "after.json"
+            for p in (before, after):
+                p.write_text("{}", encoding="utf-8", newline="")
+            evidence = Path(tmp) / "evidence"
+            evidence.mkdir()
+            outdir = evidence / "new"
+            denied = subprocess.run(["icacls", str(evidence), "/deny", f"{user}:(CI)(IO)(WD)"], capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=60)
+            if denied.returncode != 0:
+                self.skipTest("icacls could not set the inherited add-file deny: " + denied.stdout + denied.stderr)
+            try:
+                proc = _run_ps_file(_report_write_probe(tmp, before, after, outdir / "report.json", outdir))
+                refused = "RESULT=REFUSED" in proc.stdout
+                left = outdir.exists()
+            finally:
+                subprocess.run(["icacls", str(evidence), "/remove:d", user], capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=60)
+                if outdir.exists():
+                    shutil.rmtree(outdir, ignore_errors=True)
+            self.assertTrue(refused, proc.stdout + proc.stderr)
+            self.assertFalse(left, "the empty folder this call created is removed\n" + proc.stdout + proc.stderr)
 
     def test_r3_a3_a_one_element_candidate_list_is_provisional_not_unrolled_into_its_clean_member(self) -> None:
         # adversary-7efea617.json A3, its input: candidate = [one clean leg]. RED: `$x = if (...) { $Record.candidate }` unrolled the one-element list into its

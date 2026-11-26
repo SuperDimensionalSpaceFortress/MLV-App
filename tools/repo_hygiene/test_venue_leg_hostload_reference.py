@@ -624,6 +624,36 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertIn("Get-VenuePlannedLegType, Complete-VenueProcess -DisableNameChecking -Force", leg)
         self.assertIn("Complete-VenueProcess -ExitCode 0   # a host-load read given up on", leg)
 
+    def test_mr1_a3_a_read_whose_budget_is_already_spent_starts_no_worker(self) -> None:
+        # adversary-55dcf49e.json A3, its input: the caller is suspended after its first read and resumes past the shared budget's end before the second. RED on 55dcf49e: the worker was
+        # launched BEFORE the clock was looked at, so the file probe and ReadAllBytes still ran after the end (the late-answer check only discarded the answer). Here the seam
+        # VenueTestPreWaitDelayMs makes the old order observable: the worker (writing a marker file) had 1.5 s to run before the caller looked at the clock. Now nothing starts.
+        with tempfile.TemporaryDirectory() as d:
+            gone, live, blob = Path(d) / "marker-expired.txt", Path(d) / "marker-live.txt", Path(d) / "f.bin"
+            blob.write_bytes(b"abc")
+            body = (
+                "$vc = Get-Module VenueChain; $script = 'param($p) [IO.File]::WriteAllText($p, ''x'')'; "
+                "& $vc { $script:VenueTestPreWaitDelayMs = 1500 }; "
+                "$sw = [Diagnostics.Stopwatch]::StartNew(); Start-Sleep -Milliseconds 700; "
+                f"$a = & $vc {{ param($sw, $m, $s) Invoke-VenueBoundedRead -ScriptText $s -Argument $m -TimeoutSec 5 -Clock $sw -EndSec 0.3 }} $sw '{gone}' $script; "
+                "Write-Output ('A=' + $a.answered); Write-Output ('AERR=' + $a.error); "
+                f"Write-Output ('M1=' + (Test-Path -LiteralPath '{gone}')); "
+                "$c = try { & $vc { param($sw, $f) $r = Read-VenueFileBytesBounded -Path $f -TimeoutSec 5 -Clock $sw -EndSec 0.3; 'READ' } $sw "
+                f"'{blob}' }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('C=' + $c); "
+                "& $vc { $script:VenueTestPreWaitDelayMs = 0 }; "
+                "$sw2 = [Diagnostics.Stopwatch]::StartNew(); "
+                f"$b = & $vc {{ param($sw, $m, $s) Invoke-VenueBoundedRead -ScriptText $s -Argument $m -TimeoutSec 5 -Clock $sw -EndSec 30 }} $sw2 '{live}' $script; "
+                "Write-Output ('B=' + $b.answered); "
+                f"Write-Output ('M2=' + (Test-Path -LiteralPath '{live}'))")
+            p = run_ps(body)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["A"], "False", p.stdout)
+        self.assertIn("no time is left", got["AERR"], p.stdout)
+        self.assertEqual(got["M1"], "False", "the worker was started after the caller's end: " + p.stdout)
+        self.assertTrue(got["C"].startswith("THROWN") and "did not finish" in got["C"], p.stdout)
+        self.assertEqual((got["B"], got["M2"]), ("True", "True"), "a read inside its budget still runs: " + p.stdout)
+
     def test_r2_pass2_a5_a7_a13_the_matrix_refuses_a_replaced_receipt_the_planner_refuses_a_duplicated_legtype_the_verdict_keeps_a_list(self) -> None:
         # adversary-b3d61554.json A5: the matrix drops the receipt whose bytes are not the ones the child published (as the baseline refuses them), so a replacement's outcome and
         # fps are never attributed to the planned leg. A7: a spec that declares legType twice is planned 'unknown', never 'export'. A13: the GUI verdict helper never unrolls a
@@ -632,8 +662,9 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         leg = (dv / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         self.assertIn("{ $legReceiptSha = ''; $legReceipt = $null }", leg)
         runner = (dv / "DualVenueRunner.psm1").read_text(encoding="utf-8")
-        self.assertIn("$specLegTypeDeclarations = [regex]::Matches($specText, '\"legType\"\\s*:', [Text.RegularExpressions.RegexOptions]::IgnoreCase).Count", runner)
-        self.assertIn("if ($specLegTypeDeclarations -gt 1) { 'unknown' }", runner)
+        # MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A1): the planner takes the strict reader's answer; it no longer counts the literal text "legType":
+        self.assertIn("$specPlannedLegType = Get-VenuePlannedLegType -SpecText $specText", runner)
+        self.assertNotIn("$specLegTypeDeclarations", runner)
         gui = (ROOT / "tools" / "profiling" / "compare-release-gui-smoke-ab.ps1").read_text(encoding="utf-8")
         self.assertNotIn("$legEvidence = if (", gui)
         self.assertNotIn("$standing = if (", gui)

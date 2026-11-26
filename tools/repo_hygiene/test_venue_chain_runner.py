@@ -541,6 +541,21 @@ class VenueChainRunnerTests(unittest.TestCase):
         got = [(l["class"], l.get("hostLoadState"), l.get("hostLoadProvisional")) for l in res["legs"]]
         self.assertEqual(got, [("HOSTLOAD_PROVISIONAL", "unknown", True)] * 3)
 
+    def test_mr1_a4_the_host_load_read_gets_what_is_left_before_the_deadline_not_a_fresh_20_seconds(self) -> None:
+        # adversary-55dcf49e.json A4, its input class: the final leg ends at or past -DeadlineUtc and its result.json read would have a whole fresh 20 s. RED on 55dcf49e: the chain called
+        # Get-VenueLegHostLoad with no -ReadTimeoutSec (the reader's own 20 s default), read the (quiet) result past the deadline and counted the leg QUIET_PRELOAD_OK. Now the read is bounded by
+        # what is left before the deadline (the lease batch's rule): none left, so it is not started and the standing is unknown, provisional, never counted. The control (a deadline far
+        # off) still reads quiet.
+        rd = self.case / "lane-DL"
+        env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0", FAKE_LEG_HOSTLOADS="quiet", FAKE_LEG_SLEEP="14")
+        r = self.run_chain(rd, self.specs[:1], env=env, deadline_sec=10)
+        res = chain_result(r.stdout)
+        ran = [l for l in res["legs"] if l.get("status") == "RAN"]
+        self.assertEqual(len(ran), 1, r.stdout + r.stderr)
+        self.assertEqual((ran[0]["class"], ran[0].get("hostLoadState"), ran[0].get("hostLoadProvisional")), ("HOSTLOAD_PROVISIONAL", "unknown", True), r.stdout)
+        chain = (RUNNER).read_text(encoding="utf-8")
+        self.assertIn("-ExpectReceiptSha256 $receiptSha -ReadTimeoutSec ([Math]::Min(20.0, ($deadline - [DateTime]::UtcNow).TotalSeconds))", chain)
+
     # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1: Wait-VenueQuiet's FOREIGN_FLOOR early exit prints a typed line and then the same COOLDOWN_UNMET line; the chain must
     # still classify the leg COOLDOWN_UNMET (contended, never counted), never QUIET_PRELOAD_* and never VENUE_QUIET_UNKNOWN.
     def test_a_foreign_floor_early_exit_is_still_a_cooldown_unmet_leg(self) -> None:

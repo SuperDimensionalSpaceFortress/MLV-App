@@ -479,7 +479,13 @@ foreach ($b in $StandardBackends) {
             # adversary-7efea617.json A2 (the legacy-row tail, r2): the expectation is ONLY the sha256 the leg published. A chain row with no receiptSha256 member (a legacy or stub row) has none,
             # so its standing is 'unknown' (an empty expectation never matches), never this read's own hash judging itself; a receipt Get-RowFigures refused (no figures, no binding) is unknown too.
             $hlExpectSha = $(if ($null -ne $publishedSha) { [string]$publishedSha } else { '' })
-            $hl = $(if ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned -ExpectReceiptSha256 $hlExpectSha } else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' })
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R3-MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A5): a receipt Get-RowFigures REFUSED (its identity is not this run's, or the validator rejected it: a missing
+            # evidence manifest, an INVALID or incomplete verdict) is not this leg's receipt, so it binds no host load either: the standing is read from NO receipt (the reader's own unknown, provisional and
+            # uncollected answer), never from a result.json that merely hashes to what the refused receipt claims. Get-RowFigures sets resultJsonSha256 BEFORE it validates, so that field alone cannot say so.
+            $figRefused = (-not [string]::IsNullOrEmpty([string]$fig.identity)) -or (-not [string]::IsNullOrEmpty([string]$fig.rejected))
+            $hl = $(if ($figRefused) { Get-VenueLegHostLoad -ReceiptPath '' -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' }
+                    elseif ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned -ExpectReceiptSha256 $hlExpectSha }
+                    else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' })
             $hlLine = Get-VenueReferenceHostLoadRefusal -LegId $(if ($hlReceipt) { [IO.Path]::GetFileNameWithoutExtension($hlReceipt) } else { [string]$planLeg.legId }) -Standing $hl
             if ($hlLine -and $legStatus -ceq 'RAN') { Out-Line $hlLine }
             $rows.Add([ordered]@{

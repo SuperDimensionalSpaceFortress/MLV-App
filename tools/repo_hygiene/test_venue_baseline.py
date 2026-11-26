@@ -819,6 +819,29 @@ class VenueBaselineTests(unittest.TestCase):
         p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet")
         self.assertEqual((self.result(p.stdout)["reason"], self.result(p.stdout)["measuredRows"]), ("OK", 4), p.stdout)
 
+    def test_hostload_mr1_a5_a_receipt_the_row_figures_refused_binds_no_host_load(self) -> None:
+        """adversary-55dcf49e.json A5, its input class: a clean zero-exit chain row with a published sha for its receipt and an unchanged quiet, fully collected result.json, but the
+        receipt is REFUSED by Get-RowFigures (the validator rejects it, as it does a receipt whose evidence manifest is gone; or its identity is not this run's). RED on 55dcf49e: the
+        host-load reader still got that receipt's hash expectations, so the refused row was stamped quiet, provisional=false, collected=true. A refused receipt binds nothing: the row
+        reads unknown, provisional and uncollected. The same chain with an accepted receipt (advisory, no signal) still reads quiet."""
+        refused = [("validator-invalid", {"FAKE_VALIDATOR_MODE": "invalid"}), ("validator-incomplete", {"FAKE_VALIDATOR_MODE": "incomplete"}),
+                   ("validator-unknown-status", {"FAKE_VALIDATOR_MODE": "unknown"}), ("validator-error", {"FAKE_VALIDATOR_MODE": "error"}),
+                   ("identity-wrongid", {"FAKE_VALIDATOR_MODE": "advisory", "FAKE_RECEIPT_IDENTITY": "wrongid"}),
+                   ("identity-wrongleg", {"FAKE_VALIDATOR_MODE": "advisory", "FAKE_RECEIPT_IDENTITY": "wrongleg"})]
+        for label, env in refused:
+            with self.subTest(refused=label):
+                self.trend.unlink(missing_ok=True)
+                p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet", **env)
+                rows = self.trend_rows()
+                self.assertEqual(len(rows), 4, p.stdout + p.stderr)
+                for r in rows:
+                    self.assertEqual((r["hostLoadState"], r["hostLoadProvisional"], r["hostLoadCollected"]), ("unknown", True, False), r)
+        for label, validator in (("advisory", "advisory"), ("nosignal", "nosignal")):
+            with self.subTest(accepted=label):
+                self.trend.unlink(missing_ok=True)
+                self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE=validator, FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet")
+                self.assertEqual({(r["hostLoadState"], r["hostLoadProvisional"], r["hostLoadCollected"]) for r in self.trend_rows()}, {("quiet", False, True)})
+
     # F: the receipt read must be the one this run's leg wrote.
     def test_f_a_receipt_that_is_not_the_one_this_run_wrote_yields_no_figures(self) -> None:
         for ident in ("stale", "wrongid", "wrongleg", "wrongbuild", "wrongvenue"):

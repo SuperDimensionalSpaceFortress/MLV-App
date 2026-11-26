@@ -359,6 +359,41 @@ class ExportPlanAndOutcomeTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout + proc.stderr)
         self.assertEqual(sorted(got), ["cpu-export-cdng-lossless", "cpu-export-prores"], proc.stdout + proc.stderr)
 
+    def test_mr1_a1_a_legtype_declared_twice_in_any_spelling_is_planned_unknown_like_the_strict_reader(self) -> None:
+        # adversary-55dcf49e.json A1, its input: the export spec with "legType":"speed" inserted immediately before the literal "legType":"export". RED on 55dcf49e: the planner
+        # counted the literal text "legType": (one), so it planned `export` where the strict reader (Get-VenuePlannedLegType, one JSON walk) says `unknown`, and a matching export
+        # receipt then earned the host-load exemption. The planned type is now that reader's answer, so the two never differ: the plan, the chain, the baseline, the leg job.
+        import re
+        name = EXPORT_LEGS[1]
+        original = (DV / "legs" / f"{name}.json").read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r'"legType"\s*:', original)), 1, "the shipped export spec declares legType once")
+        variants = {
+            "single": original,
+            "escaped-first": re.sub(r'("legType"\s*:)', r'"leg\\u0054ype":"speed",\n  \1', original, count=1),
+            "literal-first": re.sub(r'("legType"\s*:)', r'"legType":"speed",\n  \1', original, count=1),
+            "escaped-last": re.sub(r'("legType"\s*:\s*"export"\s*,?)', r'\1\n  "leg\\u0054ype":"speed",', original, count=1),
+        }
+        want = {"single": "export", "escaped-first": "unknown", "literal-first": "unknown"}
+        results: dict[str, str] = {}
+        for label, text in variants.items():
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / "legs").mkdir()
+                (root / "legsets").mkdir()
+                (root / "legs" / f"{name}.json").write_text(text, encoding="utf-8", newline="")
+                (root / "legsets" / "x.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": "export-x", "card": CARD, "clipId": "M16-1243",
+                                                                     "legs": [f"legs/{name}.json"]}), encoding="utf-8")
+                proc, got = run_pwsh_json(f"Import-Module '{DV / 'VenueChain.psm1'}' -Function Get-VenuePlannedLegType -DisableNameChecking\n"
+                                          f"$p = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'x.json'}' -Repeats 1 -Backend cpu\n"
+                                          "$typed = Get-VenuePlannedLegType -SpecText ([IO.File]::ReadAllText($p.plan[0].specPath))\n"
+                                          "[ordered]@{ planned = [string]$p.plan[0].plannedLegType; strict = [string]$typed } | ConvertTo-Json -Compress")
+                self.assertIsNotNone(got, label + proc.stdout + proc.stderr)
+                self.assertEqual(got["planned"], got["strict"], f"{label}: the plan and the strict reader disagree: {got}")
+                results[label] = got["planned"]
+        for label, expected in want.items():
+            self.assertEqual(results[label], expected, (label, results))
+        self.assertEqual(results["escaped-last"], "unknown", results)
+
     def test_every_export_token_maps_to_its_outcome(self) -> None:
         want = {"EXPORT_CAPTURED": "CAPTURED", "EXPORT_EXIT_NONZERO": "FAIL", "EXPORT_TIMEOUT": "FAIL", "EXPORT_NO_FRAMES": "FAIL",
                 "EXPORT_FRAMES_SHORT": "FAIL", "EXPORT_PROFILE_ABSENT": "INVALID", "EXPORT_OUTPUT_MISMATCH": "INVALID",

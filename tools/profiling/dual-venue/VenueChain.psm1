@@ -1260,6 +1260,13 @@ function Invoke-VenueBoundedRead {
     # finite number is REFUSED, typed, before the worker starts. NaN skipped both the clamp (NaN -lt x is false: the full -TimeoutSec wait) and the late-answer rejection
     # (Elapsed - NaN -gt 0 is false), so an answer past the caller's end was acted on.
     if (-not [double]::IsFinite($EndSec)) { throw "VENUE_BUDGET_ENDPOINT_NONFINITE -EndSec is $($EndSec.ToString([Globalization.CultureInfo]::InvariantCulture)); a budget endpoint that is not a finite number is refused, never read as a wait wider than the caller's end" }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R3-MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A3): a caller whose budget is already spent starts NO read. The worker used to be launched first and the
+    # clock looked at only afterwards, so a caller descheduled past its end still sent the worker to do the I/O (Test-Path, ReadAllBytes) and merely discarded the answer; the late-answer
+    # check below protects the result, never the I/O. Every caller that hands over -Clock/-EndSec (Read-VenueFileBytesBounded, so Get-VenueLegHostLoad's second read, the chain's and the
+    # batch's host-load reads, and the staged-manifest reads) gets this one check, so no per-site copy can miss it.
+    if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -le 0) {
+        return [pscustomobject]@{ answered = $false; value = @(); error = "no time is left of the caller's budget to start the read (its end passed $([Math]::Round($Clock.Elapsed.TotalSeconds - $EndSec, 2)) s ago); nothing was started" }
+    }
     $ps = [powershell]::Create()
     $abandoned = $false
     try {
