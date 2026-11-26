@@ -3575,7 +3575,7 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
     script = CUDA_PROOF_SUMMARIZER_SCRIPT
     functions = ["Get-Field", "New-Diagnostic", "Add-Diagnostic"]
 
-    START_MARKER = "$playbackAbCandidateLeg = if ($playbackAbComparisonBasis -eq \"candidateSpeed\")"
+    START_MARKER = "$playbackAbCandidateLeg = $playbackAb.candidate\n"
     END_MARKER = (
         "an fps number measured under provisional or unrecorded host load is not a property "
         "of the build."
@@ -4101,6 +4101,8 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         self.assertIn("receipt = $receipt; receiptSha256 = $receiptSha }", chain)
         baseline = (dv / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
         self.assertIn("-ExpectReceiptSha256 $(if ($null -ne $publishedSha) { $publishedSha } else { [string]$fig.receiptSha256 })", baseline)
+        # (Get-RowFigures declares its parameters inline, which _extract_functions' `function <name> {` pattern does not match)
+        figures_function = re.search(r"function Get-RowFigures\(.*?\n\}\r?\n", baseline, re.DOTALL).group(0)
         with tempfile.TemporaryDirectory(prefix="residue-r3-a2b-") as tmp:
             receipt = Path(tmp) / "r-1.json"
             receipt.write_text('{"receiptId":"r-1","legId":"x"}', encoding="utf-8", newline="")
@@ -4108,7 +4110,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             script = Path(tmp) / "figures.ps1"
             script.write_text(
                 "$ErrorActionPreference = 'Stop'\n"
-                f"Import-Module '{dv / 'DualVenueRunner.psm1'}' -Force -DisableNameChecking\n" + _extract_functions(dv / "Invoke-VenueBaseline.ps1", ["Get-RowFigures"]) +
+                f"Import-Module '{dv / 'DualVenueRunner.psm1'}' -Force -DisableNameChecking\n" + figures_function +
                 f"foreach ($pub in @('{'0' * 64}', '', '{real}'.ToUpperInvariant())) {{\n"
                 f"  try {{ $f = Get-RowFigures '{receipt}' ([pscustomobject]@{{ legId = 'x' }}) 'cuda' $pub; Write-Output ('PUB=[' + $pub.Substring(0, [Math]::Min(4, $pub.Length)) + '] IDENT=' + [bool]$f.identity + ' SHA=' + $f.receiptSha256) }}\n"
                 "  catch { Write-Output ('PUB=[' + $pub.Substring(0, [Math]::Min(4, $pub.Length)) + '] THREW=' + $_.Exception.Message.Substring(0, 20)) } }\n", encoding="utf-8")
