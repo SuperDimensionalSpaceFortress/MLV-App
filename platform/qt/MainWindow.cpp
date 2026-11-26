@@ -11899,9 +11899,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         // window's / GL viewport's own record of what its paintGL() last drew; on the pixmap route the view's composed-paint record) changes, so the burst follows the
         // display's own paints and never paints. The frozen check never sees these rows: it is judged on play_unbound only.
         // R5-RESIDUE-1 (sol r1 B2): (a) the clock is re-read AFTER the event pump and the probe, right before a capture would start: the loop's
-        // own check ran before processEvents, which can come back past the target; (b) a capture starts only while it can end before the first
-        // forced target, judged by the longest burst capture so far, so only the first burst capture (taken at once) can run past it; (c) the
-        // pixmap route now reports its composed paint (basis pixmap_composed_paint), so the burst follows that route's own paints too.
+        // own check ran before processEvents, which can come back past the target, so no burst capture STARTS at or after it; (b) a later capture
+        // starts only while the time left exceeds the longest burst capture so far (a prediction, not a bound: adversary A2 on 4de735e6), so one
+        // slower than every earlier one can still end past the target, by at most its own excess over that longest; (c) the pixmap route now
+        // reports its composed paint (basis pixmap_composed_paint), so the burst follows that route's own paints too.
         {
             const qint64 visualFirstForcedMs = static_cast<qint64>( ( 2 * 0 + 1 ) * visualHalfMs / ( 2 * visualPlayFrames ) );
             const int visualBurstMax = 4;

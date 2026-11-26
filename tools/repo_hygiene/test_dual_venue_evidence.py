@@ -12377,6 +12377,15 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         self.assertLess(recheck_at, burst_grab_at)
         self.assertIn("break;", pre_forced[recheck_at:burst_grab_at])
         self.assertEqual(pre_forced.count("grabVisual("), 1)
+        # R5-RESIDUE-1 adversary A2 (on 4de735e6), its input: first capture 0-10 ms, the next pump returns at 110 ms with a changed serial, the second
+        # capture takes 30 ms: 110 + 10 < 125 admits it and it ends at 140 ms. The longest capture so far predicts, it does not bound, so neither the
+        # code comment nor the docs may claim that only the first burst capture can run past the first forced target; both state the real bound.
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        for text, where in ((pre_forced, "the burst comment"), (doc, "docs/dual-venue-visual-capture.md")):
+            flat = " ".join(text.replace("//", " ").split())
+            self.assertNotIn("only the first burst capture", flat, where)
+            self.assertIn("a prediction, not a bound", flat, where)
+            self.assertIn("by at most its own excess", flat, where)
         for painting in ("repaint(", "paintPendingNowIfActive(", "->update("):
             self.assertNotIn(painting, pre_forced)
 
@@ -20998,8 +21007,13 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         self.assertEqual(derive([ms, conform, summary, begin]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 0, "e": 2, "d": 0})
         self.assertEqual(derive([ms, conform, summary, begin, clip]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 1, "e": 2, "d": 0})
         # a drop before the begin record is the measured session's (its summary counters carry it); one after it is a tail drop
-        self.assertEqual(derive([ms, conform, summary, drop, begin, nodrop])["d"], 0)
+        self.assertEqual(derive([ms, conform, summary, drop, begin])["d"], 0)
         self.assertEqual(derive([ms, conform, summary, begin, drop])["d"], 1)
+        # R5-RESIDUE-1 adversary A1 (on 4de735e6), its input: an invalidation after the begin record with every dropped_* field 0 (the target was already
+        # computing, so it is in no dropped_* field; the worker drops its stale result later and reissues it), and the cancelled_render=1 sibling. 4de735e6
+        # counted 0 for both, so a reissued frame could be credited. Every invalidation after the begin record now counts.
+        self.assertEqual(derive([ms, conform, summary, drop, begin, nodrop])["d"], 1)
+        self.assertEqual(derive([ms, conform, summary, begin, nodrop.replace("cancelled_render=0", "cancelled_render=1")])["d"], 1)
         two = derive([ms, conform, summary, begin, begin.replace("18:00", "17:00")])
         self.assertEqual((two["s"], two["u"]), (None, None), two)
         none = derive([ms, conform.replace(" paint_wait_escapes=2", ""), summary])

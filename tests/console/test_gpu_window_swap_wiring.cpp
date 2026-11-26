@@ -881,9 +881,9 @@ TEST(VisualCaptureBinding, EveryCaptureNamesWhereItsPaintedSerialCameFrom)
     ASSERT_TRUE(unforcedBranch.contains(QStringLiteral("composedPixmapPaintedSerial(")));
 }
 
-// R5-RESIDUE-1 (sol r1 B2): the burst pumps events and probes the painted serial, then re-reads the clock: a capture that cannot end before the
-// first forced target (judged by the longest burst capture so far) is never started, so only the first burst capture can run past it. The
-// longest capture is measured around the pinned burst grab, after it.
+// R5-RESIDUE-1 (sol r1 B2): the burst pumps events and probes the painted serial, then re-reads the clock: no burst capture starts at or after
+// the first forced target, and a later one starts only while the longest burst capture so far would still end before it (a prediction, not a
+// bound: adversary A2). The longest capture is measured around the pinned burst grab, after it.
 TEST(VisualCaptureBinding, TheBurstNeverStartsACaptureThatCannotEndBeforeTheFirstForcedTarget)
 {
     const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));

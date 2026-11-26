@@ -1446,10 +1446,10 @@ function Get-DvVisualCaptureBeginRecord {
             elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture\.clip_changed(\s|$)'), $script:DvCi)) { $clipChanged++ }
             elseif ($begin.Count -gt 0 -and [regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=playback_prep\.invalidate_generation(\s|$)'), $script:DvCi)) {
                 # r4 adversary fix 2 (A7 on b6c53917): a prepared result dropped AFTER the measured close (a resize during the tail) is logged after the summary,
-                # so its counters never reach the summary's prep_* fields; any such drop (or an unreadable count) after the begin record refuses the credit
-                $drop = ConvertFrom-DvRecordKeyValues -Record ([string]$line)
-                $pending = ConvertTo-DvInt64 $drop.fields['dropped_pending']; $results = ConvertTo-DvInt64 $drop.fields['dropped_results']
-                if ($null -eq $pending -or $null -eq $results -or $pending -ne 0 -or $results -ne 0) { $tailDrops++ }
+                # so its counters never reach the summary's prep_* fields; any such drop (or an unreadable count) after the begin record refuses the credit.
+                # R5-RESIDUE-1 adversary A1 (on 4de735e6): EVERY invalidation after the begin record counts, whatever its dropped_* fields say: a task the
+                # worker was already computing is not in dropped_pending/dropped_results, and its stale result is dropped later (and the target reissued)
+                $tailDrops++
             }
         }
     }
@@ -7856,7 +7856,7 @@ function Get-DvTailInFlightCredit {
     if ($null -eq $clipChanged -or $clipChanged -ne 0) { return (& $no "TAIL_VISUAL_NOT_THIS_RUN: the run log records the open clip changed during the visual tail (gui_smoke.visual_capture.clip_changed count=$clipChanged), so the tail may be another clip's") }
     # r4 adversary fix 2 (A7 on b6c53917): a prepared result dropped during the tail (after the begin record) means the captured frame may be a reissue
     $tailDrops = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'visualTailPrepDrops') } else { $null })
-    if ($null -eq $tailDrops -or $tailDrops -ne 0) { return (& $no "TAIL_CREDIT_PREP_DROPPED: the run log records $tailDrops playback_prep.invalidate_generation drop(s) after the visual-capture begin record (or no readable count), so a target the tail shows may be a reissue of a dropped one") }
+    if ($null -eq $tailDrops -or $tailDrops -ne 0) { return (& $no "TAIL_CREDIT_PREP_DROPPED: the run log records $tailDrops playback_prep.invalidate_generation record(s) after the visual-capture begin record (or no readable count; any invalidation counts, a task already computing is in no dropped_* field), so a target the tail shows may be a reissue of a dropped one") }
     # r2 (fable r1 blocker, sol r1 findings 2, 4 and 5): each in-flight target (last painted + 1 .. Target) is credited only by a qualifying capture showing
     # EXACTLY that frame (a later frame proves nothing about it), and every such target shown is credited (478 at 126 ms and 479 at 376 ms are two).
     # r4 (adversary A1 on eabccd6c): a qualifying capture is UNFORCED (play_unbound: the app did not repaint before reading the label) and taken BEFORE any forced

@@ -19,8 +19,10 @@ read perfect while the display is frozen. So the capture runs after the measured
      (EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1). These are the only captures no forced paint precedes
      (`forced_paints_before` = 0), so they are what the in-flight tail credit below can use. The frozen check never judges them
      (it judges `play_unbound`, else `play`), and they are not input to `source_difference`. The burst re-reads the tail clock after
-     each event pump (R5-RESIDUE-1, sol r1 B2): a burst capture starts only while the time left before the first forced capture's
-     target exceeds the longest burst capture so far, so only the first burst capture (taken at once) can run past that target;
+     each event pump (R5-RESIDUE-1, sol r1 B2), so no burst capture starts at or after the first forced capture's target; and a burst
+     capture starts only while the time left before that target exceeds the longest burst capture so far. That is a prediction, not a
+     bound (adversary A2): a capture slower than every earlier one can still end past the target, by at most its own excess over the
+     longest earlier one;
    * 6 forced, bound play captures, `play-<k>.png`, across the FIRST half of a ~3 s tail (the centres of six equal slices of it);
    * then 6 unforced play captures, `play-unbound-<k>.png`, across the SECOND half (the centres of six equal slices of it): what the
      display itself shows, and what the frozen check judges;
