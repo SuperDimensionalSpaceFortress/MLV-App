@@ -757,9 +757,11 @@ file readers that pair receipts (`New-VenueSheetPair.ps1`, `New-VenueFlavorPair.
 With the text: a PASS / FAIL receipt that names `venue` more than once, or one `venue` that names `displayPath` more than once, in any letter
 case, is `INVALID` with `DISPLAY_PATH_DUPLICATE_MEMBER` (it fails closed); and `DISPLAY_PATH_UNBOUND` is owed when ANY `venue` occurrence in the
 text holds a `displayPath` member, whatever else in the text is malformed. That rule looks only at the `venue` and `displayPath` member names, so a
-lone-surrogate string or member name elsewhere in the receipt owes no marker. A text that is not strict JSON, or whose root is not an object,
-says nothing about where a member sits: the validator keeps what the parsed object says. A caller that omits `-ReceiptText` is judged on the
-parsed object alone, as before.
+lone-surrogate string or member name elsewhere in the receipt owes no marker. A text that was supplied and that the strict reader cannot inspect
+(not strict JSON for `System.Text.Json` default options: a comment, a trailing comma, nesting deeper than 64, which `ConvertFrom-Json` reads up to 1024;
+or a root that is not an object) cannot be ruled free of a duplicate member, so a PASS / FAIL receipt carrying it is `INVALID` with
+`DISPLAY_PATH_TEXT_UNREADABLE`; the parsed object's own status is never the answer for it. The depth limit is not raised: the strict reader's grammar is
+the contract. A caller that omits `-ReceiptText` (or passes an empty one) is judged on the parsed object alone, as before.
 
 **Reader.** `Read-DvReceiptDisplayPath -ReceiptText <the receipt file's text>` reads with `System.Text.Json` and its strict default options
 (no comments, no trailing commas, double-quoted names and strings only, depth 64), every string exactly as written. There is no second reader,

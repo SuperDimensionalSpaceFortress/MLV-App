@@ -6536,7 +6536,11 @@ function Test-DvReceiptValid {
     # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2 (r1 adversary pass-3 A5): the display-path block copies the health probe's own report, which no hashed artifact carries
     if (Test-DvReceiptCarriesDisplayPath $Receipt -ReceiptText $ReceiptText) { $unbound += 'DISPLAY_PATH_UNBOUND: venue.displayPath copies the health probe''s own report and is written to no hashed artifact; it is recorded, never a verdict input' }
     # R3-RESIDUE-1 A1: a duplicate member only the text can show fails closed (the strict reader types such a receipt malformed; the parsed object kept one of them)
-    if ((Get-DvReceiptTextDisplayPathFacts -ReceiptText $ReceiptText).duplicate) { $invalid.Add('DISPLAY_PATH_DUPLICATE_MEMBER: the receipt text names venue, or venue.displayPath, more than once; ConvertFrom-Json keeps only the last, so the receipt does not read the way the strict display-path reader reads it') }
+    $textFacts = Get-DvReceiptTextDisplayPathFacts -ReceiptText $ReceiptText
+    if ($textFacts.duplicate) { $invalid.Add('DISPLAY_PATH_DUPLICATE_MEMBER: the receipt text names venue, or venue.displayPath, more than once; ConvertFrom-Json keeps only the last, so the receipt does not read the way the strict display-path reader reads it') }
+    # R3-R2-RESIDUE-1 A1: text that WAS supplied and the strict reader cannot inspect (deeper than its 64, a comment, a non-object root) cannot be ruled free of a duplicate
+    # member, so the receipt is INVALID: the parsed object's own status is never the answer for it (ConvertFrom-Json reads depth 1024 and accepts comments)
+    if ($textFacts.unreadable) { $invalid.Add('DISPLAY_PATH_TEXT_UNREADABLE: the receipt text is not strict JSON the display-path reader can inspect (System.Text.Json default options: depth 64, no comments, an object root), so a duplicate venue or venue.displayPath member cannot be ruled out') }
 
     $subject = Get-DvProp $Receipt 'subject'
     $clipId = [string](Get-DvProp $subject 'clipId')
@@ -7895,9 +7899,14 @@ function Get-DvReceiptTextDisplayPathFacts {
     .SYNOPSIS
     R3-RESIDUE-1 A1: what the receipt TEXT says about `venue` and `venue.displayPath`, read with System.Text.Json (the reader's own grammar). ConvertFrom-Json
     (object and -AsHashtable) keeps only the LAST of two same-name members, so a parsed receipt cannot show a first `venue` block; the text can.
-    Returns [pscustomobject]@{ parsed; venueCount; carries; duplicate }:
+    Returns [pscustomobject]@{ parsed; unreadable; venueCount; carries; duplicate }:
       parsed    -- the text is strict JSON with an object root. Not parsed (empty, not strict JSON, an array root): carries and duplicate stay $false, and the
-                   caller keeps what the parsed receipt object says (the text cannot say where a member sits).
+                   caller keeps what the parsed receipt object says (the text cannot say where a member sits) -- EXCEPT that text which was supplied
+                   (non-empty) and could not be inspected is `unreadable`.
+      unreadable-- R3-R2-RESIDUE-1 A1: non-empty text the strict System.Text.Json reader cannot inspect: not strict JSON (a comment, a trailing comma, more
+                   than its default depth of 64 -- ConvertFrom-Json reads 1024), a root that is not an object, or a walk that threw. Duplicate members cannot be
+                   ruled out in such a text, so the validator types a PASS/FAIL receipt carrying it INVALID (DISPLAY_PATH_TEXT_UNREADABLE) and never takes the
+                   parsed object's answer. Empty text is not unreadable: it is a caller that did not supply the text, and keeps today's reading.
       venueCount-- the `venue` members at the root, in any letter case (Test-DvMemberNameIs), a name written with a JSON \u escape for one of its letters included (the parser decodes it).
       carries   -- ANY venue occurrence that is an object holds a `displayPath` member (any letter case). This is the whole marker rule for a text reading
                    that is malformed for ANOTHER reason: a lone-surrogate string or member name elsewhere in the receipt (an unreadable name is skipped, it
@@ -7905,13 +7914,15 @@ function Get-DvReceiptTextDisplayPathFacts {
       duplicate -- `venue` appears more than once, or one venue holds `displayPath` more than once.
     #>
     param([AllowNull()][AllowEmptyString()][string]$ReceiptText)
-    $facts = [pscustomobject]@{ parsed = $false; venueCount = 0; carries = $false; duplicate = $false }
+    $facts = [pscustomobject]@{ parsed = $false; unreadable = $false; venueCount = 0; carries = $false; duplicate = $false }
     if ([string]::IsNullOrEmpty($ReceiptText)) { return $facts }
+    $unreadableFacts = [pscustomobject]@{ parsed = $false; unreadable = $true; venueCount = 0; carries = $false; duplicate = $false }
     $doc = $null
-    try { $doc = [System.Text.Json.JsonDocument]::Parse($ReceiptText, [System.Text.Json.JsonDocumentOptions]::new()) } catch { return $facts }
+    # The reader's own options, on purpose (default depth 64): raising the limit here would make this reader read what Read-DvReceiptDisplayPath refuses.
+    try { $doc = [System.Text.Json.JsonDocument]::Parse($ReceiptText, [System.Text.Json.JsonDocumentOptions]::new()) } catch { return $unreadableFacts }
     try {
         $root = $doc.RootElement
-        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $facts }
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $unreadableFacts }
         $venues = @(Get-DvJsonMembersNamed -Element $root -Name 'venue' -SkipUnreadable)
         $carries = $false; $duplicate = ($venues.Count -gt 1)
         foreach ($v in $venues) {
@@ -7921,7 +7932,7 @@ function Get-DvReceiptTextDisplayPathFacts {
             if ($blocks -gt 1) { $duplicate = $true }
         }
         $facts.parsed = $true; $facts.venueCount = $venues.Count; $facts.carries = $carries; $facts.duplicate = $duplicate
-    } catch { $facts = [pscustomobject]@{ parsed = $false; venueCount = 0; carries = $false; duplicate = $false } }
+    } catch { $facts = $unreadableFacts }
     finally { $doc.Dispose() }
     $facts
 }

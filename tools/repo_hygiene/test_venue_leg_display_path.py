@@ -825,13 +825,22 @@ function Probe($text) {
                 $v = $(if ($mode -eq 'text') { Test-DvReceiptValid -Receipt $rec -AllowOfflineTestMode -ReceiptText $text } else { Test-DvReceiptValid -Receipt $rec -AllowOfflineTestMode })
                 $o["$rep|$mode"] = [ordered]@{ status = [string]$v.status
                     marker = @($v.unbound | Where-Object { $_ -like 'DISPLAY_PATH_UNBOUND*' }).Count
-                    dup = @($v.reasons | Where-Object { $_ -like 'DISPLAY_PATH_DUPLICATE_MEMBER*' }).Count }
+                    dup = @($v.reasons | Where-Object { $_ -like 'DISPLAY_PATH_DUPLICATE_MEMBER*' }).Count
+                    unreadable = @($v.reasons | Where-Object { $_ -like 'DISPLAY_PATH_TEXT_UNREADABLE*' }).Count }
             } catch { $o["$rep|$mode"] = [ordered]@{ threw = $_.Exception.Message } }
         }
     }
     $o
 }
+# R3-R2-RESIDUE-1 A1: a unique root member `noise` nested N objects deep. ConvertFrom-Json reads depth 1024; System.Text.Json's default MaxDepth is 64 (the root
+# is depth 1, so N = 63 is the deepest text the strict reader takes and N = 64 the first it refuses).
+function Deep($n) { '"noise":' + ('{"x":' * $n) + '1' + ('}' * $n) + ',' }
 $cases = [ordered]@{
+    'deep-65-two-identical-venues' = $head + (Deep 65) + '"venue":{"name":"bachelor"},"venue":{"name":"bachelor"}}'
+    'deep-65-one-venue-with-block' = $head + (Deep 65) + '"venue":{"name":"bachelor","displayPath":' + $B + '}}'
+    'deep-64-two-identical-venues' = $head + (Deep 64) + '"venue":{"name":"bachelor"},"venue":{"name":"bachelor"}}'
+    'deep-63-two-identical-venues' = $head + (Deep 63) + '"venue":{"name":"bachelor"},"venue":{"name":"bachelor"}}'
+    'deep-63-one-venue' = $head + (Deep 63) + '"venue":{"name":"bachelor"}}'
     'first-venue-has-block' = $head + '"venue":{"name":"bachelor","displayPath":' + $B + '},"venue":{"name":"bachelor"}}'
     'last-venue-has-block' = $head + '"venue":{"name":"bachelor"},"venue":{"name":"bachelor","displayPath":' + $B + '}}'
     'escaped-second-venue-name' = $head + '"venue":{"name":"bachelor","displayPath":' + $B + '},"v' + [string][char]92 + 'u0065nue":{"name":"bachelor"}}'
@@ -936,6 +945,52 @@ class ResidueR1ReceiptTextTests(unittest.TestCase):
                     self.assertEqual(v["dup"], 0)
         for rep, v in self.each_rep("last-venue-has-block", "legacy"):
             self.assertEqual(v["marker"], 1, rep)   # ConvertFrom-Json kept the last venue: what a legacy caller has always seen
+
+    def test_r2_a1_text_the_strict_reader_cannot_inspect_makes_the_receipt_invalid_never_the_parsed_objects_answer(self) -> None:
+        """R3-R2-RESIDUE-1 A1 (luna r1b on c9e93371): a PASS/FAIL receipt whose text System.Text.Json refuses (65 nested objects under a unique member, which
+        ConvertFrom-Json reads) used to come back with duplicate=false, so two identical `venue` members validated on the parsed object's own status. It is
+        INVALID, reason DISPLAY_PATH_TEXT_UNREADABLE, in both ConvertFrom-Json representations."""
+        for case in ("deep-65-two-identical-venues", "deep-65-one-venue-with-block", "deep-64-two-identical-venues", "comment-text-with-block"):
+            for rep, v in self.each_rep(case):
+                with self.subTest(f"{case}|{rep}"):
+                    self.assertNotIn("threw", v, v)
+                    self.assertEqual(v["status"], "INVALID")
+                    self.assertEqual(v["unreadable"], 1, f"{case}|{rep}: DISPLAY_PATH_TEXT_UNREADABLE reasons {v['unreadable']!r}")
+                    self.assertEqual(v["dup"], 0, f"{case}|{rep}: an unreadable text is not also judged for duplicates")
+
+    def test_r2_a1_the_two_readers_depth_limits_are_pinned(self) -> None:
+        """ConvertFrom-Json reads every one of these (no `threw`, a marker/dup answer from the parsed object); System.Text.Json's default MaxDepth of 64 takes the
+        root plus 63 nested objects (depth 64) and refuses 64 (depth 65). The limit is not raised: the strict reader's grammar is the contract."""
+        for rep, v in self.each_rep("deep-63-two-identical-venues"):
+            with self.subTest(f"deep-63|{rep}"):
+                self.assertNotIn("threw", v, v)
+                self.assertEqual((v["status"], v["dup"], v["unreadable"]), ("INVALID", 1, 0))
+        for rep, v in self.each_rep("deep-63-one-venue"):
+            with self.subTest(f"deep-63-single|{rep}"):
+                self.assertNotIn("threw", v, v)
+                self.assertEqual((v["dup"], v["unreadable"]), (0, 0))
+        self.assertEqual(self.got["deep-63-one-venue"]["state"], "NO_SIGNAL")
+        self.assertEqual(self.got["deep-64-two-identical-venues"]["state"], "malformed")
+        self.assertEqual(self.got["deep-65-two-identical-venues"]["state"], "malformed")
+
+    def test_r2_a1_a_caller_that_omits_the_text_never_gets_the_unreadable_reason(self) -> None:
+        for case in self.got:
+            for rep, v in self.each_rep(case, "legacy"):
+                with self.subTest(f"{case}|{rep}"):
+                    if "threw" not in v:
+                        self.assertEqual(v["unreadable"], 0)
+
+    def test_r2_a1_the_facts_reader_types_every_text_it_cannot_inspect(self) -> None:
+        """Static pin: the facts reader has ONE unreadable verdict, set by the parse failure, a non-object root and a failed walk; the validator turns it into the
+        typed reason beside the duplicate reason, and the marker lookup never takes the parsed object's answer for text that carries it."""
+        module = MODULE.read_text(encoding="utf-8")
+        facts = re.search(r"^function Get-DvReceiptTextDisplayPathFacts \{.*?^\}", module, re.S | re.M).group(0)
+        self.assertEqual(facts.count("return $unreadableFacts"), 2, "the parse failure and the non-object root each return the unreadable verdict")
+        self.assertIn("catch { $facts = $unreadableFacts }", facts, "a failed walk is the same verdict")
+        self.assertNotIn("JsonDocumentOptions]::new()) } catch { return $facts }", facts)
+        self.assertNotRegex(facts, r"MaxDepth", "the facts reader keeps the strict reader's default depth; raising it would make it read what Read-DvReceiptDisplayPath refuses")
+        validator = re.search(r"^function Test-DvReceiptValid \{.*?^\}", module, re.S | re.M).group(0)
+        self.assertIn("DISPLAY_PATH_TEXT_UNREADABLE", validator)
 
     def test_a1_every_validator_caller_passes_the_text_it_parsed(self) -> None:
         """SIBLING_SWEEP: the three file readers and Write-DvReceipt hand the validator the receipt text."""
