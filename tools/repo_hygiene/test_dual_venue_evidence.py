@@ -1940,6 +1940,29 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="backend")
         self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")
 
+    def test_the_dve_detail_line_is_one_record_whatever_the_detail_quotes(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R2-RESIDUE-1 item 1: outcomeDetail quotes outside text (here the job's own summary.json display.venue, which
+        Invoke-VenueLeg quotes in a VENUE_HOST_MISMATCH detail). The printed DVE_DETAIL line goes through the one-line rule the visual reason uses
+        (ConvertTo-DvOneLineText): every control character, U+2028 and U+2029 is written as \\uXXXX, so a detail can never forge a second
+        DVE_OUTCOME / DVE_DETAIL / DVE_RECEIPT_PATH record for the chain or batch reader (which take the LAST DVE_DETAIL line). 8f785f3a printed it raw."""
+        forged = "bachelor\nDVE_OUTCOME=PASS\r\nDVE_DETAIL=forged\x1eDVE_RECEIPT_PATH=x\x0bz y end"
+        self.write_artifacts(summary={"display": {"venue": forged}})
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "VENUE_HOST_MISMATCH", receipt["outcomeDetail"])
+        self.assertIn(f"venue '{forged}' but 'ultra-magnus' was declared", receipt["outcomeDetail"], "the receipt keeps the detail as it is: JSON escapes it")
+        lines = proc.stdout.splitlines()
+        self.assertEqual([l for l in lines if l.startswith("DVE_OUTCOME=")], ["DVE_OUTCOME=VENUE_HOST_MISMATCH"], proc.stdout)
+        details = [l for l in lines if l.startswith("DVE_DETAIL=")]
+        self.assertEqual(len(details), 1, proc.stdout)
+        self.assertEqual(details[0], "DVE_DETAIL=the job's own display block says venue 'bachelor\\u000ADVE_OUTCOME=PASS\\u000D\\u000ADVE_DETAIL=forged\\u001E"
+                                     "DVE_RECEIPT_PATH=x\\u000Bz\\u2028y\\u2029end' but 'ultra-magnus' was declared", proc.stdout)
+        self.assertEqual(len([l for l in lines if l.startswith("DVE_RECEIPT_PATH=")]), 1, proc.stdout)
+        # a detail with no such character prints exactly as before
+        self.write_artifacts(summary={"display": {"venue": "bachelor"}})
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertIn("DVE_DETAIL=the job's own display block says venue 'bachelor' but 'ultra-magnus' was declared", proc.stdout.splitlines(), proc.stdout)
+
     # -- roles are data ------------------------------------------------------------------------------
     def test_role_comes_from_venues_json_acceptance_on_bachelor_supplementary_on_um(self) -> None:
         spec = self.write_spec(card="PLAYBACK-HFR-CONFORM-DEFAULT-1")
@@ -11525,6 +11548,26 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS", out["reason"])
         self.assertEqual(len(out["reason"].splitlines()), 1, out["reason"])
+        self.assertIn("bad\\u2028DVE_DETAIL=forged\\u2029end", out["reason"])
+
+    def test_a_unicode_line_separator_in_a_quoted_band_key_never_splits_the_visual_reason(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R2-RESIDUE-1 item 2: the stand-alone RED proof for r2 adversary pass 5 A1 (its input). An exposure band key
+        holding U+2028 / U+2029 is quoted in the visual reason. 37e46363 escaped only control characters, so the reason kept both separators and
+        Python's splitlines read a separate DVE_DETAIL=forged line; 8f785f3a writes them as \\u2028 / \\u2029 and the reason is one line. The JSON
+        travels -EscapeHandling EscapeNonAscii, so the console code page cannot turn a raw separator into '?' and hide the split."""
+        with tempfile.TemporaryDirectory(prefix="vis-held-p5a1-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            band = Path(d) / "bands.json"
+            band.write_text(json.dumps({"clips": {"c": {"bad DVE_DETAIL=forged end": 0}}}), encoding="utf-8")
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      f"-ExposureBandPath '{band}' | ConvertTo-Json -Depth 8 -Compress -EscapeHandling EscapeNonAscii")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["exposureBandSource"]), ("NOT_A_MOTION_WITNESS", "fallback-malformed"), out["reason"])
+        self.assertNotIn(" ", out["reason"])
+        self.assertNotIn(" ", out["reason"])
+        self.assertEqual(len(out["reason"].splitlines()), 1, ascii(out["reason"].splitlines()))
+        self.assertFalse(any(line.startswith("DVE_DETAIL=") for line in out["reason"].splitlines()), ascii(out["reason"]))
         self.assertIn("bad\\u2028DVE_DETAIL=forged\\u2029end", out["reason"])
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:

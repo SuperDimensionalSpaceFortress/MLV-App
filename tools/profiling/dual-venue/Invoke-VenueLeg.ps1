@@ -369,19 +369,22 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
             $receipt.outcomeDetail = "evidence-validation-io: $($parts[1]) $($parts[2]) (the job result was ${Outcome}: $Detail)"
             $Outcome = 'UNRESOLVED'
         } else {
-            Write-Output "DVE_RECEIPT_WRITE_FAILED $refusal"
+            Write-Output "DVE_RECEIPT_WRITE_FAILED $(ConvertTo-DvOneLineText $refusal)"
             exit 2
         }
         try {
             $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode -LegSpecBytes $specBytes
         } catch {
-            Write-Output "DVE_RECEIPT_WRITE_FAILED $($_.Exception.Message)"
+            Write-Output "DVE_RECEIPT_WRITE_FAILED $(ConvertTo-DvOneLineText $_.Exception.Message)"
             exit 2
         }
     }
     Write-Output "DVE_OUTCOME=$Outcome"
     # (the writer relabels an advisory production PASS/FAIL in outcomeDetail and stamps receipt.verification: say so here too)
-    Write-Output "DVE_DETAIL=$($receipt.outcomeDetail)"
+    # UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R2-RESIDUE-1: outcomeDetail quotes outside text (the job's own display.venue, a um-run or exception message, the
+    # visual reason ...), so the printed line goes through the one-line rule (ConvertTo-DvOneLineText): a line break, U+2028 or U+2029 in a detail can never
+    # forge a DVE_OUTCOME / DVE_DETAIL / DVE_RECEIPT_PATH record for a chain or batch reader. The receipt keeps the detail as it is (JSON escapes it).
+    Write-Output "DVE_DETAIL=$(ConvertTo-DvOneLineText $receipt.outcomeDetail)"
     if ($null -ne $receipt['verification']) { Write-Output "DVE_VERIFICATION=$($receipt['verification'].status)" }
     # PLAYBACK-VISUAL-INSPECTION-1: the visual verdict and the strip a reviewer opens.
     if ($null -ne $receipt['visual']) { Write-Output "DVE_VISUAL=$($receipt['visual'].verdict) STRIP=$(if ($receipt['visual'].stripCopyPath) { $receipt['visual'].stripCopyPath } elseif ($receipt['visual'].stripPath) { $receipt['visual'].stripPath } else { 'none' })" }

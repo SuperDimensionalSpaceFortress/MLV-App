@@ -3958,6 +3958,15 @@ function Get-DvVisualCaptureRequest {
     [pscustomobject]@{ applies = $applies; requested = $applies; optOutReason = $null }
 }
 
+function ConvertTo-DvOneLineText($Value) {
+    # UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2 (pass 4 A2, pass 5 A1) and R2-RESIDUE-1: the one rule for outside text printed inside a record line (the visual
+    # reason, Invoke-VenueLeg's DVE_DETAIL). Every control character (Cc: CR, LF, VT, FF, NEL, the C1 set, ...) and the Unicode line and paragraph separators
+    # (Zl U+2028, Zp U+2029) is written as \uXXXX, so nothing a detail quotes can split the line into a second record, for a CR/LF reader or for
+    # Python's splitlines. $null stays $null.
+    if ($null -eq $Value) { return $null }
+    [regex]::Replace([string]$Value, '[\p{Cc}\p{Zl}\p{Zp}]', { param($m) '\u{0:X4}' -f [int][char]$m.Value })
+}
+
 function ConvertTo-DvVisualUtcText($Value) {
     # ConvertFrom-Json turns an ISO date string into a DateTime on some pwsh versions and leaves it a string on others: one round-trip UTC text either way.
     if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
@@ -4574,7 +4583,7 @@ function Read-DvVisualCaptures {
         # r2 pass 4 A2: the reason is one line. A note may quote outside text (an exposure band key, say) and Invoke-VenueLeg prints the reason inside its
         # DVE_DETAIL line, so a control character (a line break above all) is written as \uXXXX: no note can forge a second record line.
         # (r2 pass 5 A1: and the Unicode line and paragraph separators U+2028 / U+2029, which split a line for Python's splitlines too)
-        if ($null -ne $block.reason) { $block.reason = [regex]::Replace([string]$block.reason, '[\p{Cc}\p{Zl}\p{Zp}]', { param($m) '\u{0:X4}' -f [int][char]$m.Value }) }
+        if ($null -ne $block.reason) { $block.reason = ConvertTo-DvOneLineText $block.reason }
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -7680,7 +7689,7 @@ function Write-DvReceipt {
 
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
-    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
+    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, ConvertTo-DvOneLineText, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
