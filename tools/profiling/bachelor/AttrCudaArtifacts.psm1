@@ -5215,8 +5215,11 @@ function Wait-AttrCudaProcessTreeGone {
             # test have used budget), so a scan never starts, or is granted its 1 s minimum, with less than $scanFloorMs left.
             $remainMs = $WaitMs - $clock.Elapsed.TotalMilliseconds
             if ($remainMs -lt ($scanFloorMs + $scanMarginMs)) { break }
-            $leftSec = [int][Math]::Floor(($remainMs - $scanMarginMs) / 1000.0)
-            $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec ([int][Math]::Floor(($WaitMs - $clock.Elapsed.TotalMilliseconds - $scanMarginMs) / 1000.0)) -ErrorAction Stop) }
+            # r2c (sol r3 A2): the grant is read AGAIN here, and a grant under one whole second starts no scan (an OperationTimeoutSec of 0 selects the provider's server-default timeout, which
+            # is unbounded for this purpose); only the guard statement sits between this read and the dispatch.
+            $leftSec = [int][Math]::Floor(($WaitMs - $clock.Elapsed.TotalMilliseconds - $scanMarginMs) / 1000.0)
+            if ($leftSec -lt 1) { break }
+            $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
             # r5b fix (adversary A2 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started; the
             # creation-time ordering of the climb below is then untrustworthy, so the kill is UNCONFIRMED (fail closed), whatever the other rows show.
             $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [DateTime]::UtcNow.Ticks })

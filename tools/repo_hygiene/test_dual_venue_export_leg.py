@@ -4664,7 +4664,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertIn("$remainMs = $WaitMs - $clock.Elapsed.TotalMilliseconds\n", body)
         # r2 (sol r1 A2): the floor now includes the dispatch margin, and the grant is the whole seconds of the exact remaining milliseconds less that margin
         self.assertIn("if ($remainMs -lt ($scanFloorMs + $scanMarginMs)) { break }", body, "the floor and margin are re-checked where the scan's timeout is granted")
-        self.assertIn("$leftSec = [int][Math]::Floor(($remainMs - $scanMarginMs) / 1000.0)", body)
+        # r2c (sol r3 A2): the grant is re-read, and under one whole second no scan starts (a 0 s CIM timeout would select the server default)
+        self.assertIn("$leftSec = [int][Math]::Floor(($WaitMs - $clock.Elapsed.TotalMilliseconds - $scanMarginMs) / 1000.0)\n            if ($leftSec -lt 1) { break }\n", body)
+        self.assertIn("-OperationTimeoutSec $leftSec -ErrorAction Stop", body)
         self.assertNotIn("[Math]::Max(1,", body, "no 1 s minimum is forced on a scan the budget cannot cover")
         venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         line = next(ln for ln in venue.splitlines() if "Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id" in ln)
