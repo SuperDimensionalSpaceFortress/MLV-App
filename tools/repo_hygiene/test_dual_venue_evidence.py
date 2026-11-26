@@ -4191,7 +4191,13 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.assertEqual(self.status(receipt, repo, evidence_dir=edited, module=mutated)[:2], ("ADVISORY", False))
 
     def test_mutation_without_the_playback_comparison_a_lying_block_validates(self) -> None:
-        mutated = self.mutated_module([("if (-not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) {", "if ($false) {")])
+        # r4 moved the comparison into Get-DvStoredPlaybackFieldProblems, which has TWO branches that compare a stored playback field with the
+        # re-derived one: the always-compared fields ($f) and the compared-when-stored fields (stored name $n). Both are neutralised, so the mutant
+        # cannot survive by the branch the lying receipt does not reach. Each anchor must occur exactly once (mutated_module asserts it).
+        mutated = self.mutated_module([
+            ("if (-not (Test-DvJsonEquivalent (Get-DvProp $Stored $f) (Get-DvProp $Derived $f))) {", "if ($false) {"),
+            ("if (-not (Test-DvJsonEquivalent (Get-DvProp $Stored $n) (Get-DvProp $Derived $f))) {", "if ($false) {"),
+        ])
         repo = self.prod_repo()
         receipt = self.receipt_for(repo, self.evidence("m6"))
         receipt["playback"]["sourceAdvanced"] = 5000
