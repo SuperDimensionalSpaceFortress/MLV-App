@@ -4668,7 +4668,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertNotIn("[Math]::Max(1,", body, "no 1 s minimum is forced on a scan the budget cannot cover")
         venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         line = next(ln for ln in venue.splitlines() if "Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id" in ln)
-        self.assertIn("$grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 50.0) / 1000.0); if ($grantSec -ge 1)", line)
+        self.assertIn("$grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0); if ($grantSec -ge 1)", line)
+        # r2b (sol r2 A3): the timeout is read again inside the call's own argument, so no statement sits between the last clock read and the dispatch
+        self.assertIn("-OperationTimeoutSec ([int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0))", line)
         self.assertNotIn("$leftMs", line, "the snapshot timeout is read at the grant, never from a stored value")
 
     def test_r3_a_new_child_on_a_reused_member_pid_is_a_survivor(self) -> None:
@@ -4905,17 +4907,21 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertTrue(got["ctl"], f"control: a new tree under an old outsider (older at every hop by more than the band) is not a survivor: {got}")
 
     def test_r2_a2_no_scan_starts_without_its_floor_plus_margin_left_and_the_grants_are_floored_doubles(self) -> None:
-        """r2, sol r1 A2 on 76dd1e12. A scan needs CIM's 1 s floor plus the dispatch margin (50 ms); a clock read at 499.6 ms that dispatched at 500.2 ms started a 1 s scan
-        with 999.8 ms left. Behavior: -WaitMs 1040 starts no scan, 1100 starts one. Source: no truncated ElapsedMilliseconds read feeds a grant in the wait or the bounded
-        process."""
+        """r2, sol r1 A2 on 76dd1e12 (margin 50 -> 100 ms and the timeout re-read inside the call's argument: sol r2 A3 on 8cf9cae3). A scan needs CIM's 1 s floor plus the
+        dispatch margin; a clock read at 499.6 ms that dispatched at 500.2 ms started a 1 s scan with 999.8 ms left. Behavior: -WaitMs 1090 starts no scan, 1200 starts one.
+        Source: no truncated ElapsedMilliseconds read feeds a grant in the wait or the bounded process. r2b (sol r2 A6): a snapshot with no members field is an unknown tree."""
         got = self.snapshot_and_wait(
             "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
             "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1))))\n"
             "$global:scans = 0\n"
-            "$band = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1040 -Scan { $global:scans++; @($sys) }\n"
+            "$band = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1090 -Scan { $global:scans++; @($sys) }\n"
             "$bandScans = $global:scans; $global:scans = 0\n"
-            "$fits = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1100 -Scan { $global:scans++; @($sys) }\n"
-            "[ordered]@{ band = $band.confirmed; bandWhy = $band.error; bandScans = $bandScans; fits = $fits.confirmed; fitsScans = $global:scans } | ConvertTo-Json -Compress")
+            "$fits = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { $global:scans++; @($sys) }\n"
+            "$fitsScans = $global:scans\n"
+            "$nomem = Wait-AttrCudaProcessTreeGone -Snapshot ([pscustomobject]@{ ok = $true; rootProcessId = 100; rootCreationTicks = 1 }) -WaitMs 1500 -Scan { @() }\n"
+            "[ordered]@{ band = $band.confirmed; bandWhy = $band.error; bandScans = $bandScans; fits = $fits.confirmed; fitsScans = $fitsScans; nomem = $nomem.confirmed; nomemWhy = $nomem.error } | ConvertTo-Json -Compress")
+        self.assertFalse(got["nomem"], got)
+        self.assertIn("tree-unknown", got["nomemWhy"], got)
         self.assertFalse(got["band"], got)
         self.assertEqual(got["bandScans"], 0, f"no scan starts with under floor + margin left: {got}")
         self.assertEqual(got["bandWhy"], "no-time-to-confirm", got)
@@ -4923,7 +4929,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertEqual(got["fitsScans"], 1, got)
         wait_src = ARTIFACTS_MODULE.read_text(encoding="utf-8")
         body = wait_src[wait_src.index("function Wait-AttrCudaProcessTreeGone"):wait_src.index("function Get-AttrCudaProcessCpuSnapshot")]
-        self.assertNotIn("ElapsedMilliseconds", body, "the wait reads the clock to the fraction of a millisecond everywhere")
+        # r2b (sol r2 A2): the comment above the loop names the truncating property, so the code lines are checked, not the raw text
+        code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+        self.assertNotRegex(code, r"\.ElapsedMilliseconds\b", "the wait reads the clock to the fraction of a millisecond everywhere")
         venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         bounded = venue[venue.index("function Invoke-VenueBoundedProcess"):venue.index("function Get-VenueDriverScriptMissing")]
         self.assertNotIn("$cleanup.ElapsedMilliseconds", bounded, "every cleanup grant is read from the exact remaining time")

@@ -5190,6 +5190,8 @@ function Wait-AttrCudaProcessTreeGone {
     $skewTicks = 20000000L
     try {
         $recorded[[int64]$Snapshot.rootProcessId] = [int64]$Snapshot.rootCreationTicks
+        # r2b (sol r2 A6): a snapshot with no members field is an unknown tree, not an empty one
+        if ($null -eq $snapProps['members']) { throw [System.InvalidOperationException]::new('snapshot members missing') }
         foreach ($m in @($(if ($null -ne $snapProps['members']) { $snapProps['members'].Value } else { @() }))) { $recorded[[int64]$m.processId] = $(if ($null -eq $m.creationTicks) { $null } else { [int64]$m.creationTicks }) }
         # r3 fix 2 (adversary A1 on 6b788356): the outsiders the snapshot saw (pid -> creation ticks). A snapshot without them knows no outsider: every orphan is unproven.
         $othersRaw = $(if ($null -ne $snapProps['others']) { $snapProps['others'].Value } else { $null })
@@ -5200,7 +5202,9 @@ function Wait-AttrCudaProcessTreeGone {
     # r2 (sol r1 A2): a scan costs CIM's 1 s floor PLUS the time between reading the clock and dispatching the call, so it starts only with $scanFloorMs + $scanMarginMs left and
     # its timeout is the whole seconds of the exact remaining milliseconds (a double) less that margin; a truncated clock read granted 1 s with 999.8 ms left.
     $scanFloorMs = 1000
-    $scanMarginMs = 50
+    # r2b (sol r2 A3): the margin is 100 ms and the timeout is read AGAIN inside the call's own argument, so only a pause between that read and the dispatch itself can start a late scan;
+    # a scan that then ends past the bound confirms nothing (below), and a grant under 1 s is refused by the cmdlet's own validation (an unconfirmed kill).
+    $scanMarginMs = 100
     $clock = [Diagnostics.Stopwatch]::StartNew()
     $survivors = @()
     $lastError = 'no-time-to-confirm'
@@ -5212,7 +5216,7 @@ function Wait-AttrCudaProcessTreeGone {
             $remainMs = $WaitMs - $clock.Elapsed.TotalMilliseconds
             if ($remainMs -lt ($scanFloorMs + $scanMarginMs)) { break }
             $leftSec = [int][Math]::Floor(($remainMs - $scanMarginMs) / 1000.0)
-            $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
+            $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec ([int][Math]::Floor(($WaitMs - $clock.Elapsed.TotalMilliseconds - $scanMarginMs) / 1000.0)) -ErrorAction Stop) }
             # r5b fix (adversary A2 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started; the
             # creation-time ordering of the climb below is then untrustworthy, so the kill is UNCONFIRMED (fail closed), whatever the other rows show.
             $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [DateTime]::UtcNow.Ticks })
