@@ -3332,7 +3332,8 @@ $script:PlaybackComparedFields = @('sourceAdvanced', 'requiredSourceFrames', 'na
 # log re-derives WHENEVER the stored block carries them (a stored conformRepeats=0 over a log that says repeats=1 is PLAYBACK_NOT_FROM_EVIDENCE). A receipt
 # written before a field existed does not carry it and is not re-judged for it. The older conform fields are not compared (OPEN in PR #910).
 $script:PlaybackComparedFieldsWhenStored = @('conformRepeats', 'conformPresented', 'conformConflictingFields', 'summaryConflictingFields',
-    'prepReplacedBefore', 'prepReplacedAfter', 'prepStaleDrops', 'prepGenerationDrops')   # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1: the tail-credit inputs
+    'prepReplacedBefore', 'prepReplacedAfter', 'prepStaleDrops', 'prepGenerationDrops',   # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1: the tail-credit inputs
+    'conformPaintWaitEscapes', 'visualCaptureBeginSession', 'visualCaptureBeginUtc', 'visualCaptureClipChanged')   # r4 (adversary A2 on 2e941c3a): the r4 tail-credit inputs
 
 function Get-DvStoredPlaybackFieldProblems {
     <#
@@ -3360,7 +3361,10 @@ function Get-DvStoredPlaybackFieldProblems {
     }
     foreach ($f in $script:PlaybackComparedFieldsWhenStored) {
         foreach ($n in @($storedNames | Where-Object { [string]::Equals($_, $f, [StringComparison]::OrdinalIgnoreCase) })) {
-            if (-not (Test-DvJsonEquivalent (Get-DvProp $Stored $n) (Get-DvProp $Derived $f))) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
+            $storedValue = Get-DvProp $Stored $n; $derivedValue = Get-DvProp $Derived $f
+            # r4: a receipt read back with ConvertFrom-Json holds an ISO time as a DateTime, so the begin time is compared as one round-trip UTC text
+            if ($f -ceq 'visualCaptureBeginUtc') { $storedValue = ConvertTo-DvVisualUtcText $storedValue; $derivedValue = ConvertTo-DvVisualUtcText $derivedValue }
+            if (-not (Test-DvJsonEquivalent $storedValue $derivedValue)) { $problems.Add("PLAYBACK_NOT_FROM_EVIDENCE: playback.$f is not what the hashed run log and result re-derive") }
         }
     }
     # one string per problem on the pipeline (callers collect with @(...)); none when the stored block is sound

@@ -20237,8 +20237,10 @@ class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
             "ConvertTo-Json -Compress -Depth 3 -InputObject ([ordered]@{ list = @($list); a = $a.verdict; b = $b.verdict; c = $c.verdict })")
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1 appended the four prep counters the in-flight tail credit reads
+        # r4 (adversary A2 on 2e941c3a) appended the four r4 tail-credit inputs (paint_wait_escapes and the visual-capture begin binding)
         self.assertEqual(out["list"], ["conformRepeats", "conformPresented", "conformConflictingFields", "summaryConflictingFields",
-                                       "prepReplacedBefore", "prepReplacedAfter", "prepStaleDrops", "prepGenerationDrops"], out)
+                                       "prepReplacedBefore", "prepReplacedAfter", "prepStaleDrops", "prepGenerationDrops",
+                                       "conformPaintWaitEscapes", "visualCaptureBeginSession", "visualCaptureBeginUtc", "visualCaptureClipChanged"], out)
         self.assertEqual((out["a"], out["b"], out["c"]), ("NOT_MEASURED", "NOT_MEASURED", "PASS"), out)
         # r4 (sol r3 finding 3): the comparison moved into Get-DvStoredPlaybackFieldProblems, which finds a stored field by any casing; the
         # behaviour is pinned by test_r3_sol_b3_a_case_variant_stored_field_is_refused_never_skipped
@@ -20884,6 +20886,20 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         self.assertEqual((two["s"], two["u"]), (None, None), two)
         none = derive(["playback_smoke.measured_session id=3", conform.replace(" paint_wait_escapes=2", ""), summary])
         self.assertEqual(none, {"s": None, "u": None, "c": 0, "e": None})
+
+    def test_r4_pass2_a2_the_r4_playback_fields_are_compared_when_stored(self) -> None:
+        """r4 adversary pass on 2e941c3a, A2, its input: Derived {conformPaintWaitEscapes 1, visualCaptureBeginSession '3', visualCaptureBeginUtc
+        2026-11-25T18:00:00.000Z, visualCaptureClipChanged 1}, Stored {0, '999', 2000-01-01T00:00:00.000Z, 0}. 2e941c3a found zero problems. Each is now
+        PLAYBACK_NOT_FROM_EVIDENCE; equal values (the begin time stored as a DateTime, as ConvertFrom-Json reads it back) are none."""
+        proc, out = run_pwsh_json(
+            "$d = [pscustomobject]@{ conformPaintWaitEscapes = 1; visualCaptureBeginSession = '3'; visualCaptureBeginUtc = '2026-11-25T18:00:00.000Z'; visualCaptureClipChanged = 1 }\n"
+            "$s = [pscustomobject]@{ conformPaintWaitEscapes = 0; visualCaptureBeginSession = '999'; visualCaptureBeginUtc = '2000-01-01T00:00:00.000Z'; visualCaptureClipChanged = 0 }\n"
+            "$same = '{\"conformPaintWaitEscapes\":1,\"visualCaptureBeginSession\":\"3\",\"visualCaptureBeginUtc\":\"2026-11-25T18:00:00.000Z\",\"visualCaptureClipChanged\":1}' | ConvertFrom-Json\n"
+            "[ordered]@{ lie = @(Get-DvStoredPlaybackFieldProblems -Stored $s -Derived $d); same = @(Get-DvStoredPlaybackFieldProblems -Stored $same -Derived $d) } | ConvertTo-Json -Compress -Depth 3")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(sorted(p.split(" ")[1] for p in out["lie"]), ["playback.conformPaintWaitEscapes", "playback.visualCaptureBeginSession",
+                                                                       "playback.visualCaptureBeginUtc", "playback.visualCaptureClipChanged"], out)
+        self.assertEqual(out["same"], [], out)
 
     def test_r4_a3_two_rows_naming_one_file_refuse_the_tail(self) -> None:
         """A3, its input: two rows with distinct indices, row 0 frame 478 at 126 ms serial 483 file=play-1.png, row 1 frame 479 at 376 ms serial 484
