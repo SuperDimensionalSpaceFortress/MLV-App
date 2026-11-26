@@ -758,7 +758,8 @@ else {
         detail = [string]$playbackAbFpsArmVerdict.detail
     }
     # (adversary 698fffb1 A7: the arm gate judged these two legs; the compare that carries the fps must be measured on them, or the pair is refused like any other the gate refuses)
-    if (-not $playbackAbFpsArmRefusal.refused -and $playbackAbSpeedCompare -and $null -ne $playbackAbSpeedCompare.presentedFps) {
+    # (R2-RESIDUE-1 r3, sol 5add23cf A10: EVERY metric the compare publishes is bound, so the check runs for any published compare, not only one that carries presentedFps)
+    if (-not $playbackAbFpsArmRefusal.refused -and $playbackAbSpeedCompare) {
         $playbackAbCompareProblem = Get-FpsCompareBindingProblem -Compare $playbackAbSpeedCompare -Baseline $playbackAb.baseline -Candidate $playbackAbCandidateLeg
         if ($null -ne $playbackAbCompareProblem) {
             $playbackAbFpsArmRefusal = [pscustomobject]@{ refused = $true; reason = "fps-verdict-refused:compare-not-judged-pair"; detail = [string]$playbackAbCompareProblem }

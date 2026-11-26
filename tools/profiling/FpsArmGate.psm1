@@ -57,6 +57,10 @@ $script:FpsLightArgs = @(
     New-FpsAllow '--no-look-assist' 'bare' ''                           # :1534
     New-FpsAllow '--display-prefer' 'eq' 'text'                         # :1641 (the job forwards -DisplayPrefer, job:3105; producer cite, alias table in header)
     New-FpsAllow '--windowed' 'bare' ''                                 # :1681 via -AdditionalArgs; R2-RESIDUE-1 r1 (698fffb1 A5): a windowed leg (spec key displayMode) passes it (job:6330); the display mode is the A/B variable of the display matrix, not a logger
+    # R2-RESIDUE-1 r3 (sol 5add23cf A3): the venue leg keeps window captures unless its spec opts out (visualCapture), so EVERY default speed leg is launched with --visual-capture-dir <dir> (job:6677 appends it to the
+    # smoke command's one -AdditionalArgs array; its pre-launches carry the same flag with their own directory, job:6429). The app captures the window AFTER the measured Play has closed (the length gate's own
+    # option policy classifies it 'allow' for the same reason), so it is not a logger inside the timed window. The spec reader reads such a spec LIGHT, so the launch reader must read the launch it emits LIGHT too.
+    New-FpsAllow '--visual-capture-dir' 'next' 'text'                   # job:6677 (a directory path, the next list element)
 )
 # ENVIRONMENT (MLVAPP_* only; any other name is not the app's control surface). Names compare ignoring case (the Windows environment does).
 $script:FpsLightEnv = @(
@@ -369,6 +373,75 @@ function Get-FpsArmFromJobResult {
 }
 
 function Get-FpsCompareBindingProblem {
+    <#
+    .SYNOPSIS
+    R2-RESIDUE-1 r3 (sol 5add23cf A10): the speed compare is bound to the judged pair in EVERY metric it publishes, not in presentedFps alone. r1/r2 bound presentedFps (and its delta / deltaPercent), then the
+    readers printed the compare's guiStatusFps, avgPresentIntervalMs and the rest from an unbound compare (judged legs both 40 fps / 40 GUI fps, compare GUI 10 -> 20 = +100 %, interval 50 -> 25 = -50 %).
+    Every metric object the compare carries is checked with the same rule: each endpoint is the judged leg's own number of that name (float noise only), the delta and deltaPercent are recomputed from the
+    endpoints with the producer's formulas. A metric whose figures cannot be bound (the legs record no such number, a published figure that does not follow) refuses the whole compare, so an unbound
+    metric is never published as speed evidence. Returns the problem text, else $null.
+    #>
+    param([AllowNull()]$Compare, [AllowNull()]$Baseline, [AllowNull()]$Candidate)
+    if ($null -eq $Compare -or $Compare -is [string] -or $Compare -is [System.ValueType]) { return $null }
+    $leaf = { param($o, $n) if ($o -is [System.Collections.IDictionary]) { if ($o.Contains($n)) { , $o[$n] } else { $null } } elseif ($null -ne $o -and $null -ne $o.PSObject.Properties[$n]) { , $o.PSObject.Properties[$n].Value } else { $null } }
+    $names = if ($Compare -is [System.Collections.IDictionary]) { @($Compare.GetEnumerator() | ForEach-Object { [string]$_.Key }) } else { @($Compare.PSObject.Properties | ForEach-Object { $_.Name }) }
+    foreach ($name in $names) {
+        $metric = & $leaf $Compare $name
+        if ($null -eq $metric) { continue }
+        if ([string]::Equals($name, 'presentedFps', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $problem = Get-FpsPresentedFpsBindingProblem -Compare $Compare -Baseline $Baseline -Candidate $Candidate
+        } else {
+            $problem = Get-FpsMetricBindingProblem -Name $name -Metric $metric -Baseline $Baseline -Candidate $Candidate
+        }
+        if ($null -ne $problem) { return $problem }
+    }
+    $null
+}
+
+function Get-FpsMetricBindingProblem {
+    # R2-RESIDUE-1 r3 (sol 5add23cf A10): one NON-presentedFps metric of the speed compare (a New-MetricDelta object: baseline, candidate, delta, deltaPercent). The legs record the same-named figure
+    # (the producer builds the metric from the two leg summaries), so an endpoint must equal it (float noise only; a figure the leg does not record binds to nothing), and the published delta / deltaPercent
+    # must be what the producer's formulas give for those endpoints (delta = Round(c - b, 6); deltaPercent = Round((c - b) / b * 100, 3) only when |b| > 1e-6, otherwise none). A metric that carries
+    # no figure at all (the producer's all-null object) publishes nothing and binds trivially. Returns the problem text, else $null.
+    param([string]$Name, [AllowNull()]$Metric, [AllowNull()]$Baseline, [AllowNull()]$Candidate)
+    $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long]) -and [double]::IsFinite([double]$v) }
+    $leaf = { param($o, $n) if ($o -is [System.Collections.IDictionary]) { if ($o.Contains($n)) { , $o[$n] } else { $null } } elseif ($null -ne $o -and $null -ne $o.PSObject.Properties[$n]) { , $o.PSObject.Properties[$n].Value } else { $null } }
+    if ($Metric -is [string] -or $Metric -is [System.ValueType] -or $Metric -is [System.Array]) { return "the compare's $Name is not a metric object (baseline, candidate, delta, deltaPercent), so it cannot be bound to the judged legs" }
+    $figure = @(); foreach ($field in 'baseline', 'candidate', 'delta', 'deltaPercent') { if ($null -ne (& $leaf $Metric $field)) { $figure += $field } }
+    if ($figure.Count -eq 0) { return $null }
+    $endpoints = @{}
+    foreach ($side in @(@('baseline', $Baseline), @('candidate', $Candidate))) {
+        $own = & $leaf $side[1] $Name
+        $compared = & $leaf $Metric $side[0]
+        $ownIsNumber = & $isNumber $own
+        if ($null -eq $compared -and -not $ownIsNumber) { $endpoints[$side[0]] = $null; continue }
+        if (-not $ownIsNumber) { return "the judged $($side[0]) leg records no finite $Name, so the compare's $Name $($side[0]) cannot be bound to it" }
+        if (-not (& $isNumber $compared)) { return "the compare's $Name $($side[0]) is not a finite number (the judged $($side[0]) leg measured $own)" }
+        if ([Math]::Abs([double]$compared - [double]$own) -gt (0.000000001 * [Math]::Abs([double]$own))) { return "the compare's $Name $($side[0]) is $compared but the judged $($side[0]) leg measured $own" }
+        $endpoints[$side[0]] = [double]$compared
+    }
+    $publishedDelta = & $leaf $Metric 'delta'
+    $publishedPercent = & $leaf $Metric 'deltaPercent'
+    if ($null -eq $endpoints['baseline'] -or $null -eq $endpoints['candidate']) {
+        if ($null -ne $publishedDelta -or $null -ne $publishedPercent) { return "the compare's $Name publishes a delta or deltaPercent although an endpoint is missing" }
+        return $null
+    }
+    $base = $endpoints['baseline']; $cand = $endpoints['candidate']
+    if ($null -ne $publishedDelta) {
+        if (-not (& $isNumber $publishedDelta)) { return "the compare's $Name delta is not a finite number" }
+        $expectedDelta = [Math]::Round($cand - $base, 6)
+        if ([Math]::Abs([double]$publishedDelta - $expectedDelta) -gt (0.000000001 * [Math]::Max(1.0, [Math]::Abs($expectedDelta)))) { return "the compare's $Name delta is $publishedDelta but candidate $cand minus baseline $base is $expectedDelta" }
+    }
+    if ($null -ne $publishedPercent) {
+        if (-not (& $isNumber $publishedPercent)) { return "the compare's $Name deltaPercent is not a finite number" }
+        if ([Math]::Abs($base) -le 0.000001) { return "the compare's $Name deltaPercent is $publishedPercent beside a baseline of $base (the producer publishes no percent there)" }
+        $expectedPercent = [Math]::Round((($cand - $base) / $base) * 100.0, 3)
+        if ([Math]::Abs([double]$publishedPercent - $expectedPercent) -gt (0.000000001 * [Math]::Max(1.0, [Math]::Abs($expectedPercent)))) { return "the compare's $Name deltaPercent is $publishedPercent but (candidate $cand - baseline $base) / baseline * 100 is $expectedPercent" }
+    }
+    $null
+}
+
+function Get-FpsPresentedFpsBindingProblem {
     # ENVELOPE-PREEMPT-R1-RESIDUE-1 / R2-RESIDUE-1 r1 (adversary 698fffb1 A7): the speed compare and the LIGHT legs the arm gate judged are separate inputs of the packet, so a verdict could be judged on
     # one pair (a LIGHT candidateSpeed leg at 40 fps) and compared on another (the ordinary HEAVY candidate at 60 fps, +20 %). The compare's presentedFps baseline and candidate must be the very numbers
     # the judged baseline leg and the judged candidate leg recorded (a finite number on each, equal). Returns the problem text, else $null.
@@ -533,6 +606,14 @@ function Get-FpsArmFromEnvironment {
     $parsed = ConvertTo-FpsEnvMap $Environment
     if ($parsed.state -ceq 'absent') { return New-FpsArm 'UNKNOWN' 'environment' 'no-environment-recorded' }
     if ($parsed.state -cne 'ok') { return New-FpsArm 'UNKNOWN' 'environment' "malformed-environment ($($parsed.why))" }
+    # R2-RESIDUE-1 r3 (sol 5add23cf A4): the HEAVY recognizer runs BEFORE the LIGHT table refuses anything, so a launch that carries the HEAVY arm's own telemetry (frame telemetry exactly on, the per-frame log NOT
+    # opted out) is HEAVY whatever else it names (the HEAVY producer also sets timeline telemetry, stage timing and the perf field log, names no LIGHT row carries) and never UNKNOWN. Both refuse a fps verdict;
+    # the typed reason differs (heavy-arm / unknown-arm). A launch that opts the frame log out is still judged by the LIGHT table below, and the recognizer needs the exact text '1' (anything else stays UNKNOWN).
+    $earlyMap = $parsed.map
+    if ($earlyMap.ContainsKey('MLVAPP_PLAYBACK_SMOKE_TELEMETRY') -and (Test-FaTextEq $earlyMap['MLVAPP_PLAYBACK_SMOKE_TELEMETRY'] '1')) {
+        $optOut = if ($earlyMap.ContainsKey('MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG')) { $earlyMap['MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG'] } else { $null }
+        if ($null -eq $optOut -or (Test-FaTextEq $optOut '0')) { return New-FpsArm 'HEAVY' 'environment' 'frame telemetry is on and the per-frame log is not opted out' }
+    }
     if ($null -eq $Arguments) { return New-FpsArm 'UNKNOWN' 'environment' 'no-arguments-recorded' }
     $problem = Get-FpsLaunchArgumentsProblem $Arguments
     if ($null -ne $problem) { return New-FpsArm 'UNKNOWN' 'environment' "outside the LIGHT launch shape ($problem)" }

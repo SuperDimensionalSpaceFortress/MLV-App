@@ -982,9 +982,10 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
             "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary\n"
             "Write-Host ('ALLOWED=' + $fpsVerdict.allowed + ' REASON=' + $fpsVerdict.reason)\n"
             + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
-        # r8: the baseline leg (telemetry on, no per-frame opt-out) is HEAVY; the speed leg also sets MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=0, a key outside the LIGHT shape, so it is UNKNOWN
-        # (it was HEAVY by the denylist's frame-log rule). The pair is still refused with the typed HEAVY reason (heavy outranks unknown).
-        self.assertIn("ARM=HEAVY,UNKNOWN", out, "the wrapper's own legs are never LIGHT (this is the open successor BENCH-WRAPPER-LIGHT-ENV-1)")
+        # r8: the baseline leg (telemetry on, no per-frame opt-out) is HEAVY; the speed leg also sets MLVAPP_GPU_PLAYBACK_RECON_VALIDATE_OUTPUT=0, a key outside the LIGHT shape, so it read UNKNOWN there.
+        # R2-RESIDUE-1 r3 (sol 5add23cf A4): the HEAVY recognizer (frame telemetry on, per-frame log not opted out) runs before the LIGHT table refuses a name, so that leg is HEAVY too, as it always was.
+        # The pair is refused with the typed HEAVY reason either way.
+        self.assertIn("ARM=HEAVY,HEAVY", out, "the wrapper's own legs are never LIGHT (this is the open successor BENCH-WRAPPER-LIGHT-ENV-1)")
         self.assertIn(f"ALLOWED=False REASON={HEAVY_REASON}", out)
         self.assertIn("candidate-presented-fps-improvement-not-evaluated", out)
         self.assertNotIn("candidate-presented-fps-not-improved", out, "a HEAVY pair is never reported as a regression either")
@@ -1287,7 +1288,14 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         self.assertRegex(source, r"-not \$playbackAbHostLoadProvisional -and\s+-not \$playbackAbFpsArmRefusal\.refused -and")
 
     def run_summarizer_block(self, baseline_arm: str, candidate_arm: str, analysis: str = "$null", candidate_extra: str = "", bare_candidate: bool = False, stale_failures: bool = False,
-                             candidate_fps: str = "49", baseline_fps: str = "50", presented_compare: str = "baseline = 50; candidate = 49; delta = -1; deltaPercent = -2") -> list[str]:
+                             candidate_fps: str = "49", baseline_fps: str = "50", presented_compare: str = "baseline = 50; candidate = 49; delta = -1; deltaPercent = -2",
+                             leg_metrics: str | None = None,
+                             compare_metrics: str = ("guiStatusFps = [pscustomobject]@{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }; "
+                                                     "avgPresentIntervalMs = [pscustomobject]@{ baseline = 20; candidate = 21; delta = 1; deltaPercent = 5 }; "
+                                                     "avgRenderTotalMs = [pscustomobject]@{ baseline = 10; candidate = 11; delta = 1; deltaPercent = 10 }")) -> list[str]:
+        # R2-RESIDUE-1 r3 (sol 5add23cf A10): the compare binds EVERY metric it publishes, so each judged leg records the other figures the compare names (GUI status fps, present interval, render total)
+        base_metrics = "guiStatusFps = 50; avgPresentIntervalMs = 20; avgRenderTotalMs = 10; " if leg_metrics is None else leg_metrics
+        cand_metrics = "guiStatusFps = 49; avgPresentIntervalMs = 21; avgRenderTotalMs = 11; " if leg_metrics is None else leg_metrics
         # stale_failures: what the proof-failure loop (before this block) copied from a packet written before the gate: the wrapper's own fps-regression string, and one unrelated failure
         stale_injection = ""
         if stale_failures:
@@ -1308,12 +1316,9 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
             "$ErrorActionPreference = 'Stop'\n" f"Import-Module '{MODULE}' -Force\n" + funcs +
             "\n$playbackAbComparisonBasis = 'candidate'\n"
             # R2-RESIDUE-1 r1 (adversary 698fffb1 A7): each leg records the presented fps the compare below was measured from (50 and 49), so the compare is bound to the pair the gate judged
-            f"$playbackAb = [pscustomobject]@{{ analysis = {analysis}; baseline = [pscustomobject]@{{ {_light_word(baseline_arm)}presentedFps = {baseline_fps}; hostLoadProvisional = $false; hostLoadState = 'quiet' }}; "
-            f"candidate = [pscustomobject]@{{ {candidate_word}{candidate_extra}presentedFps = {candidate_fps}; hostLoadProvisional = $false; hostLoadState = 'quiet' }} }}\n"
-            f"$playbackAbSpeedCompare = [pscustomobject]@{{ presentedFps = [pscustomobject]@{{ {presented_compare} }}; "
-            "guiStatusFps = [pscustomobject]@{ baseline = 50; candidate = 49; delta = -1; deltaPercent = -2 }; "
-            "avgPresentIntervalMs = [pscustomobject]@{ baseline = 20; candidate = 21; delta = 1; deltaPercent = 5 }; "
-            "avgRenderTotalMs = [pscustomobject]@{ baseline = 10; candidate = 11; delta = 1; deltaPercent = 10 } }\n"
+            f"$playbackAb = [pscustomobject]@{{ analysis = {analysis}; baseline = [pscustomobject]@{{ {_light_word(baseline_arm)}presentedFps = {baseline_fps}; {base_metrics}hostLoadProvisional = $false; hostLoadState = 'quiet' }}; "
+            f"candidate = [pscustomobject]@{{ {candidate_word}{candidate_extra}presentedFps = {candidate_fps}; {cand_metrics}hostLoadProvisional = $false; hostLoadState = 'quiet' }} }}\n"
+            f"$playbackAbSpeedCompare = [pscustomobject]@{{ presentedFps = [pscustomobject]@{{ {presented_compare} }}; {compare_metrics} }}\n"
             "$playbackAbCandidateLeg = $playbackAb.candidate\n$playbackAbHostLoadProvisional = $false\n"
             "$playbackAbBlockers = [System.Collections.Generic.List[string]]::new()\n$diagnostics = [System.Collections.Generic.List[object]]::new()\n"
             + stale_injection
@@ -1357,6 +1362,27 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
                                                       presented_compare="baseline = 40; candidate = 47.123457; delta = 7.123457; deltaPercent = 17.809"))
         self.assertNotIn("compare-not-judged-pair", control)
         self.assertIn("presented FPS: CPU", control)
+
+    def test_r3_sol_5add23cf_a10_the_summarizer_publishes_no_unbound_gui_or_interval_figure(self) -> None:
+        # sol 5add23cf A10 (input verbatim): both judged legs record presentedFps 40, guiStatusFps 40, avgPresentIntervalMs 25; the compare binds presentedFps (40 / 40) but publishes a +100 % GUI figure and
+        # a -50 % interval figure no judged leg measured. The whole compare is refused with the typed reason; the lines for those figures are not printed.
+        text = "\n".join(self.run_summarizer_block(
+            "LIGHT", "LIGHT", candidate_fps="40", baseline_fps="40", presented_compare="baseline = 40; candidate = 40; delta = 0; deltaPercent = 0",
+            leg_metrics="guiStatusFps = 40; avgPresentIntervalMs = 25; avgRenderTotalMs = 10; ",
+            compare_metrics=("guiStatusFps = [pscustomobject]@{ baseline = 10; candidate = 20; delta = 10; deltaPercent = 100 }; "
+                             "avgPresentIntervalMs = [pscustomobject]@{ baseline = 50; candidate = 25; delta = -25; deltaPercent = -50 }; "
+                             "avgRenderTotalMs = [pscustomobject]@{ baseline = 10; candidate = 10; delta = 0; deltaPercent = 0 }")))
+        self.assertIn("fps-verdict-refused:compare-not-judged-pair", text)
+        self.assertNotIn("GUI status FPS: CPU", text)
+        self.assertNotIn("avg present interval: CPU", text)
+        control = "\n".join(self.run_summarizer_block(
+            "LIGHT", "LIGHT", candidate_fps="40", baseline_fps="40", presented_compare="baseline = 40; candidate = 40; delta = 0; deltaPercent = 0",
+            leg_metrics="guiStatusFps = 40; avgPresentIntervalMs = 25; avgRenderTotalMs = 10; ",
+            compare_metrics=("guiStatusFps = [pscustomobject]@{ baseline = 40; candidate = 40; delta = 0; deltaPercent = 0 }; "
+                             "avgPresentIntervalMs = [pscustomobject]@{ baseline = 25; candidate = 25; delta = 0; deltaPercent = 0 }; "
+                             "avgRenderTotalMs = [pscustomobject]@{ baseline = 10; candidate = 10; delta = 0; deltaPercent = 0 }")))
+        self.assertNotIn("compare-not-judged-pair", control)
+        self.assertIn("GUI status FPS: CPU", control)
 
     def test_heavy_ab_gets_a_refusal_diagnostic_and_no_fps_delta_lines(self) -> None:
         text = "\n".join(self.run_summarizer_block("HEAVY", "HEAVY"))
@@ -2815,6 +2841,103 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         importer = (PROFILING / "import-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
         self.assertIn("$proofReportJudgedSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($proofReportBytes))", importer)
         self.assertNotRegex(importer, r"\$proofReportRaw = Get-Content")
+
+    # ---- BENCH-LIGHT-ARM-GAIN-GATES-1-R2-RESIDUE-1 r3 (sol 5add23cf A3, A4, A10) ----
+
+    def test_r3_sol_5add23cf_a3_the_venue_default_visual_capture_dir_is_light_on_both_sides(self) -> None:
+        # sol 5add23cf A3: m16-1243-pace-cinematic-fullscreen-s2.json (legType speed, telemetryArm LIGHT, no visualCapture opt-out) reads LIGHT as a spec, but the venue leg launches it with
+        # --visual-capture-dir <dir> (DualVenueRunner.psm1 default on, playback-attr-3-cuda-job.ps1 Add-AttrCudaVisualCaptureArgument), which the launch reader did not know: plan LIGHT, launch UNKNOWN.
+        spec = LEGS_DIR / "m16-1243-pace-cinematic-fullscreen-s2.json"
+        capture = "'--visual-capture-dir', 'C:/run/visual'"
+        refused = {
+            "no-value": self._launch_expr("'--visual-capture-dir'", ""),
+            "repeated": self._launch_expr(capture + ", " + capture, ""),
+            "inline-value": self._launch_expr("'--visual-capture-dir=C:/run/visual'", ""),
+            "flag-as-value": self._launch_expr("'--visual-capture-dir', '--windowed'", ""),
+            "near-miss-name": self._launch_expr("'--visual-capture-frames', '6'", ""),
+        }
+        body = (f"$spec = Get-Content -Raw -LiteralPath '{spec}' | ConvertFrom-Json\n"
+                "Write-Host ('SPEC=' + (Get-FpsArmFromLegSpec $spec).arm)\n"
+                f"Write-Host ('LAUNCH=' + ({self._launch_expr(capture, '')}).arm)\n"
+                f"Write-Host ('LAUNCH-AND-WINDOWED=' + ({self._launch_expr(capture + ', ' + chr(39) + '--windowed' + chr(39), '')}).arm)\n"
+                + "".join(f"Write-Host ('{k}=' + ({expr}).arm)\n" for k, expr in refused.items()))
+        got = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(got, {"SPEC": "LIGHT", "LAUNCH": "LIGHT", "LAUNCH-AND-WINDOWED": "LIGHT", **{k: "UNKNOWN" for k in refused}})
+
+    def test_r3_sol_5add23cf_a4_a_known_heavy_launch_is_heavy_arm_never_unknown_arm(self) -> None:
+        # sol 5add23cf A4: the LIGHT allowlist refused the HEAVY producer's own telemetry names (timeline telemetry, stage timing, perf field log) before the HEAVY recognizer ran, so a known-HEAVY
+        # pair was refused as unknown-arm. The recognizer (frame telemetry on, per-frame log not opted out) now runs first; a launch that opts the frame log out stays judged by the LIGHT table.
+        heavy_env = ("MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '0'; MLVAPP_PLAYBACK_SMOKE_TIMELINE_TELEMETRY = '1'; "
+                     "MLVAPP_PLAYBACK_DETAILED_TIMELINE_TELEMETRY = '1'; MLVAPP_STAGE_TIMING = '1'; MLVAPP_PERF_FIELD_LOG = '1'; " + PRODUCER_LOGDIR_PS)
+        def launch(env: str, args: str = PRODUCER_ARGS_PS) -> str:
+            return f"Get-FpsArmFromLaunch ([pscustomobject]@{{ environment = [pscustomobject]@{{ {env} }}; arguments = @({args}) }})"
+        cases = {
+            "heavy-producer-env": launch(heavy_env),
+            "heavy-env-plus-aux-flag": launch(heavy_env, PRODUCER_ARGS_PS + ", '--stage-log=C:\\Temp\\s.csv'"),
+            "heavy-env-no-opt-out-key": launch(heavy_env.replace("MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '0'; ", "")),
+            "light-opt-out-plus-stage-timing": launch(LIGHT_LAUNCH_ENV_PS + "; MLVAPP_STAGE_TIMING = '1'"),
+            "light-opt-out-plus-aux-flag": launch(LIGHT_LAUNCH_ENV_PS, PRODUCER_ARGS_PS + ", '--stage-log=C:\\Temp\\s.csv'"),
+            "telemetry-value-two": launch(heavy_env.replace("MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'", "MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '2'")),
+        }
+        got = dict(line.split("=", 1) for line in self.ok("".join(f"Write-Host ('{k}=' + ({expr}).arm)\n" for k, expr in cases.items())).split())
+        self.assertEqual(got, {"heavy-producer-env": "HEAVY", "heavy-env-plus-aux-flag": "HEAVY", "heavy-env-no-opt-out-key": "HEAVY",
+                               "light-opt-out-plus-stage-timing": "UNKNOWN", "light-opt-out-plus-aux-flag": "UNKNOWN", "telemetry-value-two": "UNKNOWN"})
+        # and the pair verdict a reader publishes names the heavy arm
+        verdict = self.ok(f"$h = {cases['heavy-producer-env']}\n$v = Get-FpsPairVerdict $h $h\nWrite-Host ($v.allowed.ToString() + '|' + $v.reason)\n").strip()
+        self.assertEqual(verdict, "False|" + HEAVY_REASON)
+
+    BINDING_LEG = ("[pscustomobject]@{ presentedFps = 40; guiStatusFps = 40; avgPresentIntervalMs = 25; avgRenderTotalMs = 10; fallbackFrameCount = 0 }")
+
+    def _binding(self, compare: str, baseline: str | None = None, candidate: str | None = None) -> str:
+        body = (f"$cmp = [pscustomobject]@{{ {compare} }}\n"
+                f"$p = Get-FpsCompareBindingProblem -Compare $cmp -Baseline ({baseline or self.BINDING_LEG}) -Candidate ({candidate or self.BINDING_LEG})\n"
+                "if ($null -eq $p) { Write-Host 'OK' } else { Write-Host ('REFUSED ' + $p) }\n")
+        return self.ok(body).strip()
+
+    def test_r3_sol_5add23cf_a10_every_metric_the_speed_compare_publishes_is_bound_to_the_judged_legs(self) -> None:
+        # sol 5add23cf A10 (input verbatim): both judged legs presentedFps 40, guiStatusFps 40, avgPresentIntervalMs 25; the compare binds presentedFps (40 / 40, delta 0) but publishes guiStatusFps 10 -> 20
+        # (+100 %) and avgPresentIntervalMs 50 -> 25 (-50 %), which no judged leg measured.
+        honest = "presentedFps = [pscustomobject]@{ baseline = 40; candidate = 40; delta = 0; deltaPercent = 0 }"
+        adversary = (honest + "; guiStatusFps = [pscustomobject]@{ baseline = 10; candidate = 20; delta = 10; deltaPercent = 100 }; "
+                     "avgPresentIntervalMs = [pscustomobject]@{ baseline = 50; candidate = 25; delta = -25; deltaPercent = -50 }")
+        self.assertTrue(self._binding(adversary).startswith("REFUSED"), self._binding(adversary))
+        metric = lambda name, b, c, d, p: f"{name} = [pscustomobject]@{{ baseline = {b}; candidate = {c}; delta = {d}; deltaPercent = {p} }}"
+        cases = {
+            # bound: the legs' own numbers, the producer's own rounding
+            "bound-all": (honest + "; " + metric("guiStatusFps", 40, 40, 0, 0) + "; " + metric("avgPresentIntervalMs", 25, 25, 0, 0) + "; " + metric("avgRenderTotalMs", 10, 10, 0, 0), "OK"),
+            "bound-zero-count": (honest + "; " + metric("fallbackFrameCount", 0, 0, 0, "$null"), "OK"),
+            # a metric whose endpoints are not the legs' numbers
+            "gui-endpoints": (honest + "; " + metric("guiStatusFps", 10, 20, 10, 100), "REFUSED"),
+            "interval-candidate-only": (honest + "; " + metric("avgPresentIntervalMs", 25, 20, -5, -20), "REFUSED"),
+            "render-total-baseline-only": (honest + "; " + metric("avgRenderTotalMs", 12, 10, -2, -16.667), "REFUSED"),
+            # endpoints bound, the published delta / percent do not follow from them
+            "gui-delta": (honest + "; " + metric("guiStatusFps", 40, 40, 5, 0), "REFUSED"),
+            "interval-percent": (honest + "; " + metric("avgPresentIntervalMs", 25, 25, 0, 50), "REFUSED"),
+            "count-percent-at-zero-baseline": (honest + "; " + metric("fallbackFrameCount", 0, 0, 0, 100), "REFUSED"),
+            "metric-not-finite": (honest + "; " + metric("guiStatusFps", 40, 40, 0, "[double]::NaN"), "REFUSED"),
+            # a metric the legs do not record cannot be bound, so it is not published
+            "metric-no-leg-value": (honest + "; " + metric("avgQueueWaitMs", 3, 4, 1, 33.333), "REFUSED"),
+            "metric-not-an-object": (honest + "; avgQueueWaitMs = 'x'", "REFUSED"),
+            # an all-null metric publishes nothing
+            "metric-all-null": (honest + "; " + metric("avgQueueWaitMs", "$null", "$null", "$null", "$null"), "OK"),
+        }
+        got = {name: self._binding(compare).split(" ", 1)[0] for name, (compare, _) in cases.items()}
+        self.assertEqual(got, {name: want for name, (_, want) in cases.items()})
+
+    def test_r3_sol_5add23cf_a10_compare_machine_perf_binds_every_metric_even_without_presented_fps(self) -> None:
+        # the sibling reader (compare-machine-perf.ps1:572 reads the interval metric for its diagnosis) asked only when presentedFps was non-null, so a compare that dropped presentedFps and kept an
+        # unbound avgPresentIntervalMs was never asked. A10 input: legs at presentedFps 40 / avgPresentIntervalMs 25, the compare publishes the interval 50 -> 25.
+        funcs = _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Get-PlaybackAbFpsArmRefusal"])
+        body = funcs + (
+            "$leg = { [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = 40; avgPresentIntervalMs = 25; hostLoadProvisional = $false; hostLoadState = 'quiet' } }\n"
+            "$presented = [pscustomobject]@{ baseline = 40; candidate = 40; delta = 0; deltaPercent = 0 }\n"
+            "$bound = [pscustomobject]@{ baseline = 25; candidate = 25; delta = 0; deltaPercent = 0 }\n"
+            "$unbound = [pscustomobject]@{ baseline = 50; candidate = 25; delta = -25; deltaPercent = -50 }\n"
+            "$cases = [ordered]@{ 'with-presented-unbound' = [pscustomobject]@{ presentedFps = $presented; avgPresentIntervalMs = $unbound }; 'without-presented-unbound' = [pscustomobject]@{ avgPresentIntervalMs = $unbound }; "
+            "'with-presented-bound' = [pscustomobject]@{ presentedFps = $presented; avgPresentIntervalMs = $bound }; 'without-presented-bound' = [pscustomobject]@{ avgPresentIntervalMs = $bound } }\n"
+            "foreach ($k in $cases.Keys) { $r = [pscustomobject]@{ baseline = (& $leg); candidate = (& $leg); candidateSpeed = (& $leg); speedCompare = $cases[$k] }; $v = Get-PlaybackAbFpsArmRefusal -Record $r; Write-Host ($k + '=' + $v.refused + '|' + $v.reason) }\n")
+        refused = "fps-verdict-refused:compare-not-judged-pair"
+        self.assertEqual(self.ok(body).split(), [f"with-presented-unbound=True|{refused}", f"without-presented-unbound=True|{refused}", "with-presented-bound=False|", "without-presented-bound=False|"])
 
 
 if __name__ == "__main__":

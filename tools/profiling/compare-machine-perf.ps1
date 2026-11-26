@@ -520,7 +520,8 @@ function Get-PlaybackAbFpsArmRefusal {
     if ($verdict.allowed) {
         # R2-RESIDUE-1 r1 (adversary 698fffb1 A7, sibling of summarize-local-cuda-proof.ps1): the compare this reader publishes must be measured on the very legs it just judged.
         if ($Record.speedCompare) { $judgedCompare = $Record.speedCompare } else { $judgedCompare = $Record.compare }
-        if ($null -ne $judgedCompare -and $null -ne $judgedCompare.presentedFps) {
+        # R2-RESIDUE-1 r3 (sol 5add23cf A10): every metric the compare publishes is bound to the judged legs, so a compare without presentedFps is asked too
+        if ($null -ne $judgedCompare) {
             $bindingProblem = Get-FpsCompareBindingProblem -Compare $judgedCompare -Baseline $Record.baseline -Candidate $candidateLeg
             if ($null -ne $bindingProblem) {
                 return [pscustomobject]@{ refused = $true; reason = "fps-verdict-refused:compare-not-judged-pair"; detail = [string]$bindingProblem }
