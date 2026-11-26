@@ -566,6 +566,14 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
       * **Unmarked runs.** Every unmarked run is held to the marker rules, then set aside for the outcome and kept out of the sums, wherever it lies.
       * **Missing mark.** When the log carries the applied signal, a frame its render closes with no marked run is `EXPORT_RECORD_INVALID: DUALISO_RENDER_MARK_MISSING`,
         and the class is not read. A log from a build without the mark (`22d1a0a7` and earlier) is refused that way too, so its legs are re-run on a build that writes it.
+    * **r6 (sol r5 B1-B3).** One rule now decides whether the class is published at all:
+      * **Unreadable signal.** If any tagged record does not conform, the read is `EXPORT_RECORD_INVALID` and every dual-ISO class metric is null with that reason. This
+        covers a malformed or negative figure, a misplaced or repeated mark, and a stage named like the dual-ISO signal that is none of its records (for example
+        `llrawproc_dual_iso_appplied`). The receipt writer stores the reader's metrics, so it never copies a class out of an INVALID read.
+      * **Foreign evidence.** Render-decode marks beside a build whose `StageTiming.h` lacks `MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER` (such as `22d1a0a7`) are
+        `EXPORT_PROFILE_FOREIGN`. The same rule applies to outcome markers beside a build without the applied-signal macro. In both cases the class is null.
+      * **Linear reader.** The stage-log reader indexes writes, other-run spans and render-decode sums in single passes. Its cost grows linearly with the record
+        count, so a 100,000-frame window no longer means 10 billion comparisons.
     From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
     so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
     `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).

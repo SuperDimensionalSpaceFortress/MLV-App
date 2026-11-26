@@ -4920,6 +4920,104 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
         self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID: DUALISO_RENDER_MARK_MISSING: 480 frame(s)") for p in g["problems"]), g["problems"])
         self.assertIsNone(g["metrics"]["dualIsoClassAgrees"], g)
 
+    # ---- r6: sol r5 CHANGES_REQUESTED on 944b6175 (review-pr908-sol-r5-20261126T0955Z), B1-B3
+    def assert_class_unread(self, g: dict, problem: str) -> None:
+        self.assertEqual(g["outcome"], "INVALID", g)
+        self.assertTrue(any(p.startswith(problem) for p in g["problems"]), (problem, g["problems"]))
+        self.assertFalse(g["classMismatch"], g)
+        for k in ("dualIsoActiveFrames", "dualIsoClassAgrees"):
+            self.assertIsNone(g["metrics"][k], (k, g["metrics"]))
+            self.assertTrue(g["metrics"][k + "CouldNotCheck"], (k, g["metrics"]))
+        for k in ("dualIsoNotAppliedFrames", "dualIsoClassAgreesFailReason"):
+            self.assertNotIn(k, g["metrics"], g["metrics"])
+
+    def test_r6_sol_b1_a_malformed_or_unknown_dual_iso_record_leaves_every_class_metric_null(self) -> None:
+        """B1: a second render-decode mark whose figure is no number, an outcome marker with a negative figure, a misspelled outcome stage (and its siblings: an
+        unknown llrawproc_dual_iso* stage, any other record that does not conform) made the read INVALID while it still published dualIsoActiveFrames=480 and
+        dualIsoClassAgrees=true, which the receipt writer copies (Invoke-VenueLeg.ps1 writes the reader's metrics). An unreadable signal publishes no class."""
+        clean = piped_stage_log(480, outcome="applied")
+        mk0 = self.RENDER_MARK.format(0) + "\n"
+        self.assertEqual(clean.count(mk0), 1)
+        tag = "[mlv-stage-timing] frame=0 stage="
+        extra = (f"{tag}llrawproc_dual_iso_render ms=broken", f"{tag}llrawproc_dual_iso_not_applied ms=-0.001", f"{tag}llrawproc_dual_iso_appplied ms=0.000",
+                 f"{tag}llrawproc_dualiso_applied ms=0.000", f"{tag}llrawproc_dual_iso_ ms=0.000", f"{tag}processing ms=broken")
+        proc, got = evidence_cases([self.ctl(clean.replace(mk0, mk0 + line + "\n")) for line in extra] + [self.ctl(clean)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, line in zip(got, extra):
+            with self.subTest(line=line):
+                self.assert_class_unread(g, "EXPORT_RECORD_INVALID")
+        for g, line in zip(got[2:5], extra[2:5]):
+            self.assertTrue(any("no dual-ISO stage the producer writes" in p for p in g["problems"]), (line, g["problems"]))
+        self.assertEqual(got[-1]["outcome"], "PASS", got[-1])   # (the control: the log without the extra line)
+        self.assertEqual(got[-1]["metrics"]["dualIsoActiveFrames"], 480, got[-1])
+
+    @staticmethod
+    def header_fixture(d: Path, drop: str | None) -> Path:
+        # (r6, sol r5 B2 + key3 H3: the OLDER header is built from this tree's StageTiming.h, never looked up in git, so the row runs on a shallow clone too)
+        text = (ROOT / "src" / "debug" / "StageTiming.h").read_text(encoding="utf-8")
+        if drop is not None:
+            kept = [l for l in text.splitlines(keepends=True) if not re.match(r"[ \t]*#[ \t]*define[ \t]+" + drop + r"(?![A-Za-z0-9_])", l)]
+            assert len(kept) == len(text.splitlines(keepends=True)) - 1, drop
+            text = "".join(kept)
+        p = d / f"StageTiming-{drop or 'head'}.h"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    SEED_HEADERS = ("$dveRoot = [IO.Path]::GetFullPath((Join-Path (Get-Module DualVenueRunner).ModuleBase '..\\..\\..'))\n"
+                    "& (Get-Module DualVenueRunner) { param($root) foreach ($pair in @(($env:DVE_SEED -split ';') | Where-Object { $_ })) { $id, $file = $pair -split '=', 2\n"
+                    "  $script:RenderPipeHeaderCache[\"$root|$id|$($script:RenderPipeMarkerPath)\"] = [pscustomobject]@{ text = [IO.File]::ReadAllText($file) } } } $dveRoot\n")
+
+    def test_r6_sol_b2_render_marks_beside_a_build_that_cannot_write_them_are_foreign(self) -> None:
+        """B2: build 22d1a0a7 defines the outcome markers and not MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER, so a log that carries render-decode marks is not its log:
+        EXPORT_PROFILE_FOREIGN with the class unread. Its sibling: outcome markers beside a build without the applied-signal macro were typed foreign while the class
+        was still published. The headers are fixtures seeded into the reader's one header cache (no git lookup); 'd'*40 is no commit at all, so a seed that
+        missed the cache would read 'unknown' and this row would fail, never pass on git."""
+        sol_build = "22d1a0a747d9edffe897d9b2578844ecc3234be1"
+        fake_old, fake_nosignal, fake_head = "d" * 40, "c" * 40, "a" * 40
+        clean = piped_stage_log(480, outcome="applied")
+        with tempfile.TemporaryDirectory() as d:
+            old = self.header_fixture(Path(d), "MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER")
+            nosig = self.header_fixture(Path(d), "MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED")
+            head = self.header_fixture(Path(d), None)
+            seed = f"{sol_build}={old};{fake_old}={old};{fake_nosignal}={nosig};{fake_head}={head}"
+            proc, got = evidence_cases([self.ctl(clean, buildId=sol_build), self.ctl(clean, buildId=fake_old), self.ctl(clean, buildId=fake_nosignal),
+                                        self.ctl(clean, buildId=fake_head)], prelude=self.SEED_HEADERS, DVE_SEED=seed)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got[:2]:
+            self.assert_class_unread(g, "EXPORT_PROFILE_FOREIGN")
+            self.assertTrue(any("MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER" in p and "llrawproc_dual_iso_render" in p for p in g["problems"]), g["problems"])
+        self.assert_class_unread(got[2], "EXPORT_PROFILE_FOREIGN")
+        self.assertTrue(any("MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED" in p for p in got[2]["problems"]), got[2]["problems"])
+        self.assertEqual(got[3]["problems"], [], got[3])   # (the control: the head's own header emits every mark the log carries)
+        self.assertEqual(got[3]["outcome"], "PASS", got[3])
+        self.assertEqual(got[3]["metrics"]["dualIsoActiveFrames"], 480, got[3])
+
+    def test_r6_sol_b3_the_stage_log_reader_is_linear_in_the_record_count(self) -> None:
+        """B3: the reader looked up every write for every frame and re-read every timing record for every frame (1.8 s at 480 frames, 14.6 s at 1,920 on sol's
+        seat; the accepted window is 100,000). Timed inside one pwsh, around Get-DvExportEvidence alone: 6,000 frames read the same verdict as 1,000, within a
+        generous wall ceiling, and grow at most 15x for 6x the records (a per-frame rescan grows 36x)."""
+        cases = []
+        for n in (1000, 6000):
+            cases.append(prores_case(maxFrames=n, dualIsoExpected=True, stage=piped_stage_log(n, outcome="applied"),
+                                     batch=batch_log(n, elapsed=n * 0.1, verified=n), criteria=[]))
+        script = ("$cases = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                  f"@($cases | ForEach-Object {{ $c = $_; $sw = [Diagnostics.Stopwatch]::StartNew(); $e = {EVIDENCE_CALL}; $sw.Stop(); "
+                  "$o = Get-DvExportOutcome -ResultToken $c.token -ExitCode ([int]$c.exit) -Evidence $e -Criteria @($c.criteria); "
+                  "[ordered]@{ ms = $sw.Elapsed.TotalMilliseconds; outcome = $o.outcome; problems = @($e.problems); active = $e.metrics.dualIsoActiveFrames } }) "
+                  "| ConvertTo-Json -Compress -Depth 5 -AsArray")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "cases.json"
+            path.write_text(json.dumps(cases), encoding="utf-8")
+            proc, got = run_pwsh_json(script, DVE_CASES=str(path))
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        small, big = got
+        for g, n in ((small, 1000), (big, 6000)):
+            self.assertEqual(g["problems"], [], g)
+            self.assertEqual((g["outcome"], g["active"]), ("PASS", n), g)
+        # (measured on the hub VM: 4.7 s and 17.0 s linear; 9.7 s and 266 s on 944b6175. The ceiling leaves a slow hosted runner 7x)
+        self.assertLess(big["ms"], 120000.0, (small["ms"], big["ms"]))
+        self.assertLess(big["ms"], 15.0 * small["ms"], (small["ms"], big["ms"]))
+
 
 if __name__ == "__main__":
     unittest.main()

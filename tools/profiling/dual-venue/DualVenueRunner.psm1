@@ -4793,6 +4793,9 @@ $script:ExportDualIsoOutcomeWindow = 'DUALISO_OUTCOME_WINDOW_MISMATCH'
 # MARKED runs only; when the log carries the applied signal, a frame the render closes with no marked run is refused (DUALISO_RENDER_MARK_MISSING).
 $script:ExportDualIsoRenderMark = 'llrawproc_dual_iso_render'
 $script:ExportDualIsoRenderMarkMissing = 'DUALISO_RENDER_MARK_MISSING'
+$script:ExportDualIsoRenderMacro = 'MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER'
+# r6 (sol r5 B1): every dual-ISO stage the producer writes (StageTiming.h); a tagged record named like one and not in this list is a malformed signal record
+$script:ExportDualIsoKnownStages = @(@('llrawproc_dual_iso') + $script:ExportDualIsoOutcomeStages + @($script:ExportDualIsoRenderMark))
 $script:ExportSuccessor = 'EXPORT-RENDER-PIPE-TIMING-1'
 $script:ExportRenderPipeOlderBuild = "a build before $($script:ExportSuccessor)"
 # r1 fix 1 (adversary A2 on 00a7cf09): the BASE reader's ProRes shape (2b796198), reproduced exactly for a receipt written before this card over old-format evidence
@@ -5749,6 +5752,11 @@ function Test-DvExportStageLogRecords {
             $msD = [decimal]::Parse($hit.Groups['ms'].Value, [Globalization.CultureInfo]::InvariantCulture)
             $why = Get-DvExportTimingProblem $ms
             if ($null -eq $why -and $msD -gt [decimal]$script:ExportTimingMaxMs) { $why = "is past the $($script:ExportTimingMaxMs) ms ceiling" }
+            # (r6, sol r5 B1: a stage spelled like the dual-ISO signal that is none of its records -- llrawproc_dual_iso_appplied, llrawproc_dualiso_applied -- is no
+            # other stage's record the reader may skip: it is a malformed signal record, so the log is INVALID and its class is not read)
+            if ($null -eq $why -and $hit.Groups['s'].Value -cmatch '\Allrawproc_dual_?iso' -and -not ($script:ExportDualIsoKnownStages -ccontains $hit.Groups['s'].Value)) {
+                $why = "names stage $($hit.Groups['s'].Value), which is no dual-ISO stage the producer writes ($($script:ExportDualIsoKnownStages -join ', '))"
+            }
             if ($null -ne $why) { $prev = $null; $prevByFrame.Clear() }
             if ($null -eq $why) {
                 $s = $hit.Groups['s'].Value
@@ -5811,9 +5819,14 @@ function Test-DvExportStageLogRecords {
     # (r4 fix 1, adversary 25ae968d A3: and the loop thread decodes frame N only after it wrote the frame before, so the render decode is the frame's last raw_uint16
     # AFTER the last pipe write that precedes its processed16_total. A frame whose decodes all lie before that write has none of its own render: every one of them
     # is an earlier decode's, its markers decide nothing (the frame then reads unmarked), and the frame is typed below.)
-    $writeLines = @($seq | Where-Object { $_.stage -ceq 'export_pipe_write' } | ForEach-Object { $_.line })
+    # (r6, sol r5 B3: in ONE pass in line order -- the last write before a frame's first processed16_total is the last write seen when that record is reached -- never
+    # every write for every frame, which made a 100,000-frame window 10 billion comparisons)
     $renderWindowFrom = [hashtable]::new([StringComparer]::Ordinal)
-    foreach ($f in @($p16Line.Keys)) { $from = 0; foreach ($wl in $writeLines) { if ($wl -lt $p16Line[$f] -and $wl -gt $from) { $from = $wl } }; $renderWindowFrom[$f] = $from }
+    $lastWriteLine = 0
+    foreach ($r in $seq) {
+        if ($r.stage -ceq 'export_pipe_write') { $lastWriteLine = $r.line }
+        elseif ($r.stage -ceq 'processed16_total' -and $p16Line[$r.frame] -eq $r.line) { $renderWindowFrom[$r.frame] = $lastWriteLine }
+    }
     $renderDecodeLine = [hashtable]::new([StringComparer]::Ordinal)   # the frame's last raw_uint16 record inside that window, before its first processed16_total
     $decodedBeforeP16 = [hashtable]::new([StringComparer]::Ordinal)
     foreach ($r in $seq) {
@@ -5847,26 +5860,36 @@ function Test-DvExportStageLogRecords {
     # (r5, adversary 22d1a0a7 A1: in a log that carries render-decode marks, every UNMARKED llrawproc run is another decode's wherever it lies -- a cache thread's run
     # of frame N after the render's own and before its processed16_total included. Such a run spans that frame's decode records from just after its previous run end
     # (an outcome marker, a render-decode mark, or a record no decode writes) to its outcome marker, and none of it is summed into the render.)
-    $otherRunSpans = [hashtable]::new([StringComparer]::Ordinal)
+    # (r6, sol r5 B3: the span's records are collected AS the pass reaches them -- each frame's records since its last run end are pending, and an unmarked outcome
+    # marker sets every pending line (and its own) aside -- so each record is visited once, never every span of its frame per record; the same lines as the r5 spans)
+    $otherRunLines = [hashtable]::new()
     if ($renderMarkRecs.Count -gt 0) {
-        $runStart = [hashtable]::new([StringComparer]::Ordinal)
+        $pending = [hashtable]::new([StringComparer]::Ordinal)
         foreach ($r in $seq) {
             if ($script:ExportDualIsoOutcomeWord.ContainsKey($r.stage)) {
                 if (-not $markedOutcomeLines.ContainsKey($r.line)) {
-                    if (-not $otherRunSpans.ContainsKey($r.frame)) { $otherRunSpans[$r.frame] = [System.Collections.Generic.List[object]]::new() }
-                    $otherRunSpans[$r.frame].Add(@($(if ($runStart.ContainsKey($r.frame)) { $runStart[$r.frame] } else { 0 }), $r.line))
+                    if ($pending.ContainsKey($r.frame)) { foreach ($pl in $pending[$r.frame]) { $otherRunLines[$pl] = $true } }
+                    $otherRunLines[$r.line] = $true
                 }
-                $runStart[$r.frame] = $r.line + 1
+                $pending.Remove($r.frame)
             }
-            elseif ($r.stage -ceq $script:ExportDualIsoRenderMark -or -not (& $isDecodeStage $r.stage)) { $runStart[$r.frame] = $r.line + 1 }
+            elseif ($r.stage -ceq $script:ExportDualIsoRenderMark -or -not (& $isDecodeStage $r.stage)) { $pending.Remove($r.frame) }
+            else {
+                if (-not $pending.ContainsKey($r.frame)) { $pending[$r.frame] = [System.Collections.Generic.List[int]]::new() }
+                $pending[$r.frame].Add($r.line)
+            }
         }
     }
-    $inOtherRun = { param($f, $line) if (-not $otherRunSpans.ContainsKey($f)) { return $false }; foreach ($sp in $otherRunSpans[$f]) { if ($line -ge $sp[0] -and $line -le $sp[1]) { return $true } }; $false }
+    $inOtherRun = { param($f, $line) $otherRunLines.ContainsKey($line) }
     $isEarlierDecode = { param($f, $line) $startupOnly.ContainsKey($f) -or ($earlierEnd.ContainsKey($f) -and $line -le $earlierEnd[$f]) -or (& $inOtherRun $f $line) }
     $earlierDecodeRecords = 0
+    $renderDecodeSum = [hashtable]::new([StringComparer]::Ordinal)   # (r6, sol r5 B3: each frame's render-decode sum, gathered in this one pass)
     foreach ($t in $tabled) {
         if (& $isEarlierDecode $t.frame $t.line) { $earlierDecodeRecords++; continue }
         $s = $t.stage; $f = $t.frame
+        if (($s -ceq 'raw_uint16' -or $s -ceq 'llrawproc') -and $renderDecodeLine.ContainsKey($f) -and $t.line -lt $p16Line[$f]) {
+            $renderDecodeSum[$f] = $t.msD + $(if ($renderDecodeSum.ContainsKey($f)) { $renderDecodeSum[$f] } else { [decimal]0 })
+        }
         $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $t.ms } else { $t.ms })
         # (r5, sol r4 B4: and the EXACT [decimal] sum beside it, which the containment means read: a double keeps about 15 digits, so 3500001.000000401 read as
         # 3500001.0000004 and passed a limit it is past)
@@ -5875,10 +5898,8 @@ function Test-DvExportStageLogRecords {
     }
     $uncontained = [System.Collections.Generic.List[string]]::new()
     foreach ($f in @($renderDecodeLine.Keys | Sort-Object { [int64]$_ })) {
-        $decode = [decimal]0
-        foreach ($t in $tabled) {
-            if ($t.frame -ceq $f -and $t.line -lt $p16Line[$f] -and ($t.stage -ceq 'raw_uint16' -or $t.stage -ceq 'llrawproc') -and -not (& $isEarlierDecode $t.frame $t.line)) { $decode += $t.msD }
-        }
+        # (r6, sol r5 B3: read from the one pass above, never a rescan of every timing record per frame)
+        $decode = $(if ($renderDecodeSum.ContainsKey($f)) { [decimal]$renderDecodeSum[$f] } else { [decimal]0 })
         $parentName = $(if ($perStageD['debayered_frame'].ContainsKey($f)) { 'debayered_frame' } else { 'processed16_total' })
         if (-not $perStageD[$parentName].ContainsKey($f)) { continue }
         $parent = [decimal]$perStageD[$parentName][$f]
@@ -6029,7 +6050,8 @@ function Test-DvExportStageLogRecords {
     }
     [pscustomobject]@{ perStage = $perStage; perStageD = $perStageD; clipRecords = $clipRecords; lastPerFrameLine = $lastPerFrameLine; problems = @($problems)
                        outcomeRecords = $outcomeRecs.Count; outcomeInvalid = $outcomeBad.Count + $markBad.Count; outcomes = $outcomes; outcomeUnmarked = $outcomeUnmarked
-                       outcomeOtherRunMarkers = $otherRunMarkers; renderMarks = $renderMarkRecs.Count; renderMarkMissing = $markMissing.Count }
+                       outcomeOtherRunMarkers = $otherRunMarkers; renderMarks = $renderMarkRecs.Count; renderMarkMissing = $markMissing.Count
+                       recordInvalid = $bad.Count }
 }
 
 function Get-DvExportEvidence {
@@ -6480,6 +6502,14 @@ function Get-DvExportEvidence {
             elseif ($signalClass -ceq 'older' -and $records.outcomeRecords -gt 0) {
                 $problems.Add("EXPORT_PROFILE_FOREIGN: stage-timing.log carries the dual-ISO applied signal ($($script:ExportDualIsoOutcomeList)), which build $ExpectedBuildId cannot write (its src/debug/StageTiming.h defines no $($script:ExportDualIsoSignalMacro)), so the log is not the build's the job ran")
             }
+            # r6 (sol r5 B2): the render-decode mark has its own macro. A build whose StageTiming.h defines the outcome markers and not
+            # MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER (22d1a0a7) never writes a mark, so a log that carries one beside it is not its log: foreign, and the class unread below.
+            if ($records.renderMarks -gt 0) {
+                $renderClass = Get-DvRenderPipeBuildClass -BuildId $ExpectedBuildId -Macro $script:ExportDualIsoRenderMacro
+                if ($renderClass -ceq 'older') {
+                    $problems.Add("EXPORT_PROFILE_FOREIGN: stage-timing.log carries $($records.renderMarks) render-decode mark(s) ($($script:ExportDualIsoRenderMark)), which build $ExpectedBuildId cannot write (its src/debug/StageTiming.h defines no $($script:ExportDualIsoRenderMacro)), so the log is not the build's the job ran")
+                }
+            }
             # EXPORT-RENDER-PIPE-TIMING-2 r4 (sol r3 B3; adversary pass 2 A4 on 2d8e9bf2): on an older or unnamed build with none of this card's stages, a PRESENT
             # RENDER_START is read too, by the one grammar, the declaration's own checks and the same bindings (order, the manifest's .mov, the verified dimensions, the
             # timed window: the older producer prints the same line, BatchRunner.cpp:470 on 2b796198, and runs the same loop); an absent one adds nothing there, so a
@@ -6518,6 +6548,21 @@ function Get-DvExportEvidence {
                         $problems.Add("EXPORT_STAGE_WINDOW_MISMATCH: stage-timing.log times processed16_total on $($p16Frames.Count) frame(s), $($outside.Count) of them outside frames $lo..$hi; RENDER_START declares cutIn=$($decl.cutIn) cutOut=$($decl.cutOut), and the producer's loop times frames cutIn-1 .. cutOut-1 only, so the log is of another window")
                     }
                 }
+            }
+            # r6 (sol r5 B1, B2): ONE rule for the class after every check: a log with a record that does not conform (a malformed figure, a misplaced or repeated
+            # mark, a stage named like the dual-ISO signal that is none of its records), or evidence typed foreign to the build, publishes NO dual-ISO class. The read
+            # is INVALID, and the metrics the receipt writer copies (Invoke-VenueLeg.ps1 stores this reader's metrics) are null with the reason, never the class the
+            # rest of the log would give; a class mismatch or product failure read from that signal is not this run's either.
+            $dualSeen = $perStage['llrawproc_dual_iso'].Count -gt 0 -or $records.outcomeRecords -gt 0 -or $records.renderMarks -gt 0
+            $foreign = @($problems | Where-Object { ([string]$_).StartsWith('EXPORT_PROFILE_FOREIGN', [StringComparison]::Ordinal) })
+            $unread = $null
+            if ($records.recordInvalid -gt 0) { $unread = "EXPORT_RECORD_INVALID: $($records.recordInvalid) stage-timing record(s) do not conform, so no record of the log, the dual-ISO signal's included, is read as the producer's and the class is not readable" }
+            elseif ($foreign.Count -gt 0) { $unread = "EXPORT_PROFILE_FOREIGN: stage-timing.log is not bound to build $ExpectedBuildId, so its dual-ISO signal is not this run's and the class is not readable" }
+            if ($dualSeen -and $null -ne $unread) {
+                $m.dualIsoActiveFrames = $null; $m['dualIsoActiveFramesCouldNotCheck'] = $unread
+                $m.dualIsoClassAgrees = $null; $m['dualIsoClassAgreesCouldNotCheck'] = $unread
+                $m.Remove('dualIsoNotAppliedFrames'); $m.Remove('dualIsoClassAgreesFailReason')
+                $classMismatch = $false; $classDetail = $null; $productFailure = $null
             }
         }
         # r1 fix 1 (adversary A2): the base reader's shape, for old-format evidence only (no log, or a log with none of the new stages). The problems and the outcome are the
