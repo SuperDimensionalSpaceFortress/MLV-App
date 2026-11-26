@@ -7066,7 +7066,8 @@ exit 0
     # transcript a second run sharing the RunDir (same leg name) may have written, and from both streams merged. A refusal record from another child with the same planned
     # hash was published as THIS child's observed digest. The primary now classifies the child's own captured STDOUT, as the supplementary route does.
     FOREIGN_DIGEST = "f" * 64
-    CHAIN_FOREIGN_ANCHOR = "            $legCode = $LASTEXITCODE\n"
+    # (r2, adversary pass 1 A7: injected AFTER the operator's copy is written, so a primary that re-read the transcript for its refusal would publish the foreign digest)
+    CHAIN_FOREIGN_ANCHOR = "            try { $legLines | Out-File -LiteralPath $out } catch { [Console]::Error.WriteLine(\"leg transcript write failed for $($leg.name): $($_.Exception.Message -replace '\\s+', ' ')\") }\n"
     CHAIN_FOREIGN_INJECT = ("            if ($env:DVT_FOREIGN_TRANSCRIPT -and $legCode -ne 0) { [IO.File]::WriteAllText($out, $env:DVT_FOREIGN_TRANSCRIPT + [Environment]::NewLine + "
                             "$(if (Test-Path -LiteralPath $out) { [IO.File]::ReadAllText($out) } else { '' })) }   # TEST FIXTURE: another run sharing the RunDir wrote the leg's transcript first\n")
 
@@ -7102,6 +7103,33 @@ exit 0
         self.assertEqual(len(typed), 1, proc.stdout + proc.stderr)
         self.assertIn(f"planned_sha256={planned} read_sha256={twin}", typed[0], "old: a stderr record and the shared transcript's record both stood in for the child's stdout\n" + proc.stdout)
         self.assertNotIn(self.FOREIGN_DIGEST, "\n".join(typed))
+
+    # r2 (adversary pass 1 on 6de082e2, A1): the receipt/outcome/detail were still read from the merged capture, so a DVE_RECEIPT_PATH= line on the child's STDERR was taken as a
+    # receipt and suppressed the real stdout refusal. Every parse now reads the child's stdout only.
+    def test_planned_hash_bind_r9_residue_r2_a1_a_receipt_line_on_the_childs_stderr_does_not_suppress_its_stdout_refusal(self) -> None:
+        stderr_line = '    [Console]::Error.WriteLine("DVE_RECEIPT_PATH=C:\\scratch\\phantom.json")\n'
+        anchor = '    if ($readSpecSha -cne $ExpectSpecSha256) { Write-Output "DVE_LEG_SPEC_REFUSED'
+        self.assertEqual(self.CHAIN_FAKE_LEG.count(anchor), 1)
+        proc, planned, twin = self.foreign_transcript_run(self.CHAIN_FAKE_LEG.replace(anchor, stderr_line + anchor, 1))
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row["outcome"], row.get("specRefusal")), ("LEG_FAILED", "INVALID", "DVE_CHAIN_SPEC_CHANGED"), "old: the stderr receipt line suppressed the refusal\n" + proc.stdout + proc.stderr)
+
+    # r2 (adversary pass 1, A2): the operator's transcript copy is written before the child's result is classified; a write failure (the leaf is a directory) must not cost the
+    # typed refusal, exit 7, CHAIN_RESULT or the next leg.
+    def test_planned_hash_bind_r9_residue_r2_a2_an_unwritable_transcript_leaf_costs_neither_the_refusal_nor_the_chain_result(self) -> None:
+        anchor = "            $legCode = $LASTEXITCODE\n"
+        obstruct = "            if ($env:DVT_OBSTRUCT_TRANSCRIPT) { New-Item -ItemType Directory -Force -Path $out | Out-Null }   # TEST FIXTURE: the transcript leaf cannot be written\n"
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", anchor, anchor + obstruct)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        fx = self.chain_fixture(dv, target, source)
+        fx["env"]["DVT_OBSTRUCT_TRANSCRIPT"] = "1"
+        proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+        self.assertEqual(proc.returncode, 7, "old: Out-File threw and the chain died before classifying\n" + proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row.get("specRefusal")), ("LEG_FAILED", "DVE_CHAIN_SPEC_CHANGED"), proc.stdout + proc.stderr)
 
     def test_planned_hash_bind_r9_residue_a1_control_an_unshared_transcript_still_types_the_refusal(self) -> None:
         proc = self.chain_set_run("copy")[0]
@@ -7143,6 +7171,30 @@ exit 0
         self.assertIn(f"planned_sha256={planned}", refusal[0], "old: the budget read's refusal named no planned hash\n" + proc.stderr)
         self.assertIn(f"sha256 {twin}", refusal[0])
         self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ") and self.SWAP_TARGET in l], proc.stdout)
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    # r2 (adversary pass 1, A4): the budget read's OTHER refusals (SPEC_READ_FAILED for a spec that vanished after the shape read) named no planned hash either.
+    def test_planned_hash_bind_r9_residue_r2_a4_a_legset_spec_deleted_before_the_budget_read_names_the_planned_hash(self) -> None:
+        delete = ("        if ($env:DVT_BUDGET_DELETE -and [IO.Path]::GetFileName([string]$e.specPath) -ceq $env:DVT_BUDGET_DELETE) { Remove-Item -LiteralPath ([string]$e.specPath) -Force }"
+                  "   # TEST FIXTURE: the spec vanishes after the shape read\n")
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_BUDGET_ANCHOR, delete + self.BATCH_BUDGET_ANCHOR),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP)])
+        target = dv / "legs" / self.SWAP_TARGET
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline],
+                        env_extra={"DVT_BUDGET_DELETE": self.SWAP_TARGET}, timeout=420)
+        self.assertFalse(target.exists(), "the fixture really deleted the planned spec")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertTrue(refusal[0].startswith("BATCH_USAGE SPEC_READ_FAILED "), refusal[0])
+        self.assertIn(f"planned_sha256={planned}", refusal[0], "old: the budget read's SPEC_READ_FAILED named no planned hash\n" + proc.stderr)
         self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
 
     def test_planned_hash_bind_r9_residue_b_a_legset_spec_cut_to_one_brace_before_the_budget_read_is_refused_with_the_planned_hash(self) -> None:

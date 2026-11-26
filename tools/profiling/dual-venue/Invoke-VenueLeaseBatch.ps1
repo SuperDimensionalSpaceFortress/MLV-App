@@ -1689,7 +1689,7 @@ if ($legPlanMode) {
     $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
     foreach ($e in $sp.plan) {
         $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath)   # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): before the lease, as -LegPlan does
-        if ($shapeRefusal -clike 'SPEC_READ_TIMEOUT *') { Stop-Usage $shapeRefusal }   # r19 (sol r18 B2 sibling): the read's own typed code
+        if ($shapeRefusal -clike 'SPEC_READ_TIMEOUT *') { Stop-Usage "$shapeRefusal (planned_sha256=$($e.specSha256))" }   # r19 (sol r18 B2 sibling): the read's own typed code (r2 A4: with the planner's hash, as the other -LegSet refusals)
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-3 r9 (adversary pass 11 A2): the planner comparison comes BEFORE the shape and budget verdicts, so bytes that changed after
         # planning are named as changed (with the planned hash) whatever those checks would have said about the new bytes
         $shapeSha = [string]$script:SpecShapeSha256[[string]$e.specPath]
@@ -1700,7 +1700,8 @@ if ($legPlanMode) {
         $budgetRefusal = Get-ExportBudgetRefusal ([string]$e.specPath)   # r8 (adversary r7 A3): before the lease, as -LegPlan does
         # DV-PLANNED-SPEC-HASH-BIND-R9-RESIDUE-1 r1 (sol r9): bytes replaced AFTER the shape read and BEFORE the budget read are refused by the budget read itself, whose message knows no
         # planner. In this -LegSet loop that refusal names the planner's hash like every other spec-changed refusal here.
-        if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])$(if ($budgetRefusal[0] -ceq 'SPEC_CHANGED_AFTER_PREFLIGHT') { " (planned_sha256=$($e.specSha256))" })" }
+        # (r2, adversary pass 1 A4: every budget-read refusal here, SPEC_READ_FAILED and the preflight timeout included, names the hash the planner judged)
+        if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1]) (planned_sha256=$($e.specSha256))" }
         # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 (sol r6 INV-3 sibling): the set planner judged THESE bytes (legId, twin, the name it reached; Get-DvLegSetPlan's specSha256), and the
         # shape and budget reads above are later reads of the same path. The bytes they judged (and every later read, the leg's own -ExpectSpecSha256 included, is bound to) must
         # be the planner's, or bytes swapped in after planning (a committed visual twin's) would pass both checks and run in the planned speed slot. Refused before any claim or lease.

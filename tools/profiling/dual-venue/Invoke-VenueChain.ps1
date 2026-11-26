@@ -570,12 +570,14 @@ foreach ($leg in $plan) {
             $legCode = $LASTEXITCODE
             $legLines = @($legCaptured | ForEach-Object { [string]$_ })
             $legStdoutLines = @($legCaptured | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
-            $legLines | Out-File -LiteralPath $out
-            $o = $legLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
+            # (r2, adversary pass 1 A2: the operator's copy is written best-effort; a write failure never costs the refusal, exit 7, CHAIN_RESULT or the next leg)
+            try { $legLines | Out-File -LiteralPath $out } catch { [Console]::Error.WriteLine("leg transcript write failed for $($leg.name): $($_.Exception.Message -replace '\s+', ' ')") }
+            # (r2, adversary pass 1 A1: outcome, receipt and detail are the child's STDOUT records too; a DVE_ line on its stderr is no result of the leg)
+            $o = $legStdoutLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
             $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
-            $p = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
+            $p = $legStdoutLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
             $receipt = $(if ($p -and $p -match '^DVE_RECEIPT_PATH=(.+)$') { $Matches[1].Trim() } else { $null })
-            $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
+            $dl = $legStdoutLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
             $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
             if ($legCode -ne 0) {
                 # Invoke-VenueLeg exits 0 whenever it wrote a receipt (any outcome, INVALID included); non-zero means it died without one. Whatever
