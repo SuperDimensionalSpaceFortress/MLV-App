@@ -390,6 +390,26 @@ class VenueLegWritesTheBlockTests(RunnerHarness, unittest.TestCase):
         got = read_texts([files[-1].read_text(encoding="utf-8")])[0]
         self.assertEqual(got["state"], "present", got["reason"])
 
+    def test_a2_a_probe_powershell_cannot_parse_still_leaves_its_readable_sample_on_the_unhealthy_receipt(self) -> None:
+        """adversary pass A2: an empty member name is legal JSON the writer reads and ConvertFrom-Json refuses, so ConvertFrom-DvProbeStdout answers $null and
+        the leg refuses VENUE_UNHEALTHY; the sample the writer could read before that refusal stays on the receipt."""
+        # The stub venue re-serializes the probe through ConvertTo-Json, so the odd line cannot travel through run_leg: the premise is checked on the two
+        # readers, and the ORDER on the leg's source (the attachment sits before the refusal on a probe that did not parse).
+        script = (
+            f"Import-Module '{psq(MODULE)}' -Force\n"
+            "$line = 'DVE_PROBE={\"hostName\":\"ULTRA-MAGNUS\",\"gpuNames\":[\"Intel\"],\"driverVersion\":null,\"displayDevice\":null,\"\":0}'\n"
+            "$parsed = & (Get-Module DualVenueRunner) { param($s) ConvertFrom-DvProbeStdout $s } $line\n"
+            "$block = New-DvDisplayPathBlock -ProbeStdout $line\n"
+            "Write-Output ('CASES=' + (ConvertTo-Json -InputObject @(, [ordered]@{ powershellParses = ($null -ne $parsed); writerCopies = ($null -ne $block) }) -Compress))\n"
+        )
+        got = cases_line(run_pwsh(["-Command", script]), 1, "empty-member-name")[0]
+        self.assertEqual(got, {"powershellParses": False, "writerCopies": True})
+        text = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        attach = text.index("New-DvDisplayPathBlock -ProbeStdout")
+        refusal = text.index("if ($null -eq $probe) {")
+        self.assertLess(attach, refusal, "the display-path block is attached before the leg refuses a probe PowerShell could not parse")
+        self.assertEqual(text.count("New-DvDisplayPathBlock -ProbeStdout"), 1)
+
     def test_an_unhealthy_leg_still_carries_the_block(self) -> None:
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=dict(HEALTHY_PROBE, pwshColdStartMs=9000))
         self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
@@ -750,6 +770,46 @@ class SolR2ProbeLineOrdinalPickTests(unittest.TestCase):
         self.assertEqual(got["parser"], "Real GPU")
         self.assertFalse(got["writer-only"])
         self.assertFalse(got["parser-only"])
+
+
+SESSION_DEFAULTS_SCRIPT = r"""
+Import-Module '__MODULE__' -Force
+$m = Get-Module DualVenueRunner
+$probe = 'DVE_PROBE={"gpuNames":["Intel"],"driverVersion":null,"displayDevice":null}'
+$out = [ordered]@{}
+# the caller's session defaults, set in the scope the module's own functions are called from (dynamic scope: the callee sees them)
+$out['plain-writer'] = & $m { param($p) [bool](New-DvDisplayPathBlock -ProbeStdout $p) } $probe
+$out['asarray-writer'] = & $m { param($p) $PSDefaultParameterValues = @{ 'ConvertTo-Json:AsArray' = $true }; [bool](New-DvDisplayPathBlock -ProbeStdout $p) } $probe
+$receiptState = {
+    param($p, $defaults)
+    $PSDefaultParameterValues = $defaults
+    $r = New-DvReceipt -Card 'C' -LegId 'L' -DeclaredVenue 'bachelor' -Actor ([string][char]0xd800)
+    $r.outcome = 'UNRESOLVED'
+    $r.venue['displayPath'] = New-DvDisplayPathBlock -ProbeStdout $p
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('dvp-sess-' + [guid]::NewGuid().ToString('N'))
+    try { [string](Read-DvReceiptDisplayPath -ReceiptText ([IO.File]::ReadAllText((Write-DvReceipt -Receipt $r -ReceiptRoot $root)))).state }
+    finally { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+$out['plain-receipt'] = & $m $receiptState $probe @{}
+$out['escape-receipt'] = & $m $receiptState $probe @{ 'ConvertTo-Json:EscapeHandling' = 'EscapeNonAscii' }
+$out['asarray-receipt'] = & $m $receiptState $probe @{ 'ConvertTo-Json:AsArray' = $true }
+Write-Output ('CASES=' + (ConvertTo-Json -InputObject @(, $out) -Depth 4 -Compress))
+"""
+
+
+@requires_windows_pwsh
+class AdversaryPass5SessionDefaultsTests(unittest.TestCase):
+    """r3 adversary pass A3: `$PSDefaultParameterValues` (ConvertTo-Json:AsArray / :EscapeHandling) is a preference of the session; it must never change the
+    JSON text the receipt writer writes or the text the display-path writer proved readable."""
+
+    def test_a3_session_defaults_never_change_what_the_writers_serialize(self) -> None:
+        proc = run_pwsh(["-Command", SESSION_DEFAULTS_SCRIPT.replace("__MODULE__", psq(MODULE))])
+        got = cases_line(proc, 1, "session-defaults")[0]
+        self.assertIs(got["plain-writer"], True)
+        self.assertIs(got["asarray-writer"], True, "AsArray in the session made the writer's own readability check read an array root")
+        self.assertEqual(got["plain-receipt"], "present")
+        self.assertEqual(got["escape-receipt"], "present", "EscapeNonAscii in the session wrote the actor's lone surrogate as an escape the reader rejects")
+        self.assertEqual(got["asarray-receipt"], "present")
 
 
 class DocsTests(unittest.TestCase):

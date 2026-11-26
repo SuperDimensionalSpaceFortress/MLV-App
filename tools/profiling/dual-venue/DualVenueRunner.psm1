@@ -84,6 +84,15 @@ function Get-DvDictionaryKeys {
     [System.Collections.IDictionary].GetProperty('Keys').GetValue($Dictionary)
 }
 
+function ConvertTo-DvReceiptJson {
+    # r3 (adversary pass A3): ConvertTo-Json with NO session default parameter values. $PSDefaultParameterValues (`ConvertTo-Json:AsArray`,
+    # `ConvertTo-Json:EscapeHandling`) is a preference of the session, not of the receipt: AsArray wraps the root in a list and EscapeNonAscii writes a lone
+    # surrogate as an escape, and the strict reader types either malformed. The receipt writer and the display-path writer's own check both serialize here,
+    # inside a child scope that clears the defaults, so the text they write and the text the writer proved readable are the same text in every session.
+    param($Value, [int]$Depth = 12)
+    & { $PSDefaultParameterValues = @{}; ConvertTo-Json -Depth $Depth -InputObject $Value }
+}
+
 function ConvertTo-DvCanonicalJson {
     <#
     .SYNOPSIS
@@ -7788,7 +7797,7 @@ function Write-DvReceipt {
     $dir = Join-Path (Join-Path (Join-Path $ReceiptRoot $Receipt['card']) $Receipt['legId']) $Receipt['venue']['name']
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $path = Join-Path $dir ($Receipt['receiptId'] + '.json')
-    $json = ($Receipt | ConvertTo-Json -Depth 12)
+    $json = (ConvertTo-DvReceiptJson $Receipt 12)
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json + "`n")
     $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)   # CreateNew: never overwrite
     try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
@@ -8042,7 +8051,7 @@ function New-DvDisplayPathBlock {
             primaryDisplayDevice = $device
         }
         # The writer never writes a block its reader does not type `present`: it hands back the reader's own typed block.
-        $read = Read-DvReceiptDisplayPath -ReceiptText (ConvertTo-Json -Depth 6 -InputObject ([ordered]@{ venue = [ordered]@{ displayPath = $block } }))
+        $read = Read-DvReceiptDisplayPath -ReceiptText (ConvertTo-DvReceiptJson ([ordered]@{ venue = [ordered]@{ displayPath = $block } }) 6)
         if (-not (Test-DvOrdinalEqual $read.state 'present')) { return $null }
         return $read.block
     } catch { return $null }
