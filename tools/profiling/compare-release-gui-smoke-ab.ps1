@@ -80,6 +80,95 @@ public static class MlvSmokeFileIdentityV2 {
     return ([string]$stat).Trim()
 }
 
+function Initialize-SmokeOwnedFs {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1-R2-RESIDUE-1 r1 (adversary-3be19c39.json A3 and A4): the report's temporary file and the report folders this call makes are held and acted on through ONE
+    # handle each, never through a second lookup of their path (which another process can have re-pointed in between). Windows only (the callers branch); returns $true when the type is ready.
+    #   CreateDirectoryOwned: NtCreateFile FILE_CREATE of a directory, so the handle returned IS the folder THIS call created (a name that already exists returns $null: not ours). It is opened with DELETE
+    #     access and read/write sharing only, so nobody can rename or delete the folder while it is held (a rename-aside is a sharing violation), and DeleteDirIfEmpty removes it by that handle.
+    #   CreateTempFile / RenameOver / DeleteByHandle: the temporary report file is created CreateNew with DELETE access and NO sharing, written through the handle, then renamed over the report BY the
+    #     handle (SetFileInformationByHandle FileRenameInfo with ReplaceIfExists), and on any failure deleted by the handle. The bytes published are the bytes this call wrote.
+    if (-not ($IsWindows -or $null -eq $IsWindows)) { return $false }
+    if (-not ('MlvSmokeOwnedFsV1' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class MlvSmokeOwnedFsV1 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct UNICODE_STRING { public ushort Length; public ushort MaximumLength; public IntPtr Buffer; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct OBJECT_ATTRIBUTES { public int Length; public IntPtr RootDirectory; public IntPtr ObjectName; public uint Attributes; public IntPtr SecurityDescriptor; public IntPtr SecurityQualityOfService; }
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_STATUS_BLOCK { public IntPtr Status; public IntPtr Information; }
+    [DllImport("ntdll.dll")]
+    private static extern int NtCreateFile(out SafeFileHandle FileHandle, uint DesiredAccess, ref OBJECT_ATTRIBUTES ObjectAttributes, out IO_STATUS_BLOCK IoStatusBlock, IntPtr AllocationSize, uint FileAttributes, uint ShareAccess, uint CreateDisposition, uint CreateOptions, IntPtr EaBuffer, uint EaLength);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, IntPtr buffer, uint size);
+    public static SafeFileHandle CreateDirectoryOwned(string fullPath) {
+        string nt = fullPath.StartsWith(@"\\") ? @"\??\UNC\" + fullPath.Substring(2) : @"\??\" + fullPath;
+        IntPtr text = Marshal.StringToHGlobalUni(nt);
+        IntPtr name = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
+        try {
+            UNICODE_STRING u = new UNICODE_STRING();
+            u.Length = (ushort)(nt.Length * 2); u.MaximumLength = (ushort)(u.Length + 2); u.Buffer = text;
+            Marshal.StructureToPtr(u, name, false);
+            OBJECT_ATTRIBUTES oa = new OBJECT_ATTRIBUTES();
+            oa.Length = Marshal.SizeOf(typeof(OBJECT_ATTRIBUTES)); oa.ObjectName = name; oa.Attributes = 0x40;
+            SafeFileHandle handle; IO_STATUS_BLOCK io;
+            // DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE; share read+write (no delete); FILE_CREATE; FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT
+            int status = NtCreateFile(out handle, 0x00110080u, ref oa, out io, IntPtr.Zero, 0x80u, 3u, 2u, 0x00200021u, IntPtr.Zero, 0u);
+            if (status == unchecked((int)0xC0000035)) { return null; } // STATUS_OBJECT_NAME_COLLISION: the name exists: not ours
+            if (status < 0) { throw new IOException("the report folder could not be created (NTSTATUS 0x" + status.ToString("X8") + ")"); }
+            return handle;
+        } finally { Marshal.FreeHGlobal(name); Marshal.FreeHGlobal(text); }
+    }
+    public static bool DeleteDirIfEmpty(SafeFileHandle handle) {
+        IntPtr buffer = Marshal.AllocHGlobal(4);
+        try {
+            Marshal.WriteInt32(buffer, 1);
+            if (SetFileInformationByHandle(handle, 4, buffer, 1)) { return true; } // FileDispositionInfo: removed when this handle closes
+            int error = Marshal.GetLastWin32Error();
+            if (error == 145) { return false; } // ERROR_DIR_NOT_EMPTY
+            throw new Win32Exception(error);
+        } finally { Marshal.FreeHGlobal(buffer); }
+    }
+    public static SafeFileHandle CreateTempFile(string fullPath) {
+        // GENERIC_WRITE | DELETE, no sharing, CREATE_NEW, FILE_ATTRIBUTE_NORMAL
+        SafeFileHandle handle = CreateFileW(fullPath, 0x40000000u | 0x00010000u, 0u, IntPtr.Zero, 1u, 0x80u, IntPtr.Zero);
+        if (handle.IsInvalid) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        return handle;
+    }
+    public static void DeleteByHandle(SafeFileHandle handle) {
+        IntPtr buffer = Marshal.AllocHGlobal(4);
+        try {
+            Marshal.WriteInt32(buffer, 1);
+            if (!SetFileInformationByHandle(handle, 4, buffer, 1)) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        } finally { Marshal.FreeHGlobal(buffer); }
+    }
+    public static void RenameOver(SafeFileHandle handle, string destinationFullPath) {
+        // the extended-length spelling, so a destination past MAX_PATH (a long report name in a deep folder) is renamed to like any other
+        if (!destinationFullPath.StartsWith(@"\\?\")) { destinationFullPath = destinationFullPath.StartsWith(@"\\") ? @"\\?\UNC\" + destinationFullPath.Substring(2) : @"\\?\" + destinationFullPath; }
+        int nameOffset = IntPtr.Size * 2 + 4;
+        int bytes = destinationFullPath.Length * 2;
+        IntPtr buffer = Marshal.AllocHGlobal(nameOffset + bytes + 2);
+        try {
+            for (int i = 0; i < nameOffset + bytes + 2; i++) { Marshal.WriteByte(buffer, i, 0); }
+            Marshal.WriteInt32(buffer, 0, 1); // ReplaceIfExists
+            Marshal.WriteInt32(buffer, IntPtr.Size * 2, bytes); // FileNameLength
+            for (int i = 0; i < destinationFullPath.Length; i++) { Marshal.WriteInt16(buffer, nameOffset + i * 2, (short)destinationFullPath[i]); }
+            if (!SetFileInformationByHandle(handle, 3, buffer, (uint)(nameOffset + bytes + 2))) { throw new Win32Exception(Marshal.GetLastWin32Error()); }
+        } finally { Marshal.FreeHGlobal(buffer); }
+    }
+} // MlvSmokeOwnedFsV1 (never a bare column-0 brace: the function extractors end a function at one)
+'@
+    }
+    return $true
+}
+
 function Get-SmokeReparsePointComponent {
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A1, NARROWED): the first existing component of $Path, from the root down (the leaf
     # included), that is a reparse point (a symlink or a directory junction), else $null. A component that can be swapped for a link to the report folder after the
@@ -1388,9 +1477,14 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
     # made). Now the bytes go to a NEW file (CreateNew: it can alias nothing) beside the report, and only a complete one is moved over the report name: a rename replaces
     # the directory entry and never touches the inode any other name (an input, a link, a symlink target) still points at. Any refusal or failure removes that
     # temporary file and, when this call created it, the empty folder; the report that was there before is left exactly as it was.
-    $createdDirs = [System.Collections.Generic.List[string]]::new()
+    # R2-RESIDUE-1 r1 (adversary-3be19c39.json A3 and A4): on Windows each report folder level this call makes and the temporary report file are HELD by a handle from the moment they are created (see
+    # Initialize-SmokeOwnedFs) and acted on only through it; elsewhere the older path-based steps stand ($ownedFs false). Each $createdDirs entry carries its handle (Windows) or its creation time (elsewhere).
+    $ownedFs = Initialize-SmokeOwnedFs
+    $createdDirs = [System.Collections.Generic.List[object]]::new()
     $inputHolds = [System.Collections.Generic.List[IO.FileStream]]::new()
     $tempOutput = $null
+    $tempStream = $null
+    $tempHandle = $null
     $wroteOutput = $false
     $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json + [Environment]::NewLine)
     # adversary-ac722a96.json A3: the missing levels of the report folder (topmost first) as seen now; a level is THIS call's only when its own non-forced creation succeeds below, so a level another
@@ -1410,8 +1504,16 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         foreach ($level in $missingDirs) {
             # adversary-d10f5241.json A1: each level this call made is remembered WITH the creation time of the folder it made, so the cleanup removes that folder and never a different empty
             # folder another process later put under the same name (a rename-aside plus a new mkdir keeps the path and changes the creation time)
-            try { New-Item -ItemType Directory -Path $level -ErrorAction Stop | Out-Null; $createdDirs.Add("$([IO.Directory]::GetCreationTimeUtc($level).Ticks)|$level") }
-            catch { if (-not (Test-Path -LiteralPath $level -PathType Container)) { throw } }   # a level that exists now was made by someone else: not ours
+            # R2-RESIDUE-1 r1 (adversary-3be19c39.json A3): on Windows the level is created THROUGH a handle that is kept (NtCreateFile FILE_CREATE), so the folder held IS the one this call made: a name that
+            # already exists returns $null (not ours) and a replacement can never be recorded as owned. Held without delete sharing, it cannot be renamed aside while the write runs.
+            if ($ownedFs) {
+                $levelHandle = [MlvSmokeOwnedFsV1]::CreateDirectoryOwned([IO.Path]::GetFullPath($level))
+                if ($null -ne $levelHandle) { $createdDirs.Add([pscustomobject]@{ Path = $level; Handle = $levelHandle; Stamp = $null }) }
+            }
+            else {
+                try { New-Item -ItemType Directory -Path $level -ErrorAction Stop | Out-Null; $createdDirs.Add([pscustomobject]@{ Path = $level; Handle = $null; Stamp = "$([IO.Directory]::GetCreationTimeUtc($level).Ticks)|$level" }) }
+                catch { if (-not (Test-Path -LiteralPath $level -PathType Container)) { throw } }   # a level that exists now was made by someone else: not ours
+            }
         }
         # a report that already exists is judged by its handle identity (read-only, nothing truncated); an input that IS it is refused before anything is written
         $outIdentity = $null
@@ -1446,34 +1548,48 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         }
         # adversary-ac722a96.json A2: the temporary name never carries the report's leaf (a 231-character report name plus ".", a guid and ".tmp" is past the 255-character component limit), so a valid report is published
         $tempOutput = Join-Path $outputDir ('.mlvsmoke.' + [Guid]::NewGuid().ToString('N') + '.tmp')
-        $tempStream = [IO.FileStream]::new($tempOutput, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try {
-            $tempStream.Write($outBytes, 0, $outBytes.Length)
-            $tempStream.Flush($true)
+        # R2-RESIDUE-1 r1 (adversary-3be19c39.json A4): on Windows the temporary file is created with DELETE access and NO sharing and stays open from its creation to its publication, so no other process can
+        # rename it aside or swap a file under its name; it is renamed over the report BY THIS HANDLE (never a second lookup of the temporary name) and, if anything fails first, deleted BY THE HANDLE.
+        if ($ownedFs) {
+            $tempHandle = [MlvSmokeOwnedFsV1]::CreateTempFile($tempOutput)
+            $tempStream = [IO.FileStream]::new($tempHandle, [IO.FileAccess]::Write, 4096, $false)
         }
-        finally { $tempStream.Dispose() }
+        else { $tempStream = [IO.FileStream]::new($tempOutput, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None) }
+        $tempStream.Write($outBytes, 0, $outBytes.Length)
+        $tempStream.Flush($true)
         # test-only seam (R2-RESIDUE-1 r1, adversary-3be19c39.json A4): a script block a test sets to act in the gap between the temporary file being written and its publication; production leaves it unset
         if ($null -ne $script:SmokeTestAfterTempWrite) { & $script:SmokeTestAfterTempWrite $tempOutput }
-        [IO.File]::Move($tempOutput, $resolvedOutput, $true)
+        if ($ownedFs) { [MlvSmokeOwnedFsV1]::RenameOver($tempHandle, [IO.Path]::GetFullPath($resolvedOutput)) }
+        else { $tempStream.Dispose(); $tempStream = $null; [IO.File]::Move($tempOutput, $resolvedOutput, $true) }
         $tempOutput = $null
         $wroteOutput = $true
     }
     finally {
         foreach ($hold in $inputHolds) { try { $hold.Dispose() } catch { } }
-        if ($null -ne $tempOutput) { try { Remove-Item -LiteralPath $tempOutput -Force -ErrorAction Stop } catch { } }
+        # a refused or failed write removes the temporary file BY ITS OWN HANDLE (Windows), so a different file another process put under the temporary name is never touched; the handle is closed after
+        if ($null -ne $tempHandle -and -not $wroteOutput) { try { [MlvSmokeOwnedFsV1]::DeleteByHandle($tempHandle) } catch { } }
+        if ($null -ne $tempStream) { try { $tempStream.Dispose() } catch { } }
+        if ($null -ne $tempOutput -and -not $ownedFs) { try { Remove-Item -LiteralPath $tempOutput -Force -ErrorAction Stop } catch { } }
         if (-not $wroteOutput) {
             # only the folder levels whose own creation this call succeeded (deepest first) are removed, and only while each is empty (a file another process put there is never ours to delete)
             for ($levelIndex = $createdDirs.Count - 1; $levelIndex -ge 0; $levelIndex--) {
-                $levelPath = $createdDirs[$levelIndex].Substring($createdDirs[$levelIndex].IndexOf('|') + 1)
+                $level = $createdDirs[$levelIndex]
                 try {
-                    if ("$([IO.Directory]::GetCreationTimeUtc($levelPath).Ticks)|$levelPath" -cne $createdDirs[$levelIndex]) { break }
-                    if (@(Get-ChildItem -LiteralPath $levelPath -Force -ErrorAction Stop).Count -ne 0) { break }
-                    # test-only seam (R2-RESIDUE-1 r1, adversary-3be19c39.json A3): a script block a test sets to act after the folder was checked and found empty and before it is deleted; production leaves it unset
-                    if ($null -ne $script:SmokeTestBeforeDirCleanup) { & $script:SmokeTestBeforeDirCleanup $levelPath }
-                    Remove-Item -LiteralPath $levelPath -Force -ErrorAction Stop
+                    if ($null -ne $level.Handle) {
+                        # R2-RESIDUE-1 r1 (adversary-3be19c39.json A3): the delete is by the handle taken at creation (it fails while the folder holds anything): no path is looked up a second time
+                        if ($null -ne $script:SmokeTestBeforeDirCleanup) { & $script:SmokeTestBeforeDirCleanup $level.Path }
+                        if (-not [MlvSmokeOwnedFsV1]::DeleteDirIfEmpty($level.Handle)) { break }
+                        $level.Handle.Dispose()
+                        continue
+                    }
+                    if ("$([IO.Directory]::GetCreationTimeUtc($level.Path).Ticks)|$($level.Path)" -cne $level.Stamp) { break }
+                    if (@(Get-ChildItem -LiteralPath $level.Path -Force -ErrorAction Stop).Count -ne 0) { break }
+                    if ($null -ne $script:SmokeTestBeforeDirCleanup) { & $script:SmokeTestBeforeDirCleanup $level.Path }
+                    Remove-Item -LiteralPath $level.Path -Force -ErrorAction Stop
                 } catch { break }
             }
         }
+        foreach ($held in $createdDirs) { if ($null -ne $held.Handle) { try { $held.Handle.Dispose() } catch { } } }
     }
 }
 

@@ -3789,7 +3789,7 @@ QUIET_SMOKE = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"colle
 def _extract_report_write_block(cmp_source: str) -> str:
     """The comparator's report-write block as it runs (MERGE-RESIDUE-1 r1): from the folder bookkeeping to the end of the cleanup `finally`."""
     if "    $createdDirs = [System.Collections.Generic.List[" in cmp_source:
-        return _extract_block(cmp_source, "    $createdDirs = [System.Collections.Generic.List[", "                } catch { break }", trailing_lines=3)
+        return _extract_block(cmp_source, "    $createdDirs = [System.Collections.Generic.List[", "                } catch { break }", trailing_lines=4)
     return _extract_block(cmp_source, "    $createdDir = $false\n    $tempOutput = $null", "if ([string]::Equals($cleanDir, $firstMissingDir", trailing_lines=3)   # the shape before R4-NARROW-1 r2 (adversary-ac722a96.json A3)
 
 
@@ -3798,7 +3798,7 @@ def _report_write_probe(tmp: str, before: Path, after: Path, report: Path, outdi
     block = _extract_report_write_block(COMPARE_SCRIPT.read_text(encoding="utf-8"))
     script = Path(tmp) / "write-probe.ps1"
     script.write_text(
-        "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity", "Get-SmokeReparsePointComponent"]) +
+        "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity", "Initialize-SmokeOwnedFs", "Get-SmokeReparsePointComponent"]) +
         f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $outputDir = '{outdir}'; $json = '{{\"report\":true}}'\n"
         "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
         "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
@@ -4081,7 +4081,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
                 p.write_text("{}", encoding="utf-8", newline="")
             script = Path(tmp) / "write.ps1"
             script.write_text(
-                "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity", "Get-SmokeReparsePointComponent"]) +
+                "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity", "Initialize-SmokeOwnedFs", "Get-SmokeReparsePointComponent"]) +
                 f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $outputDir = '{tmp}'; $json = '{{\"report\":true}}'\n"
                 "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
                 "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
@@ -4126,7 +4126,7 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
                 p.write_text("{}", encoding="utf-8", newline="")
             script = Path(tmp) / "write.ps1"
             script.write_text(
-                "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity", "Get-SmokeReparsePointComponent"]) +
+                "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity", "Initialize-SmokeOwnedFs", "Get-SmokeReparsePointComponent"]) +
                 f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $outputDir = '{outdir}'; $json = '{{\"report\":true}}'\n"
                 "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
                 "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
