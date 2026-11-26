@@ -1390,3 +1390,40 @@ TEST(PlaybackSlipHistogram, R10ARepeatedFirstFrameKeepsTheFirstPresentsJumpForTh
     ASSERT_EQ( 2LL, v.slipsTotal );
     ASSERT_EQ( 2, v.startupCatchupFrames );
 }
+
+// R10-OUTER-BRANCH-RESIDUE-1 r2 (adversary pass 11 A3 on 6ff14cd4, its input): 200 frames at 25 fps, Drop Frame and Loop on, start
+// frame 10. Cut In is raised to 41 before frame 10 is ready: the 8 ms tick requests 40 at 40.2 (the correction 10 -> 40), the 192 ms
+// tick requests 45, and the first present shows 10 with the timeline at 45 (its jump is 41..44, passed after the correction). Frame
+// 40 then lands the rebase ON 40, and frame 45 skips 41..44. 6ff14cd4 closed the first-present window on the landing, so the jump's
+// four frames were four slips; the landing shows none of the jump, so they are startup catch-up.
+TEST(PlaybackSlipHistogram, R2ARebaseLandingOnItsFrameKeepsTheFirstPresentsJumpForTheNextMove)
+{
+    SlipHistogram h;
+    h.reset( 10, 25.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 40, 8.0, 0.2, 0.0 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 192.0, 4.8, 0.0 );
+    h.notePresent( r2Present( 10, 200.0, 45 ) );                          // requested before the correction: unlanded
+    h.notePresent( r2Present( 40, 205.0, 45, 1, true, 40 ) );             // lands the rebase ON 40
+    h.notePresent( r2Present( 45, 210.0, 45 ) );                          // skips 41..44
+    const Summary s = h.finish( 220.0, 45 );
+    ASSERT_EQ( 0LL, s.slipsTotal );                                      // 6ff14cd4: 4
+    ASSERT_EQ( 0, s.slipEvents );                                        // 6ff14cd4: 1
+    ASSERT_EQ( 4, s.startupCatchupFrames );                              // 6ff14cd4: 0
+    ASSERT_EQ( 0, s.repeats );
+    ASSERT_EQ( 0, s.wraps );
+    // a rebase landing that MOVES from its frame (45 landing rebase 40) still spends the window: a later skip is a slip
+    SlipHistogram moved;
+    moved.reset( 10, 25.0 );
+    moved.setPlayStart( 0.0 );
+    moved.noteTimelineCorrection( 40 );
+    moved.noteTimelineMove( AdvancePath::DropTick, 45, 192.0, 5.0, 0.0 );
+    moved.notePresent( r2Present( 10, 200.0, 45 ) );
+    moved.notePresent( r2Present( 45, 240.0, 45, 1, true, 40 ) );         // spends the jump 41..44
+    moved.noteTimelineMove( AdvancePath::DropTick, 48, 360.0, 3.0, 0.0 );
+    moved.notePresent( r2Present( 48, 400.0, 48 ) );                      // 46..47 skipped
+    const Summary t = moved.finish( 410.0, 48 );
+    ASSERT_EQ( 2LL, t.slipsTotal );
+    ASSERT_EQ( 4, t.startupCatchupFrames );
+}

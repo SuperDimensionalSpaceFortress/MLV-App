@@ -511,18 +511,23 @@ public:
         const int advanced = m_timelineAdvanceSincePresent;
         m_timelineAdvanceSincePresent = 0;
         // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1 (adversary pass 10 A2 on 87a6d64b): the first present's
-        // jump is spent on the first LATER present that moves the display or lands a correction, not on the second present. A pure
+        // jump is spent on the first LATER present that moves the display (r2: from the rebased endpoint, or laps), not on the second present. A pure
         // repeat of the first frame (a duplicate request, no rebase) shows nothing of the jump, so it keeps the window open:
         // first present 10 at timeline 45 (10 corrected to 40 before it), a repeat of 10, then 45 landing the correction booked the
         // jump's four frames as four slips (m_presents == 3 passed neither guard) where they are startup catch-up.
         const bool firstJumpWindow = m_firstPresentJumpOpen;
-        if( s.rebase || s.displayFrame != m_lastDisplayFrame ) m_firstPresentJumpOpen = false;
 
         // r2 (r1 adversary pass 2 A1): the presentation that lands a correction rebases the display endpoint to the correction's frame
         // (PlaybackSourceAdvanceTracker::noteRebase's rule, adversary pass 3 A1 on c4fa34c3: the frame itself, so travel 40 -> 45 is
         // 4 slips, as 10 -> 15 is): only what the engine travelled from it is slips, a landing ON it is neither a slip nor a repeat,
         // and a lap after it is a wrap.
         if( s.rebase ) m_lastDisplayFrame = s.rebaseFrame;
+        // R10-OUTER-BRANCH-RESIDUE-1 r2 (adversary pass 11 A3 on 6ff14cd4): a rebase that lands ON its frame with no lap shows nothing
+        // of the jump either (it is neither a slip nor a repeat), so it keeps the window open like a pure repeat. Start 10, Cut In
+        // raised to 41 (corrected to 40) and granted to 45 before the first present shows 10; 40 lands the rebase ON 40; 45 then
+        // skips 41..44. 6ff14cd4 closed the window on the landing (s.rebase), so the jump's four frames became four slips where
+        // they are startup catch-up. The window closes on the first present that shows a move from the (rebased) endpoint or laps.
+        if( ( s.rebase && s.rebaseLapped ) || s.displayFrame != m_lastDisplayFrame ) m_firstPresentJumpOpen = false;
         // r2 iteration 2 (adversary pass 4 A3 on b30cd3a1): the first present's jump was passed BEFORE the correction; a rebased
         // interval's skips are after it, so the jump is startup catch-up of its own and never covers them.
         // r3 (escalated adversary pass 5 A1 on 2a3371ff): only when the rebase's correction (the LAST one this present landed, in

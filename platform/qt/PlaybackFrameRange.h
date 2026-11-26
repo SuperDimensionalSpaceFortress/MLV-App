@@ -553,9 +553,13 @@ inline double normalizeDropFramePosition( double position, const CutRange & rang
     // the cut, or the non-Loop clamp onto the last frame), and the fold reads the phase, fraction included: a stale 100.9 with Cut
     // Out lowered to 50 (Cut In 1) truncated to 100 folded onto 2 where its phase is 2.9. That is now the dispatch of every Drop
     // Frame Loop tick (the outer last-frame branch no longer takes one). Outside the clip and below the cut the repair is unchanged.
-    if( position > static_cast<double>( lastFrameIndex( range ) ) && position == bounded
-     && static_cast<double>( repairedFrame ) == std::floor( bounded ) )
-        return bounded;
+    // r2 (adversary pass 11 A1 on 6ff14cd4): "inside the clip" is the clip's whole last source frame, [top, top + 1), not
+    // position <= top. A stale 199.5 on a 200-frame 60 fps clip conformed to 25 fps, Cut Out lowered to 50 (Cut In 1), was
+    // clipped to 199, so the Loop fold lost the half frame of phase: a 0.6 grant ended at 49.6 with no lap where the phase-kept
+    // start laps once to about 0.1.
+    if( position > static_cast<double>( lastFrameIndex( range ) ) && position < top + 1.0
+     && static_cast<double>( repairedFrame ) == std::floor( position ) )
+        return position;
     return static_cast<double>( repairedFrame );
 }
 
@@ -766,6 +770,22 @@ inline bool isContactSheetLoopWrapTransition(
     // arbitrary earlier position essentially never satisfies this by coincidence.
     const int kOvershootToleranceFrames = 8;
     return backwardJump >= loopWidth - kOvershootToleranceFrames;
+}
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r2 (adversary pass 11 A2 on 6ff14cd4): the presented-frame
+// heuristic's decision for a presentation that crossed \a correctionsCrossed engine POSITION CORRECTIONS (the stamped count
+// notePlaybackSmokePresentedFrame computes for the paint hand-off). Every Drop Frame Loop tick is now the engine's, so a stale
+// playhead past an edited Cut Out is folded onto its phase (100 -> 2 on cut 1..50) as a correction, never a wrap. That backward
+// jump of 98 passed the heuristic (98 >= 49 - 8), which set inferredWrap and m_playbackSmokeWrapped: wrapped=1 with wrap_count=0
+// and a contact-sheet span of the whole cut. A presentation that lands a correction is explained by it. The drop-frame engine
+// that made the correction counts its own wraps (noteEngineWrap, authoritative), so suppressing the second signal here never
+// hides one. Without a crossed correction the decision is isContactSheetLoopWrapTransition's, unchanged.
+inline bool presentedTransitionInfersLoopWrap(
+    bool loopActive, int cutInFrame, int cutOutFrame,
+    int lastPresentedFrame, int displayFrame, int correctionsCrossed )
+{
+    if( correctionsCrossed > 0 ) return false;
+    return isContactSheetLoopWrapTransition( loopActive, cutInFrame, cutOutFrame, lastPresentedFrame, displayFrame );
 }
 
 // PlaybackWrapRecorder -- PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol BLOCKER 4), widened in ENFORCE-2: the

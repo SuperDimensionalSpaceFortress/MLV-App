@@ -28660,19 +28660,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // "went backward" test also fires for an external backward scrub, or a stress seek to an
     // arbitrary earlier frame, during a session where Loop never actually wrapped -- see
     // isContactSheetLoopWrapTransition for why Loop state and jump size now both gate this.
-    const bool playbackSmokeWrapNow =
-        m_playbackSmokePresentedFrames > 0
-     && playback_frame_range::isContactSheetLoopWrapTransition(
-            ui->actionLoop->isChecked(),
-            ui->spinBoxCutIn->value() - 1,
-            ui->spinBoxCutOut->value() - 1,
-            m_playbackSmokeLastPresentedFrame,
-            static_cast<int>( displayFrame ) );
-    if( playbackSmokeWrapNow )
-    {
-        m_playbackSmokeWrapped = true;
-        m_playbackWrapRecorder.noteInferredWrap();   // second signal only; see PlaybackWrapRecorder
-    }
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r2 (adversary pass 11 A2 on 6ff14cd4): decided below, once
+    // the engine corrections this presentation crossed are known (presentedTransitionInfersLoopWrap: a landed correction is no wrap).
     // PLAYBACK-HFR-CONFORM-DEFAULT-1: how fast the TIMELINE moves (source frames per wall second) and the
     // largest jump between PRESENTED source frames, loop wrap excluded (1 == every source frame shown).
     // r16 (adversary A1 on ff41b4fa, re-pass A1/A2): the wrap is the engine's own count, never the inference
@@ -28703,6 +28692,22 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     const playback_frame_range::PaintCreditHandOff sourceAdvanceHandOff =
         playback_frame_range::paintCreditHandOff( m_playbackWrapRecorder, sourceAdvanceWrapsBefore, sourceAdvanceWraps,
                                                   sourceAdvanceCorrectionsBefore, sourceAdvanceCorrections );
+    // The presented-frame wrap inference (the block comment above): Loop state and jump size gate it, and r2 a landed engine
+    // correction explains the backward jump (the engine counts its own wraps).
+    const bool playbackSmokeWrapNow =
+        m_playbackSmokePresentedFrames > 0
+     && playback_frame_range::presentedTransitionInfersLoopWrap(
+            ui->actionLoop->isChecked(),
+            ui->spinBoxCutIn->value() - 1,
+            ui->spinBoxCutOut->value() - 1,
+            m_playbackSmokeLastPresentedFrame,
+            static_cast<int>( displayFrame ),
+            sourceAdvanceCorrections );
+    if( playbackSmokeWrapNow )
+    {
+        m_playbackSmokeWrapped = true;
+        m_playbackWrapRecorder.noteInferredWrap();   // second signal only; see PlaybackWrapRecorder
+    }
     // r29 (adversary A1 on cf403dba, A2 on 4201a437): this is the HAND-OFF. The frame waits in the ledger for the surface's paint,
     // which credits m_playbackSmokeSourceAdvance (notePlaybackSmokePainted); replaced before that paint, it is never credited.
     m_playbackSmokePaintCredit.noteSubmitted( static_cast<uint64_t>( readyFrame.requestSerial ),

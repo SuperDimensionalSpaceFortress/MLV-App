@@ -3443,9 +3443,12 @@ TEST( PlaybackConformDropFrame, R33B1TheGenuineOutOfRangeRepairIsKept )
     const CutRange full = normalizeCutRange( 1, 720, 720, true );
     const CutRange trimmed = normalizeCutRange( 101, 460, 720, true );
     bool out = false;
-    // without conform the pre-r33 rule is unchanged: past the last frame is out and truncated (719.04 -> 719)
-    ASSERT_EQ( 719.0, normalizeDropFramePosition( 719.04, full, 720, false, &out ) );
+    // without conform past the last frame is still OUT. PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r2 (adversary
+    // pass 11 A1 on 6ff14cd4): a position on the clip's final source frame [719, 720) is inside the clip, so it keeps its fraction
+    // like any position above the cut (r1), and the engine's Loop fold reads its whole phase (was truncated to 719, folding onto 0)
+    ASSERT_EQ( 719.04, normalizeDropFramePosition( 719.04, full, 720, false, &out ) );
     ASSERT_TRUE( out );
+    ASSERT_NEAR( 0.04, playback_frame_range::advanceDropFrameTick( 719.04, 0.0, 1, 720, true, false ).correctedStart, 1e-9 );
     // at or past the conformed wrap bound: out, repaired (a position the engine never holds)
     ASSERT_EQ( 719.0, normalizeDropFramePosition( 720.0, full, 720, true, &out ) );
     ASSERT_TRUE( out );

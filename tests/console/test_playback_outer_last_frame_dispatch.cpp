@@ -38,6 +38,10 @@ DropLoopDispatch dispatchDropLoopTick( int totalFrames, int slider, double dropP
     // 1. the play-path normalizer (normalizePlaybackCutRangeForLoadedClip)
     const playback_frame_range::CutRange range = playback_frame_range::normalizeCutRange( cutIn, cutOut, totalFrames, true );
     const double position = playback_frame_range::normalizeDropFramePosition( dropPosition, range, totalFrames, conform );
+    // r2 (adversary pass 11 A5 on 6ff14cd4): every later step reads the REPAIRED cut, as MainWindow reads the spin boxes the
+    // normalizer wrote (the raw 1..1 of a 41-frame clip advanced against itself while the normalizer used 1..41)
+    cutIn = range.cutIn;
+    cutOut = range.cutOut;
     // 2. the outer last-frame branch decision, exactly as MainWindow passes it (Drop Frame on, Loop on)
     d.outerBranch = playback_frame_range::outerLastFrameBranchHandlesTick( slider, cutOut, true, true, conform );
     if( d.outerBranch )
@@ -151,6 +155,64 @@ TEST( PlaybackOuterLastFrameDispatch, AStaleFractionalStartAboveTheCutKeepsItsPh
     late.cutOut = 50;
     late.valid = true;
     ASSERT_EQ( 10.0, playback_frame_range::normalizeDropFramePosition( 10.75, late, 200, false ) );
+}
+
+// r2 (adversary pass 11 A1 on 6ff14cd4, its input): a fractional position on the clip's FINAL source frame is inside the clip too.
+// 200-frame clip conformed (60 fps to 25 fps), Drop Frame and Loop on, slider 199, position 199.5, Cut Out lowered from 200 to 50
+// (Cut In 1), grant 0.6. 6ff14cd4 clipped 199.5 to 199 (the old "position <= top" test), so the tick folded 199 onto 49 and ended at
+// 49.6 with no lap. Phase kept: 199.5 folds onto 49.5 and 0.6 laps once to 0.1.
+TEST( PlaybackOuterLastFrameDispatch, R2AFractionalStartOnTheClipsFinalFrameKeepsItsPhaseThroughTheNormalizer )
+{
+    const DropLoopDispatch conformed = dispatchDropLoopTick( 200, 199, 199.5, 1, 50, true, 0.6 );
+    ASSERT_FALSE( conformed.outerBranch );
+    ASSERT_TRUE( conformed.corrected );
+    ASSERT_NEAR( 49.5, conformed.correctedStart, 1e-9 );          // 6ff14cd4: 49
+    ASSERT_EQ( 1, conformed.recorder.engineWraps );                // 6ff14cd4: 0
+    ASSERT_NEAR( 0.1, conformed.landing, 1e-9 );                   // 6ff14cd4: 49.6
+    ASSERT_NEAR( 0.6, conformed.traceFrames, 1e-9 );
+    // the same start without conform: 199.5 on its phase in the 49-frame cut is 3.5 (6ff14cd4: 3)
+    const DropLoopDispatch plain = dispatchDropLoopTick( 200, 199, 199.5, 1, 50, false, 0.6 );
+    ASSERT_TRUE( plain.corrected );
+    ASSERT_NEAR( 3.5, plain.correctedStart, 1e-9 );
+    ASSERT_NEAR( 4.1, plain.landing, 1e-9 );
+    // the normalizer's boundary: [199, 200) is the clip's last source frame; 200 and past it are outside the clip, as before
+    playback_frame_range::CutRange cut;
+    cut.cutIn = 1;
+    cut.cutOut = 50;
+    cut.valid = true;
+    ASSERT_EQ( 199.5, playback_frame_range::normalizeDropFramePosition( 199.5, cut, 200, true ) );
+    ASSERT_EQ( 199.5, playback_frame_range::normalizeDropFramePosition( 199.5, cut, 200, false ) );
+    ASSERT_EQ( 199.0, playback_frame_range::normalizeDropFramePosition( 199.0, cut, 200, false ) );
+    ASSERT_EQ( 199.0, playback_frame_range::normalizeDropFramePosition( 200.0, cut, 200, false ) );
+    ASSERT_EQ( 199.0, playback_frame_range::normalizeDropFramePosition( 200.25, cut, 200, true ) );
+    ASSERT_EQ( 199.0, playback_frame_range::normalizeDropFramePosition( HUGE_VAL, cut, 200, false ) );
+}
+
+// r2 (adversary pass 11 A2 on 6ff14cd4, its input): first Play of a 200-frame 24 fps clip, Drop Frame and Loop on, conform off,
+// frame 100 presented, the cut changed to 1..50, a 0.192 grant, then frame 2 presented. The engine folds 100 onto 2 as a CORRECTION
+// with zero laps; the presentation of 2 crosses it. The presented-frame heuristic alone calls the 98-frame backward jump a wrap
+// (98 >= 49 - 8), which set inferredWrap and m_playbackSmokeWrapped (wrapped=1, wrap_count=0). With the crossed correction it is
+// not a wrap; without one the heuristic's decision is unchanged.
+TEST( PlaybackOuterLastFrameDispatch, R2APresentationThatLandsACorrectionIsNeverAnInferredWrap )
+{
+    const DropLoopDispatch d = dispatchDropLoopTick( 200, 100, 100.0, 1, 50, false, 0.192 );
+    ASSERT_TRUE( d.corrected );
+    ASSERT_EQ( 0, d.recorder.engineWraps );
+    ASSERT_EQ( 2, static_cast<int>( d.landing ) );
+    const int crossed = d.recorder.engineCorrections;              // the presentation of 2 was requested after the correction
+    ASSERT_EQ( 1, crossed );
+    // the heuristic MainWindow called on 6ff14cd4 fires on this transition (0-based cut 0..49)
+    ASSERT_TRUE( playback_frame_range::isContactSheetLoopWrapTransition( true, 0, 49, 100, 2 ) );
+    ASSERT_FALSE( playback_frame_range::presentedTransitionInfersLoopWrap( true, 0, 49, 100, 2, crossed ) );
+    playback_frame_range::PlaybackWrapRecorder recorder = d.recorder;
+    if( playback_frame_range::presentedTransitionInfersLoopWrap( true, 0, 49, 100, 2, crossed ) ) recorder.noteInferredWrap();
+    ASSERT_FALSE( recorder.wrapped() );
+    ASSERT_EQ( 0, recorder.replayCount() );
+    // no crossed correction: the heuristic's decision, unchanged (a genuine 719 -> 0 wrap, a short backward scrub, Loop off)
+    ASSERT_TRUE( playback_frame_range::presentedTransitionInfersLoopWrap( true, 0, 719, 719, 0, 0 ) );
+    ASSERT_TRUE( playback_frame_range::presentedTransitionInfersLoopWrap( true, 0, 49, 100, 2, 0 ) );
+    ASSERT_FALSE( playback_frame_range::presentedTransitionInfersLoopWrap( true, 0, 719, 400, 390, 0 ) );
+    ASSERT_FALSE( playback_frame_range::presentedTransitionInfersLoopWrap( false, 0, 719, 719, 0, 0 ) );
 }
 
 // Sibling sweep (the same dispatch): a playhead on the last frame (conform off) and one past it under conform are the engine's
