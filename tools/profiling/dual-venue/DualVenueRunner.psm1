@@ -2708,9 +2708,10 @@ function Test-DvVisualTwinName {
     <#
     .SYNOPSIS
     M16-1457-VENUE-BASELINE-DRIFT-1 r6 (sol r5 B1, luna r5 B1): is this leg id or spec file name a VISUAL TWIN (its id carries the word `visual` between hyphens)? A twin is the
-    capture-on copy of a speed arm, so it is never a measured matrix speed cell: the matrix's speed cells are the capture-free arms. (UNPACED-VISUAL-MIDPLAY-CAPTURE-1, adversary
-    r1 A2: the capture tail starts only after finishPlaybackSmokeTelemetry("visual-capture") has closed the measured session, and an unpaced Play does NOT keep playing past
-    the measured window: it holds its last required frame through the tail, so an unpaced twin's strip is its end frame, NOT_A_MOTION_WITNESS.)
+    capture-on copy of a speed arm, and the planner keeps it out of the measured matrix speed cells by this name. (UNPACED-VISUAL-MIDPLAY-CAPTURE-1, adversary r1 A2 and
+    pass 2 A3: the capture tail starts only after finishPlaybackSmokeTelemetry("visual-capture") has closed the measured session, and an unpaced Play does NOT keep playing
+    past the measured window: it holds its last required frame through the tail, so an unpaced twin's play captures are labelled with its end frame and its visual
+    verdict is NOT_A_MOTION_WITNESS unless an earlier one, CAPTURE_BLANK say, applies.)
     Judged on the RESOLVED spec's own identity (its legId and its file leaf), never on the spelling of the reference that reached it, and case-folded (Windows resolves
     `LEGS\X.JSON` to the file `legs/x.json`).
     #>
@@ -4333,14 +4334,19 @@ function Get-DvVisualVerdict {
     # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: one timeline position (or none) across the judged play frames witnesses no motion, whatever the pictures show.
     # r1 adversary A1: the reason says only what the JUDGED frames establish -- how many carry a frame number (-LabelledPlayFrames, when the caller
     # counted them), the one number they carry -- and never describes the whole strip (unjudged tiles, forced ones say, may carry other labels).
+    # r1 adversary pass 2 A1: the claim is about the LABELS (display_frame), never about the pictures: a picture may be an older paint than its label.
+    # Pass 2 A2: -LabelledPlayFrames counts only as a whole number in 0..PlayFrames (Get-DvFrameNumber; never a throw); anything else is not known, and
+    # an unknown count never reads as "all".
     if ($AppDistinctDisplayFrames -lt 2) {
         $sole = Get-DvFrameNumber $SoleDisplayFrame
-        $labelled = $(if ($null -ne $LabelledPlayFrames) { [int]$LabelledPlayFrames } else { $null })
+        $labelled = Get-DvFrameNumber $LabelledPlayFrames
+        if ($null -ne $labelled -and $labelled -gt $PlayFrames) { $labelled = $null }
         $frameText = $(if ($null -ne $sole) { "display frame $sole" } else { 'one display frame' })
-        $position = $(if ($AppDistinctDisplayFrames -le 0) { "none of the $PlayFrames judged play frames carries a display frame number: they name no timeline position" }
-                      elseif ($null -ne $labelled -and $labelled -lt $PlayFrames) { "$labelled of the $PlayFrames judged play frames carry $frameText and the other $($PlayFrames - $labelled) carry no display frame number: they name at most one timeline position" }
-                      else { "the $PlayFrames judged play frames all carry ${frameText}: they show one timeline position" })
-        return [pscustomobject]@{ verdict = 'NOT_A_MOTION_WITNESS'; counted = $true; reason = "${position} ($DistinctContentHashes distinct picture(s) among them), so the judged play frames cannot witness motion during playback (one known cause: an unpaced Play holds its last required frame through the capture tail)" }
+        $position = $(if ($AppDistinctDisplayFrames -le 0) { "none of the $PlayFrames judged play frames carries a valid display frame label: their labels name no timeline position" }
+                      elseif ($null -eq $labelled) { "the valid display frame labels among the $PlayFrames judged play frames all name ${frameText}: their labels name one timeline position at most" }
+                      elseif ($labelled -lt $PlayFrames) { "$labelled of the $PlayFrames judged play frames are labelled $frameText and the other $($PlayFrames - $labelled) carry no valid display frame label: their labels name one timeline position at most" }
+                      else { "all $PlayFrames judged play frames are labelled ${frameText}: their labels name one timeline position" })
+        return [pscustomobject]@{ verdict = 'NOT_A_MOTION_WITNESS'; counted = $true; reason = "${position} ($DistinctContentHashes distinct picture(s) among them), so they cannot witness motion during playback (one known cause: an unpaced Play holds its last required frame through the capture tail)" }
     }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
         return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them and the source frames are known to differ" }
