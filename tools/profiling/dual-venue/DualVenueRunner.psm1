@@ -7904,7 +7904,8 @@ function Get-DvReceiptTextDisplayPathFacts {
                    caller keeps what the parsed receipt object says (the text cannot say where a member sits) -- EXCEPT that text which was supplied
                    (non-empty) and could not be inspected is `unreadable`.
       unreadable-- R3-R2-RESIDUE-1 A1: non-empty text the strict System.Text.Json reader cannot inspect: not strict JSON (a comment, a trailing comma, more
-                   than its default depth of 64 -- ConvertFrom-Json reads 1024), a root that is not an object, or a walk that threw. Duplicate members cannot be
+                   than its default depth of 64 -- ConvertFrom-Json reads 1024), a root that is not an object, a walk that threw, or a name or string that
+                   cannot be read back (an escaped lone surrogate: Test-DvJsonTextReadable, the check Read-DvReceiptDisplayPath makes). Duplicate members cannot be
                    ruled out in such a text, so the validator types a PASS/FAIL receipt carrying it INVALID (DISPLAY_PATH_TEXT_UNREADABLE) and never takes the
                    parsed object's answer. Empty text is not unreadable: it is a caller that did not supply the text, and keeps today's reading.
       venueCount-- the `venue` members at the root, in any letter case (Test-DvMemberNameIs), a name written with a JSON \u escape for one of its letters included (the parser decodes it).
@@ -7932,6 +7933,9 @@ function Get-DvReceiptTextDisplayPathFacts {
             if ($blocks -gt 1) { $duplicate = $true }
         }
         $facts.parsed = $true; $facts.venueCount = $venues.Count; $facts.carries = $carries; $facts.duplicate = $duplicate
+        # luna r1l A1: the reader (Read-DvReceiptDisplayPath) also refuses a text holding any name or string that cannot be read back (an escaped lone surrogate), so the
+        # SAME check decides `unreadable` here. The member walk above skips such a name (it is neither `venue` nor `displayPath`), so carries / duplicate stay as they were.
+        $facts.unreadable = -not (Test-DvJsonTextReadable -Element $root)
     } catch { $facts = $unreadableFacts }
     finally { $doc.Dispose() }
     $facts

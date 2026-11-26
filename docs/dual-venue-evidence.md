@@ -759,7 +759,7 @@ case, is `INVALID` with `DISPLAY_PATH_DUPLICATE_MEMBER` (it fails closed); and `
 text holds a `displayPath` member, whatever else in the text is malformed. That rule looks only at the `venue` and `displayPath` member names, so a
 lone-surrogate string or member name elsewhere in the receipt owes no marker. A text that was supplied and that the strict reader cannot inspect
 (not strict JSON for `System.Text.Json` default options: a comment, a trailing comma, nesting deeper than 64, which `ConvertFrom-Json` reads up to 1024;
-or a root that is not an object) cannot be ruled free of a duplicate member, so a PASS / FAIL receipt carrying it is `INVALID` with
+or a root that is not an object, or any name or string that cannot be read back, an escaped lone surrogate) cannot be ruled free of a duplicate member, so a PASS / FAIL receipt carrying it is `INVALID` with
 `DISPLAY_PATH_TEXT_UNREADABLE`; the parsed object's own status is never the answer for it. The depth limit is not raised: the strict reader's grammar is
 the contract. A caller that omits `-ReceiptText` (or passes an empty one) is judged on the parsed object alone, as before.
 

@@ -921,6 +921,23 @@ class ResidueR1ReceiptTextTests(unittest.TestCase):
                     self.assertNotIn("threw", v, v)
                     self.assertEqual((v["marker"], v["dup"]), (0, 0), f"{case}|{rep}: {v}")
 
+    def test_r2_a1_a_name_or_string_the_strict_reader_cannot_read_back_makes_the_receipt_invalid(self) -> None:
+        """R3-R2-RESIDUE-1 A1 (luna r1l on f3bb16a5): the reader (Read-DvReceiptDisplayPath, Test-DvJsonTextReadable) refuses any name or string that cannot be
+        read back, so the validator's text reading must too: INVALID, DISPLAY_PATH_TEXT_UNREADABLE, whichever member holds the lone surrogate, and WITHOUT
+        changing the marker or duplicate answers above (the facts reader still skips the unreadable name when it looks for `venue` and `displayPath`)."""
+        for case in ("lone-surrogate-elsewhere-no-block", "lone-surrogate-in-a-name-no-block", "lone-surrogate-elsewhere-with-block"):
+            self.assertEqual(self.got[case]["state"], "malformed", case)
+            for rep, v in self.each_rep(case):
+                with self.subTest(f"{case}|{rep}"):
+                    self.assertNotIn("threw", v, v)
+                    self.assertEqual(v["status"], "INVALID")
+                    self.assertEqual(v["unreadable"], 1, f"{case}|{rep}: DISPLAY_PATH_TEXT_UNREADABLE reasons {v['unreadable']!r}")
+
+    def test_r2_a1_the_facts_reader_asks_the_readers_own_readability_check(self) -> None:
+        module = MODULE.read_text(encoding="utf-8")
+        facts = re.search(r"^function Get-DvReceiptTextDisplayPathFacts \{.*?^\}", module, re.S | re.M).group(0)
+        self.assertIn("Test-DvJsonTextReadable", facts, "one readability rule: the facts reader asks the check Read-DvReceiptDisplayPath asks")
+
     def test_a1_a_lone_surrogate_elsewhere_does_not_hide_a_block_that_is_there(self) -> None:
         for rep, v in self.each_rep("lone-surrogate-elsewhere-with-block"):
             with self.subTest(rep):
