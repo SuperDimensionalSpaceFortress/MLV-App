@@ -19794,6 +19794,11 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
         mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         calls = re.findall(r"Test-DvCriteria -Criteria \$criteria -Metrics ([^\r\n]+)", leg + "\n" + mod)
+        # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r2 hoisted the leg's argument into $criteriaMetrics (Get-DvTailCreditDetail reads it too): follow the
+        # one assignment, so a call site that judges anything but the criteria metrics still fails here
+        hoisted = re.findall(r"^\s*\$criteriaMetrics = ([^\r\n]+)", leg, re.MULTILINE)
+        self.assertEqual(len(hoisted), 1, hoisted)
+        calls = [hoisted[0] if c == "$criteriaMetrics" else c for c in calls]
         self.assertEqual([c.split(" -Visual ")[0] for c in calls], ["(Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback",
                                                                   "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived"], calls)   # + -Visual (Get-DvTailVisualEvidence ...): EveryFrameTailInFlightVsNeverPaintedTests
 
