@@ -2081,9 +2081,13 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
     # judged against E itself (_VERDICT_LATENCY_MS). The `cannot run out by L` pair runs to H and keeps the r4 allowance (_DERIVED_ALLOW_MS).
     _FITS_ALLOW_MS = 60000
     _DERIVED_ALLOW_MS = 16000
-    # the runner's chunk wait ends at E and the verdict poll starts there; 2000 ms is the host scheduling between the two (the merge base rejected a verdict
-    # 2400 ms after an E of 5000). The probe wait inside the poll is bounded by its own tests (test_probe_wait_is_bounded_by_the_remaining_budget...)
-    _VERDICT_LATENCY_MS = 2000
+    # The end-to-end bound on the verdict poll's start after E is a GROSS one. The tight guarantee (the chunk wait ends at E, so the poll starts there) is
+    # deterministic and lives in TheSilenceModelIsLaunchAnchored.test_the_chunk_wait_lands_on_the_expiry_and_never_passes_the_deadline (scripted launch stamps)
+    # plus the wiring pins on the runner's two chunk waits; the probe wait inside the poll in test_probe_wait_is_bounded_by_the_remaining_budget.... A real-clock
+    # bound tighter than the host's scheduling is a CI flake (adversary df44ab80 and 0f77ebcb: a caller descheduled across the last chunk for 2100 ms is a correct
+    # verdict, while sol r5 asked for 2400 ms after an E of 5000 to be rejected; no wall-clock reading separates the two). 5000 ms still rejects a loop that
+    # ends at the deadline, at L, or one chunk wait (4000 ms) past E, which is what the allowance had hidden.
+    _VERDICT_LATENCY_MS = 5000
 
     def _run(self, sample_ms: int, override_ms: int = 0, allow_ms: int = 6000, setup_ms: int = 0) -> dict:
         # r3 (adversary 77606b95 A2): the override is always set ("0" is no override: the harness reads it as [int]0), so a GS_OVERRIDE_MS inherited from
@@ -2157,7 +2161,12 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
                 "timedOut": True, "exitCode": 124, "alive": False}
         self._assert_fires_before_the_deadline(dict(base), "in time", hard=hard)
         self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=4600, loopEndMs=7100), "descheduled after the verdict", hard=hard)
-        for poll_start in (7400, 9000, hard - 1000):
+        # a caller descheduled across the last chunk (a poll that began 2100 ms, or 2500 ms, after E) is a correct verdict on a loaded host
+        for poll_start in (7100, 7500):
+            self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=poll_start, loopEndMs=poll_start + 50), "descheduled across the chunk", hard=hard)
+        # the deterministic guarantee that carries the tight sensitivity must still exist under the name this bound's comment cites
+        self.assertTrue(hasattr(TheSilenceModelIsLaunchAnchored, "test_the_chunk_wait_lands_on_the_expiry_and_never_passes_the_deadline"))
+        for poll_start in (10100, 20000, hard - 1000):
             with self.assertRaises(AssertionError, msg="a verdict poll that began %d ms after E was accepted" % (poll_start - 5000)):
                 self._assert_fires_before_the_deadline(dict(base, verdictPollStartMs=poll_start, loopEndMs=poll_start + 100), "late", hard=hard)
         with self.assertRaises(AssertionError, msg="a verdict a whole second before E was accepted"):
