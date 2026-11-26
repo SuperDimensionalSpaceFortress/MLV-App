@@ -5074,6 +5074,29 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertLess(body.index("if ($censusClock.Elapsed.TotalMilliseconds -ge $TimeoutSec * 1000.0) { return"), body.index("[Diagnostics.Process]::Start($psi)"))
         self.assertIn("$timedOut = $(if (($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds) -le 0.0) { $true } else {", body)
 
+    def test_r2_residue_a3_no_early_record_scan_starts_past_the_bound_and_a2_no_one_ms_wait_floor(self) -> None:
+        """R2-RESIDUE r1 (sol A3, A2 on 96cbe079). A3: a 5 s call whose cold listing returns at about 4.85 s resumes with under 150 ms left; the early record is a scan with a 1 s CIM timeout, so
+        it must not start (the tree is unknown, an unconfirmed kill, and the kill is not held behind a scan that ends after the deadline). A2: the child's wait is never granted a 1 ms floor
+        once the allowance is spent (a root seen exiting 0.7 ms past the bound would read as a success): the grant is the whole milliseconds left, 0 being a poll."""
+        module = DV / "VenueChain.psm1"
+        proc = run_pwsh(["-Command",
+            "$ErrorActionPreference = 'Stop'\n"
+            f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
+            "& $m { function script:Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, [switch]$BaselineOnly) if ($BaselineOnly) { Start-Sleep -Milliseconds 4850; return @{ ([int64]4) = [int64]1 } }; "
+            "$global:rootScans++; [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } } }\n"
+            "$global:rootScans = 0; $exe = (Get-Process -Id $PID).Path\n"
+            "$r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 5 -CleanupWaitMs 1500\n"
+            "[ordered]@{ timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; rootScans = $global:rootScans } | ConvertTo-Json -Compress"], timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(got["timedOut"], got)
+        self.assertEqual(got["rootScans"], 0, f"no record scan starts with under 1.1 s of the allowance left: {got}")
+        self.assertFalse(got["killConfirmed"], f"an unrecorded tree is an unconfirmed kill: {got}")
+        venue = module.read_text(encoding="utf-8")
+        body = venue[venue.index("function Invoke-VenueBoundedProcess"):venue.index("function Get-VenueDriverScriptMissing")]
+        self.assertNotIn("[Math]::Max(1.0, [Math]::Floor($TimeoutSec", body, "the child's wait has no 1 ms floor past the allowance")
+        self.assertIn("[Math]::Max(0.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds))", body)
+
     def test_r2_sol_a3_a4_the_tree_is_recorded_before_the_bound_so_the_kill_is_at_the_bound(self) -> None:
         """sol r2 A3 on b428e461: a call granted 5 s or more records the tree one lead (2 s) BEFORE the bound, so the kill is not held behind a slow scan; a call granted less records it
         at the timeout (the earlier rule). Behavior: the fake snapshot reports when it ran."""

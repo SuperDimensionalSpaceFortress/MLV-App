@@ -1533,9 +1533,15 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         parts = got.split()
         self.assertEqual(parts[:3], ["False", "0", "True"], got)
         self.assertLess(int(parts[3]), 10, f"the cleanup waits are one 1 s budget, not 15 s each: {got}")
-        killed = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 6 -CleanupWaitMs 5000; "   # r2: 6 s granted, so the listing before the root and the record before the bound exist (under 5 s no census runs)
-                           "\"$($r.timedOut) $($r.killConfirmed)\"")
-        self.assertEqual(killed, "True True")
+        # A1-CLOCK-FREE-ANCESTRY-1 r2 residue (A5): the strict ancestry proof leaves an unrelated process that started after the root unproven (correct, fail closed), so on a busy host the
+        # clean-kill control read `True False`. Same route as r15's real-tree control: the real root runs, but the process LISTING is injected (the listing before the root, plus what descends
+        # from this harness); the module's proof is not widened.
+        from tools.repo_hygiene.test_dual_venue_export_leg import PROCESS_LISTING_FIXTURE
+        killed = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking\n" + PROCESS_LISTING_FIXTURE + f"$r =Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 6 -CleanupWaitMs 5000; "   # r2: 6 s granted, so the listing before the root and the record before the bound exist (under 5 s no census runs)
+                           "\"$($r.timedOut) $($r.killConfirmed) $global:fixtureScans\"")
+        parts = killed.split()
+        self.assertEqual(parts[:2], ["True", "True"], killed)
+        self.assertGreaterEqual(int(parts[2]), 3, f"the injected listing served the baseline, the snapshot and the wait: {killed}")
         text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
         self.assertIn("try { $p.Kill($true) } catch { $killErrored = $true }", body, "a tree kill that threw is recorded, not swallowed")

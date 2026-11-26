@@ -2076,10 +2076,12 @@ function Invoke-VenueBoundedProcess {
     if ($earlyRecord) {
         $leadWaitMs = $TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds - 2000.0
         if ($leadWaitMs -ge 1.0) { $exitedEarly = $p.WaitForExit([int][Math]::Floor($leadWaitMs)) }
-        if (-not $exitedEarly) { try { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -Baseline $script:VenueBaseline -OperationTimeoutSec 1 } catch { $tree = $null } }
+        # R2-RESIDUE r1 (sol A3 on 96cbe079): the record is a scan like the others: it starts only when its 1 s CIM timeout (and 100 ms of slack) still fits what is left of the allowance, read at the
+        # moment it is granted; a caller resumed at or past the bound launches no scan (the tree is then unknown, an unconfirmed kill, never a scan that delays the kill past the deadline).
+        if (-not $exitedEarly) { try { $earlyGrantSec = [int][Math]::Min(1.0, [Math]::Floor(($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds - 100.0) / 1000.0)); if ($earlyGrantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -Baseline $script:VenueBaseline -OperationTimeoutSec $earlyGrantSec } } catch { $tree = $null } }
     }
     # sol r2-b A2: a root seen exiting only after the call's allowance ran out is not a success: with no time left the run counts as timed out (the kill then reaches an exited root, or its tree)
-    $timedOut = $(if (($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds) -le 0.0) { $true } else { -not ($exitedEarly -or $p.WaitForExit([int][Math]::Max(1.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds)))) })
+    $timedOut = $(if (($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds) -le 0.0) { $true } else { -not ($exitedEarly -or $p.WaitForExit([int][Math]::Max(0.0, [Math]::Floor($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds)))) })   # R2-RESIDUE r1 (sol A2 on 96cbe079): never a 1 ms floor past the allowance; under 1 ms left the wait is a poll
     $killErrored = $false
     $treeGone = $true
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
