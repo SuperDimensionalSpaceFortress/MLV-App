@@ -1347,3 +1347,46 @@ TEST(PlaybackSlipHistogram, R3Iter1TheJumpCoversOnlyTheTravelAfterTheLandedCorre
     ASSERT_EQ( 2LL, t.slipsTotal );
     ASSERT_EQ( 4, t.startupCatchupFrames );
 }
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1 (adversary pass 10 A2 on 87a6d64b), its input: a pure repeat of
+// the first frame before the present that lands the correction does not spend the first present's jump. 10 corrected to 40 and
+// granted to 45 before the first present, which shows 10; a duplicate of 10; then 45 lands the correction. 87a6d64b booked the
+// jump's four frames (41..44) as four slips (m_presents == 3 passed neither first-present guard); they are startup catch-up.
+TEST(PlaybackSlipHistogram, R10ARepeatedFirstFrameKeepsTheFirstPresentsJumpForTheLanding)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 200.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 45 ) );
+    h.notePresent( r2Present( 10, 220.0, 45 ) );
+    h.notePresent( r2Present( 45, 250.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 260.0, 45 );
+    ASSERT_EQ( 0LL, s.slipsTotal );                                      // 87a6d64b: 4
+    ASSERT_EQ( 0, s.slipEvents );                                        // 87a6d64b: 1
+    ASSERT_EQ( 4, s.startupCatchupFrames );                              // 87a6d64b: 0
+    // the same shape without the repeat is unchanged (the second present lands it)
+    SlipHistogram once;
+    once.reset( 10, 24.0 );
+    once.setPlayStart( 0.0 );
+    once.noteTimelineCorrection( 40 );
+    once.noteTimelineMove( AdvancePath::DropTick, 45, 200.0, 5.0, 0.0 );
+    once.notePresent( r2Present( 10, 210.0, 45 ) );
+    once.notePresent( r2Present( 45, 250.0, 45, 1, true, 40 ) );
+    const Summary u = once.finish( 260.0, 45 );
+    ASSERT_EQ( 0LL, u.slipsTotal );
+    ASSERT_EQ( 4, u.startupCatchupFrames );
+    // a repeat AFTER the display moved closes the window as before: a later skip is a slip
+    SlipHistogram moved;
+    moved.reset( 10, 24.0 );
+    moved.noteTimelineMove( AdvancePath::DropTick, 13, 100.0, 3.0, 0.0 );
+    moved.notePresent( r2Present( 10, 110.0, 13 ) );                     // jump 11..12
+    moved.notePresent( r2Present( 13, 150.0, 13 ) );                     // spends the jump
+    moved.noteTimelineMove( AdvancePath::DropTick, 16, 190.0, 3.0, 0.0 );
+    moved.notePresent( r2Present( 13, 192.0, 16 ) );                     // a repeat of 13
+    moved.notePresent( r2Present( 16, 230.0, 16 ) );                     // 14..15 skipped
+    const Summary v = moved.finish( 240.0, 16 );
+    ASSERT_EQ( 2LL, v.slipsTotal );
+    ASSERT_EQ( 2, v.startupCatchupFrames );
+}

@@ -547,7 +547,16 @@ inline double normalizeDropFramePosition( double position, const CutRange & rang
     if( std::isnan( position ) ) return static_cast<double>( clampFrameIndex( firstFrameIndex( range ), totalFrames ) );
     const double top = static_cast<double>( std::max( totalFrames, 1 ) - 1 );
     const double bounded = std::max( 0.0, std::min( position, top ) );
-    return static_cast<double>( clampFrameIndex( static_cast<int>( bounded ), totalFrames ) );
+    const int repairedFrame = clampFrameIndex( static_cast<int>( bounded ), totalFrames );
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1 (adversary pass 10 A1 on 87a6d64b): a position ABOVE the
+    // cut that is still inside the clip keeps its fraction. advanceDropFrameTick corrects it (the Loop fold onto its own phase in
+    // the cut, or the non-Loop clamp onto the last frame), and the fold reads the phase, fraction included: a stale 100.9 with Cut
+    // Out lowered to 50 (Cut In 1) truncated to 100 folded onto 2 where its phase is 2.9. That is now the dispatch of every Drop
+    // Frame Loop tick (the outer last-frame branch no longer takes one). Outside the clip and below the cut the repair is unchanged.
+    if( position > static_cast<double>( lastFrameIndex( range ) ) && position == bounded
+     && static_cast<double>( repairedFrame ) == std::floor( bounded ) )
+        return bounded;
+    return static_cast<double>( repairedFrame );
 }
 
 // HFR-NATIVE-60FPS-FULLRES-1 r32 fix iteration 2 (adversary A1 + A2 on 03850f7b): whether MainWindow::playbackHandling's outer

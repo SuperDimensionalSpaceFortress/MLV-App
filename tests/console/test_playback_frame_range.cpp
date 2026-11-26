@@ -3453,8 +3453,9 @@ TEST( PlaybackConformDropFrame, R33B1TheGenuineOutOfRangeRepairIsKept )
     ASSERT_TRUE( out );
     // a trimmed cut: Cut Out moved below the playhead (500.3 > 459 + 1) is out; the repair clamps to the CLIP, as before, and the
     // drop-frame engine then corrects it into the cut (PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1: the
-    // outer last-frame branch no longer takes a Drop Frame Loop tick back to cut-in)
-    ASSERT_EQ( 500.0, normalizeDropFramePosition( 500.3, trimmed, 720, true, &out ) );
+    // outer last-frame branch no longer takes a Drop Frame Loop tick back to cut-in). r1 (adversary pass 10 A1 on 87a6d64b): above
+    // the cut and inside the clip the fraction is kept, so the engine's fold reads the start's whole phase (was 500.0)
+    ASSERT_EQ( 500.3, normalizeDropFramePosition( 500.3, trimmed, 720, true, &out ) );
     ASSERT_TRUE( out );
     ASSERT_FALSE( playback_frame_range::outerLastFrameBranchHandlesTick( 500, 460, true, true, true ) );
     // below the cut's first frame: out, truncated (the pre-r33 repair)

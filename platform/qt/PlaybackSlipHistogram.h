@@ -479,6 +479,7 @@ public:
             m_correctedAtFirstPresent = m_correctedFrames;
             m_correctionMovesAtFirstPresent = m_correctionMoves.size();
             m_timelineAdvanceSincePresent = 0;
+            m_firstPresentJumpOpen = true;   // r1 (adversary pass 10 A2): spent by the first later present that shows a move
             // The frames passed before the first present, plus whatever its own early advance jumped past the
             // next frame (the repaid wait for the first frame): never slips. r2: a correction is neither (both endpoints are
             // measured with the corrections they carry taken out).
@@ -509,6 +510,13 @@ public:
         m_pendingGrabMs = 0.0;
         const int advanced = m_timelineAdvanceSincePresent;
         m_timelineAdvanceSincePresent = 0;
+        // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1 (adversary pass 10 A2 on 87a6d64b): the first present's
+        // jump is spent on the first LATER present that moves the display or lands a correction, not on the second present. A pure
+        // repeat of the first frame (a duplicate request, no rebase) shows nothing of the jump, so it keeps the window open:
+        // first present 10 at timeline 45 (10 corrected to 40 before it), a repeat of 10, then 45 landing the correction booked the
+        // jump's four frames as four slips (m_presents == 3 passed neither guard) where they are startup catch-up.
+        const bool firstJumpWindow = m_firstPresentJumpOpen;
+        if( s.rebase || s.displayFrame != m_lastDisplayFrame ) m_firstPresentJumpOpen = false;
 
         // r2 (r1 adversary pass 2 A1): the presentation that lands a correction rebases the display endpoint to the correction's frame
         // (PlaybackSourceAdvanceTracker::noteRebase's rule, adversary pass 3 A1 on c4fa34c3: the frame itself, so travel 40 -> 45 is
@@ -526,7 +534,7 @@ public:
         // correction left the timeline at net travel C, so the interval's frames in the jump are the last min( jump, T1 - C - 1 ).
         // The rest was passed before the correction (10 -> 15, corrected to 40, first present 10 at 40: all four of 11..14) and
         // is startup catch-up of its own, never cover for the interval's skips 41..44.
-        if( s.rebase && m_presents == 2 && m_firstPresentJumpFrames > 0 )
+        if( s.rebase && firstJumpWindow && m_firstPresentJumpFrames > 0 )
         {
             long long cover = 0;
             if( m_correctionMovesLanded > 0 && m_correctionMovesLanded <= m_correctionMovesAtFirstPresent
@@ -552,7 +560,7 @@ public:
         else
         {
             slip = s.displayFrame - m_lastDisplayFrame - 1;
-            if( m_presents == 2 && m_firstPresentJumpFrames > 0 )
+            if( firstJumpWindow && m_firstPresentJumpFrames > 0 )
             {
                 const int catchup = std::min( slip, m_firstPresentJumpFrames );
                 slip -= catchup;
@@ -900,6 +908,7 @@ private:
     int m_timelineAtFirstPresent = 0;
     int m_startupCatchupFrames = 0;
     int m_firstPresentJumpFrames = 0;
+    bool m_firstPresentJumpOpen = false;   // r1 (adversary pass 10 A2): the first present's jump is not yet spent
     int m_timelineAdvanceSincePresent = 0;
     bool m_previousIntervalWasGap = false;
     int m_wraps = 0;

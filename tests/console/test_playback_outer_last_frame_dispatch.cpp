@@ -120,6 +120,39 @@ TEST( PlaybackOuterLastFrameDispatch, TerminalOneFrameCutHoldsWithNoLapAndNoTrac
     ASSERT_EQ( static_cast<int64_t>( 0 ), d.source.forwardSteps );
 }
 
+// Adversary pass 10 A1 on 87a6d64b: the play-path normalizer truncated a stale fractional start above the cut (100.9 -> 100) before
+// the engine folded it, so the fold lost the start's phase: Cut Out lowered from 200 to 50 under 100.9 landed at 2.192 (slider 2)
+// where the phase is 2.9 + 0.192 = 3.092 (slider 3) without conform, and at 0.192 where it is 0.9 + 0.192 = 1.092 with conform.
+TEST( PlaybackOuterLastFrameDispatch, AStaleFractionalStartAboveTheCutKeepsItsPhaseThroughTheNormalizer )
+{
+    const DropLoopDispatch plain = dispatchDropLoopTick( 200, 100, 100.9, 1, 50, false, 0.192 );
+    ASSERT_FALSE( plain.outerBranch );
+    ASSERT_TRUE( plain.corrected );
+    ASSERT_NEAR( 2.9, plain.correctedStart, 1e-9 );
+    ASSERT_NEAR( 3.092, plain.landing, 1e-9 );
+    ASSERT_NEAR( 0.192, plain.traceFrames, 1e-12 );
+    ASSERT_EQ( 0, plain.recorder.engineWraps );
+    ASSERT_EQ( 2, plain.recorder.engineCorrectionRecords.front().rebaseFrame );
+    const DropLoopDispatch conformed = dispatchDropLoopTick( 200, 100, 100.9, 1, 50, true, 0.192 );
+    ASSERT_FALSE( conformed.outerBranch );
+    ASSERT_TRUE( conformed.corrected );
+    ASSERT_NEAR( 0.9, conformed.correctedStart, 1e-9 );
+    ASSERT_NEAR( 1.092, conformed.landing, 1e-9 );
+    ASSERT_EQ( 0, conformed.recorder.engineWraps );
+    // the repair outside the clip and below the cut is unchanged: truncated, clamped to the clip
+    playback_frame_range::CutRange cut;
+    cut.cutIn = 1;
+    cut.cutOut = 50;
+    cut.valid = true;
+    ASSERT_EQ( 199.0, playback_frame_range::normalizeDropFramePosition( 250.7, cut, 200, false ) );
+    ASSERT_EQ( 100.9, playback_frame_range::normalizeDropFramePosition( 100.9, cut, 200, false ) );
+    playback_frame_range::CutRange late;
+    late.cutIn = 41;
+    late.cutOut = 50;
+    late.valid = true;
+    ASSERT_EQ( 10.0, playback_frame_range::normalizeDropFramePosition( 10.75, late, 200, false ) );
+}
+
 // Sibling sweep (the same dispatch): a playhead on the last frame (conform off) and one past it under conform are the engine's
 // too, so they fold through the contract rather than book an outer-branch lap. Normal mode and Loop off keep the outer branch:
 // Normal mode has no drop-frame correction contract, and Loop off stops playback on the last frame.
