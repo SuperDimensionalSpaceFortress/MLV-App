@@ -198,8 +198,27 @@ function Invoke-ProofSummarizer {
         if (!(Test-Path -LiteralPath $jsonTemp -PathType Leaf)) {
             throw "JSON proof report generation exited with code $jsonExit and wrote no report at $JsonReport (the summary was refused)."
         }
+        # (adversary 698fffb1 A2: two packagers on one RunRoot share the final report names, so this run keeps its OWN bytes and hashes from the private temp files: the caller judges and packages
+        # those, never a re-read of the shared final path. The pair is published all or nothing, and a final report another packager replaced after this run published it is refused, not read.)
+        $markdownBytes = [IO.File]::ReadAllBytes($markdownTemp)
+        $jsonBytes = [IO.File]::ReadAllBytes($jsonTemp)
+        $markdownSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($markdownBytes)).ToLowerInvariant()
+        $jsonSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($jsonBytes)).ToLowerInvariant()
         Move-Item -LiteralPath $markdownTemp -Destination $MarkdownReport -Force
-        Move-Item -LiteralPath $jsonTemp -Destination $JsonReport -Force
+        try {
+            Move-Item -LiteralPath $jsonTemp -Destination $JsonReport -Force
+        }
+        catch {
+            if (Test-Path -LiteralPath $MarkdownReport -PathType Leaf) { Remove-Item -LiteralPath $MarkdownReport -Force -ErrorAction SilentlyContinue }
+            throw
+        }
+        foreach ($published in @(@($MarkdownReport, $markdownSha256), @($JsonReport, $jsonSha256))) {
+            $publishedSha256 = if (Test-Path -LiteralPath $published[0] -PathType Leaf) { (Get-FileHash -LiteralPath $published[0] -Algorithm SHA256).Hash.ToLowerInvariant() } else { '' }
+            if ($publishedSha256 -cne $published[1]) {
+                throw "The proof report $($published[0]) was replaced by another process after this run published it; refusing to package a report this run did not write."
+            }
+        }
+        $jsonText = [Text.UTF8Encoding]::new($false).GetString($jsonBytes).TrimStart([char]0xFEFF)
     }
     finally {
         foreach ($leftover in @($markdownTemp, $jsonTemp)) {
@@ -210,6 +229,9 @@ function Invoke-ProofSummarizer {
     [pscustomobject]@{
         markdownExitCode = $markdownExit
         jsonExitCode = $jsonExit
+        jsonText = $jsonText
+        markdownSha256 = $markdownSha256
+        jsonSha256 = $jsonSha256
     }
 }
 
@@ -263,7 +285,8 @@ $summarizerResult = Invoke-ProofSummarizer `
     -Summary $summaryFullPath `
     -MarkdownReport $ReportPath `
     -JsonReport $jsonReportPath
-$proofReportRaw = Get-Content -LiteralPath $jsonReportPath -Raw
+# (adversary 698fffb1 A2: the report this run judges is the text of the bytes it wrote, not a re-read of a path another packager may have replaced)
+$proofReportRaw = $summarizerResult.jsonText
 $proofReport = $proofReportRaw | ConvertFrom-Json -Depth 100
 
 $hostSafe = if ([string]::IsNullOrWhiteSpace([string]$summary.host.name)) {

@@ -757,6 +757,13 @@ else {
         reason = [string]$playbackAbFpsArmVerdict.reason
         detail = [string]$playbackAbFpsArmVerdict.detail
     }
+    # (adversary 698fffb1 A7: the arm gate judged these two legs; the compare that carries the fps must be measured on them, or the pair is refused like any other the gate refuses)
+    if (-not $playbackAbFpsArmRefusal.refused -and $playbackAbSpeedCompare -and $null -ne $playbackAbSpeedCompare.presentedFps) {
+        $playbackAbCompareProblem = Get-FpsCompareBindingProblem -Compare $playbackAbSpeedCompare -Baseline $playbackAb.baseline -Candidate $playbackAbCandidateLeg
+        if ($null -ne $playbackAbCompareProblem) {
+            $playbackAbFpsArmRefusal = [pscustomobject]@{ refused = $true; reason = "fps-verdict-refused:compare-not-judged-pair"; detail = [string]$playbackAbCompareProblem }
+        }
+    }
     if ($playbackAbFpsArmRefusal.refused) {
         # r5 (adversary A8): a packet written before this gate carries the wrapper's own "candidate-presented-fps-not-improved ..." failure, computed from an fps pair this gate now refuses. The proof-failure
         # loop above copied it into the blockers and a diagnostic before the arm was judged; it is not a finding about a refused pair, so it is taken back out here (every other failure stays).

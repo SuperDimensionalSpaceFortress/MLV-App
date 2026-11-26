@@ -41,7 +41,7 @@ $script:FpsLightArgs = @(
     New-FpsAllow '--seconds' 'next' 'num' -Required                     # :1483
     New-FpsAllow '--start-frame' 'next' 'int' -Required                 # :1487
     New-FpsAllow '--presented-frames' 'next' 'int'                      # :1490
-    New-FpsAllow '--drop-frame-mode' 'next' 'exact:persisted'           # :1493 (default :27)
+    New-FpsAllow '--drop-frame-mode' 'next' 'oneof:persisted|off'       # :1493 (default :27); R2-RESIDUE-1 r1 (698fffb1 A5): an unpaced leg (spec key unpaced) forwards -DropFrameMode off (job:6550) beside MLVAPP_PLAYBACK_UNPACED, a row below
     New-FpsAllow '--settle-ms' 'next' 'int' -Required                   # :1496
     New-FpsAllow '--settle-cpu-percent' 'next' 'num' -Required          # :1497
     New-FpsAllow '--settle-cpu-stable-ms' 'next' 'int' -Required        # :1501
@@ -56,6 +56,7 @@ $script:FpsLightArgs = @(
     New-FpsAllow '--gpu-amaze-texture-present' 'bare' ''                # :1531
     New-FpsAllow '--no-look-assist' 'bare' ''                           # :1534
     New-FpsAllow '--display-prefer' 'eq' 'text'                         # :1641 (the job forwards -DisplayPrefer, job:3105; producer cite, alias table in header)
+    New-FpsAllow '--windowed' 'bare' ''                                 # :1681 via -AdditionalArgs; R2-RESIDUE-1 r1 (698fffb1 A5): a windowed leg (spec key displayMode) passes it (job:6330); the display mode is the A/B variable of the display matrix, not a logger
 )
 # ENVIRONMENT (MLVAPP_* only; any other name is not the app's control surface). Names compare ignoring case (the Windows environment does).
 $script:FpsLightEnv = @(
@@ -64,7 +65,7 @@ $script:FpsLightEnv = @(
     New-FpsAllow 'MLVAPP_GPU_PLAYBACK_RECON_ELIGIBILITY_DIAG' 'env' 'exact:1'          # job:3029  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_CRASH_FORENSICS_LOG_DIR' 'env' 'text' -Required               # runner:1695 and :1717 (every launch sets it)  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_PLAYBACK_MAX_THREADS' 'env' 'int'                             # runner:1690  (producer cite, alias table in header)
-    New-FpsAllow 'MLVAPP_PLAYBACK_QUALITY_MODE' 'env' 'exact:phase3_hq'                # job:3049  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_QUALITY_MODE' 'env' 'oneof:phase3_hq|hq'            # job:3049; 'hq' is the spec key qualityMode on a cpu leg (job:421 ValidateSet, :5951)  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_PLAYBACK_PHASE3_UNATTENDED' 'env' 'exact:1'                   # runner:1700, job:3053  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_PLAYBACK_SCALE_FACTOR' 'env' 'int'                            # runner:1703  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_PLAYBACK_PREFER_HQ_MEAN23' 'env' 'exact:1'                    # runner:1706  (producer cite, alias table in header)
@@ -90,6 +91,19 @@ $script:FpsLightEnv = @(
     New-FpsAllow 'MLVAPP_PLAYBACK_UNPACED' 'env' 'exact:1'                             # job:6531  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_AUTOMATION_SETTINGS_DIR' 'env' 'text'                         # job:6392  (producer cite, alias table in header)
     New-FpsAllow 'MLVAPP_LOOK_ASSIST_FLAVOR' 'env' 'word'                              # job:6092  (producer cite, alias table in header)
+    # R2-RESIDUE-1 r1 (adversary 698fffb1 A5, 1ce472bc A6): the venue leg forwards these isolation / A/B arms from its spec for any leg (Invoke-VenueLeg.ps1:572-607), and the SPEC reader reads such a
+    # leg as LIGHT, so the launch reader must read the launch it emits as LIGHT too (a spec and its own launch that disagree admit a plan whose recorded run then fails the gate). Each is a decode,
+    # pacing or scheduling switch, not a logger or a sampler; each row carries the exact value domain the generator writes. Unknown stays UNKNOWN: a name or value not here is still refused.
+    New-FpsAllow 'MLVAPP_RAW_UINT16_PREFETCH_DECODERS' 'env' 'oneof:1|2|3|4'           # job:6126 (spec key rawPrefetchDecoders 1..4, ValidateRange -1..4)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_DISABLE_RAW_UINT16_PREFETCH' 'env' 'exact:1'                  # job:6126 (rawPrefetchDecoders 0)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_DISABLE_PREP_POINTWISE_FAST' 'env' 'exact:1'                  # job:6565 (spec key disablePrepPointwiseFast)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_PREP_CONFLATED_MOVE' 'env' 'exact:1'                 # job:6577 (spec key prepConflatedMove)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_GPU_RECON_RELEASE_DEFERRED' 'env' 'exact:0'                   # job:6589 (spec key disableReconReleaseDeferred)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_DUE_WAKE_DELIVERY' 'env' 'exact:post'                # job:6601 (spec key dueWakeDeliveryPost)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_RECON_OMP_THREADS' 'env' 'int'                       # job:6655 (spec key reconOmpThreads)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_PREP_OMP_THREADS' 'env' 'int'                        # job:6655 (spec key prepOmpThreads)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_PLAYBACK_RENDER_LOOKAHEAD_FRAMES' 'env' 'int'                 # job:6120 (spec key playbackRenderLookaheadFrames, a forced-look pace leg)  (producer cite, alias table in header)
+    New-FpsAllow 'MLVAPP_GPU_SAFE_START' 'env' 'exact:clear'                           # job:6416 (spec key gpuSafeStart, ValidateSet '' | clear)  (producer cite, alias table in header)
 )
 $script:FpsLightArgIndex = [System.Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 foreach ($row in $script:FpsLightArgs) { $script:FpsLightArgIndex[$row.name] = $row }
@@ -352,6 +366,26 @@ function Get-FpsArmFromJobResult {
     }
     if (Test-FaTextEq $arm 'HEAVY') { return New-FpsArm 'HEAVY' 'result' 'telemetryArm=HEAVY' }
     New-FpsArm 'UNKNOWN' 'result' 'telemetryArm-invalid (not LIGHT or HEAVY)'
+}
+
+function Get-FpsCompareBindingProblem {
+    # ENVELOPE-PREEMPT-R1-RESIDUE-1 / R2-RESIDUE-1 r1 (adversary 698fffb1 A7): the speed compare and the LIGHT legs the arm gate judged are separate inputs of the packet, so a verdict could be judged on
+    # one pair (a LIGHT candidateSpeed leg at 40 fps) and compared on another (the ordinary HEAVY candidate at 60 fps, +20 %). The compare's presentedFps baseline and candidate must be the very numbers
+    # the judged baseline leg and the judged candidate leg recorded (a finite number on each, equal). Returns the problem text, else $null.
+    param([AllowNull()]$Compare, [AllowNull()]$Baseline, [AllowNull()]$Candidate)
+    $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long]) -and [double]::IsFinite([double]$v) }
+    $leaf = { param($o, $n) if ($o -is [System.Collections.IDictionary]) { if ($o.Contains($n)) { , $o[$n] } else { $null } } elseif ($null -ne $o -and $null -ne $o.PSObject.Properties[$n]) { , $o.PSObject.Properties[$n].Value } else { $null } }
+    $metric = & $leaf $Compare "presentedFps"
+    foreach ($side in @(@("baseline", $Baseline), @("candidate", $Candidate))) {
+        $own = & $leaf $side[1] "presentedFps"
+        $compared = & $leaf $metric $side[0]
+        if (-not (& $isNumber $own)) { return "the judged $($side[0]) leg records no finite presentedFps, so the compare's $($side[0]) cannot be bound to it" }
+        if (-not (& $isNumber $compared)) { return "the compare's presentedFps $($side[0]) is not a finite number" }
+        if ([Math]::Abs([double]$compared - [double]$own) -gt (0.000001 * [Math]::Max(1.0, [Math]::Abs([double]$own)))) {
+            return "the compare's presentedFps $($side[0]) is $compared but the judged $($side[0]) leg measured $own"
+        }
+    }
+    $null
 }
 
 function Get-FpsArm {
@@ -780,4 +814,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Test-FpsProofReportSpeedQuotable, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-FpsCompareBindingProblem, Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Test-FpsProofReportSpeedQuotable, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
