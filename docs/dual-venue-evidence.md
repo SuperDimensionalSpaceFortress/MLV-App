@@ -556,6 +556,16 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
       (`debayered_frame`, `processing`, `processed16_cache_store`, `processed16_total`, `export_scale`, `export_pipe_write`) are one block per frame (A4). `%:` is read as
       `#` in `StageTiming.h` (A5). In `dualiso.c`, a preview with no regression sample (weight 0, so `a` and `b` are NaN) returns 0 before the rowscale: `NOT_APPLIED`,
       and the frame stays as decoded (A6).
+    * **r5: the render-decode mark (adversary `22d1a0a7` A1).** Position alone could not tell a cache thread's decode from the render's. Example: a frame whose only
+      decode is a cache thread's run, placed before the first write, read as its render. `video_mlv.c` now writes one `llrawproc_dual_iso_render ms=0.000` record
+      (`StageTiming.h` `MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER`) right after the outcome marker. It writes it for each `llrawproc` run made while the render's
+      `getMlvProcessedFrame16` entry is on the thread (a thread-local depth), and never for a cache thread's run. The reader rules on the mark:
+      * **What counts as a mark.** A 0.000 record that directly follows (among its frame's records) an outcome marker closing one `llrawproc` run of that frame, before
+        the frame's `processed16_total`. Anything else is `EXPORT_RECORD_INVALID`.
+      * **Outcome.** A frame's outcome is read from its marked runs only. The render decode starts at the frame's last `raw_uint16` before the first marked run.
+      * **Unmarked runs.** Every unmarked run is held to the marker rules, then set aside for the outcome and kept out of the sums, wherever it lies.
+      * **Missing mark.** When the log carries the applied signal, a frame its render closes with no marked run is `EXPORT_RECORD_INVALID: DUALISO_RENDER_MARK_MISSING`,
+        and the class is not read. A log from a build without the mark (`22d1a0a7` and earlier) is refused that way too, so its legs are re-run on a build that writes it.
     From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
     so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
     `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).

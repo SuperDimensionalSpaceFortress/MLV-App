@@ -4788,6 +4788,11 @@ $script:ExportDualIsoSignalMacro = 'MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED'
 $script:ExportDualIsoNotApplied = 'DUALISO_NOT_APPLIED'
 $script:ExportDualIsoOutcomeMixed = 'DUALISO_OUTCOME_MIXED'
 $script:ExportDualIsoOutcomeWindow = 'DUALISO_OUTCOME_WINDOW_MISMATCH'
+# r5 (adversary 22d1a0a7 A1): the render-decode mark (StageTiming.h MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER). video_mlv.c writes it as one 0.000 record right after the
+# outcome marker of each llrawproc run made inside the render's getMlvProcessedFrame16 entry, and never for a cache thread's run. A frame's outcome is read from its
+# MARKED runs only; when the log carries the applied signal, a frame the render closes with no marked run is refused (DUALISO_RENDER_MARK_MISSING).
+$script:ExportDualIsoRenderMark = 'llrawproc_dual_iso_render'
+$script:ExportDualIsoRenderMarkMissing = 'DUALISO_RENDER_MARK_MISSING'
 $script:ExportSuccessor = 'EXPORT-RENDER-PIPE-TIMING-1'
 $script:ExportRenderPipeOlderBuild = "a build before $($script:ExportSuccessor)"
 # r1 fix 1 (adversary A2 on 00a7cf09): the BASE reader's ProRes shape (2b796198), reproduced exactly for a receipt written before this card over old-format evidence
@@ -5729,6 +5734,7 @@ function Test-DvExportStageLogRecords {
     $prevByFrame = [hashtable]::new([StringComparer]::Ordinal)
     $tabled = [System.Collections.Generic.List[object]]::new()     # r4 fix 1: every tabled per-frame record, summed after the loop
     $llrFrames = [hashtable]::new([StringComparer]::Ordinal)       # r4 fix 1: the frames that carry any llrawproc record (any decode)
+    $renderMarkRecs = [System.Collections.Generic.List[object]]::new()   # r5: each render-decode mark with the record of its frame it follows
     $lineNo = 0
     foreach ($line in ($Text -split "`r?`n")) {
         $lineNo++
@@ -5754,6 +5760,7 @@ function Test-DvExportStageLogRecords {
                 if ($clipRecords.ContainsKey($s)) { $clipRecords[$s].Add([pscustomobject]@{ frame = $f; ms = $ms; msD = $msD; line = $lineNo }); continue }
                 $lastPerFrameLine = $lineNo   # (r2 fix 1, pass 4 A1: ANY per-frame record, a stage this reader does not table included; the producer writes none after the drain)
                 $seq.Add([pscustomobject]@{ stage = $s; frame = $f; line = $lineNo })   # (r2 fix 2, adversary A1 on c2da7e24: untabled stages are frame records too)
+                if ($s -ceq $script:ExportDualIsoRenderMark) { $renderMarkRecs.Add([pscustomobject]@{ frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $beforeSame }); continue }
                 if ($script:ExportDualIsoOutcomeWord.ContainsKey($s)) { $outcomeRecs.Add([pscustomobject]@{ stage = $s; frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $beforeSame }); continue }
                 if (-not $perStage.ContainsKey($s)) { continue }
                 # (r4, both r3 Bachelor legs on 04004b4e: the cache threads interleave frames, so a dual-ISO record is paired with the previous record OF ITS FRAME, as the
@@ -5780,6 +5787,27 @@ function Test-DvExportStageLogRecords {
     $isDecodeStage = { param($s) $s -ceq 'raw_uint16' -or $s.StartsWith('raw_uint16_', [StringComparison]::Ordinal) -or $s -ceq 'llrawproc' -or $s -ceq 'llrawproc_dual_iso' -or $script:ExportDualIsoOutcomeWord.ContainsKey($s) }
     $p16Line = [hashtable]::new([StringComparer]::Ordinal)
     foreach ($r in $seq) { if ($r.stage -ceq 'processed16_total' -and -not $p16Line.ContainsKey($r.frame)) { $p16Line[$r.frame] = $r.line } }
+    # r5 (adversary 22d1a0a7 A1: the reader could not tell a cache thread's decode from the render's own except by position, so a frame whose only decode is a
+    # cache thread's, placed before the first write, read as its render). video_mlv.c now writes the render-decode mark right after the outcome marker of each
+    # llrawproc run made inside the render's getMlvProcessedFrame16, and for no other run. A mark is the producer's only as a 0.000 record that directly follows
+    # (among its frame's records) an outcome marker which closes one llrawproc run of that frame (llrawproc, llrawproc_dual_iso, the marker), before that frame's
+    # first processed16_total. A valid mark names its run: the frame's outcome is read from marked runs only, and its render decode starts at the frame's last
+    # raw_uint16 before the first marked run's llrawproc record.
+    $markBad = [System.Collections.Generic.List[string]]::new()
+    $markRunLine = [hashtable]::new([StringComparer]::Ordinal)   # frame -> the llrawproc line of its first marked run
+    $markedOutcomeLines = @{}                                     # the outcome marker lines a valid mark follows
+    foreach ($mk in $renderMarkRecs) {
+        $at = "line $($mk.line) records $($script:ExportDualIsoRenderMark) for frame $($mk.frame)"
+        $o = $mk.after
+        $d = $(if ($null -ne $o) { $o.afterSame } else { $null })
+        $run = $(if ($null -ne $d) { $d.afterSame } else { $null })
+        if ($mk.msText -cnotmatch '\A0(?:\.0{1,9})?\z') { $markBad.Add("$at at $($mk.msText) ms; the render-decode mark is a 0.000 record, never a timing"); continue }
+        if ($null -eq $o -or -not $script:ExportDualIsoOutcomeWord.ContainsKey($o.stage) -or $o.frame -cne $mk.frame) { $markBad.Add("$at, which does not directly follow an outcome marker of that frame (among that frame's records)"); continue }
+        if ($null -eq $d -or $d.stage -cne 'llrawproc_dual_iso' -or $d.frame -cne $mk.frame -or $null -eq $run -or $run.stage -cne 'llrawproc' -or $run.frame -cne $mk.frame) { $markBad.Add("$at after an outcome marker (line $($o.line)) that does not close one llrawproc run of that frame (llrawproc, then llrawproc_dual_iso, then the marker)"); continue }
+        if (-not $p16Line.ContainsKey($mk.frame) -or $mk.line -gt $p16Line[$mk.frame]) { $markBad.Add("$at with no processed16_total of that frame after it; the mark is written only inside the render's getMlvProcessedFrame16, which the frame's processed16_total closes"); continue }
+        $markedOutcomeLines[$o.line] = $true
+        if (-not $markRunLine.ContainsKey($mk.frame)) { $markRunLine[$mk.frame] = $run.line }
+    }
     # (r4 fix 1, adversary 25ae968d A3: and the loop thread decodes frame N only after it wrote the frame before, so the render decode is the frame's last raw_uint16
     # AFTER the last pipe write that precedes its processed16_total. A frame whose decodes all lie before that write has none of its own render: every one of them
     # is an earlier decode's, its markers decide nothing (the frame then reads unmarked), and the frame is typed below.)
@@ -5791,6 +5819,8 @@ function Test-DvExportStageLogRecords {
     foreach ($r in $seq) {
         if ($r.stage -cne 'raw_uint16' -or -not $p16Line.ContainsKey($r.frame) -or $r.line -ge $p16Line[$r.frame]) { continue }
         $decodedBeforeP16[$r.frame] = $r.line
+        # (r5: a frame with a marked run starts its render decode at its last raw_uint16 before that run's llrawproc, never at a later decode's)
+        if ($markRunLine.ContainsKey($r.frame) -and $r.line -gt $markRunLine[$r.frame]) { continue }
         if ($r.line -gt $renderWindowFrom[$r.frame]) { $renderDecodeLine[$r.frame] = $r.line }
     }
     $noRenderDecode = @($decodedBeforeP16.Keys | Where-Object { -not $renderDecodeLine.ContainsKey($_) } | Sort-Object { [int64]$_ })
@@ -5814,7 +5844,25 @@ function Test-DvExportStageLogRecords {
         if (-not $renderDecodeLine.ContainsKey($r.frame) -or $r.line -ge $renderDecodeLine[$r.frame]) { continue }
         if ($r.stage -ceq 'llrawproc' -or $r.stage -ceq 'llrawproc_dual_iso' -or $script:ExportDualIsoOutcomeWord.ContainsKey($r.stage)) { $earlierEnd[$r.frame] = $r.line }
     }
-    $isEarlierDecode = { param($f, $line) $startupOnly.ContainsKey($f) -or ($earlierEnd.ContainsKey($f) -and $line -le $earlierEnd[$f]) }
+    # (r5, adversary 22d1a0a7 A1: in a log that carries render-decode marks, every UNMARKED llrawproc run is another decode's wherever it lies -- a cache thread's run
+    # of frame N after the render's own and before its processed16_total included. Such a run spans that frame's decode records from just after its previous run end
+    # (an outcome marker, a render-decode mark, or a record no decode writes) to its outcome marker, and none of it is summed into the render.)
+    $otherRunSpans = [hashtable]::new([StringComparer]::Ordinal)
+    if ($renderMarkRecs.Count -gt 0) {
+        $runStart = [hashtable]::new([StringComparer]::Ordinal)
+        foreach ($r in $seq) {
+            if ($script:ExportDualIsoOutcomeWord.ContainsKey($r.stage)) {
+                if (-not $markedOutcomeLines.ContainsKey($r.line)) {
+                    if (-not $otherRunSpans.ContainsKey($r.frame)) { $otherRunSpans[$r.frame] = [System.Collections.Generic.List[object]]::new() }
+                    $otherRunSpans[$r.frame].Add(@($(if ($runStart.ContainsKey($r.frame)) { $runStart[$r.frame] } else { 0 }), $r.line))
+                }
+                $runStart[$r.frame] = $r.line + 1
+            }
+            elseif ($r.stage -ceq $script:ExportDualIsoRenderMark -or -not (& $isDecodeStage $r.stage)) { $runStart[$r.frame] = $r.line + 1 }
+        }
+    }
+    $inOtherRun = { param($f, $line) if (-not $otherRunSpans.ContainsKey($f)) { return $false }; foreach ($sp in $otherRunSpans[$f]) { if ($line -ge $sp[0] -and $line -le $sp[1]) { return $true } }; $false }
+    $isEarlierDecode = { param($f, $line) $startupOnly.ContainsKey($f) -or ($earlierEnd.ContainsKey($f) -and $line -le $earlierEnd[$f]) -or (& $inOtherRun $f $line) }
     $earlierDecodeRecords = 0
     foreach ($t in $tabled) {
         if (& $isEarlierDecode $t.frame $t.line) { $earlierDecodeRecords++; continue }
@@ -5913,13 +5961,23 @@ function Test-DvExportStageLogRecords {
         if ($o.msText -cnotmatch $zeroMs) { $outcomeBad.Add("line $($o.line) records $($o.stage) at $($o.msText) ms; an outcome marker is a 0.000 record, never a timing"); continue }
         if ($script:ExportDualIsoOutcomeWord[$o.stage] -ceq 'not_attempted' -and $a.msText -cnotmatch $zeroMs) { $outcomeBad.Add("line $($o.line) records $($o.stage) for frame $($o.frame) after a $($a.msText) ms llrawproc_dual_iso record (line $($a.line)); llrawproc.c times dual-ISO only inside an attempt, so a timed run that did not attempt it is no producer outcome"); continue }
         $markedDualLines[$a.line] = $true
-        if (& $isEarlierDecode $o.frame $a.line) { $otherRunMarkers++; continue }
+        # (r5, adversary 22d1a0a7 A1: only a run the render marked decides its frame; every other run's marker -- a cache thread's, an open or receipt run's -- is
+        # held to every rule above and then set aside, wherever it lies in the stream)
+        if (-not $markedOutcomeLines.ContainsKey($o.line)) { $otherRunMarkers++; continue }
         $word = $script:ExportDualIsoOutcomeWord[$o.stage]
         $outcomes[$o.frame] = $(if (-not $outcomes.ContainsKey($o.frame) -or $outcomes[$o.frame] -ceq $word) { $word } else { 'mixed' })
     }
     if ($outcomeBad.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($outcomeBad.Count) dual-ISO outcome marker(s) are not the producer's (video_mlv.c writes exactly one 0.000 marker right after each llrawproc_dual_iso record, of its frame) (first: $($outcomeBad[0]))") }
     $outcomeUnmarked = [hashtable]::new([StringComparer]::Ordinal)
     if ($outcomeRecs.Count -gt 0) { foreach ($d in $dualRecs) { if (-not $markedDualLines.ContainsKey($d.line)) { $outcomeUnmarked[$d.frame] = $true } } }
+    if ($markBad.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($markBad.Count) render-decode mark(s) are not the producer's (video_mlv.c writes one 0.000 $($script:ExportDualIsoRenderMark) right after the outcome marker of each llrawproc run made inside the render's getMlvProcessedFrame16) (first: $($markBad[0]))") }
+    # (r5, adversary 22d1a0a7 A1, fail closed: a log that carries the applied signal comes from a build whose render marks its own run, so a frame the render closes
+    # with no marked run has no outcome of its own render. It is refused, typed, and never read from a cache thread's run.)
+    $markMissing = @()
+    if ($outcomeRecs.Count -gt 0) {
+        $markMissing = @($p16Line.Keys | Where-Object { -not $markRunLine.ContainsKey($_) } | Sort-Object { [int64]$_ })
+        if ($markMissing.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($script:ExportDualIsoRenderMarkMissing): $($markMissing.Count) frame(s) the render closes (processed16_total) carry the dual-ISO applied signal but no render-decode mark ($($script:ExportDualIsoRenderMark)) on any llrawproc run of their own, so no run of the frame is the render's and its outcome is not readable (first: frame $($markMissing[0]))") }
+    }
     # r2 fix 1 (adversary A2 on 2bd239b8): the frame loop (BatchRunner.cpp:541-567) renders a frame (processed16_total last), then scales it when the plan is scaled, then
     # writes it to the pipe, and only then starts the next frame, in rising order. When the log carries the pipe or scale stage, that sequence is held: no pipe write or scale
     # before its frame's processed16_total, no scale after its pipe write, no record of a frame after its pipe write, and each frame closed before the next one renders.
@@ -5970,8 +6028,8 @@ function Test-DvExportStageLogRecords {
         if ($null -ne $order) { $problems.Add("EXPORT_RECORD_INVALID: stage-timing.log is not in the frame loop's order (per frame: render, then export_scale, then export_pipe_write; the writes once each in rising frame order): $order") }
     }
     [pscustomobject]@{ perStage = $perStage; perStageD = $perStageD; clipRecords = $clipRecords; lastPerFrameLine = $lastPerFrameLine; problems = @($problems)
-                       outcomeRecords = $outcomeRecs.Count; outcomeInvalid = $outcomeBad.Count; outcomes = $outcomes; outcomeUnmarked = $outcomeUnmarked
-                       outcomeOtherRunMarkers = $otherRunMarkers }
+                       outcomeRecords = $outcomeRecs.Count; outcomeInvalid = $outcomeBad.Count + $markBad.Count; outcomes = $outcomes; outcomeUnmarked = $outcomeUnmarked
+                       outcomeOtherRunMarkers = $otherRunMarkers; renderMarks = $renderMarkRecs.Count; renderMarkMissing = $markMissing.Count }
 }
 
 function Get-DvExportEvidence {
