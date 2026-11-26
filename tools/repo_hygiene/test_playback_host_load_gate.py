@@ -17,6 +17,7 @@ fixture-driven unit level only. Everything is skipped cleanly when pwsh is not o
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -4043,6 +4044,80 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             self.assertEqual(before.read_text(encoding="utf-8"), QUIET_SMOKE, "the before input is untouched")
         cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn("if ($null -ne $inputIdentity -and [string]::Equals(", cmp, "neither alias check skips a null identity")
+
+    def test_r3_a1_pass2_an_input_swapped_for_a_link_to_the_report_since_the_early_check_is_refused_at_the_write(self) -> None:
+        # adversary-7efea617.json A1, its input: three distinct files; after the early check and before the write, before.json is replaced by a hard link to the
+        # existing report. RED: the write compared the report with the two HISTORICAL identities (read when the inputs were first opened), so it truncated and wrote
+        # the inode before.json now names. The write block runs here as extracted, after the swap; the current files are re-read through fresh handles.
+        cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        block = _extract_block(cmp, "    $outBytes = [Text.UTF8Encoding]::new($false).GetBytes($json", "    finally { $outStream.Dispose() }", trailing_lines=0)
+        with tempfile.TemporaryDirectory(prefix="residue-r3-a1b-") as tmp:
+            before, after, report = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "report.json"
+            for p in (before, after, report):
+                p.write_text("{}", encoding="utf-8", newline="")
+            script = Path(tmp) / "write.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n" + _extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity"]) +
+                f"$beforeJsonPath = '{before}'; $afterJsonPath = '{after}'; $resolvedOutput = '{report}'; $json = '{{\"report\":true}}'\n"
+                "function Get-Identity([string]$Path) { $s = [IO.FileStream]::new($Path, 'Open', 'Read', 'ReadWrite, Delete'); try { Get-SmokeFileIdentity -Stream $s -ResolvedPath $Path } finally { $s.Dispose() } }\n"
+                "$beforeSource = [pscustomobject]@{ identity = (Get-Identity $beforeJsonPath) }; $afterSource = [pscustomobject]@{ identity = (Get-Identity $afterJsonPath) }\n"
+                f"Remove-Item -LiteralPath '{before}'; New-Item -ItemType HardLink -Path '{before}' -Target '{report}' | Out-Null\n"
+                "try {\n" + block + "\nWrite-Output 'RESULT=WRITTEN' } catch { Write-Output ('RESULT=REFUSED ' + $_.Exception.Message) }\n",
+                encoding="utf-8")
+            proc = _run_ps_file(script)
+            self.assertEqual(report.read_text(encoding="utf-8"), "{}", "the report (now also before.json) is not truncated or written\n" + proc.stdout + proc.stderr)
+        self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("RESULT=WRITTEN", proc.stdout)
+
+    def test_r3_a3_a_one_element_candidate_list_is_provisional_not_unrolled_into_its_clean_member(self) -> None:
+        # adversary-7efea617.json A3, its input: candidate = [one clean leg]. RED: `$x = if (...) { $Record.candidate }` unrolled the one-element list into its
+        # member before the list guard, so the member's own clean standing counted and a +50 percent delta was published. A plain assignment keeps the list.
+        functions = _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Get-PlaybackAbLegHostLoadProvisional", "Get-PlaybackAbHostLoadRefusal"])
+        clean = '{"hostLoadState":"quiet","hostLoadProvisional":false,"hostLoadCollected":true}'
+        with tempfile.TemporaryDirectory(prefix="residue-r3-a3-") as tmp:
+            script = Path(tmp) / "refusal.ps1"
+            script.write_text(
+                functions +
+                f"$listed = '{{\"baseline\":{clean},\"candidate\":[{clean}]}}' | ConvertFrom-Json\n"
+                f"$plain = '{{\"baseline\":{clean},\"candidate\":{clean}}}' | ConvertFrom-Json\n"
+                f"$speed = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"x\":1}},\"candidateSpeed\":[{clean}]}}' | ConvertFrom-Json\n"
+                "Write-Output ('LISTED=' + (Get-PlaybackAbHostLoadRefusal -Record $listed).provisional)\n"
+                "Write-Output ('PLAIN=' + (Get-PlaybackAbHostLoadRefusal -Record $plain).provisional)\n"
+                "Write-Output ('SPEED=' + (Get-PlaybackAbHostLoadRefusal -Record $speed).provisional)\n", encoding="utf-8")
+            proc = _run_ps_file(script)
+        self.assertIn("LISTED=True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("PLAIN=False", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("SPEED=True", proc.stdout, proc.stdout + proc.stderr)
+        summarizer = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("$playbackAbCandidateLeg = if (", summarizer)
+        self.assertIn("$playbackAbCandidateLeg = $playbackAb.candidate\n", summarizer)
+
+    def test_r3_a2_the_baseline_compares_the_receipt_it_reads_with_the_sha_the_leg_published(self) -> None:
+        # adversary-7efea617.json A2 (the r2 A4 blocker), its input: a receipt and its result.json replaced together after the chain read them. RED: the chain row
+        # carried no receipt sha, so the baseline hashed the replacement and used that hash as its own expectation. The chain row now carries receiptSha256 (the
+        # sha the child published) and Get-RowFigures refuses bytes that are not those; an empty published sha is refused too.
+        dv = ROOT / "tools" / "profiling" / "dual-venue"
+        chain = (dv / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        self.assertIn("receipt = $receipt; receiptSha256 = $receiptSha }", chain)
+        baseline = (dv / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
+        self.assertIn("-ExpectReceiptSha256 $(if ($null -ne $publishedSha) { $publishedSha } else { [string]$fig.receiptSha256 })", baseline)
+        with tempfile.TemporaryDirectory(prefix="residue-r3-a2b-") as tmp:
+            receipt = Path(tmp) / "r-1.json"
+            receipt.write_text('{"receiptId":"r-1","legId":"x"}', encoding="utf-8", newline="")
+            real = hashlib.sha256(receipt.read_bytes()).hexdigest()
+            script = Path(tmp) / "figures.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module '{dv / 'DualVenueRunner.psm1'}' -Force -DisableNameChecking\n" + _extract_functions(dv / "Invoke-VenueBaseline.ps1", ["Get-RowFigures"]) +
+                f"foreach ($pub in @('{'0' * 64}', '', '{real}'.ToUpperInvariant())) {{\n"
+                f"  try {{ $f = Get-RowFigures '{receipt}' ([pscustomobject]@{{ legId = 'x' }}) 'cuda' $pub; Write-Output ('PUB=[' + $pub.Substring(0, [Math]::Min(4, $pub.Length)) + '] IDENT=' + [bool]$f.identity + ' SHA=' + $f.receiptSha256) }}\n"
+                "  catch { Write-Output ('PUB=[' + $pub.Substring(0, [Math]::Min(4, $pub.Length)) + '] THREW=' + $_.Exception.Message.Substring(0, 20)) } }\n", encoding="utf-8")
+            proc = _run_ps_file(script)
+        lines = [l for l in proc.stdout.splitlines() if l.startswith("PUB=")]
+        self.assertEqual(len(lines), 3, proc.stdout + proc.stderr)
+        self.assertIn("[0000] IDENT=True", lines[0], lines[0])
+        self.assertIn("[] IDENT=True", lines[1], lines[1])
+        self.assertNotIn("IDENT=True", lines[2], "the receipt bytes the leg published are accepted past the sha check: " + lines[2])
 
     def test_r3_a2_a_soft_hyphen_in_an_outcome_token_or_an_evidence_name_is_not_the_writers(self) -> None:
         # adversary-fd0141e8.json A2, its input: outcome and export.verdict 'PA<U+00AD>SS', and (sibling) ordinary PASS tokens with evidence member

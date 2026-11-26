@@ -482,7 +482,10 @@ function Get-PlaybackAbHostLoadRefusal {
     # how $compare/$playbackComparisonBasis are chosen below).
     param([object]$Record)
 
-    $candidateLeg = if ($Record.speedCompare -and $Record.candidateSpeed) { $Record.candidateSpeed } else { $Record.candidate }
+    # adversary-7efea617.json A3: a plain assignment, never `$x = if (...) { $list }`: an if-expression's output unrolls a one-element list into its member,
+    # so the list guard of Get-PlaybackAbLegHostLoadProvisional never saw it and the member's own clean standing counted
+    $candidateLeg = $Record.candidate
+    if ($Record.speedCompare -and $Record.candidateSpeed) { $candidateLeg = $Record.candidateSpeed }
     $baselineProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $Record.baseline
     $candidateProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $candidateLeg
     [pscustomobject]@{

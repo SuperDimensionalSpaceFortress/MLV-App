@@ -656,11 +656,9 @@ else {
     # host load at all. Check the relevant legs' hostLoadProvisional independently, defaulting a
     # missing/absent property to provisional (fail toward provisional, same stance as every other
     # reader in this card).
-    $playbackAbCandidateLeg = if ($playbackAbComparisonBasis -eq "candidateSpeed") {
-        $playbackAb.candidateSpeed
-    } else {
-        $playbackAb.candidate
-    }
+    # adversary-7efea617.json A3: a plain assignment, never `$x = if (...) { $list }` (an if-expression unrolls a one-element list into its member, past the list guard)
+    $playbackAbCandidateLeg = $playbackAb.candidate
+    if ($playbackAbComparisonBasis -eq "candidateSpeed") { $playbackAbCandidateLeg = $playbackAb.candidateSpeed }
     $playbackAbHostLoadLegs = @(
         [pscustomobject]@{ Name = "baseline"; Leg = $playbackAb.baseline },
         [pscustomobject]@{ Name = $playbackAbComparisonBasis; Leg = $playbackAbCandidateLeg }

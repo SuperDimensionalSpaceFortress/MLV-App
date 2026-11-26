@@ -573,7 +573,9 @@ foreach ($leg in $plan) {
                 $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 # a FOREIGN_FLOOR early exit in ANY probe of the leg (either phase, any attempt, GATE_BUSY retries included) leaves it contended: a later QUIET reading never promotes it to a counted class
                 $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET' -or $legPreFF -or $legReFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })
-                $ranExtra = @{ verdict = $re.verdict; quietMean = $re.mean; preClaimVerdict = $pre.verdict; preClaimMean = $pre.mean; preLoadMean = $preLoad; class = $class; hostLoadState = [string]$hl.state; hostLoadProvisional = [bool]$hl.provisional; preClaimForeignFloor = $legPreFF; underClaimForeignFloor = $legReFF; outcome = $outcome; legExit = $legCode; receipt = $receipt }
+                $ranExtra = @{ verdict = $re.verdict; quietMean = $re.mean; preClaimVerdict = $pre.verdict; preClaimMean = $pre.mean; preLoadMean = $preLoad; class = $class; hostLoadState = [string]$hl.state; hostLoadProvisional = [bool]$hl.provisional; preClaimForeignFloor = $legPreFF; underClaimForeignFloor = $legReFF; outcome = $outcome; legExit = $legCode; receipt = $receipt; receiptSha256 = $receiptSha }
+                # adversary-7efea617.json A2: the sha256 the leg PUBLISHED for its receipt (DVE_RECEIPT_SHA256, the one the host-load read above is bound to) travels in the
+                # chain row ('' when the child printed none), so a consumer that re-reads the receipt later compares those bytes with it and never with its own read
                 if ($legPreFF) { $ranExtra['preClaimForeignFloorLine'] = $legPreFFLine }
                 if ($legReFF) { $ranExtra['underClaimForeignFloorLine'] = $legReFFLine }
                 if ($detail) { $ranExtra['outcomeDetail'] = $detail }

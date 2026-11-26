@@ -1363,6 +1363,19 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         foreach ($inputIdentity in @($beforeSource.identity, $afterSource.identity)) {
             if ($null -eq $inputIdentity -or [string]::Equals([string]$inputIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
         }
+        # adversary-7efea617.json A1: the identities above were read when the inputs were first opened, and both input handles are long closed. An input path
+        # swapped for a hard link to the report since then (a second process, between the early check and this write) is the report. So the CURRENT file each
+        # input path names is opened again here, through a fresh handle, and judged by the same identity; one that cannot be read is refused, nothing truncated.
+        foreach ($currentLeg in @([pscustomobject]@{ Name = 'before'; Path = $beforeJsonPath }, [pscustomobject]@{ Name = 'after'; Path = $afterJsonPath })) {
+            $currentStream = $null
+            try {
+                $currentStream = [IO.FileStream]::new($currentLeg.Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                $currentIdentity = Get-SmokeFileIdentity -Stream $currentStream -ResolvedPath $currentLeg.Path
+            }
+            catch { throw "Output refused: the current file identity of the $($currentLeg.Name) smoke JSON could not be read at the write ($($_.Exception.Message -replace '\s+', ' ')); nothing was written." }
+            finally { if ($null -ne $currentStream) { $currentStream.Dispose() } }
+            if ([string]::Equals([string]$currentIdentity, $outIdentity, [StringComparison]::Ordinal)) { throw "Output must not overwrite either smoke JSON input." }
+        }
         $outStream.SetLength(0)
         $outStream.Write($outBytes, 0, $outBytes.Length)
     }
