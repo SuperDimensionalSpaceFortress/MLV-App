@@ -4314,6 +4314,30 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         block = _extract_report_write_block(COMPARE_SCRIPT.read_text(encoding="utf-8"))
         self.assertNotIn("New-Item -ItemType Directory -Force", block, "no -Force mkdir: a level that already exists is not claimed")
 
+    @requires_windows_pwsh
+    def test_r4n2_p3_a1_the_cleanup_never_removes_a_folder_another_process_put_under_the_same_name(self) -> None:
+        # adversary-d10f5241.json A1, its input: after this call made the report folder `new`, a second process renames it aside (new-moved) and makes an EMPTY folder of its own at `new`, then the
+        # write is refused. RED on d10f5241: the cleanup removed by the recorded path and deleted the other process's empty `new`. Each level is now remembered with the creation time of the
+        # folder this call made, and the cleanup skips a folder whose creation time is not that one. (The folder that was renamed aside is out of reach by path and is left, empty.)
+        with tempfile.TemporaryDirectory(prefix="r4n2-p3a1-") as tmp:
+            before, after = Path(tmp) / "before.json", Path(tmp) / "after.json"
+            for p in (before, after):
+                p.write_text("{}", encoding="utf-8", newline="")
+            out = Path(tmp) / "out"
+            out.mkdir()
+            new = out / "new"
+            pre = (
+                "$script:swapped = $false; $script:madeDir = $null\n"
+                "function New-Item { $r = Microsoft.PowerShell.Management\\New-Item @args; if ($null -eq $script:madeDir) { $script:madeDir = $r.FullName }; $r }\n"
+                # the swap happens at the first existence probe AFTER the call made (and recorded) its folder: the report path's own Test-Path
+                "function Test-Path { param([string]$LiteralPath, [string]$PathType) if ($null -ne $script:madeDir -and -not $script:swapped -and $PathType -eq 'Leaf') { $script:swapped = $true; Start-Sleep -Milliseconds 50; "
+                "Rename-Item -LiteralPath $script:madeDir -NewName 'new-moved'; Microsoft.PowerShell.Management\\New-Item -ItemType Directory -Path $script:madeDir | Out-Null }; Microsoft.PowerShell.Management\\Test-Path @PSBoundParameters }\n"
+                f"Remove-Item -LiteralPath '{before}'\n")
+            proc = _run_ps_file(_report_write_probe(tmp, before, after, new / "report.json", new, pre_block=pre))
+            self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
+            self.assertTrue(new.is_dir(), "the folder the other process made under the name is not this call's to remove\n" + proc.stdout + proc.stderr)
+            self.assertTrue((out / "new-moved").is_dir())
+
     @requires_pwsh
     def test_r4n2_p2_a6_a_smoke_file_the_figure_parser_refused_leaves_no_clean_host_load_standing(self) -> None:
         # adversary-ac722a96.json A6, its input: Before holds a quiet hostLoad and {"extra":{"x":1,"X":2}} (members differing only in case: the figure parser refuses the text), After a

@@ -1408,7 +1408,9 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
             if ($null -ne $linkComponent) { throw "Output refused: the $($linkCheck.Name) path has a reparse-point (symlink or junction) component ($linkComponent), so a swap of it for a link to the report cannot be ruled out; nothing was written." }
         }
         foreach ($level in $missingDirs) {
-            try { New-Item -ItemType Directory -Path $level -ErrorAction Stop | Out-Null; $createdDirs.Add($level) }
+            # adversary-d10f5241.json A1: each level this call made is remembered WITH the creation time of the folder it made, so the cleanup removes that folder and never a different empty
+            # folder another process later put under the same name (a rename-aside plus a new mkdir keeps the path and changes the creation time)
+            try { New-Item -ItemType Directory -Path $level -ErrorAction Stop | Out-Null; $createdDirs.Add("$([IO.Directory]::GetCreationTimeUtc($level).Ticks)|$level") }
             catch { if (-not (Test-Path -LiteralPath $level -PathType Container)) { throw } }   # a level that exists now was made by someone else: not ours
         }
         # a report that already exists is judged by its handle identity (read-only, nothing truncated); an input that IS it is refused before anything is written
@@ -1460,7 +1462,8 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         if (-not $wroteOutput) {
             # only the folder levels whose own creation this call succeeded (deepest first) are removed, and only while each is empty (a file another process put there is never ours to delete)
             for ($levelIndex = $createdDirs.Count - 1; $levelIndex -ge 0; $levelIndex--) {
-                try { if (@(Get-ChildItem -LiteralPath $createdDirs[$levelIndex] -Force -ErrorAction Stop).Count -eq 0) { Remove-Item -LiteralPath $createdDirs[$levelIndex] -Force -ErrorAction Stop } else { break } } catch { break }
+                $levelPath = $createdDirs[$levelIndex].Substring($createdDirs[$levelIndex].IndexOf('|') + 1)
+                try { if ("$([IO.Directory]::GetCreationTimeUtc($levelPath).Ticks)|$levelPath" -cne $createdDirs[$levelIndex]) { break }; if (@(Get-ChildItem -LiteralPath $levelPath -Force -ErrorAction Stop).Count -eq 0) { Remove-Item -LiteralPath $levelPath -Force -ErrorAction Stop } else { break } } catch { break }
             }
         }
     }

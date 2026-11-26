@@ -769,6 +769,29 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertTrue(got["E"].startswith("THROWN") and "absolute end" in got["E"], p.stdout)
         self.assertTrue(got["F"].endswith("READ"), p.stdout)
 
+    def test_r4n2_p3_a2_an_answer_seen_after_the_absolute_deadline_is_never_acted_on(self) -> None:
+        # adversary-d10f5241.json A2, its input: Get-VenueLegHostLoad -CallDeadlineUtc <now+2 s>; the receipt read finishes; the caller is suspended (or the wall clock steps ten seconds) INSIDE the
+        # final result.json read, which then returns its bytes while the stopwatch still shows under a second. RED on d10f5241: the late-answer check read the stopwatch alone, the bytes were
+        # accepted and the leg read quiet, collected, non-provisional after its UTC deadline. The seam VenueTestPostReadDelayMs is that suspension (after the read answered, before the answer is
+        # judged): the standing is now unknown. Without the suspension the same call still reads quiet.
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            quiet = json.dumps({"hostLoad": QUIET})
+            sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            rid = "cdcdcdcd-cdcd-4dcd-8dcd-cdcdcdcdcdcd"
+            path = self.write_leg(Path(d), rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+            p = run_ps(
+                "$vc = Get-Module VenueChain; "
+                f"$a = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(2.5)); Write-Output ('A=' + $a.state + '/' + $a.provisional); "
+                "& $vc { $script:VenueTestPostReadDelayMs = 3000 }; "
+                f"$b = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(2.5)); Write-Output ('B=' + $b.state + '/' + $b.provisional); Write-Output ('BWHY=' + $b.reason); "
+                "& $vc { $script:VenueTestPostReadDelayMs = 0 }")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["A"], "quiet/False", p.stdout)
+        self.assertEqual(got["B"], "unknown/True", "an answer seen after the absolute deadline is not acted on: " + p.stdout)
+        self.assertIn("absolute end", got["BWHY"], p.stdout)
+
     def test_r2_pass2_a5_a7_a13_the_matrix_refuses_a_replaced_receipt_the_planner_refuses_a_duplicated_legtype_the_verdict_keeps_a_list(self) -> None:
         # adversary-b3d61554.json A5: the matrix drops the receipt whose bytes are not the ones the child published (as the baseline refuses them), so a replacement's outcome and
         # fps are never attributed to the planned leg. A7: a spec that declares legType twice is planned 'unknown', never 'export'. A13: the GUI verdict helper never unrolls a

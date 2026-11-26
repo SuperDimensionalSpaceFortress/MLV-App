@@ -1232,6 +1232,9 @@ $script:VenueTestFileReadDelayMs = 0
 # Test-only (VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2, adversary-6596e055.json A3): Invoke-VenueBoundedRead sleeps this many ms after it created the worker and gave it its script and
 # argument, right before the budget is looked at again and BeginInvoke runs, as a caller descheduled during worker setup does. Production leaves it 0.
 $script:VenueTestPreBeginDelayMs = 0
+# Test-only (VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2, adversary-d10f5241.json A2): Read-VenueFileBytesBounded sleeps this many ms after its read answered and before it judges the answer against
+# -EndUtc, as a caller suspended (or a wall clock stepped) inside the read does. Production leaves it 0.
+$script:VenueTestPostReadDelayMs = 0
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the worker of Read-VenueFileBytesBounded. It is handed the ABSOLUTE UTC end of the caller's budget (endUtcTicks, 0 = none) and
 # checks it before the existence probe and again before ReadAllBytes, so a read that was started in time still performs no I/O once the end has passed. (No apostrophe in the messages: this is single-quoted text.)
 $script:VenueFileReadWorkerText = 'param($a) $ErrorActionPreference = ''Stop''; if ($a.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$a.delayMs) }; if ($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) { throw ''the call end had passed before the read started; no file was touched'' }; if ($a.missingOk -and -not (Test-Path -LiteralPath $a.path -PathType Leaf)) { return }; if ($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) { throw ''the call end passed during the existence probe; the file was not read'' }; ,[IO.File]::ReadAllBytes($a.path)'
@@ -1337,6 +1340,12 @@ function Read-VenueFileBytesBounded {
     $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd }
            else { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec })
     if (-not $r.answered) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: $($r.error)" }
+    # adversary-d10f5241.json A2: an answer is judged against the ABSOLUTE end when it is OBSERVED too, not only before the read starts: the late-answer check inside Invoke-VenueBoundedRead reads the
+    # stopwatch alone, so a wall clock stepped (or a caller suspended) inside the read let bytes seen after the caller's UTC deadline be acted on and a leg be counted
+    if ($PSBoundParameters.ContainsKey('EndUtc')) {
+        if ($script:VenueTestPostReadDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPostReadDelayMs) }
+        if ($EndUtc.ToUniversalTime().AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: an answer seen after the caller's absolute end is never acted on" }
+    }
     $got = @($r.value)
     if ($got.Count -eq 0) {
         if ($MissingIsNull) { return $null }

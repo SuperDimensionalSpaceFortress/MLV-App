@@ -440,7 +440,9 @@ class ExportPlanAndOutcomeTests(unittest.TestCase):
         original = (DV / "legs" / f"{name}.json").read_text(encoding="utf-8")
         variants = {"array": original.replace('"legType": "export"', '"legType": ["export"]'),
                     "soft-hyphen": original.replace('"legType": "export"', '"legType": "ex\\u00adport"'),
-                    "uppercase": original.replace('"legType": "export"', '"legType": "EXPORT"')}
+                    "uppercase": original.replace('"legType": "export"', '"legType": "EXPORT"'),
+                    # adversary-d10f5241.json A3: a present-but-null member is refused too (the child tests the property's presence, not a non-null value)
+                    "null": original.replace('"legType": "export"', '"legType": null')}
         twin_id = "m16-1243-export-prores-b"
         twin = json.loads(original)
         twin["legId"] = twin_id

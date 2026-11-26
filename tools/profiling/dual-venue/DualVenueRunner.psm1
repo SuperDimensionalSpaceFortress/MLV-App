@@ -2881,8 +2881,11 @@ function Get-DvLegSetPlan {
         }
         # adversary-ac722a96.json A5: the strict reader types ["export"] or "ex<soft hyphen>port" as playback, while the loose casts downstream took them for export. A legType that is present must be ONE string of the schema's
         # enum, compared ordinally (the rule Get-DvLegSpecShapeRefusal applies to a leg that runs), or the spec is refused here; and the cell is chosen from the strict planned type below, never from the raw member.
-        $rawLegType = Get-DvProp $spec 'legType'
-        if ($null -ne $rawLegType -and -not ($rawLegType -is [string] -and @($script:LegTypes | Where-Object { [string]::Equals([string]$_, $rawLegType, [StringComparison]::Ordinal) }).Count -eq 1)) {
+        # adversary-d10f5241.json A3: PRESENCE, not a non-null value, is what the child tests (Get-DvLegSpecShapeRefusal: the legType PROPERTY exists), so "legType": null is refused here too
+        $legTypeProp = $spec.PSObject.Properties['legType']
+        $rawLegType = $null
+        if ($null -ne $legTypeProp) { $rawLegType = $legTypeProp.Value }   # (a plain assignment: a $(if ...) would unroll a one-element array into its member)
+        if ($null -ne $legTypeProp -and -not ($rawLegType -is [string] -and @($script:LegTypes | Where-Object { [string]::Equals([string]$_, $rawLegType, [StringComparison]::Ordinal) }).Count -eq 1)) {
             throw "DVE_LEGSET_INVALID leg '$($spec.legId)' has a legType that is not one string of the schema's enum ($($script:LegTypes -join ', ')); a spec whose legType is an array, an object or a look-alike spelling is never planned"
         }
         $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256; plannedLegType = $specPlannedLegType })
