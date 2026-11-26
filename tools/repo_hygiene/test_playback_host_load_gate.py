@@ -2012,8 +2012,10 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
 
     def _record(
         self, baseline_provisional: bool, candidate_provisional: bool,
-        baseline_fps: float = 10.0, candidate_fps: float = 20.0, delta_pct: float = 100.0,
+        baseline_fps: float = 10.0, candidate_fps: float = 20.0, delta_pct: float = 100.0, published_delta: float | None = None,
     ) -> str:
+        # published_delta: what the compare publishes as delta when it is not candidate - baseline (a record whose figures do not follow from its endpoints)
+        delta = candidate_fps - baseline_fps if published_delta is None else published_delta
         baseline_leg = self._leg(baseline_provisional, presented_fps=baseline_fps)
         candidate_leg = self._leg(candidate_provisional, presented_fps=candidate_fps)
         return (
@@ -2022,7 +2024,7 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
             "hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
             f"baseline = {baseline_leg}; candidate = {candidate_leg}; candidateSpeed = $null; "
             "compare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ "
-            f"baseline = {baseline_fps}; candidate = {candidate_fps}; delta = {candidate_fps - baseline_fps}; deltaPercent = {delta_pct} }} }} }}"
+            f"baseline = {baseline_fps}; candidate = {candidate_fps}; delta = {delta}; deltaPercent = {delta_pct} }} }} }}"
         )
 
     def _row(self, record: str) -> subprocess.CompletedProcess:
@@ -2062,7 +2064,7 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DELTA= REASON=fps-verdict-refused:compare-not-judged-pair:", proc.stdout)
         # luna r1b A1 through the row: both legs 40 fps, the compare says delta 40 / +100 %
-        proc = self._row(self._record(False, False, baseline_fps=40.0, candidate_fps=40.0, delta_pct=100.0).replace("delta = 0.0;", "delta = 40.0;"))
+        proc = self._row(self._record(False, False, baseline_fps=40.0, candidate_fps=40.0, delta_pct=100.0, published_delta=40.0))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("DELTA= REASON=fps-verdict-refused:compare-not-judged-pair:", proc.stdout)
 

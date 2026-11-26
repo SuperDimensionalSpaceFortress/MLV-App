@@ -2,7 +2,9 @@ param(
     [string]$RepoRoot = ".",
     [string]$SummaryPath = "",
     [string]$Output = "",
-    [switch]$Json
+    [switch]$Json,
+    # R2-RESIDUE-1 r3 (sol 5add23cf A8): the packager hands the summarizer a private copy of the summary (the bytes it read once); the report names the summary it was made FROM, not the copy
+    [string]$SourceSummaryLabel = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -525,6 +527,7 @@ if (!(Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
 }
 
 $summaryFullPath = (Resolve-Path -LiteralPath $SummaryPath).Path
+$sourceSummaryShown = if ([string]::IsNullOrWhiteSpace($SourceSummaryLabel)) { $summaryFullPath } else { $SourceSummaryLabel }
 $summaryRaw = Get-Content -LiteralPath $summaryFullPath -Raw
 Assert-FpsJsonNoRepeatedKey $summaryRaw $summaryFullPath   # r14 (sol r13 B4, adversary r14 A2): a repeated key is refused, never collapsed to its last value
 $summary = $summaryRaw | ConvertFrom-Json -Depth 100
@@ -1128,7 +1131,7 @@ $actionPlan = New-ActionPlan `
 $report = [pscustomobject]@{
     schema = "mlvapp-local-cuda-proof-report.v1"
     createdAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-    sourceSummary = $summaryFullPath
+    sourceSummary = $sourceSummaryShown
     status = $overallStatus
     # r15 (adversary r14 pass 18 A6): the machine-readable claim gate; `status` stays the support gate
     claimAuthority = $claimAuthority
@@ -1165,7 +1168,7 @@ $lines = [System.Collections.Generic.List[string]]::new()
 [void]$lines.Add("")
 [void]$lines.Add("- Status: $($report.status)")
 [void]$lines.Add("- Speed claim authority: $(if ($claimAuthority.speed) { 'granted' } else { "none ($($claimAuthority.speedRefusal))" })")
-[void]$lines.Add("- Source summary: $summaryFullPath")
+[void]$lines.Add("- Source summary: $sourceSummaryShown")
 [void]$lines.Add("- Host: $($report.host.name)")
 [void]$lines.Add("- NVIDIA: $(if ($nvidiaRows.Count -gt 0) { $nvidiaRows -join '; ' } else { 'not reported' })")
 [void]$lines.Add("- Dry run: $dryRun")

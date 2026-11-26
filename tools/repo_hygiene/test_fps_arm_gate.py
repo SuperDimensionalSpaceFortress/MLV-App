@@ -2477,79 +2477,14 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         self.assertEqual(out["MEASURED_WITH_DELTA"], "True|")
         self.assertIn("-PlaybackSpeedVerdict $playbackAbVerdict -SpeedCompare $playbackAbSpeedCompare", SUMMARIZER_SCRIPT.read_text(encoding="utf-8"))
 
-    def test_p2_a5_packaging_never_reuses_a_report_an_earlier_run_left(self) -> None:
-        # adversary 8747fced A5: the summarizer refuses a repeated key BEFORE it writes, with exit 1 (the same code as NOT_QUOTABLE); the packager accepted exit 1 and read the stale passing report
-        # an earlier run had left at the same path. Both reports are removed first, and a run that writes none is a packaging error.
-        repo = self.tmp / "repo"
-        (repo / "tools" / "profiling").mkdir(parents=True)
-        fake = repo / "tools" / "profiling" / "summarize-local-cuda-proof.ps1"
-        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Get-RealFilePath", "Invoke-ProofSummarizer"])
-        md, js = self.tmp / "proof-report.md", self.tmp / "proof-report.json"
-        body = funcs + "\n"
-        for label, fake_body in (("REFUSES", "exit 1\n"),
-                                 ("WRITES", "param($RepoRoot, $SummaryPath, $Output, [switch]$Json)\n[IO.File]::WriteAllText($Output, 'fresh')\nexit 1\n")):
-            body += (f"[IO.File]::WriteAllText('{fake}', @'\n{fake_body}'@)\n"
-                     f"[IO.File]::WriteAllText('{md}', 'stale'); [IO.File]::WriteAllText('{js}', 'stale')\n"
-                     f"$msg = ''\n"
-                     f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary 's.json' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW'; $msg = $_.Exception.Message }}\n"
-                     f"$left = if (Test-Path -LiteralPath '{js}') {{ [IO.File]::ReadAllText('{js}') }} else {{ 'none' }}\n"
-                     f"Write-Host ('{label}=' + $res + '|' + $left)\n"
-                     f"Write-Host ('MSG_{label}=' + ($msg -replace '\\s', '_'))\n")
-        # adversary 0e9672e5 A2: the cleanup removes report FILES only; a directory given as the report path is kept (and the run is still a packaging error, no report was written)
-        keep = self.tmp / "keep"
-        body += (f"[IO.File]::WriteAllText('{fake}', 'exit 1')\n$null = New-Item -ItemType Directory -Path '{keep}'\n"
-                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary 's.json' -MarkdownReport '{keep}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
-                 f"Write-Host ('DIR=' + $res + '|' + (Test-Path -LiteralPath '{keep}' -PathType Container))\n")
-        out = dict(line.split("=", 1) for line in self.ok(body).split())
-        # hosted run 45786756378 (Linux): the thrown message is what names the cause, so a mismatch prints it
-        thrown = {key: out.pop(key) for key in [k for k in out if k.startswith("MSG_")]}
-        self.assertEqual(out, {"REFUSES": "THREW|none", "WRITES": "OK|fresh", "DIR": "THREW|True"}, thrown)
+    # (r3: adversary 8747fced A5 "packaging never reuses a report an earlier run left" is held by the end-to-end test_r3_sol_5add23cf_a7_...: the children write into this run's empty private directory, so
+    # no report an earlier run left can be taken, and a summarizer that refuses before writing is a packaging error that touches nothing. Adversary 0e9672e5 A2 (a directory as the report path) is held by
+    # test_r3_sol_5add23cf_pkg_report_paths_...)
 
-    def test_r2_adversary_1ce472bc_a1_a7_the_packager_keeps_its_input_and_publishes_only_its_own_reports(self) -> None:
-        # adversary 1ce472bc A1: -ReportPath next to the summary and named like it made the .json twin the summary, and the stale-report cleanup deleted the input before the first child read it.
-        # A7: a report another packager wrote at the same path between this run's two children was taken as this run's own, so each child now writes a name only this run knows.
-        repo = self.tmp / "repo"
-        (repo / "tools" / "profiling").mkdir(parents=True)
-        fake = repo / "tools" / "profiling" / "summarize-local-cuda-proof.ps1"
-        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Get-RealFilePath", "Invoke-ProofSummarizer"])
-        proof = self.tmp / "proof"
-        proof.mkdir()
-        summary, md, js, seen = proof / "summary.json", proof / "summary.md", proof / "summary-report.json", proof / "seen.txt"
-        body = funcs + "\n"
-        body += (f"[IO.File]::WriteAllText('{summary}', '{{\"input\":true}}')\n"
-                 f"[IO.File]::WriteAllText('{fake}', @'\nparam($RepoRoot, $SummaryPath, $Output, [switch]$Json)\n[IO.File]::AppendAllText('{seen}', $Output + \"`n\")\n[IO.File]::WriteAllText($Output, 'fresh')\nexit 0\n'@)\n"
-                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{md}' -JsonReport '{summary}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
-                 f"Write-Host ('ALIAS=' + $res + '|' + [IO.File]::ReadAllText('{summary}') + '|' + (Test-Path -LiteralPath '{seen}'))\n"
-                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
-                 f"Write-Host ('OWN=' + $res + '|' + [IO.File]::ReadAllText('{md}') + '|' + [IO.File]::ReadAllText('{js}') + '|' + [IO.File]::ReadAllText('{summary}'))\n"
-                 f"Write-Host ('LEFT=' + @(Get-ChildItem -LiteralPath '{proof}' -Filter '*.tmp').Count)\n")
-        # adversary 698fffb1 A1: a junction (a symlink off Windows) in front of the report path must not hide that the .json report IS the input summary
-        real, link = self.tmp / "real", self.tmp / "link"
-        long_md, long_js = proof / (("x" * 218) + ".md"), proof / (("x" * 218) + ".json")
-        body += (f"$null = New-Item -ItemType Directory -Path '{real}'; [IO.File]::WriteAllText('{real / 'summary.json'}', 'input')\n"
-                 f"$itemType = if ([IO.Path]::DirectorySeparatorChar -eq [char]92) {{ 'Junction' }} else {{ 'SymbolicLink' }}\n"
-                 f"$null = New-Item -ItemType $itemType -Path '{link}' -Target '{real}'\n"
-                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{real / 'summary.json'}' -MarkdownReport '{link / 'summary.md'}' -JsonReport '{link / 'summary.json'}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
-                 f"Write-Host ('LINK=' + $res + '|' + [IO.File]::ReadAllText('{real / 'summary.json'}'))\n"
-                 # adversary 698fffb1 A8: reports whose basenames are at the filesystem's limit (243 and 246 characters) still stage and publish
-                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{long_md}' -JsonReport '{long_js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
-                 f"Write-Host ('LONG=' + $res + '|' + (Test-Path -LiteralPath '{long_md}') + '|' + (Test-Path -LiteralPath '{long_js}'))\n")
-        out = self.ok(body).split()
-        self.assertEqual(out[0], 'ALIAS=THREW|{"input":true}|False')
-        self.assertEqual(out[1], "OWN=OK|fresh|fresh|{\"input\":true}")
-        self.assertEqual(out[2], "LEFT=0")
-        self.assertEqual(out[3], "LINK=THREW|input")
-        self.assertEqual(out[4], "LONG=OK|True|True")
-        names = [line.strip() for line in seen.read_text(encoding="utf-8").splitlines() if line.strip()]
-        self.assertEqual(len(names), 4)
-        for name, final in zip(names, (md, js)):
-            self.assertNotEqual(Path(name), final)
-            # hosted run 45812013587 (heavy 14/14): the packager resolves a directory by its REAL path (adversary 698fffb1 A1), which expands a Windows 8.3 short name (RUNNER~1 -> runneradmin) that
-            # the test's own temp path still spells short, so the two parents are compared by real path, not by spelling
-            self.assertEqual(os.path.realpath(Path(name).parent), os.path.realpath(final.parent))
-            self.assertRegex(Path(name).name, r"^[0-9a-f]{32}\.(md|json)\.tmp$")
-        packager = (PROFILING / "package-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
-        self.assertIn("$pwshExe = Join-Path $PSHOME $pwshLeaf", packager)
+    # (r3: adversary 1ce472bc A1 / A7 and 698fffb1 A1 / A8 (the input kept, each child writing a name only this run knows, a junction in front of the report, a report name at the filesystem's limit) are
+    # held end to end by test_r3_sol_5add23cf_pkg_report_paths_... and test_r3_sol_5add23cf_pkg_a_normal_run_...; the children's private names are asserted there)
+    def test_r2_packager_launches_its_summarizer_from_the_running_powershell(self) -> None:
+        self.assertIn("$pwshExe = Join-Path $PSHOME $pwshLeaf", (PROFILING / "package-local-cuda-proof-result.ps1").read_text(encoding="utf-8"))
 
     def test_r2_adversary_1ce472bc_a8_an_imported_speed_claim_needs_a_verified_proof_report_hash(self) -> None:
         # adversary 1ce472bc A8: a packet whose manifest listed no files (zero hash checks) published speedQuotable=true; the importer's own line now runs against each shape of file checks
@@ -2557,6 +2492,11 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         match = re.search(r"(?m)^\$speedHashBound = .*$", text)
         self.assertIsNotNone(match)
         line = match.group(0)
+        # sol 5add23cf A9: the spelling of the report's name is compared the way the volume compares names (the importer opened the file by that name), so the line is run with its own comparison
+        comparison = re.search(r"(?m)^\$nameComparison = .*$", text)
+        self.assertIsNotNone(comparison)
+        line = comparison.group(0) + "\n" + line
+        case_insensitive_volume = os.name == "nt"
         # sol c29f8dc1 A3 (importer sibling): the hash the manifest check verified (actualSha256) must be the hash of the bytes that were parsed ($proofReportJudgedSha256); a report replaced between the
         # read and the hash verifies a different file than the one judged. HASH_OF_OTHER_BYTES / NOTHING_JUDGED fail on c29f8dc1, which bound the check to the path alone.
         cases = {
@@ -2569,14 +2509,18 @@ class EnvelopePreemptR1ResidueTests(_Probe):
             "FAILED_IMPORT": ("1", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json'; actualSha256 = 'ab12' })", "'AB12'"),
             "HASH_OF_OTHER_BYTES": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json'; actualSha256 = 'ff00' })", "'AB12'"),
             "NOTHING_JUDGED": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json'; actualSha256 = 'ab12' })", "$null"),
+            # sol 5add23cf A9: the genuine report of a packet built with -ReportPath ...\Proof-Report.md is listed as Proof-Report.json; a different file never gains the authority
+            "GENUINE_CASE_VARIANT": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'Proof-Report.json'; actualSha256 = 'ab12' })", "'AB12'"),
+            "SUFFIXED": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'proof-report.json.bak'; actualSha256 = 'ab12' })", "'AB12'"),
+            "BELOW_A_FOLDER": ("0", "@([pscustomobject]@{ ok = $true; relativePath = 'old/proof-report.json'; actualSha256 = 'ab12' })", "'AB12'"),
         }
         body = ""
         for label, (failures, checks, judged) in cases.items():
             body += (f"$failures = [System.Collections.Generic.List[string]]::new(); if ({failures} -gt 0) {{ $failures.Add('x') }}\n"
                      f"$fileChecks = {checks}\n$proofReportJudgedSha256 = {judged}\n{line}\nWrite-Host ('{label}=' + $speedHashBound)\n")
         out = dict(item.split("=", 1) for item in self.ok(body).split())
-        self.assertEqual(out, {"VERIFIED": "True", "NO_CHECKS": "False", "OTHER_FILE": "False", "OTHER_CASE": "False", "HASH_WRONG": "False", "FAILED_IMPORT": "False",
-                               "HASH_OF_OTHER_BYTES": "False", "NOTHING_JUDGED": "False"})
+        self.assertEqual(out, {"VERIFIED": "True", "NO_CHECKS": "False", "OTHER_FILE": "False", "OTHER_CASE": str(case_insensitive_volume), "HASH_WRONG": "False", "FAILED_IMPORT": "False",
+                               "HASH_OF_OTHER_BYTES": "False", "NOTHING_JUDGED": "False", "GENUINE_CASE_VARIANT": str(case_insensitive_volume), "SUFFIXED": "False", "BELOW_A_FOLDER": "False"})
 
     def test_p2_a5_the_packager_launches_its_summarizer_by_a_path_and_a_name_that_exist_on_linux(self) -> None:
         # hosted run 45786756378 (ubuntu shard 3/4): Invoke-ProofSummarizer joined "tools\profiling\summarize-local-cuda-proof.ps1" (one file name on Linux, so "Proof summarizer not
@@ -2745,103 +2689,6 @@ class EnvelopePreemptR1ResidueTests(_Probe):
                                "sol-a1": "REFUSED", "sol-a2-tie": "REFUSED", "sol-a2-percent": "REFUSED", "sol-a2-percent-producer-rounded": "OK", "endpoint-off-by-ten-ppm": "REFUSED",
                                "sol2-a1-percent": "REFUSED", "sol2-a1-percent-producer": "OK", "sol2-a1-tiny-baseline": "REFUSED", "sol2-a2-tie": "REFUSED"})
 
-    def test_r2_adversary_698fffb1_a2_a_packager_publishes_and_reads_only_its_own_reports(self) -> None:
-        # adversary 698fffb1 A2: two packagers on one RunRoot share the final report names, so the packager re-read the published JSON and took another run's report as its own. It now keeps its own
-        # bytes (jsonText, the hashes), publishes the pair all or nothing, and refuses a final report that was replaced after it published.
-        repo = self.tmp / "repo"
-        (repo / "tools" / "profiling").mkdir(parents=True)
-        fake = repo / "tools" / "profiling" / "summarize-local-cuda-proof.ps1"
-        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Get-RealFilePath", "Invoke-ProofSummarizer"])
-        proof = self.tmp / "proof"
-        proof.mkdir()
-        summary, md, js = proof / "summary.json", proof / "proof-report.md", proof / "proof-report.json"
-        shadow_replace = ("function Move-Item { param([string]$LiteralPath, [string]$Destination, [switch]$Force); Microsoft.PowerShell.Management\\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force; "
-                          "if ($Destination -like '*.json') { [IO.File]::WriteAllText($Destination, '{\"who\":\"B\"}') } }\n")
-        shadow_fail = ("function Move-Item { param([string]$LiteralPath, [string]$Destination, [switch]$Force); if ($Destination -like '*.json') { throw 'sharing violation' }; "
-                       "Microsoft.PowerShell.Management\\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force }\n")
-        body = funcs + "\n"
-        body += (f"[IO.File]::WriteAllText('{summary}', '{{\"input\":true}}')\n"
-                 f"[IO.File]::WriteAllText('{fake}', @'\nparam($RepoRoot, $SummaryPath, $Output, [switch]$Json)\nif ($Json) {{ [IO.File]::WriteAllText($Output, '{{\"who\":\"A\"}}') }} else {{ [IO.File]::WriteAllText($Output, 'md-A') }}\nexit 0\n'@)\n"
-                 # (1) a rival packager replaces the published JSON right after this run published it: the run's own text is what it judges
-                 f"$r = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{md}' -JsonReport '{js}'\n"
-                 f"[IO.File]::WriteAllText('{js}', '{{\"who\":\"B\"}}')\n"
-                 "Write-Host ('OWN=' + $r.jsonText + '|' + $r.jsonSha256.Length + '|' + $r.markdownSha256.Length)\n"
-                 # (2) the rival's write lands between this run's publish and its check: refused, never read
-                 + shadow_replace +
-                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW:' + ($_.Exception.Message -match 'replaced') }}\n"
-                 "Write-Host ('REPLACED=' + $res)\nRemove-Item Function:\\Move-Item\n"
-                 # (3) the second move fails: the first report is not left published
-                 + shadow_fail +
-                 f"Remove-Item -LiteralPath '{md}', '{js}' -Force -ErrorAction SilentlyContinue\n"
-                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
-                 f"Write-Host ('ROLLBACK=' + $res + '|' + (Test-Path -LiteralPath '{md}'))\nRemove-Item Function:\\Move-Item\n")
-        out = self.ok(body).split()
-        self.assertEqual(out[0], 'OWN={"who":"A"}|64|64')
-        self.assertEqual(out[1], "REPLACED=THREW:True")
-        self.assertEqual(out[2], "ROLLBACK=THREW|False")
-        packager = (PROFILING / "package-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
-        self.assertIn("$proofReportRaw = $summarizerResult.jsonText", packager)
-        self.assertNotRegex(packager, r"\$proofReportRaw = Get-Content")
-
-    def test_r2_residue_r2_sol_c29f8dc1_a4_a_failed_publication_rolls_back_only_its_own_markdown(self) -> None:
-        # sol c29f8dc1 A4: A moved its Markdown, a rival published its own pair, A's JSON move then failed, and A's catch deleted the rival's Markdown (a leaf-existence check only). The rollback removes the
-        # file only while it is still this run's bytes.
-        repo = self.tmp / "repo"
-        (repo / "tools" / "profiling").mkdir(parents=True)
-        fake = repo / "tools" / "profiling" / "summarize-local-cuda-proof.ps1"
-        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Get-RealFilePath", "Invoke-ProofSummarizer"])
-        proof = self.tmp / "proof"
-        proof.mkdir()
-        summary, md, js = proof / "summary.json", proof / "proof-report.md", proof / "proof-report.json"
-        shadow_rival = (f"function Move-Item {{ param([string]$LiteralPath, [string]$Destination, [switch]$Force); if ($Destination -like '*.json') {{ [IO.File]::WriteAllText('{md}', 'md-B'); throw 'sharing violation' }}; "
-                        "Microsoft.PowerShell.Management\\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force }\n")
-        body = funcs + "\n"
-        body += (f"[IO.File]::WriteAllText('{summary}', '{{\"input\":true}}')\n"
-                 f"[IO.File]::WriteAllText('{fake}', @'\nparam($RepoRoot, $SummaryPath, $Output, [switch]$Json)\nif ($Json) {{ [IO.File]::WriteAllText($Output, '{{\"who\":\"A\"}}') }} else {{ [IO.File]::WriteAllText($Output, 'md-A') }}\nexit 0\n'@)\n"
-                 + shadow_rival +
-                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary '{summary}' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
-                 f"Write-Host ('RIVAL=' + $res + '|' + (Test-Path -LiteralPath '{md}') + '|' + $(if (Test-Path -LiteralPath '{md}') {{ [IO.File]::ReadAllText('{md}') }} else {{ 'GONE' }}))\n")
-        self.assertEqual(self.ok(body).split(), ["RIVAL=THREW|True|md-B"])
-        packager = (PROFILING / "package-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
-        self.assertNotRegex(packager, r"Remove-Item -LiteralPath \$MarkdownReport -Force -ErrorAction SilentlyContinue")
-
-    def test_r2_residue_r2_sol_c29f8dc1_a3_the_manifest_and_archive_carry_only_the_reports_this_run_wrote(self) -> None:
-        # sol c29f8dc1 A3: B replaced both reports after A's publication check and before A's manifest read, so A judged its own report but hashed and archived B's. The packager's report artifacts are
-        # bound to the hashes it wrote, and the reports are re-checked right before and right after the archive.
-        funcs = _extract_functions(PROFILING / "package-local-cuda-proof-result.ps1", ["Get-FileSha256", "Get-FileArtifact", "Assert-OwnedProofReports", "Get-OwnedReportArtifact"])
-        md, js = self.tmp / "proof-report.md", self.tmp / "proof-report.json"
-        body = funcs + (
-            f"[IO.File]::WriteAllText('{md}', 'md-A'); [IO.File]::WriteAllText('{js}', '{{\"who\":\"A\"}}')\n"
-            f"$own = [pscustomobject]@{{ markdownSha256 = (Get-FileHash -LiteralPath '{md}' -Algorithm SHA256).Hash.ToLowerInvariant(); jsonSha256 = (Get-FileHash -LiteralPath '{js}' -Algorithm SHA256).Hash.ToLowerInvariant() }}\n"
-            "function Try-It($block) { try { & $block; 'OK' } catch { 'THREW' } }\n"
-            f"Write-Host ('ASSERT-OWN=' + (Try-It {{ Assert-OwnedProofReports -MarkdownReport '{md}' -JsonReport '{js}' -Result $own }}))\n"
-            f"Write-Host ('ARTIFACT-OWN=' + (Try-It {{ $null = Get-OwnedReportArtifact -Path '{js}' -OwnedSha256 $own.jsonSha256 }}))\n"
-            f"Write-Host ('ARTIFACT-OWN-UPPER=' + (Try-It {{ $null = Get-OwnedReportArtifact -Path '{js}' -OwnedSha256 $own.jsonSha256.ToUpperInvariant() }}))\n"
-            f"[IO.File]::WriteAllText('{js}', '{{\"who\":\"B\"}}')\n"
-            f"Write-Host ('ASSERT-JSON-REPLACED=' + (Try-It {{ Assert-OwnedProofReports -MarkdownReport '{md}' -JsonReport '{js}' -Result $own }}))\n"
-            f"Write-Host ('ARTIFACT-JSON-REPLACED=' + (Try-It {{ $null = Get-OwnedReportArtifact -Path '{js}' -OwnedSha256 $own.jsonSha256 }}))\n"
-            f"Write-Host ('ARTIFACT-NO-OWNED-HASH=' + (Try-It {{ $null = Get-OwnedReportArtifact -Path '{md}' -OwnedSha256 '' }}))\n"
-            f"Remove-Item -LiteralPath '{md}' -Force\n"
-            f"Write-Host ('ASSERT-MD-GONE=' + (Try-It {{ Assert-OwnedProofReports -MarkdownReport '{md}' -JsonReport '{js}' -Result $own }}))\n")
-        got = dict(item.split("=", 1) for item in self.ok(body).split())
-        self.assertEqual(got, {"ASSERT-OWN": "OK", "ARTIFACT-OWN": "OK", "ARTIFACT-OWN-UPPER": "OK", "ASSERT-JSON-REPLACED": "THREW", "ARTIFACT-JSON-REPLACED": "THREW",
-                               "ARTIFACT-NO-OWNED-HASH": "THREW", "ASSERT-MD-GONE": "THREW"})
-        packager = (PROFILING / "package-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
-        self.assertIn("markdown = Get-OwnedReportArtifact -Path $ReportPath -OwnedSha256 $summarizerResult.markdownSha256", packager)
-        self.assertIn("json = Get-OwnedReportArtifact -Path $jsonReportPath -OwnedSha256 $summarizerResult.jsonSha256", packager)
-        self.assertNotIn("markdown = Get-FileArtifact -Path $ReportPath", packager)
-        call = "Assert-OwnedProofReports -MarkdownReport $ReportPath -JsonReport $jsonReportPath -Result $summarizerResult"
-        self.assertEqual(packager.count(call), 3)
-        archive = packager.index("Compress-Archive -Path")
-        self.assertLess(packager.index(call), packager.index("Write-JsonFile -Value ([pscustomobject]$manifest) -Path $manifestPath\n\nif ($DryRun)"))
-        before_archive = packager.rindex(call, 0, archive)
-        after_archive = packager.index(call, archive)
-        self.assertLess(before_archive, archive)
-        self.assertLess(archive, after_archive)
-        importer = (PROFILING / "import-local-cuda-proof-result.ps1").read_text(encoding="utf-8")
-        self.assertIn("$proofReportJudgedSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($proofReportBytes))", importer)
-        self.assertNotRegex(importer, r"\$proofReportRaw = Get-Content")
-
     # ---- BENCH-LIGHT-ARM-GAIN-GATES-1-R2-RESIDUE-1 r3 (sol 5add23cf A3, A4, A10) ----
 
     def test_r3_sol_5add23cf_a3_the_venue_default_visual_capture_dir_is_light_on_both_sides(self) -> None:
@@ -2923,6 +2770,238 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         }
         got = {name: self._binding(compare).split(" ", 1)[0] for name, (compare, _) in cases.items()}
         self.assertEqual(got, {name: want for name, (_, want) in cases.items()})
+
+    # ---- R2-RESIDUE-1 r3 (sol 5add23cf A5-A9): the packager and importer, run END TO END (the real scripts, a fake summarizer in a throwaway repo) ----
+
+    PACKAGER = PROFILING / "package-local-cuda-proof-result.ps1"
+    IMPORTER = PROFILING / "import-local-cuda-proof-result.ps1"
+    # The throwaway summarizer: it reads the summary it is given, writes a valid report that names the host and fps it read (so a test can see WHICH summary a child read), and behaves as the environment
+    # says (FAKE_REFUSE = exit 1 before writing; FAKE_SWAP_FIRST_CHILD / FAKE_SWAP_CONTENT = a rival replaces the ORIGINAL summary while the first child runs; FAKE_LOG = a line per call).
+    FAKE_SUMMARIZER = (
+        "param($RepoRoot, $SummaryPath, $Output, [switch]$Json, $SourceSummaryLabel)\n"
+        "$ErrorActionPreference = 'Stop'\n"
+        "if ($env:FAKE_LOG) { [IO.File]::AppendAllText($env:FAKE_LOG, ($SummaryPath + '|' + $Output + '|' + $SourceSummaryLabel + \"`n\")) }\n"
+        "if ($env:FAKE_REFUSE -eq '1') { exit 1 }\n"
+        "$s = [IO.File]::ReadAllText($SummaryPath) | ConvertFrom-Json\n"
+        "if ($env:FAKE_SWAP_FIRST_CHILD -and -not $Json) { [IO.File]::WriteAllText($env:FAKE_SWAP_FIRST_CHILD, $env:FAKE_SWAP_CONTENT) }\n"
+        "if ($Json) {\n"
+        "    $report = [ordered]@{ schema = 'mlvapp-local-cuda-proof-report.v1'; status = 'QUOTABLE_PASS'; claimAuthority = [ordered]@{ speed = $true }; playbackSpeed = [ordered]@{ status = 'PASS' }; topLevelStatus = 'PASS'; host = [string]$s.host.name; fps = [string]$s.fps; who = 'own'; blockers = @(); warnings = @(); diagnostics = @() }\n"
+        "    [IO.File]::WriteAllText($Output, ($report | ConvertTo-Json -Depth 8))\n"
+        "} else { [IO.File]::WriteAllText($Output, ('md host=' + $s.host.name + ' fps=' + $s.fps)) }\n"
+        "exit ([int]$env:FAKE_EXIT)\n")
+
+    def _pkg_fixture(self, host: str = "Dell", fps: int = 40) -> tuple[Path, Path, bytes]:
+        repo = self.tmp / "repo"
+        (repo / "tools" / "profiling").mkdir(parents=True, exist_ok=True)
+        (repo / "tools" / "profiling" / "summarize-local-cuda-proof.ps1").write_text(self.FAKE_SUMMARIZER, encoding="utf-8")
+        run = self.tmp / "run"
+        (run / "logs").mkdir(parents=True, exist_ok=True)
+        original = json.dumps({"schema": "mlvapp-local-cuda-playback-dng-smoke.v1", "status": "success", "host": {"name": host}, "fps": fps}).encode("utf-8")
+        (run / "summary.json").write_bytes(original)
+        (run / "logs" / "a.txt").write_text("log-a", encoding="utf-8")
+        return repo, run, original
+
+    def _package(self, repo: Path, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        full_env = dict(os.environ)
+        full_env.update(env or {})
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(self.PACKAGER), "-RepoRoot", str(repo), *args],
+                              capture_output=True, text=True, env=full_env, creationflags=_NO_WINDOW)
+
+    def _import(self, repo: Path, packet: Path, *args: str) -> dict:
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(self.IMPORTER), "-RepoRoot", str(repo), "-PacketPath", str(packet),
+                               "-DestinationRoot", str(self.tmp / "imported"), "-AllowRepoHeadMismatch", *args], capture_output=True, text=True, creationflags=_NO_WINDOW)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return json.loads(proc.stdout)
+
+    def _private_dirs(self) -> list[str]:
+        return sorted(p.name for p in self.tmp.iterdir() if p.name.startswith(".pkg-"))
+
+    def test_r3_sol_5add23cf_pkg_a_normal_run_packages_exactly_the_bytes_it_hashed_and_leaves_nothing_behind(self) -> None:
+        # the whole packet from one structure: the archive, the manifest's hashes and the published reports all describe the same bytes, and the private directory is gone
+        import hashlib, zipfile
+        repo, run, original = self._pkg_fixture()
+        packet = self.tmp / "out" / "packet.zip"
+        log = self.tmp / "children.log"
+        proc = self._package(repo, "-RunRoot", str(run), "-PacketPath", str(packet), env={"FAKE_LOG": str(log)})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        manifest = json.loads(proc.stdout)
+        sha = lambda data: hashlib.sha256(data).hexdigest()
+        with zipfile.ZipFile(packet) as archive:
+            names = sorted(archive.namelist())
+            self.assertEqual(names, ["local-cuda-proof-packet-manifest.json", "logs/a.txt", "proof-report.json", "proof-report.md", "summary.json"])
+            carried = {name: archive.read(name) for name in names}
+        listed = {entry["relativePath"]: entry["sha256"].lower() for entry in manifest["files"]}
+        self.assertEqual(sorted(listed), ["logs/a.txt", "proof-report.json", "proof-report.md", "summary.json"])
+        for name, digest in listed.items():
+            self.assertEqual(sha(carried[name]), digest, name)
+        self.assertEqual(carried["summary.json"], original)
+        # the published files are the same bytes the packet carries, the manifest is the published one, and no private directory is left
+        self.assertEqual((run / "proof-report.json").read_bytes(), carried["proof-report.json"])
+        self.assertEqual((run / "proof-report.md").read_bytes(), carried["proof-report.md"])
+        self.assertEqual(manifest["proofReport"]["json"]["sha256"].lower(), listed["proof-report.json"])
+        self.assertEqual(manifest["proofReport"]["markdown"]["sha256"].lower(), listed["proof-report.md"])
+        self.assertEqual(json.loads((run / "local-cuda-proof-packet-manifest.json").read_text(encoding="utf-8-sig"))["packet"]["sha256"].lower(), sha(packet.read_bytes()))
+        self.assertEqual(self._private_dirs(), [])
+        self.assertTrue(manifest["proofReport"]["speedQuotable"])
+        # the children read the PRIVATE copy and wrote into the private directory; the report names the real summary
+        calls = [line.split("|") for line in log.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.assertEqual(len(calls), 2)
+        for summary_path, output, label in calls:
+            self.assertTrue(Path(summary_path).parent.name.startswith(".pkg-"), summary_path)
+            self.assertEqual(Path(summary_path).parent, Path(output).parent)
+            self.assertNotEqual(os.path.realpath(summary_path), os.path.realpath(run / "summary.json"))
+            self.assertEqual(os.path.realpath(label), os.path.realpath(run / "summary.json"))
+        # the importer accepts it, and the genuine report keeps its speed authority
+        imported = self._import(repo, packet, "-ExpectedHostName", "Dell")
+        self.assertEqual((imported["status"], imported["proofReport"]["speedHashBound"], imported["proofReport"]["speedQuotable"]), ("imported", True, True))
+        source = self.PACKAGER.read_text(encoding="utf-8")
+        self.assertIn("$proofReportRaw = $summarizerResult.jsonText", source)
+        self.assertNotRegex(source, r"\$proofReportRaw = Get-Content")
+        importer = self.IMPORTER.read_text(encoding="utf-8")
+        self.assertIn("$proofReportJudgedSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($proofReportBytes))", importer)
+        self.assertNotRegex(importer, r"\$proofReportRaw = Get-Content")
+
+    def test_r3_sol_5add23cf_pkg_a_dry_run_publishes_the_reports_and_a_planned_manifest_but_no_packet(self) -> None:
+        repo, run, original = self._pkg_fixture()
+        packet = self.tmp / "out" / "packet.zip"
+        proc = self._package(repo, "-RunRoot", str(run), "-PacketPath", str(packet), "-DryRun")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        manifest = json.loads(proc.stdout)
+        self.assertEqual((manifest["status"], manifest["dryRun"]), ("planned", True))
+        self.assertFalse(packet.exists())
+        self.assertEqual(sorted(e["relativePath"] for e in manifest["files"]), ["logs/a.txt", "proof-report.json", "proof-report.md", "summary.json"])
+        self.assertEqual(json.loads((run / "local-cuda-proof-packet-manifest.json").read_text(encoding="utf-8-sig"))["status"], "planned")
+        self.assertEqual((run / "summary.json").read_bytes(), original)
+        self.assertEqual(self._private_dirs(), [])
+        # -StrictQuotable still exits 1 for a report that is not QUOTABLE_PASS (the fake's report always is, so the strict run exits 0)
+        self.assertEqual(self._package(repo, "-RunRoot", str(run), "-PacketPath", str(packet), "-StrictQuotable").returncode, 0)
+
+    def test_r3_sol_5add23cf_a8_a_summary_swapped_after_the_first_read_is_not_what_gets_packaged(self) -> None:
+        # sol 5add23cf A8 (input): a valid quotable LIGHT summary for host Dell; after the first child reads it a rival atomically replaces summary.json with another valid summary (host UltraMagnus,
+        # different fps) and leaves it. The packager read the summary three times, so the manifest said Dell while the JSON child, the artifact hash and the archive carried UltraMagnus.
+        import hashlib, zipfile
+        repo, run, original = self._pkg_fixture(host="Dell", fps=40)
+        swapped = json.dumps({"schema": "mlvapp-local-cuda-playback-dng-smoke.v1", "status": "success", "host": {"name": "UltraMagnus"}, "fps": 99})
+        packet = self.tmp / "out" / "packet.zip"
+        proc = self._package(repo, "-RunRoot", str(run), "-PacketPath", str(packet), env={"FAKE_SWAP_FIRST_CHILD": str(run / "summary.json"), "FAKE_SWAP_CONTENT": swapped})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        manifest = json.loads(proc.stdout)
+        with zipfile.ZipFile(packet) as archive:
+            self.assertEqual(archive.read("summary.json"), original)
+            report = json.loads(archive.read("proof-report.json"))
+        self.assertEqual((report["host"], report["fps"]), ("Dell", "40"), "the JSON child read the same bytes as the first read")
+        self.assertEqual(manifest["source"]["host"], "Dell")
+        self.assertEqual(manifest["summary"]["artifact"]["sha256"].lower(), hashlib.sha256(original).hexdigest())
+        self.assertEqual({e["relativePath"]: e["sha256"].lower() for e in manifest["files"]}["summary.json"], hashlib.sha256(original).hexdigest())
+        self.assertEqual(self._import(repo, packet, "-ExpectedHostName", "Dell")["proofReport"]["speedQuotable"], True)
+
+    @requires_windows_pwsh
+    def test_r3_sol_5add23cf_a6_a_rival_report_at_the_shared_name_never_reaches_the_archive_or_the_manifest(self) -> None:
+        # sol 5add23cf A6: a second writer replaces proof-report.json at the shared name while this run is between its checks (a stand-in `git` writes it during the run, after the children). The archive
+        # and the manifest took the shared name, so the run either threw or archived the rival's report; they now come from this run's private bytes.
+        import hashlib, zipfile
+        repo, run, original = self._pkg_fixture()
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        (self.tmp / "rival.json").write_text('{"schema":"mlvapp-local-cuda-proof-report.v1","status":"RIVAL","who":"rival"}', encoding="utf-8")
+        (bin_dir / "git.cmd").write_text('@echo off\r\ncopy /y "%FAKE_RIVAL_SRC%" "%FAKE_RIVAL_DST%" >nul\r\nexit /b 1\r\n', encoding="ascii")
+        packet = self.tmp / "out" / "packet.zip"
+        proc = self._package(repo, "-RunRoot", str(run), "-PacketPath", str(packet),
+                             env={"PATH": str(bin_dir) + os.pathsep + os.environ.get("PATH", ""), "FAKE_RIVAL_SRC": str(self.tmp / "rival.json"), "FAKE_RIVAL_DST": str(run / "proof-report.json")})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        manifest = json.loads(proc.stdout)
+        with zipfile.ZipFile(packet) as archive:
+            carried = archive.read("proof-report.json")
+        self.assertEqual(json.loads(carried)["who"], "own")
+        listed = {e["relativePath"]: e["sha256"].lower() for e in manifest["files"]}
+        self.assertEqual(listed["proof-report.json"], hashlib.sha256(carried).hexdigest())
+        self.assertEqual(manifest["proofReport"]["json"]["sha256"].lower(), hashlib.sha256(carried).hexdigest())
+
+    def test_r3_sol_5add23cf_a7_a_run_that_fails_removes_nothing_at_a_shared_name(self) -> None:
+        # sol 5add23cf A7: the stale-report removal at start, the manifest and packet removals and the rollback deleted files at shared names this run did not create (a rival's completed reports, manifest
+        # and ZIP). A run whose summarizer refuses its input now touches none of them, and leaves no private directory.
+        repo, run, _ = self._pkg_fixture()
+        packet = self.tmp / "out" / "packet.zip"
+        packet.parent.mkdir()
+        rival = {run / "proof-report.md": "rival-md", run / "proof-report.json": "rival-json", run / "local-cuda-proof-packet-manifest.json": "rival-manifest", packet: "rival-zip"}
+        for path, text in rival.items():
+            path.write_text(text, encoding="utf-8")
+        proc = self._package(repo, "-RunRoot", str(run), "-PacketPath", str(packet), env={"FAKE_REFUSE": "1"})
+        self.assertNotEqual(proc.returncode, 0, proc.stdout)
+        self.assertEqual({path: path.read_text(encoding="utf-8") for path in rival}, rival)
+        self.assertEqual(self._private_dirs(), [])
+        # a summarizer that exits 1 AFTER writing is still a packaged run (the report says why); the stale files are then replaced, never read
+        proc = self._package(repo, "-RunRoot", str(run), "-PacketPath", str(packet), env={"FAKE_EXIT": "1"})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads((run / "proof-report.json").read_text(encoding="utf-8"))["who"], "own")
+        # the source holds no delete of a shared name at all: the only Remove-Item removes a file inside this run's own private directory
+        source = self.PACKAGER.read_text(encoding="utf-8")
+        removals = re.findall(r"Remove-Item[^\n]*", source)
+        self.assertEqual(len(removals), 1, removals)
+        self.assertIn("-LiteralPath $leftover.FullName", removals[0])
+        self.assertNotIn("Compress-Archive", source)
+        self.assertEqual(len(re.findall(r"Move-Item -LiteralPath", source)), 4)
+        self.assertEqual(source.count("[IO.File]::ReadAllBytes($summaryFullPath)"), 1)
+        self.assertEqual(source.count("New-Item -ItemType Directory -Path $privateDir -ErrorAction Stop"), 1)
+
+    @requires_windows_pwsh
+    def test_r3_sol_5add23cf_a5_a_device_prefix_spelling_of_the_input_is_refused_before_anything_is_written(self) -> None:
+        # sol 5add23cf A5 (input): -RunRoot C:\Proof\Run -SummaryPath ...\summary.json -ReportPath \\?\C:\Proof\Run\summary.md. The JSON twin keeps the device prefix and is the same file as the input; the
+        # stale-report removal deleted the input before either child started. The input survives and the run is refused.
+        repo, run, original = self._pkg_fixture()
+        for label, report in (("device-prefix", "\\\\?\\" + str(run / "summary.md")), ("dot-prefix", "\\\\.\\" + str(run / "summary.md"))):
+            proc = self._package(repo, "-RunRoot", str(run), "-SummaryPath", str(run / "summary.json"), "-ReportPath", report, "-DryRun")
+            self.assertNotEqual(proc.returncode, 0, label + proc.stdout)
+            self.assertEqual((run / "summary.json").read_bytes(), original, label)
+            self.assertFalse((run / "summary.md").exists(), label)
+        funcs = _extract_functions(self.PACKAGER, ["ConvertTo-PlainFilePath", "Get-RealFilePath"])
+        plain = str(run / "summary.md")
+        body = funcs + (f"Write-Host ('PLAIN=' + (Get-RealFilePath '{plain}'))\nWrite-Host ('DEVICE=' + (Get-RealFilePath ('\\\\?\\' + '{plain}')))\n"
+                        # (string work only for the forms with no local file: a UNC name would make Get-Item ask the network)
+                        "Write-Host ('UNC=' + (ConvertTo-PlainFilePath '\\\\?\\UNC\\srv\\share\\a\\b.md'))\nWrite-Host ('DOTUNC=' + (ConvertTo-PlainFilePath '\\\\.\\UNC\\srv\\share\\a\\b.md'))\n"
+                        "Write-Host ('VOLUME=' + (ConvertTo-PlainFilePath '\\\\?\\Volume{0123}\\a.md'))\nWrite-Host ('PLAINUNC=' + (ConvertTo-PlainFilePath '\\\\srv\\share\\a\\b.md'))\n")
+        out = dict(line.split("=", 1) for line in self.ok(body).splitlines())
+        self.assertEqual(out["PLAIN"], out["DEVICE"])
+        self.assertEqual((out["UNC"], out["DOTUNC"], out["PLAINUNC"]), ("\\\\srv\\share\\a\\b.md",) * 3)
+        self.assertEqual(out["VOLUME"], "\\\\?\\Volume{0123}\\a.md")
+
+    def test_r3_sol_5add23cf_pkg_report_paths_that_are_the_input_a_directory_or_at_the_filesystem_limit(self) -> None:
+        # the report-path refusals the packager always had (adversary 1ce472bc A1, 698fffb1 A1, A8; 0e9672e5 A2), run through the real script: the json twin is the input, a junction in front of the report,
+        # a directory given as the report; and a report name at the filesystem's limit still publishes.
+        repo, run, original = self._pkg_fixture()
+        real = self.tmp / "real"
+        real.mkdir()
+        (real / "summary.json").write_bytes(original)
+        link = self.tmp / "link"
+        item_type = "Junction" if os.name == "nt" else "SymbolicLink"
+        self.ok(f"$null = New-Item -ItemType {item_type} -Path '{link}' -Target '{real}'\n")
+        keep = self.tmp / "keep"
+        keep.mkdir()
+        for label, args in (("twin-is-input", ("-RunRoot", str(run), "-ReportPath", str(run / "summary.md"))),
+                            ("junction", ("-RunRoot", str(real), "-ReportPath", str(link / "summary.md"))),
+                            ("directory", ("-RunRoot", str(run), "-ReportPath", str(keep)))):
+            proc = self._package(repo, *args, "-DryRun")
+            self.assertNotEqual(proc.returncode, 0, label + proc.stdout)
+            self.assertEqual((run / "summary.json").read_bytes(), original, label)
+            self.assertEqual((real / "summary.json").read_bytes(), original, label)
+        self.assertTrue(keep.is_dir())
+        long_md = run / (("x" * 218) + ".md")
+        proc = self._package(repo, "-RunRoot", str(run), "-ReportPath", str(long_md), "-PacketPath", str(self.tmp / "out" / "long.zip"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(long_md.is_file() and long_md.with_suffix(".json").is_file())
+        self.assertEqual(self._private_dirs(), [])
+
+    @requires_windows_pwsh
+    def test_r3_sol_5add23cf_a9_a_case_variant_of_the_genuine_report_keeps_speed_authority_on_import(self) -> None:
+        # sol 5add23cf A9 (input): -ReportPath C:\Proof\Run\Proof-Report.md, then import on the same case-insensitive volume. The packager lists Proof-Report.json, the importer opened the same file as
+        # proof-report.json and verified its hash, and the ordinal spelling check then granted no authority (speedHashBound false).
+        repo, run, _ = self._pkg_fixture()
+        packet = self.tmp / "out" / "packet.zip"
+        proc = self._package(repo, "-RunRoot", str(run), "-ReportPath", str(run / "Proof-Report.md"), "-PacketPath", str(packet))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("Proof-Report.json", [e["relativePath"] for e in json.loads(proc.stdout)["files"]])
+        imported = self._import(repo, packet)
+        self.assertEqual((imported["status"], imported["proofReport"]["speedHashBound"], imported["proofReport"]["speedQuotable"]), ("imported", True, True))
 
     def test_r3_sol_5add23cf_a10_compare_machine_perf_binds_every_metric_even_without_presented_fps(self) -> None:
         # the sibling reader (compare-machine-perf.ps1:572 reads the interval metric for its diagnosis) asked only when presentedFps was non-null, so a compare that dropped presentedFps and kept an
