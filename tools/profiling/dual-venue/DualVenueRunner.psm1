@@ -7624,10 +7624,150 @@ function Write-DvReceipt {
     $path
 }
 
+# --- the display-path block (VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2) -----------------------------
+$script:DisplayPathSchema = 'mlv-app/venue-display-path/v2'
+$script:DisplayPathSource = 'health-probe'
+$script:DisplayPathFields = @('schema', 'source', 'adapters', 'firstAdapterDriverVersion', 'primaryDisplayDevice')
+$script:DisplayPathMaxAdapters = 64
+
+function Get-DvJsonMembersNamed {
+    # The members of a System.Text.Json object element whose name equals -Name in ANY letter case (PowerShell reads member names case-insensitively, so a
+    # case variant must never hide). A name that cannot be read back (an escaped lone surrogate) throws: the caller's catch types the block malformed.
+    param([System.Text.Json.JsonElement]$Element, [string]$Name)
+    $hits = [System.Collections.Generic.List[object]]::new()
+    foreach ($p in $Element.EnumerateObject()) {
+        $n = $p.Name
+        if ($null -eq $n) { throw 'a member name cannot be read back' }
+        if ([string]::Equals([string]$n, $Name, [System.StringComparison]::OrdinalIgnoreCase)) { $hits.Add($p) }
+    }
+    $hits.ToArray()   # unrolled to the caller, which collects it with @(): zero, one or more JsonProperty values
+}
+
+function Read-DvReceiptDisplayPath {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2: the ONE reader of a leg receipt's `venue.displayPath` block. It reads the receipt TEXT with System.Text.Json
+    and its default, strict options (no comments, no trailing commas, double-quoted names and strings only, depth 64); every string is the text as
+    written. There is no second reader, no fallback to the PowerShell JSON cmdlet and no recovery rewrite. Returns [pscustomobject]@{ state; block; reason }:
+      present   -- block is the typed block: [ordered]@{ schema; source; adapters ([string[]]); firstAdapterDriverVersion; primaryDisplayDevice }
+      malformed -- block $null, reason names why: the text is empty or not strict JSON, the root is not an object, a `venue` or `displayPath` member
+                   appears twice in any letter case, venue is not an object, the block member is not spelled `displayPath`, the block is not an
+                   object, a field is missing, unknown, doubled (any letter case) or of the wrong type, schema/source is not the exact string, more
+                   than 64 adapters, or any name or string cannot be read back. Every exception inside the reader is this state.
+      NO_SIGNAL -- block and reason $null: no `venue` member, or a venue object with no `displayPath` member (every receipt fork/master writes).
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$ReceiptText)
+    if ([string]::IsNullOrEmpty($ReceiptText)) { return [pscustomobject]@{ state = 'malformed'; block = $null; reason = 'the receipt text is empty' } }
+    $doc = $null
+    try { $doc = [System.Text.Json.JsonDocument]::Parse($ReceiptText, [System.Text.Json.JsonDocumentOptions]::new()) }
+    catch { return [pscustomobject]@{ state = 'malformed'; block = $null; reason = 'the receipt text is not strict JSON' } }
+    $why = $null
+    try {
+        $object = [System.Text.Json.JsonValueKind]::Object
+        $root = $doc.RootElement
+        if ($root.ValueKind -ne $object) { $why = 'the receipt root is not an object' }
+        else {
+            $venues = @(Get-DvJsonMembersNamed -Element $root -Name 'venue')
+            if ($venues.Count -eq 0) { return [pscustomobject]@{ state = 'NO_SIGNAL'; block = $null; reason = $null } }
+            if ($venues.Count -gt 1) { $why = 'the receipt names venue more than once' }
+            elseif ($venues[0].Value.ValueKind -ne $object) { $why = 'venue is not an object' }
+            else {
+                $members = @(Get-DvJsonMembersNamed -Element $venues[0].Value -Name 'displayPath')
+                if ($members.Count -eq 0) { return [pscustomobject]@{ state = 'NO_SIGNAL'; block = $null; reason = $null } }
+                if ($members.Count -gt 1) { $why = 'venue names displayPath more than once' }
+                elseif ([string]$members[0].Name -cne 'displayPath') { $why = 'the block member is not spelled displayPath' }
+                elseif ($members[0].Value.ValueKind -ne $object) { $why = 'the block is not an object' }
+                else {
+                    $fields = @{}
+                    foreach ($p in $members[0].Value.EnumerateObject()) {
+                        $n = $p.Name
+                        if ($null -eq $n) { throw 'a block member name cannot be read back' }
+                        if ($fields.ContainsKey([string]$n)) { $why = "the block names $n more than once"; break }
+                        if ($script:DisplayPathFields -cnotcontains [string]$n) { $why = "the block carries an unknown field $n"; break }
+                        $fields[[string]$n] = $p.Value
+                    }
+                    if ($null -eq $why) {
+                        foreach ($f in $script:DisplayPathFields) { if (-not $fields.ContainsKey($f)) { $why = "the block has no $f"; break } }
+                    }
+                    if ($null -eq $why) {
+                        $string = [System.Text.Json.JsonValueKind]::String
+                        $null_ = [System.Text.Json.JsonValueKind]::Null
+                        $adapters = $fields['adapters']
+                        $nullable = @{}
+                        foreach ($f in @('firstAdapterDriverVersion', 'primaryDisplayDevice')) {
+                            $v = $fields[$f]
+                            if ($v.ValueKind -eq $null_) { $nullable[$f] = $null }
+                            elseif ($v.ValueKind -eq $string) { $nullable[$f] = [string]$v.GetString() }
+                            else { $why = "$f is neither a string nor null"; break }
+                        }
+                        if ($null -ne $why) { }
+                        elseif ($fields['schema'].ValueKind -ne $string -or [string]$fields['schema'].GetString() -cne $script:DisplayPathSchema) { $why = "schema is not $($script:DisplayPathSchema)" }
+                        elseif ($fields['source'].ValueKind -ne $string -or [string]$fields['source'].GetString() -cne $script:DisplayPathSource) { $why = "source is not $($script:DisplayPathSource)" }
+                        elseif ($adapters.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { $why = 'adapters is not a list' }
+                        elseif ($adapters.GetArrayLength() -gt $script:DisplayPathMaxAdapters) { $why = "adapters lists more than $($script:DisplayPathMaxAdapters)" }
+                        else {
+                            $names = [System.Collections.Generic.List[string]]::new()
+                            foreach ($e in $adapters.EnumerateArray()) {
+                                if ($e.ValueKind -ne $string) { $why = 'an adapter is not a string'; break }
+                                $names.Add([string]$e.GetString())
+                            }
+                            if ($null -eq $why) {
+                                return [pscustomobject]@{ state = 'present'; reason = $null; block = [ordered]@{
+                                    schema = $script:DisplayPathSchema
+                                    source = $script:DisplayPathSource
+                                    adapters = [string[]]$names.ToArray()
+                                    firstAdapterDriverVersion = $nullable['firstAdapterDriverVersion']
+                                    primaryDisplayDevice = $nullable['primaryDisplayDevice']
+                                } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch {
+        $why = 'the block cannot be read back as written'
+    } finally { $doc.Dispose() }
+    [pscustomobject]@{ state = 'malformed'; block = $null; reason = [string]$why }
+}
+
+function New-DvDisplayPathBlock {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2: the ONE writer of a leg receipt's `venue.displayPath` block. It copies three fields the health probe ALREADY
+    reported (gpuNames from its Win32_VideoController read, driverVersion, displayDevice = Screen.PrimaryScreen.DeviceName) into the block; it reads nothing
+    on the venue, waits on nothing and reads no clock. Returns the block the ONE reader (Read-DvReceiptDisplayPath) gives back for it, or $null when a probe
+    field is not of its type (gpuNames missing or not a list, an element that is not a [string], a driver or device that is neither $null nor a [string],
+    e.g. a time-looking text ConvertFrom-Json made a [datetime]): the caller then writes no block and the receipt reads NO_SIGNAL. Never throws.
+    #>
+    param([AllowNull()]$Probe)
+    try {
+        $names = Get-DvProp $Probe 'gpuNames'
+        if ($names -isnot [array]) { return $null }
+        foreach ($n in $names) { if ($n -isnot [string]) { return $null } }
+        $driver = Get-DvProp $Probe 'driverVersion'
+        if ($null -ne $driver -and $driver -isnot [string]) { return $null }
+        $device = Get-DvProp $Probe 'displayDevice'
+        if ($null -ne $device -and $device -isnot [string]) { return $null }
+        $block = [ordered]@{
+            schema = $script:DisplayPathSchema
+            source = $script:DisplayPathSource
+            adapters = [string[]]@($names)
+            firstAdapterDriverVersion = $driver
+            primaryDisplayDevice = $device
+        }
+        # The writer never writes a block its reader does not type `present`: it hands back the reader's own typed block.
+        $read = Read-DvReceiptDisplayPath -ReceiptText (ConvertTo-Json -Depth 6 -InputObject ([ordered]@{ venue = [ordered]@{ displayPath = $block } }))
+        if ($read.state -cne 'present') { return $null }
+        return $read.block
+    } catch { return $null }
+}
+
 Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
-    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt
+    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt,
+    Read-DvReceiptDisplayPath, New-DvDisplayPathBlock

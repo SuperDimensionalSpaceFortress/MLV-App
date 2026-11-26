@@ -696,6 +696,10 @@ try {
     $receipt.venue.driverVersion = $probe.driverVersion
     $receipt.venue.displayDevice = $probe.displayDevice
     $receipt.venue.instrumentDigests.presentmon = $probe.presentmonSha256
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2: the ONE display-path block, copied by its one writer from the probe fields above (no new venue read, no
+    # clock, no wait). A probe the writer cannot copy writes no block, so the receipt reads NO_SIGNAL (Read-DvReceiptDisplayPath, the one reader).
+    $displayPathBlock = New-DvDisplayPathBlock -Probe $probe
+    if ($null -ne $displayPathBlock) { $receipt.venue['displayPath'] = $displayPathBlock }
 
     # P6: one source of truth for which venue a host is.
     Import-Module (Join-Path $here '..\bachelor\AttrCudaArtifacts.psm1') -Force

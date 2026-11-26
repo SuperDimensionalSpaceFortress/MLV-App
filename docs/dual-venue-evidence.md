@@ -718,6 +718,45 @@ pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1 [-
   (`.claude-state\hub-autopilot\disk-floor.ps1`, `host-commit-gate.ps1`): exit 3 with the gate's own text, and a missing gate is
   `GATE_UNAVAILABLE`. It bounds every child by `-MaxTotalSec`. The typed exit table is in the script header.
 
+## The display-path block (`venue.displayPath`, VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2)
+
+Why it exists: two legs on one venue with a byte-identical exe, clip and spec can still differ because the venue drove its display through a
+different adapter (Bachelor's 59.56 -> 38.78 fps control, BACHELOR-1457-NATIVE-GUI-LATE-ENV-DIFF-1). A receipt therefore carries ONE display-path
+block, written by ONE writer and read by ONE reader. It replaces the closed PR #904 (VENUE-LEG-DISPLAY-PATH-RECEIPT-1), whose wider collector and
+timing work were not carried over: this block adds no venue read, no CIM query, no clock and no wait.
+
+**Writer.** `New-DvDisplayPathBlock -Probe <probe>` (`DualVenueRunner.psm1`), called once by `Invoke-VenueLeg.ps1` right after the health probe's
+fields are copied, so an unhealthy or host-mismatched leg carries the block too. It copies three fields the probe already reports:
+
+| Field | Type | Value |
+|---|---|---|
+| `schema` | string | exactly `mlv-app/venue-display-path/v2` (`v1` was the closed #904 shape; it reads malformed) |
+| `source` | string | exactly `health-probe`: the probe's sample, taken before the measurement job is submitted, never re-read during the run |
+| `adapters` | list of strings | the probe's `gpuNames` (every `Win32_VideoController` name, in probe order), at most 64 |
+| `firstAdapterDriverVersion` | string or null | the probe's `driverVersion` (the first video controller's driver) |
+| `primaryDisplayDevice` | string or null | the probe's `displayDevice` (`Screen.PrimaryScreen.DeviceName`, e.g. `\\.\DISPLAY1`) |
+
+A probe field of the wrong type (no `gpuNames` list, a name that is not a string, a time-looking text the probe parse turned into a `[datetime]`)
+makes the writer write **no** block, never a malformed one and never a throw; that receipt reads `NO_SIGNAL`. The writer hands back only a block
+its reader types `present`. The block names the adapters and the primary display device; it does not say which adapter drives that display.
+
+**Reader.** `Read-DvReceiptDisplayPath -ReceiptText <the receipt file's text>` reads with `System.Text.Json` and its strict default options
+(no comments, no trailing commas, double-quoted names and strings only, depth 64), every string exactly as written. There is no second reader,
+no `ConvertFrom-Json` fallback and no recovery rewrite. It returns `{ state; block; reason }` with `state` one of:
+
+* `present`: `block` is the typed block above.
+* `NO_SIGNAL`: no `venue` member, or a `venue` object with no `displayPath` member. That is every receipt written before this card, so a legacy
+  receipt reads as it did on fork/master. `Test-DvReceiptValid` does not read the block, and its status for every receipt is unchanged.
+* `malformed`: any parse failure of the block. That covers a text that is not strict JSON, a root that is not an object, `venue` or `displayPath`
+  twice in any letter case, a `venue` that is not an object, a block member not spelled `displayPath`, a block that is not an object (JSON
+  `null` included), and a missing, unknown, doubled or wrongly typed field. So are a `schema`/`source` that is not the exact string, more than 64
+  adapters, and a name or string that cannot be read back (an escaped lone surrogate).
+
+`ConvertFrom-Json` reads several of those texts differently: it keeps the last of two same-name keys, accepts `//` comments, single quotes and
+trailing commas, reads a lone surrogate and turns `2026-11-24T00:00:00Z` into a `[datetime]`. That is why the block is read with one grammar
+only (pass-2 A3 of #904). `tools/repo_hygiene/test_venue_leg_display_path.py` pins the four rows: grammar parity, malformed, legacy `NO_SIGNAL`
+and the round trip through `Write-DvReceipt` and `Invoke-VenueLeg`.
+
 ## How to read the evidence
 
 * **Acceptance** reads only receipts whose `venue.role` is `acceptance` for the card, and only `PASS`/`FAIL`.
