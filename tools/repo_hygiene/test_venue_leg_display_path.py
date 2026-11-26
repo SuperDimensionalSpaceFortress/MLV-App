@@ -74,12 +74,12 @@ def with_block(block_text: str, venue_extra: str = "", root_extra: str = "") -> 
 def read_texts(texts: list[str], reader: str = "Read-DvReceiptDisplayPath", prefix: str | None = None) -> list[dict]:
     """Run THE reader over each text in one pwsh; returns per text {state, reason, block, adapterTypes, threw}. The texts travel in a UTF-8 file read
     with System.Text.Json (never ConvertFrom-Json, so the harness itself cannot reinterpret a text)."""
-    with tempfile.TemporaryDirectory(prefix=prefix) as d:
+    with tempfile.TemporaryDirectory(prefix=TMP_PREFIX if prefix is None else prefix) as d:
         cases = Path(d) / "cases.json"
         cases.write_text(json.dumps(texts, ensure_ascii=True), encoding="utf-8")
         script = (
-            f"Import-Module '{MODULE}' -Force\n"
-            f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{cases}'))\n"
+            f"Import-Module '{psq(MODULE)}' -Force\n"
+            f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{psq(cases)}'))\n"
             "$out = @(foreach ($e in $doc.RootElement.EnumerateArray()) {\n"
             "  $t = $e.GetString()\n"
             f"  try {{ $r = {reader} -ReceiptText $t\n"
@@ -98,11 +98,11 @@ def read_texts(texts: list[str], reader: str = "Read-DvReceiptDisplayPath", pref
 
 def cfj_reads(texts: list[str]) -> list[dict]:
     """How ConvertFrom-Json (the grammar the reader must NOT use) reads venue.displayPath of each text: the premise of the A3 rows."""
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(prefix=TMP_PREFIX) as d:
         cases = Path(d) / "cases.json"
         cases.write_text(json.dumps(texts, ensure_ascii=True), encoding="utf-8")
         script = (
-            f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{cases}'))\n"
+            f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{psq(cases)}'))\n"
             "$out = @(foreach ($e in $doc.RootElement.EnumerateArray()) {\n"
             "  try { $o = $e.GetString() | ConvertFrom-Json; $b = $o.venue.displayPath\n"
             "        [ordered]@{ ok = $true; device = [string]$b.primaryDisplayDevice; adapterTypes = @(@($b.adapters) | ForEach-Object { $_.GetType().FullName }) } }\n"
@@ -239,7 +239,7 @@ class LegacyNoBlockTests(unittest.TestCase):
         """New-DvReceipt still carries no displayPath member (the block is added only by the writer), and Test-DvReceiptValid's status of a legacy
         non-PASS/FAIL receipt is NO_SIGNAL, as on fork/master."""
         script = (
-            f"Import-Module '{MODULE}' -Force\n"
+            f"Import-Module '{psq(MODULE)}' -Force\n"
             "$r = New-DvReceipt -Card 'DUAL-VENUE-EVIDENCE-1' -LegId 'unit-leg' -DeclaredVenue 'bachelor'\n"
             "$r.outcome = 'UNRESOLVED'\n"
             "$t = $r | ConvertTo-Json -Depth 12\n"
@@ -248,10 +248,10 @@ class LegacyNoBlockTests(unittest.TestCase):
             "$v = Test-DvReceiptValid -Receipt ($legacy | ConvertFrom-Json)\n"
             "Write-Output ('OUT=' + (ConvertTo-Json -Compress -InputObject ([ordered]@{ hasMember = $r.venue.Contains('displayPath'); state = [string]$read.state; status = [string]$v.status; valid = [bool]$v.valid })))\n"
         )
-        with tempfile.TemporaryDirectory() as d:
+        with tempfile.TemporaryDirectory(prefix=TMP_PREFIX) as d:
             p = Path(d) / "legacy.json"
             p.write_text(LEGACY_TEXT, encoding="utf-8")
-            proc = run_pwsh(["-Command", script.replace("{0}", str(p))])
+            proc = run_pwsh(["-Command", script.replace("{0}", psq(p))])
         line = next((l for l in proc.stdout.splitlines() if l.startswith("OUT=")), None)
         self.assertIsNotNone(line, proc.stdout + proc.stderr)
         out = json.loads(line[4:])
@@ -264,13 +264,13 @@ class LegacyNoBlockTests(unittest.TestCase):
 def writer_round_trip(probes: list[dict]) -> list[dict]:
     """For each probe dict: ConvertTo-Json -> DVE_PROBE line -> ConvertFrom-DvProbeStdout (the runner's own probe parse) -> New-DvDisplayPathBlock ->
     a receipt written by Write-DvReceipt -> its file text -> Read-DvReceiptDisplayPath."""
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(prefix=TMP_PREFIX) as d:
         cases = Path(d) / "probes.json"
         cases.write_text(json.dumps(probes), encoding="utf-8")
         root = Path(d) / "receipts"
         script = (
-            f"Import-Module '{MODULE}' -Force\n"
-            f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{cases}'))\n"
+            f"Import-Module '{psq(MODULE)}' -Force\n"
+            f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{psq(cases)}'))\n"
             "$out = @(foreach ($e in $doc.RootElement.EnumerateArray()) {\n"
             "  $probe = ConvertFrom-DvProbeStdout ('DVE_PROBE=' + $e.GetRawText())\n"
             "  $threw = $null; $block = $null\n"
@@ -278,7 +278,7 @@ def writer_round_trip(probes: list[dict]) -> list[dict]:
             "  $r = New-DvReceipt -Card 'DUAL-VENUE-EVIDENCE-1' -LegId 'unit-leg' -DeclaredVenue 'bachelor'\n"
             "  $r.outcome = 'UNRESOLVED'\n"
             "  if ($null -ne $block) { $r.venue['displayPath'] = $block }\n"
-            f"  $path = Write-DvReceipt -Receipt $r -ReceiptRoot '{root}'\n"
+            f"  $path = Write-DvReceipt -Receipt $r -ReceiptRoot '{psq(root)}'\n"
             "  $read = Read-DvReceiptDisplayPath -ReceiptText ([IO.File]::ReadAllText($path))\n"
             "  [ordered]@{ threw = $threw; wrote = ($null -ne $block); state = [string]$read.state; reason = $read.reason; block = $read.block }\n"
             "})\n"
@@ -375,7 +375,7 @@ A2_ROWS = [
 ]
 A3_READER_ROWS = [
     ("an escaped U+FFFD adapter name", with_block(GOOD_BLOCK_TEXT.replace("Intel(R) Iris(R) Xe Graphics", "Intel\\ufffd"))),
-    ("a raw U+FFFD driver version", with_block(GOOD_BLOCK_TEXT.replace("31.0.101.5186", "31.0�"))),
+    ("a raw U+FFFD driver version", with_block(GOOD_BLOCK_TEXT.replace("31.0.101.5186", "31.0" + chr(0xFFFD)))),
     ("an escaped U+FFFD display device", with_block(GOOD_BLOCK_TEXT.replace("DISPLAY1", "DISPLAY\\ufffd"))),
 ]
 
@@ -393,7 +393,7 @@ class AdversaryPass1Tests(unittest.TestCase):
 
     def test_a3_a_lone_surrogate_in_the_probe_writes_no_block(self) -> None:
         rows = [dict(HEALTHY_PROBE, gpuNames=["\ud800"]), dict(HEALTHY_PROBE, driverVersion="\ud800"), dict(HEALTHY_PROBE, displayDevice="\ud800"),
-                dict(HEALTHY_PROBE, gpuNames=["NVIDIA �"])]
+                dict(HEALTHY_PROBE, gpuNames=["NVIDIA " + chr(0xFFFD)])]
         for i, g in enumerate(writer_round_trip(rows)):
             with self.subTest(i=i):
                 self.assertIsNone(g["threw"])

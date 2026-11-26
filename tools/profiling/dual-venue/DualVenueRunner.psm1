@@ -7675,15 +7675,17 @@ function Read-DvReceiptDisplayPath {
                 $members = @(Get-DvJsonMembersNamed -Element $venues[0].Value -Name 'displayPath')
                 if ($members.Count -eq 0) { return [pscustomobject]@{ state = 'NO_SIGNAL'; block = $null; reason = $null } }
                 if ($members.Count -gt 1) { $why = 'venue names displayPath more than once' }
-                elseif ([string]$members[0].Name -cne 'displayPath') { $why = 'the block member is not spelled displayPath' }
+                # r1 adversary pass-1 A1/A2: every name and string comparison below is ORDINAL (Test-DvOrdinalEqual, an OrdinalIgnoreCase dictionary):
+                # PowerShell's -ceq / -cne / -cnotcontains compare by culture and ignore a NUL, a soft hyphen or a U+034F inside a text.
+                elseif (-not (Test-DvOrdinalEqual $members[0].Name 'displayPath')) { $why = 'the block member is not spelled displayPath' }
                 elseif ($members[0].Value.ValueKind -ne $object) { $why = 'the block is not an object' }
                 else {
-                    $fields = @{}
+                    $fields = [System.Collections.Generic.Dictionary[string, System.Text.Json.JsonElement]]::new([System.StringComparer]::OrdinalIgnoreCase)
                     foreach ($p in $members[0].Value.EnumerateObject()) {
                         $n = $p.Name
                         if ($null -eq $n) { throw 'a block member name cannot be read back' }
-                        if ($fields.ContainsKey([string]$n)) { $why = "the block names $n more than once"; break }
-                        if ($script:DisplayPathFields -cnotcontains [string]$n) { $why = "the block carries an unknown field $n"; break }
+                        if ($fields.ContainsKey([string]$n)) { $why = 'the block names a field more than once'; break }
+                        if (@($script:DisplayPathFields | Where-Object { Test-DvOrdinalEqual $_ $n }).Count -ne 1) { $why = 'the block carries an unknown field'; break }
                         $fields[[string]$n] = $p.Value
                     }
                     if ($null -eq $why) {
@@ -7693,23 +7695,32 @@ function Read-DvReceiptDisplayPath {
                         $string = [System.Text.Json.JsonValueKind]::String
                         $null_ = [System.Text.Json.JsonValueKind]::Null
                         $adapters = $fields['adapters']
+                        # r1 adversary pass-1 A3: U+FFFD is the mark of a text that was not read back as it was reported (the probe-line parse turns the
+                        # probe's escaped lone surrogate into it, and so does a UTF-8 write of one), so a block string carrying it is malformed, never present evidence.
+                        $replacement = [char]0xFFFD
                         $nullable = @{}
                         foreach ($f in @('firstAdapterDriverVersion', 'primaryDisplayDevice')) {
                             $v = $fields[$f]
                             if ($v.ValueKind -eq $null_) { $nullable[$f] = $null }
-                            elseif ($v.ValueKind -eq $string) { $nullable[$f] = [string]$v.GetString() }
+                            elseif ($v.ValueKind -eq $string) {
+                                $s = [string]$v.GetString()
+                                if ($s.IndexOf($replacement) -ge 0) { $why = "$f carries U+FFFD"; break }
+                                $nullable[$f] = $s
+                            }
                             else { $why = "$f is neither a string nor null"; break }
                         }
                         if ($null -ne $why) { }
-                        elseif ($fields['schema'].ValueKind -ne $string -or [string]$fields['schema'].GetString() -cne $script:DisplayPathSchema) { $why = "schema is not $($script:DisplayPathSchema)" }
-                        elseif ($fields['source'].ValueKind -ne $string -or [string]$fields['source'].GetString() -cne $script:DisplayPathSource) { $why = "source is not $($script:DisplayPathSource)" }
+                        elseif ($fields['schema'].ValueKind -ne $string -or -not (Test-DvOrdinalEqual $fields['schema'].GetString() $script:DisplayPathSchema)) { $why = "schema is not $($script:DisplayPathSchema)" }
+                        elseif ($fields['source'].ValueKind -ne $string -or -not (Test-DvOrdinalEqual $fields['source'].GetString() $script:DisplayPathSource)) { $why = "source is not $($script:DisplayPathSource)" }
                         elseif ($adapters.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { $why = 'adapters is not a list' }
                         elseif ($adapters.GetArrayLength() -gt $script:DisplayPathMaxAdapters) { $why = "adapters lists more than $($script:DisplayPathMaxAdapters)" }
                         else {
                             $names = [System.Collections.Generic.List[string]]::new()
                             foreach ($e in $adapters.EnumerateArray()) {
                                 if ($e.ValueKind -ne $string) { $why = 'an adapter is not a string'; break }
-                                $names.Add([string]$e.GetString())
+                                $s = [string]$e.GetString()
+                                if ($s.IndexOf($replacement) -ge 0) { $why = 'an adapter carries U+FFFD'; break }
+                                $names.Add($s)
                             }
                             if ($null -eq $why) {
                                 return [pscustomobject]@{ state = 'present'; reason = $null; block = [ordered]@{
@@ -7743,7 +7754,7 @@ function New-DvDisplayPathBlock {
     param([AllowNull()]$Probe)
     try {
         $names = Get-DvProp $Probe 'gpuNames'
-        if ($names -isnot [array]) { return $null }
+        if ($names -isnot [array] -or $names.Rank -ne 1) { return $null }   # r1 adversary pass-1 A4: a rank-two array is not a list of names
         foreach ($n in $names) { if ($n -isnot [string]) { return $null } }
         $driver = Get-DvProp $Probe 'driverVersion'
         if ($null -ne $driver -and $driver -isnot [string]) { return $null }
@@ -7758,7 +7769,7 @@ function New-DvDisplayPathBlock {
         }
         # The writer never writes a block its reader does not type `present`: it hands back the reader's own typed block.
         $read = Read-DvReceiptDisplayPath -ReceiptText (ConvertTo-Json -Depth 6 -InputObject ([ordered]@{ venue = [ordered]@{ displayPath = $block } }))
-        if ($read.state -cne 'present') { return $null }
+        if (-not (Test-DvOrdinalEqual $read.state 'present')) { return $null }
         return $read.block
     } catch { return $null }
 }

@@ -750,7 +750,9 @@ no `ConvertFrom-Json` fallback and no recovery rewrite. It returns `{ state; blo
 * `malformed`: any parse failure of the block. That covers a text that is not strict JSON, a root that is not an object, `venue` or `displayPath`
   twice in any letter case, a `venue` that is not an object, a block member not spelled `displayPath`, a block that is not an object (JSON
   `null` included), and a missing, unknown, doubled or wrongly typed field. So are a `schema`/`source` that is not the exact string, more than 64
-  adapters, and a name or string that cannot be read back (an escaped lone surrogate).
+  adapters, a name or string that cannot be read back (an escaped lone surrogate), and a block string that carries U+FFFD (the mark of a text
+  that was not read back as reported: the probe-line parse turns a lone surrogate into it, so the writer then writes no block). Every name and
+  string comparison is ordinal: PowerShell's `-ceq` / `-cne` / `-cnotcontains` compare by culture and ignore a NUL or a soft hyphen inside a text.
 
 `ConvertFrom-Json` reads several of those texts differently: it keeps the last of two same-name keys, accepts `//` comments, single quotes and
 trailing commas, reads a lone surrogate and turns `2026-11-24T00:00:00Z` into a `[datetime]`. That is why the block is read with one grammar
