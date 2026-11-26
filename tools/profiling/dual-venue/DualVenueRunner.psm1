@@ -7605,6 +7605,9 @@ $script:TailInFlightCapFrames = 2L
 # R4-RESIDUE-1 (r4 pass-5 A8): the launcher's 32-hex run nonce, anchored with \z (`$` also matches before a final newline: the r4 pass-5 A6 lesson),
 # for the three nonces the tail credit binds: visual.json's run_nonce, result.json's (expectedRunNonce) and the summary line's echo (observedRunNonce)
 $script:TailRunNoncePattern = '^[0-9a-f]{32}\z'
+# R5-RESIDUE-1 (sol r1 B1): the label_bound_basis values that are a paint-path record (the paint that drew the frame recorded its serial), compared ordinally;
+# a forced repaint's pixmap_item_by_construction (painted == label by construction) is not one, so it never earns tail credit
+$script:TailCreditPaintBases = @('gl_window_paint', 'gl_viewport_paint', 'pixmap_composed_paint')
 # r2 (adversary A4 on 9f327333): the diagnostics only Get-DvCriteriaMetrics derives; a verbatim summary.json key of one of these names is dropped, never trusted
 $script:CriteriaDerivedOnlyMetrics = @('conformTailUnpaintedAtCloseFrames', 'conformTailInFlightCreditedFrames', 'conformTailInFlightCreditNote',
     'conformFrozenTailFrames', 'conformTailAllowanceFrames', 'conformPaintStepsImpliedMaxJump')
@@ -7668,6 +7671,8 @@ function Get-DvTailVisualEvidence {
     R4-RESIDUE-1 (r4 pass-5 A8): runNonce is the app's top-level run_nonce when it is a JSON string (else $null; Get-DvTailInFlightCredit judges its form and
     binds it to the launcher's nonce). The play_first_unbound burst (the unforced captures the app takes before its first forced paint) is read exactly like
     play_unbound: its own kind-index file name, the duplicate check, its PNG read (typed when unreadable) and the recorded sha.
+    R5-RESIDUE-1 (sol r1 B1): each frame also carries labelBoundBasis, the row's label_bound_basis when it is a JSON string (else $null): where the app's
+    painted serial came from (gl_window_paint, gl_viewport_paint, pixmap_composed_paint, pixmap_item_by_construction or none); Get-DvTailInFlightCredit judges it.
     Pure apart from reading files; never throws.
     #>
     param([AllowNull()][AllowEmptyString()][string]$EvidenceDir, [AllowNull()][AllowEmptyString()][string]$LegId, [AllowNull()][AllowEmptyString()][string]$ExpectedSha256,
@@ -7755,8 +7760,11 @@ function Get-DvTailVisualEvidence {
             $forced = Get-DvProp $row 'forced_paints_before'
             # r4 (adversary A2): the app writes source_id only while the capture's clip is still the clip the capture run began on (MainWindow.cpp r7)
             $sourceId = Get-DvProp $row 'source_id'
+            # R5-RESIDUE-1 (sol r1 B1): where the painted serial came from (MainWindow.cpp paintPresentedFrameForCapture); a JSON string only, judged by the credit
+            $basis = Get-DvProp $row 'label_bound_basis'
             $frames.Add([pscustomobject]@{ kind = $kind; index = [int64]$index; saved = (($saved -is [bool]) -and $saved); playActive = (($active -is [bool]) -and $active)
                                            displayFrame = $display; tailElapsedMs = $(if ($tailOk) { [double]$tail } else { $null }); pngSha256 = $pngSha; labelBound = $labelBound
+                                           labelBoundBasis = $(if ($basis -is [string]) { $basis } else { $null })
                                            serial = $(if ($serialsOk) { [int64]$serial } else { $null })
                                            forcedPaintsBefore = $(if (($forced -is [int]) -or ($forced -is [long])) { [int64]$forced } else { $null })
                                            sourceId = $(if ($sourceId -is [string] -and $sourceId -cmatch '^[0-9a-f]{16}\z') { $sourceId } else { $null }) })
@@ -7791,6 +7799,9 @@ function Get-DvTailInFlightCredit {
     line's echo), each itself well-formed, else TAIL_VISUAL_NONCE_MISMATCH: two runs can share a session number and a millisecond tail_begin_utc. The
     qualifying captures are the unforced kinds play_unbound and play_first_unbound (the app's burst before its first forced paint), each with
     forced_paints_before = JSON integer 0.
+    R5-RESIDUE-1 (sol r1 B1): a qualifying capture's labelBoundBasis must also be a paint-path record, ordinally one of TailCreditPaintBases: gl_window_paint,
+    gl_viewport_paint (the paintGL() that drew it recorded it) or pixmap_composed_paint (GraphicsZoomView's own record of its last composed paintEvent, the
+    pixmap route's unforced capture). A forced repaint's by-construction basis (pixmap_item_by_construction), none, or anything else never qualifies.
     Pure: no I/O; a missing or malformed input is a reason, never a credit.
     #>
     param([Parameter(Mandatory)][int64]$Unpainted, [Parameter(Mandatory)][int64]$Target, $Playback, $Visual)
@@ -7862,7 +7873,10 @@ function Get-DvTailInFlightCredit {
         # R4-RESIDUE-1: the unforced kinds are play_unbound and the play_first_unbound burst (taken before the first forced paint, so it can qualify)
         $fKind = [string](Get-DvProp $f 'kind')
         $unforcedKind = [string]::Equals($fKind, 'play_unbound', [StringComparison]::Ordinal) -or [string]::Equals($fKind, 'play_first_unbound', [StringComparison]::Ordinal)
-        if ((Get-DvProp $f 'saved') -eq $true -and (Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'labelBound') -eq $true -and
+        # R5-RESIDUE-1 (sol r1 B1): and its painted serial is a paint-path record (never a forced repaint's by-construction one)
+        $fBasis = Get-DvProp $f 'labelBoundBasis'
+        $paintBasis = ($fBasis -is [string]) -and ($fBasis -cin $script:TailCreditPaintBases)
+        if ((Get-DvProp $f 'saved') -eq $true -and (Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'labelBound') -eq $true -and $paintBasis -and
             $unforcedKind -and $null -ne $forcedBefore -and [int64]$forcedBefore -eq 0 -and
             -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'sourceId')) -and $null -ne (Get-DvProp $f 'serial') -and
             -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'pngSha256')) -and $null -ne $tailMs -and $null -ne $display) {
@@ -7871,7 +7885,7 @@ function Get-DvTailInFlightCredit {
             if ($d -gt ($Target - $Unpainted) -and $d -le $Target) { [void]$shown.Add($d) }
         }
     }
-    if ($shown.Count -eq 0) { return (& $no "no play capture (unforced play_unbound or play_first_unbound taken before any forced repaint, saved, label-bound, bound to its clip by a source_id, its PNG on disk and decodable, Play active) in the post-close tail shows exactly an in-flight target ($(($Target - $Unpainted + 1))..$Target)") }
+    if ($shown.Count -eq 0) { return (& $no "no play capture (unforced play_unbound or play_first_unbound taken before any forced repaint, saved, label-bound with a paint-path label_bound_basis ($($script:TailCreditPaintBases -join ', '); a forced repaint's by-construction basis never qualifies), bound to its clip by a source_id, its PNG on disk and decodable, Play active) in the post-close tail shows exactly an in-flight target ($(($Target - $Unpainted + 1))..$Target)") }
     # r4 (adversary A5 on eabccd6c): the qualifying captures, in the order they were taken (tail_elapsed_ms), must show a non-decreasing display frame and paint
     # serial: 479 at 126 ms then 478 at 376 ms is a backward paint after the close, never two credits. Two captures at the same instant cannot be ordered.
     $byTime = @($ordered | Sort-Object -Property @{ Expression = { [double](Get-DvProp $_ 'tailElapsedMs') } })

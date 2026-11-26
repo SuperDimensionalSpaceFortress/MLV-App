@@ -219,6 +219,16 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
             "        ui->graphicsView->notePixmapPresentSerial( static_cast<quint64>( task.requestSerial ) );")));
         const QString zoomView = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.cpp"));
         ASSERT_TRUE(zoomView.contains(QStringLiteral("    QGraphicsView::paintEvent(event);\n    m_pixmapPaintedSerial = m_pixmapPendingSerial;")));
+        // R5-RESIDUE-1 (sol r1 B1): the pixmap route's unforced capture reads the COMPOSED paint record, never m_pixmapPaintedSerial (an offscreen
+        // grab promotes that one)
+        const QString zoomHeader = readRepoFile(QStringLiteral("platform/qt/GraphicsZoomView.h"));
+        const int composedAt = zoomHeader.indexOf(QStringLiteral("bool composedPixmapPaintedSerial( quint64 *serial ) const"));
+        ASSERT_TRUE(composedAt > 0);
+        const int composedEnd = zoomHeader.indexOf(QStringLiteral("\n    }\n"), composedAt);
+        ASSERT_TRUE(composedEnd > composedAt);
+        const QString composedBody = zoomHeader.mid(composedAt, composedEnd - composedAt);
+        ASSERT_TRUE(composedBody.contains(QStringLiteral("m_pixmapComposedPaint")));
+        ASSERT_FALSE(composedBody.contains(QStringLiteral("m_pixmapPaintedSerial")));
         ASSERT_TRUE(paintBody.contains(QStringLiteral("playback_frame_range::conformDisplayPaintPending(")));
         const int shown = src.indexOf(QStringLiteral("long long MainWindow::conformDisplayedPlaybackFrame()"));
         ASSERT_TRUE(shown > 0);

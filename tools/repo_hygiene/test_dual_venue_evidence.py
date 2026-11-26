@@ -12330,8 +12330,23 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         self.assertLess(lam.index("grab.forcedPaintsBefore = visualForcedPaints;"), lam.index(helper), "the ordinal is read before this capture's own paint")
         self.assertIn("if( forcePaint ) ++visualForcedPaints;", lam)
         # where the painted serial came from is named (the pixmap route's binding holds by construction)
-        for basis in ('"gl_window_paint"', '"gl_viewport_paint"', '"pixmap_item_by_construction"', '"none"'):
+        for basis in ('"gl_window_paint"', '"gl_viewport_paint"', '"pixmap_item_by_construction"', '"pixmap_composed_paint"', '"none"'):
             self.assertIn(f"QStringLiteral({basis})", src)
+        # R5-RESIDUE-1 S4 (sol r1 B1): an UNFORCED capture on the pixmap route reads the view's own composed-paint record (basis pixmap_composed_paint), in a
+        # branch taken only without the forced paint, after the forced route's by-construction basis, and never paints to get it
+        helper_at = src.index("static bool paintPresentedFrameForCapture(")
+        next_static = src.find("static ", helper_at + len("static bool"))
+        helper_src = src[helper_at:min(next_static if next_static > helper_at else helper_at + 3000, helper_at + 3000)]
+        construction_at = helper_src.index('QStringLiteral("pixmap_item_by_construction")')
+        composed_at = helper_src.index('QStringLiteral("pixmap_composed_paint")')
+        record_at = helper_src.index("composedPixmapPaintedSerial(")
+        self.assertLess(construction_at, record_at)
+        self.assertLess(record_at, composed_at)
+        branch_at = helper_src.rindex("else if(", 0, record_at)
+        self.assertGreater(branch_at, construction_at)
+        condition = helper_src[branch_at:helper_src.index("\n", branch_at)]
+        self.assertIn("!paint", condition, "the composed-paint record is read only by an unforced capture")
+        self.assertNotIn("repaint(", helper_src[branch_at:composed_at], "the unforced pixmap branch never paints")
         # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1. S1 (r4 pass-5 A8): visual.json carries the launcher's run nonce, the one the summary echoes.
         self.assertIn('visualJson.insert( QStringLiteral("run_nonce"), automationRunNonce() );', block)
         # S2: an unforced play_first_unbound burst between the tail clock's start and the first forced play capture (the only captures no forced paint
@@ -12353,6 +12368,17 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         header = (ROOT / "platform" / "qt" / "VisualCaptureSourceDifference.h").read_text(encoding="utf-8")
         self.assertIn('return kind == QStringLiteral("play") || kind == QStringLiteral("play_unbound");', header)
         self.assertIn("isSourceBoundCaptureKind(", header)
+        # R5-RESIDUE-1 S5 (sol r1 B2): after the event pump and the serial probe the burst re-reads the clock and stops before a capture that cannot end
+        # before the first forced target (the longest burst capture so far), so no burst capture starts after the cutoff
+        probe_at = pre_forced.index("&visualBurstProbeSerial, nullptr );")
+        recheck_at = pre_forced.index("visualTailClock.elapsed() + visualBurstLongestMs >= visualFirstForcedMs")
+        burst_grab_at = pre_forced.index(burst)
+        self.assertLess(probe_at, recheck_at)
+        self.assertLess(recheck_at, burst_grab_at)
+        self.assertIn("break;", pre_forced[recheck_at:burst_grab_at])
+        self.assertEqual(pre_forced.count("grabVisual("), 1)
+        for painting in ("repaint(", "paintPendingNowIfActive(", "->update("):
+            self.assertNotIn(painting, pre_forced)
 
 
 # ---------------------------------------------------------------------------------------------------
@@ -21212,6 +21238,49 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             self.assertFalse(res["isNull"], res)
             self.assertIn("TAIL_VISUAL_UNREADABLE", res["refused"], res)
             self.assertTrue(res["path"].endswith(f"{self.LEG}-play-first-unbound-0.png"), res)
+
+    # ---- R5-RESIDUE-1 r1 (sol r1 B1 on 6e945568: the pixmap route's unforced capture had no paint record, so the CPU leg's credit was unreachable;
+    # the credit now admits only a paint-path label_bound_basis). Each is RED on 6e945568 unless marked (control). ----
+    PAINT_BASES = ("gl_window_paint", "gl_viewport_paint", "pixmap_composed_paint")
+
+    def test_r5r_r7_a_pixmap_composed_paint_burst_row_is_credited(self) -> None:
+        """R7 (control): the CPU/pixmap route's play_first_unbound row (index 0, forced_paints_before=0, saved, Play active, painted_serial_valid true,
+        serial == painted_serial, label-bound, label_bound_basis pixmap_composed_paint: GraphicsZoomView's own record of its last composed paint), a
+        source_id, its recorded PNG, display_frame = the in-flight target 479: credited."""
+        first = self.play(0, kind="play_first_unbound", tail_elapsed_ms=4, label_bound_basis="pixmap_composed_paint")
+        out = self.metrics(self.HELD, app=self.app_json(first), criteria=self.BOTH)
+        self.assertEqual((out["m"].get("conformTailInFlightCreditedFrames"), out["m"]["conformTailUnpaintedFrames"]), (1, 0), out)
+        self.assertTrue(out["v"]["pass"], out)
+
+    def test_r5r_r8_a_capture_without_a_paint_path_basis_is_never_credited(self) -> None:
+        """R8 (sol B1's class): the same row with label_bound_basis pixmap_item_by_construction (a forced repaint's: painted == label holds by
+        construction) is not credited, and the reason names the basis. So is every other value: "none", the key absent, a JSON number, "GL_WINDOW_PAINT"
+        (ordinal compare) and "gl_window_paint " (a trailing space). The same holds for a play_unbound row with forced_paints_before=0. RED on 6e945568:
+        its reader ignored the basis."""
+        bases = {"pixmap_item_by_construction": "pixmap_item_by_construction", "none": "none", "absent": None, "a JSON number": 7,
+                 "GL_WINDOW_PAINT": "GL_WINDOW_PAINT", "gl_window_paint plus a trailing space": "gl_window_paint "}
+        for kind, extra in (("play_first_unbound", {"tail_elapsed_ms": 4}), ("play_unbound", {})):
+            for name, basis in bases.items():
+                with self.subTest(kind=kind, basis=name):
+                    row = self.play(0, kind=kind, **extra, label_bound_basis=basis)
+                    if name == "absent":
+                        row.pop("label_bound_basis")
+                    out = self.metrics(self.HELD, app=self.app_json(row), criteria=self.BOTH)
+                    self.assert_no_credit(out, 1)
+                    note = out["m"]["conformTailInFlightCreditNote"]
+                    self.assertIn("label_bound_basis", note, out)
+                    for paint_basis in self.PAINT_BASES:
+                        self.assertIn(paint_basis, note, out)
+
+    def test_r5r_r9_every_paint_path_basis_still_credits(self) -> None:
+        """R9 (control): the existing credited fixtures (gl_window_paint, play() default) and a gl_viewport_paint row stay credited, on both unforced kinds."""
+        self.assertEqual(self.play(0)["label_bound_basis"], "gl_window_paint")
+        for kind, extra in (("play_first_unbound", {"tail_elapsed_ms": 4}), ("play_unbound", {})):
+            for basis in self.PAINT_BASES:
+                with self.subTest(kind=kind, basis=basis):
+                    out = self.metrics(self.HELD, app=self.app_json(self.play(0, kind=kind, **extra, label_bound_basis=basis)), criteria=self.BOTH)
+                    self.assertEqual((out["m"].get("conformTailInFlightCreditedFrames"), out["m"]["conformTailUnpaintedFrames"]), (1, 0), out)
+                    self.assertTrue(out["v"]["pass"], out)
 
 
 class DriftLegSpecTests(unittest.TestCase):

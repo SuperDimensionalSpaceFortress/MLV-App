@@ -52,6 +52,13 @@ public:
         // r30 (adversary A1 on 71104385): a composed paint, never m_pixmapPaintedSerial (an offscreen viewport grab promotes it)
         return m_pixmapComposedPaint.pendingFor( m_pixmapPendingSerial, serial );
     }
+    // EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R5-RESIDUE-1 (sol r1 B1): the serial the last COMPOSED viewport paint drew; an offscreen grab
+    // never counts (r30). Whether one is known; the --visual-capture-dir unforced capture's paint record on the pixmap route.
+    bool composedPixmapPaintedSerial( quint64 *serial ) const
+    {
+        if( serial ) *serial = m_pixmapComposedPaint.valid() ? static_cast<quint64>( m_pixmapComposedPaint.serial() ) : 0;
+        return m_pixmapComposedPaint.valid();
+    }
 
 public slots:
     void shortCutZoomIn(void);

@@ -857,13 +857,58 @@ TEST(VisualCaptureBinding, EveryCaptureNamesWhereItsPaintedSerialCameFrom)
     ASSERT_TRUE(source.contains(QStringLiteral("frameJson.insert( QStringLiteral(\"label_bound_basis\"), grab.labelBoundBasis );")));
     const int helperAt = source.indexOf(QStringLiteral("static bool paintPresentedFrameForCapture("));
     ASSERT_TRUE(helperAt >= 0);
-    const QString helper = source.mid(helperAt, 2200);
+    // R5-RESIDUE-1 (sol r1 B1): the window runs to the helper's own end (its closing `return valid;`), never past it
+    const int helperEnd = source.indexOf(QStringLiteral("return valid;"), helperAt);
+    ASSERT_TRUE(helperEnd > helperAt);
+    const QString helper = source.mid(helperAt, helperEnd - helperAt);
     const int windowAt = helper.indexOf(QStringLiteral("basis = QStringLiteral(\"gl_window_paint\");"));
     const int viewportAt = helper.indexOf(QStringLiteral("basis = QStringLiteral(\"gl_viewport_paint\");"));
     const int pixmapAt = helper.indexOf(QStringLiteral("basis = QStringLiteral(\"pixmap_item_by_construction\");"));
     ASSERT_TRUE(windowAt >= 0 && viewportAt > windowAt && pixmapAt > viewportAt);
     // the pixmap-route basis is set only beside the item's own serial, never for a GL route
     ASSERT_TRUE(helper.lastIndexOf(QStringLiteral("serial = pixmapItemSerial;"), pixmapAt) > viewportAt);
+    // R5-RESIDUE-1 (sol r1 B1): an UNFORCED pixmap capture names the view's own record of its last composed paint, in a branch taken only
+    // without the forced paint (`!paint`), and that branch never paints
+    const int composedAt = helper.indexOf(QStringLiteral("basis = QStringLiteral(\"pixmap_composed_paint\");"));
+    ASSERT_TRUE(composedAt > pixmapAt);
+    const int branchAt = helper.lastIndexOf(QStringLiteral("else if("), composedAt);
+    ASSERT_TRUE(branchAt > pixmapAt);
+    const int conditionEnd = helper.indexOf(QLatin1Char('\n'), branchAt);
+    ASSERT_TRUE(conditionEnd > branchAt);
+    ASSERT_TRUE(helper.mid(branchAt, conditionEnd - branchAt).contains(QStringLiteral("!paint")));
+    const QString unforcedBranch = helper.mid(branchAt, composedAt - branchAt);
+    ASSERT_EQ(0, countOccurrences(unforcedBranch, QStringLiteral("repaint(")));
+    ASSERT_TRUE(unforcedBranch.contains(QStringLiteral("composedPixmapPaintedSerial(")));
+}
+
+// R5-RESIDUE-1 (sol r1 B2): the burst pumps events and probes the painted serial, then re-reads the clock: a capture that cannot end before the
+// first forced target (judged by the longest burst capture so far) is never started, so only the first burst capture can run past it. The
+// longest capture is measured around the pinned burst grab, after it.
+TEST(VisualCaptureBinding, TheBurstNeverStartsACaptureThatCannotEndBeforeTheFirstForcedTarget)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    const int blockAt = source.indexOf(QStringLiteral("if( !options.visualCaptureDir.isEmpty() && ui->actionPlay->isChecked() )"));
+    const int blockEnd = source.indexOf(QStringLiteral("// (4) files:"), blockAt);
+    ASSERT_TRUE(blockAt >= 0 && blockEnd > blockAt);
+    const QString block = source.mid(blockAt, blockEnd - blockAt);
+    const QString probe = QStringLiteral("&visualBurstProbeSerial, nullptr );");
+    const QString burst = QStringLiteral("grabVisual( QStringLiteral(\"play_first_unbound\"), visualBurstCount, false );");
+    const QString recheck = QStringLiteral("visualTailClock.elapsed() + visualBurstLongestMs >= visualFirstForcedMs");
+    ASSERT_EQ(1, countOccurrences(block, probe));
+    ASSERT_EQ(1, countOccurrences(block, burst));
+    const int probeAt = block.indexOf(probe);
+    const int burstAt = block.indexOf(burst);
+    ASSERT_TRUE(probeAt >= 0 && burstAt > probeAt);
+    const QString probeToGrab = block.mid(probeAt, burstAt - probeAt);
+    const int recheckAt = probeToGrab.indexOf(recheck);
+    ASSERT_TRUE(recheckAt > 0);
+    ASSERT_TRUE(probeToGrab.indexOf(QStringLiteral("break;"), recheckAt) > recheckAt);
+    // visualBurstLongestMs is declared before the loop and updated only after the burst grab
+    const QString update = QStringLiteral("visualBurstLongestMs = qMax(");
+    ASSERT_EQ(1, countOccurrences(block, update));
+    ASSERT_TRUE(block.indexOf(update) > burstAt);
+    ASSERT_EQ(1, countOccurrences(block, QStringLiteral("qint64 visualBurstLongestMs = 0;")));
+    ASSERT_TRUE(block.indexOf(QStringLiteral("qint64 visualBurstLongestMs = 0;")) < probeAt);
 }
 
 // PLAYBACK-PRESENT-TAIL-TIMING-1 (T9): the tail markers around the path-3 paint/swap and at the next setup start are
