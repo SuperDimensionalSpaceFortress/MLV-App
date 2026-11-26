@@ -537,6 +537,17 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     byte, so a receipt written before the signal re-derives the same metrics. On the producer side, `dual_iso` 1 (full) and 2 (preview) are the only modes:
     `llrpSetDualIsoMode` (and the playback runtime setter) store any other value (a receipt can carry any integer) as 0, so every reader, pixel repair included, runs it
     as `dual_iso` 0 and the run is `not_attempted` with a zero time. The build class reads a build's `StageTiming.h` once and decides both macros from those bytes.
+    **r4: the reader follows the real, pipelined producer.** Both r3 Bachelor ProRes legs on `04004b4e` (receipts `82f50eaf`, `43d898b5`) read INVALID on the reader's
+    own rules. Before the frame loop's first write, the MLV cache threads decode frames and run `llrawproc` on them without dual-ISO (`not_attempted`, no render), and
+    they interleave in the log (frames 0..11 of M16-1243, 0..31 of M16-1456). The loop then renders each of those frames again. The loop itself is one thread
+    (`BatchRunner.cpp`: render, scale, write, frame by frame). Three rules now read that shape, each per frame:
+    * **Order.** The frame loop's order is held per frame: no scale or write before the frame's `processed16_total`, one total, at most one scale (before the write),
+      nothing of the frame after its total but its scale and write, and nothing after its write. Every frame with a record must be written. Records of other frames may
+      come in between. The writes still come once each in rising frame order, since one loop writes them.
+    * **Pairing.** A `llrawproc_dual_iso` record pairs with the previous record **of its frame**, which must be `llrawproc`. It is never paired with the line before it.
+    * **Outcome.** A rendered frame's dual-ISO outcome comes from the runs of its *render's* decode. That decode starts at the frame's last `raw_uint16` record before
+      its `processed16_total`. A marker from an earlier decode of the frame (a cache-thread prefetch) is still held to every marker rule, but it never makes the frame
+      `DUALISO_OUTCOME_MIXED`, and it never rescues a render that did not apply. Two runs inside the render's own decode that disagree are still `mixed`.
     From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
     so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
     `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).

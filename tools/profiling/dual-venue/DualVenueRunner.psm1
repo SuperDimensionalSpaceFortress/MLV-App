@@ -5746,7 +5746,9 @@ function Test-DvExportStageLogRecords {
                 $seq.Add([pscustomobject]@{ stage = $s; frame = $f; line = $lineNo })   # (r2 fix 2, adversary A1 on c2da7e24: untabled stages are frame records too)
                 if ($script:ExportDualIsoOutcomeWord.ContainsKey($s)) { $outcomeRecs.Add([pscustomobject]@{ stage = $s; frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $beforeSame }); continue }
                 if (-not $perStage.ContainsKey($s)) { continue }
-                if ($s -ceq 'llrawproc_dual_iso') { $dualRecs.Add([pscustomobject]@{ frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $before }) }
+                # (r4, both r3 Bachelor legs on 04004b4e: the cache threads interleave frames, so a dual-ISO record is paired with the previous record OF ITS FRAME, as the
+                # marker is above, never with the physically previous line; $before stays the line-adjacent record for nothing else)
+                if ($s -ceq 'llrawproc_dual_iso') { $dualRecs.Add([pscustomobject]@{ frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $beforeSame; lineAfter = $before }) }
                 $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
                 # (r5, sol r4 B4: and the EXACT [decimal] sum beside it, which the containment means read: a double keeps about 15 digits, so 3500001.000000401 read as
                 # 3500001.0000004 and passed a limit it is past)
@@ -5803,6 +5805,18 @@ function Test-DvExportStageLogRecords {
     # parentless dual-ISO leaf above stays a timing rule and never feeds the signal). A3: a not_attempted marker after a dual-ISO time above 0 is no producer outcome
     # (llrawproc.c resets that time at each run entry and adds to it only inside an attempt), so it is typed here, never read as a run that did not attempt dual-ISO.)
     $zeroMs = '\A0(?:\.0{1,9})?\z'
+    # (r4, both r3 Bachelor legs on 04004b4e: before the frame loop renders frame N, an MLV cache thread may already have decoded it and run llrawproc on it once, without
+    # dual-ISO (llrawproc_dual_iso_not_attempted, no debayer, no processed16_total). The loop's render then runs llrawproc again on that frame, and THAT run is the one
+    # its processed16_total closes and its pipe write exports. That render starts with its own raw_uint16 record (a cache hit still notes it). So a marker whose frame is
+    # DECODED AGAIN after it -- a raw_uint16 record of that frame after the marker's llrawproc_dual_iso record and before the frame's first processed16_total -- reports an
+    # earlier decode's run, not the exported one: it is still held to every rule here (shape, place, figure) and still marks its dual-ISO record, but its word is not
+    # the frame's outcome. Every run of the render's own decode keeps deciding it, so two runs there that disagree are still 'mixed'. A frame with no
+    # processed16_total, or with no raw_uint16 before it, keeps every marker's word, as before.)
+    $p16Line = [hashtable]::new([StringComparer]::Ordinal)
+    foreach ($r in $seq) { if ($r.stage -ceq 'processed16_total' -and -not $p16Line.ContainsKey($r.frame)) { $p16Line[$r.frame] = $r.line } }
+    $renderDecodeLine = [hashtable]::new([StringComparer]::Ordinal)   # the frame's last raw_uint16 record before its first processed16_total
+    foreach ($r in $seq) { if ($r.stage -ceq 'raw_uint16' -and $p16Line.ContainsKey($r.frame) -and $r.line -lt $p16Line[$r.frame]) { $renderDecodeLine[$r.frame] = $r.line } }
+    $otherRunMarkers = 0
     foreach ($o in $outcomeRecs) {
         $a = $o.after
         if ($null -ne $a -and $script:ExportDualIsoOutcomeWord.ContainsKey($a.stage)) { $outcomeBad.Add("line $($o.line) records $($o.stage) for frame $($o.frame) after another outcome marker (line $($a.line)); the producer writes one marker per llrawproc_dual_iso record"); continue }
@@ -5812,6 +5826,7 @@ function Test-DvExportStageLogRecords {
         if ($o.msText -cnotmatch $zeroMs) { $outcomeBad.Add("line $($o.line) records $($o.stage) at $($o.msText) ms; an outcome marker is a 0.000 record, never a timing"); continue }
         if ($script:ExportDualIsoOutcomeWord[$o.stage] -ceq 'not_attempted' -and $a.msText -cnotmatch $zeroMs) { $outcomeBad.Add("line $($o.line) records $($o.stage) for frame $($o.frame) after a $($a.msText) ms llrawproc_dual_iso record (line $($a.line)); llrawproc.c times dual-ISO only inside an attempt, so a timed run that did not attempt it is no producer outcome"); continue }
         $markedDualLines[$a.line] = $true
+        if ($renderDecodeLine.ContainsKey($o.frame) -and $a.line -lt $renderDecodeLine[$o.frame]) { $otherRunMarkers++; continue }
         $word = $script:ExportDualIsoOutcomeWord[$o.stage]
         $outcomes[$o.frame] = $(if (-not $outcomes.ContainsKey($o.frame) -or $outcomes[$o.frame] -ceq $word) { $word } else { 'mixed' })
     }
@@ -5823,37 +5838,44 @@ function Test-DvExportStageLogRecords {
     # before its frame's processed16_total, no scale after its pipe write, no record of a frame after its pipe write, and each frame closed before the next one renders.
     # (r2 fix 2, adversary A1 on c2da7e24: as ONE block per frame. video_mlv.c notes processed16_total right after processing, last of the render (video_mlv.c:7656-7661), so after
     # it only that frame's export_scale and then its export_pipe_write follow; a frame's first record opens its block, and no record of another frame comes before the write closes it)
+    # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 r4, both r3 Bachelor legs on 04004b4e read INVALID here on real exporter output: the order is held PER FRAME. The frame
+    # loop is one thread (BatchRunner.cpp:541-576: getMlvProcessedFrame16, then the scale, then pipeline.writeAll, frame by frame), but the MLV cache threads decode
+    # frames beside it and note their raw_uint16 / llrawproc records into the same stream (frames 0..11 of m16-1243 and 0..31 of m16-1456, interleaved, before the first
+    # write). So records of other frames may come between a frame's first record and its write. Within ONE frame the loop's order still holds: no scale or write before
+    # its processed16_total, one processed16_total, at most one scale and before the write, nothing of that frame after its processed16_total but its scale and write,
+    # nothing after its write, and every frame that has a record is written. The WRITES are that one loop's, so they still come once each, in rising frame order.)
     if (@($seq | Where-Object { $_.stage -ceq 'export_pipe_write' -or $_.stage -ceq 'export_scale' }).Count -gt 0) {
-        $order = $null; $closed = @{}; $open = $null; $p16Done = $false; $scaleDone = $false; $lastClosed = $null
+        $order = $null; $fst = [hashtable]::new([StringComparer]::Ordinal); $lastWritten = $null
         foreach ($r in $seq) {
             $at = "line $($r.line) records $($r.stage) for frame $($r.frame)"
-            if ($closed.ContainsKey($r.frame)) { $order = "$at after that frame's export_pipe_write"; break }
+            $st = $fst[$r.frame]
+            if ($null -eq $st) { $st = @{ p16 = $false; scale = $false; written = $false }; $fst[$r.frame] = $st }
             $isWrite = $r.stage -ceq 'export_pipe_write'; $isScale = $r.stage -ceq 'export_scale'
-            if ($null -eq $open) {
-                if ($isWrite -or $isScale) { $order = "$at before that frame's processed16_total"; break }
-                if ($null -ne $lastClosed -and [int64]$r.frame -le $lastClosed) { $order = "$at after frame $lastClosed was written (frames run one at a time in rising order)"; break }
-                $open = $r.frame; $p16Done = $false; $scaleDone = $false
-            }
-            elseif ($r.frame -cne $open) { $order = "$at while frame $open is not yet written (each frame is written before the next one renders)"; break }
+            if ($st.written) { $order = "$at $(if ($isWrite) { 'twice (the frame loop writes each frame once)' } else { "after that frame's export_pipe_write" })"; break }
             if ($isWrite) {
-                if (-not $p16Done) { $order = "$at before that frame's processed16_total"; break }
-                $closed[$open] = $true; $lastClosed = [int64]$open; $open = $null
+                if (-not $st.p16) { $order = "$at before that frame's processed16_total"; break }
+                if ($null -ne $lastWritten -and [int64]$r.frame -le $lastWritten) { $order = "$at after frame $lastWritten was written (the one frame loop writes frames in rising order)"; break }
+                $st.written = $true; $lastWritten = [int64]$r.frame
             }
             elseif ($isScale) {
-                if (-not $p16Done -or $scaleDone) { $order = "$at $(if ($scaleDone) { 'twice' } else { "before that frame's processed16_total" })"; break }
-                $scaleDone = $true
+                if (-not $st.p16 -or $st.scale) { $order = "$at $(if ($st.scale) { 'twice' } else { "before that frame's processed16_total" })"; break }
+                $st.scale = $true
             }
-            # (r5, sol r4 B2: a second processed16_total of an open frame is a second render total, which the sums above add into the timed work; the render notes it once)
-            elseif ($r.stage -ceq 'processed16_total') { if ($p16Done) { $order = "$at twice (the render notes its total once per frame)"; break }; $p16Done = $true }
-            elseif ($p16Done) { $order = "$at after that frame's processed16_total (the render's last note)"; break }
+            # (r5, sol r4 B2: a second processed16_total of a frame is a second render total, which the sums above add into the timed work; the render notes it once)
+            elseif ($r.stage -ceq 'processed16_total') { if ($st.p16) { $order = "$at twice (the render notes its total once per frame)"; break }; $st.p16 = $true }
+            elseif ($st.p16) { $order = "$at after that frame's processed16_total (the render's last note)"; break }
         }
-        # (r5, sol r4 B2: a frame opened after the last write and never written -- a record of frame 1 after a one-frame cut's write -- is no frame of the loop: the loop writes
-        # every frame it renders before the next one or the drain)
-        if ($null -eq $order -and $null -ne $open) { $order = "frame $open is recorded but never written (no export_pipe_write closes it)" }
-        if ($null -ne $order) { $problems.Add("EXPORT_RECORD_INVALID: stage-timing.log is not in the frame loop's order (render, then export_scale, then export_pipe_write, frame by frame): $order") }
+        # (r5, sol r4 B2: a frame recorded and never written -- a record of frame 1 after a one-frame cut's write -- is no frame of the loop: the loop writes every frame it
+        # renders, and the cache threads decode only frames the loop then renders, r4)
+        if ($null -eq $order) {
+            $unwritten = @($fst.Keys | Where-Object { -not $fst[$_].written } | Sort-Object { [int64]$_ })
+            if ($unwritten.Count -gt 0) { $order = "frame $($unwritten[0]) is recorded but never written (no export_pipe_write closes it)$(if ($unwritten.Count -gt 1) { "; $($unwritten.Count) frame(s) are" })" }
+        }
+        if ($null -ne $order) { $problems.Add("EXPORT_RECORD_INVALID: stage-timing.log is not in the frame loop's order (per frame: render, then export_scale, then export_pipe_write; the writes once each in rising frame order): $order") }
     }
     [pscustomobject]@{ perStage = $perStage; perStageD = $perStageD; clipRecords = $clipRecords; lastPerFrameLine = $lastPerFrameLine; problems = @($problems)
-                       outcomeRecords = $outcomeRecs.Count; outcomeInvalid = $outcomeBad.Count; outcomes = $outcomes; outcomeUnmarked = $outcomeUnmarked }
+                       outcomeRecords = $outcomeRecs.Count; outcomeInvalid = $outcomeBad.Count; outcomes = $outcomes; outcomeUnmarked = $outcomeUnmarked
+                       outcomeOtherRunMarkers = $otherRunMarkers }
 }
 
 function Get-DvExportEvidence {

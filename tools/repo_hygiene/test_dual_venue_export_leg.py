@@ -1852,11 +1852,14 @@ class ExportRenderPipeTimingTests(unittest.TestCase):
         v3 = lines[:w0 + 1] + ["[mlv-stage-timing] frame=0 stage=raw_uint16_copy ms=0.001"] + lines[w0 + 1:]
         v4 = lines[:1] + ["[mlv-stage-timing] frame=9999 stage=raw_uint16_copy ms=0.001"] + lines[1:]
         self.assertLess(p0, w0)
-        proc, got = evidence_cases([self.ctl("\n".join(v) + "\n") for v in (v1, v2, v3, v4)])
+        # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 r4: v2 is the overlap the real exporter writes -- an MLV cache thread decodes frame 1 before frame 0's write, the two
+        # r3 Bachelor legs on 04004b4e -- so the per-frame order no longer refuses it; v1, v3 and v4 break the order WITHIN one frame and stay refused)
+        proc, got = evidence_cases([self.ctl("\n".join(v) + "\n") for v in (v1, v3, v4, v2)])
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
-        for g in got:
+        for g in got[:3]:
             self.assertEqual(g["outcome"], "INVALID", g)
             self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "frame loop's order" in p for p in g["problems"]), g)
+        self.assertFalse(any("frame loop's order" in p for p in got[3]["problems"]), got[3])
 
     def test_adversary_r2f2_a4_a_build_id_with_a_newline_or_a_tree_without_the_header_is_classed(self) -> None:
         """pass 5 A4: the base id with a trailing LF matched the '$' anchor and failed the lookup (unknown, PASS); and a commit whose tree has no src/debug/StageTiming.h read
@@ -4566,7 +4569,7 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
     def test_r3_venue_a_marker_follows_its_own_frames_dual_iso_record_when_threads_interleave_the_log(self) -> None:
         """The Bachelor m16-1456 leg on 928fad78 (receipt 13313451-d9dd-4a6f-bd28-00b7f6d2beb3): the MLV cache threads decode frames side by side, so another frame's
         record can land between a frame's llrawproc_dual_iso and its marker. Each run's three notes are one thread's, in order, so the marker is bound to the previous
-        record OF ITS FRAME, never to the previous line. (The frame-order check of EXPORT-RENDER-PIPE-TIMING-1 still types such a log; that is its successor's.)"""
+        record OF ITS FRAME, never to the previous line. (r4: and the frame order is held per frame, so the interleaving is no order problem either.)"""
         clean = piped_stage_log(480, outcome="applied")
         dual0 = "[mlv-stage-timing] frame=0 stage=llrawproc_dual_iso ms=30.000\n"
         mark0 = "[mlv-stage-timing] frame=0 stage=llrawproc_dual_iso_applied ms=0.000\n"
@@ -4578,7 +4581,8 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         g = got[0]
         self.assertFalse(any("outcome marker" in p for p in g["problems"]), g)
-        self.assertTrue(any("frame loop's order" in p for p in g["problems"]), g)
+        self.assertFalse(any("frame loop's order" in p for p in g["problems"]), g)
+        self.assertEqual(g["outcome"], "PASS", g)
 
     # ---- r3 fix iteration 2: adversary 9a8772dd (adversary-9a8772dd.json) A1, A2, A4 (A3 is native: DualIsoAppliedOutcome.ModeThatNamesNoReconstructionReportsNotAttempted)
     def test_r3_9a8772dd_a1_a_signal_capture_that_leaves_one_run_unmarked_never_passes(self) -> None:
@@ -4630,6 +4634,109 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
             proc, got = run_pwsh_json(script)
         self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
         self.assertEqual(got, {"pipe": "emits", "signal": "emits"})
+
+    # ---- r4: the r3 Bachelor legs on 04004b4e (receipts 82f50eaf m16-1243, 43d898b5 m16-1456) read INVALID on the reader's global order and adjacency rules. The MLV
+    # cache threads decode frames and run llrawproc on them (dual-ISO not_attempted, no render) before the frame loop's first write, interleaved; the fixture carries
+    # those first lines verbatim. Each row puts that real prefix in front of the clean applied-signal log, whose frame loop then renders and writes every frame.
+    R4_FIXTURE = Path(__file__).resolve().parent / "fixtures" / "export_prores_cache_thread_prefetch_r4.json"
+
+    @classmethod
+    def r4_prefix(cls, name: str) -> str:
+        return "".join(l + "\n" for l in json.loads(cls.R4_FIXTURE.read_text(encoding="utf-8"))["excerpts"][name]["text"])
+
+    @classmethod
+    def r4_log(cls, name: str, outcome="applied") -> str:
+        return cls.r4_prefix(name) + piped_stage_log(480, outcome=outcome)
+
+    def test_r4_fixture_is_the_real_logs_first_lines(self) -> None:
+        """The fixture names its source receipts and log hashes, and its m16-1456 excerpt carries the two r3 refusals' own lines: line 5 (frame 2 while frame 1 is not
+        written) and line 25 (frame 1's dual-ISO record after another frame's line)."""
+        fx = json.loads(self.R4_FIXTURE.read_text(encoding="utf-8"))["excerpts"]
+        self.assertEqual((len(fx["m16-1243"]["text"]), len(fx["m16-1456"]["text"])), (20, 40))
+        self.assertEqual(fx["m16-1243"]["text"][10], "[mlv-stage-timing] frame=1 stage=raw_uint16 ms=39.132")
+        self.assertEqual(fx["m16-1456"]["text"][4], "[mlv-stage-timing] frame=2 stage=raw_uint16 ms=9.818")
+        self.assertEqual(fx["m16-1456"]["text"][24], "[mlv-stage-timing] frame=1 stage=llrawproc_dual_iso ms=0.000")
+        self.assertNotIn("llrawproc", fx["m16-1456"]["text"][23])
+
+    def test_r4_the_real_cache_thread_prefix_reads_pass_with_every_frame_applied(self) -> None:
+        """RED on 04004b4e: m16-1243's prefix read INVALID on the global frame order (line 11, frame 1 while frame 0 is not written); m16-1456's read INVALID on the global
+        dual-ISO adjacency (line 25) and the frame order (line 5); with the order fixed, the prefetch runs' not_attempted markers beside the render runs' applied ones read
+        every prefetched frame DUALISO_OUTCOME_MIXED (FAIL). GREEN: the order is per frame, the dual-ISO record pairs with its own frame's llrawproc record, and a rendered
+        frame's outcome is its render run's marker, so both read PASS with all 480 frames applied."""
+        proc, got = evidence_cases([self.ctl(self.r4_log("m16-1243")), self.ctl(self.r4_log("m16-1456"))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["problems"], [], g)
+            self.assertEqual(g["outcome"], "PASS", g)
+            self.assertIs(g["metrics"]["dualIsoClassAgrees"], True, g)
+            self.assertEqual(g["metrics"]["dualIsoActiveFrames"], 480, g)
+
+    def test_r4_a_frame_order_that_is_wrong_within_one_frame_is_still_refused(self) -> None:
+        """RED rows that a reordered-but-wrong log still refuses on the per-frame rule, each behind the real m16-1456 prefix: frame 0 written before its processed16_total,
+        frame 5 written twice, frame 7 never written, frames 3 and 4 written out of rising order, a record of frame 0 after its write, and a frame (9999) recorded and never
+        written."""
+        base = self.r4_log("m16-1456").splitlines()
+        w = lambda f: f"[mlv-stage-timing] frame={f} stage=export_pipe_write ms=10.000"
+        p = lambda f: f"[mlv-stage-timing] frame={f} stage=processed16_total ms=56.000"
+        early = [l for l in base if l != w(0)]
+        early.insert(early.index(p(0)), w(0))
+        twice = list(base)
+        twice.insert(twice.index(w(5)) + 1, w(5))
+        missing = [l for l in base if l != w(7)]
+        b3 = [i for i, l in enumerate(base) if l.startswith("[mlv-stage-timing] frame=3 ") and i > 40]
+        b4 = [i for i, l in enumerate(base) if l.startswith("[mlv-stage-timing] frame=4 ") and i > 40]
+        swapped = base[:b3[0]] + base[b4[0]:b4[-1] + 1] + base[b3[0]:b3[-1] + 1] + base[b4[-1] + 1:]
+        after = list(base)
+        after.insert(after.index(w(0)) + 1, "[mlv-stage-timing] frame=0 stage=raw_uint16_copy ms=0.001")
+        stray = base[:3] + ["[mlv-stage-timing] frame=9999 stage=raw_uint16_copy ms=0.001"] + base[3:]
+        rows = (early, "export_pipe_write for frame 0 before that frame's processed16_total"), (twice, "export_pipe_write for frame 5 twice"),(missing, "frame 7 is recorded but never written"), \
+               (swapped, "frame 3 after frame 4 was written (the one frame loop writes frames in rising order)"), \
+               (after, "raw_uint16_copy for frame 0 after that frame's export_pipe_write"), (stray,"frame 9999 is recorded but never written")
+        self.assertEqual(len(swapped), len(base))
+        proc, got = evidence_cases([self.ctl("\n".join(v) + "\n") for v, _ in rows])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, (_, why) in zip(got, rows):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "frame loop's order" in p and why in p for p in g["problems"]), (why, g["problems"]))
+
+    def test_r4_a_dual_iso_record_not_paired_with_its_own_frames_llrawproc_run_is_still_refused(self) -> None:
+        """RED rows on the real m16-1456 prefix: frame 1's llrawproc record moved after its dual-ISO record (unpaired), and a second dual-ISO record of frame 2 right after
+        its first (doubly paired: the second follows a dual-ISO record of that frame, not an llrawproc one)."""
+        base = self.r4_log("m16-1456").splitlines()
+        llr1 = "[mlv-stage-timing] frame=1 stage=llrawproc ms=0.035"
+        dual1 = "[mlv-stage-timing] frame=1 stage=llrawproc_dual_iso ms=0.000"
+        dual2 = "[mlv-stage-timing] frame=2 stage=llrawproc_dual_iso ms=0.000"
+        unpaired = [l for l in base if l != llr1]
+        unpaired.insert(unpaired.index(dual1) + 1, llr1)
+        doubled = list(base)
+        doubled.insert(doubled.index(dual2) + 1, dual2)
+        proc, got = evidence_cases([self.ctl("\n".join(v) + "\n") for v in (unpaired, doubled)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, frame in zip(got, ("1", "2")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "not the dual-ISO share" in p and f"frame {frame} does not follow an llrawproc record of that frame" in p
+                                for p in g["problems"]), g["problems"])
+
+    def test_r4_the_render_run_decides_a_frame_and_a_prefetch_run_never_rescues_it(self) -> None:
+        """The render run's marker is the frame's outcome, and the prefetch run's marker is still held to the marker rules: frame 0's render run not_applied behind an
+        applied-looking prefetch run is DUALISO_NOT_APPLIED (FAIL); frame 0's render-run marker removed is an incomplete capture (INVALID); a prefetch marker that is not
+        a 0.000 record is still EXPORT_RECORD_INVALID."""
+        ren0 = "[mlv-stage-timing] frame=0 stage=llrawproc_dual_iso_applied ms=0.000\n"
+        pre0 = "[mlv-stage-timing] frame=0 stage=llrawproc_dual_iso_not_attempted ms=0.000\n"
+        clean = self.r4_log("m16-1243")
+        self.assertEqual((clean.count(ren0), clean.count(pre0)), (1, 1))
+        rescued = clean.replace(pre0, pre0.replace("not_attempted", "applied"), 1)
+        rescued = rescued[:rescued.rindex(ren0)] + ren0.replace("_applied", "_not_applied") + rescued[rescued.rindex(ren0) + len(ren0):]
+        lost = clean.replace(ren0, "")
+        timed = clean.replace(pre0, pre0.replace("ms=0.000", "ms=0.500"))
+        proc, got = evidence_cases([self.ctl(rescued), self.ctl(lost), self.ctl(timed)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "FAIL", got[0])
+        self.assertTrue(got[0]["detail"].startswith("EXPORT_CAPTURED: dualIsoClassAgrees: DUALISO_NOT_APPLIED: 1 of 480"), got[0])
+        self.assertEqual(got[1]["outcome"], "INVALID", got[1])
+        self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH: DUALISO_OUTCOME_WINDOW_MISMATCH: ") for p in got[1]["problems"]), got[1])
+        self.assertEqual(got[2]["outcome"], "INVALID", got[2])
+        self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "outcome marker" in p and "0.500" in p for p in got[2]["problems"]), got[2])
 
 
 if __name__ == "__main__":
