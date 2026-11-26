@@ -222,25 +222,42 @@ TEST(VisualCaptureSourceDifference, TheFirstUnforcedBurstIsSourceBoundButNotAPla
 TEST(VisualCaptureSourceDifference, ABurstCaptureNeverStartsWhenTheReadBeforeItsStartIsAtTheCutoff)
 {
     const qint64 cutoffMs = 125;   // the first forced play capture's target time
-    const qint64 clockReads[] = { 124, 125 };   // the admission read, then the read immediately before the capture starts
+    const qint64 clockReads[] = { 123, 125 };   // the admission read, then the read immediately before the capture starts
     int capturesStarted = 0;
     const bool admitted = vcsd::captureMayStartBeforeCutoff(clockReads[0], 0, cutoffMs);
     ASSERT_TRUE(admitted);
     if (admitted && vcsd::captureMayStartBeforeCutoff(clockReads[1], 0, cutoffMs)) ++capturesStarted;
     ASSERT_EQ(0, capturesStarted);
 
-    // at, past and just before the cutoff, with no earlier burst capture (reserve 0)
-    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(124, 0, 125));
+    // at, past and just before the cutoff, with no earlier burst capture (reserve 0); r2: a read of 124 is within the 1 ms start margin
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(123, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(124, 0, 125));
     ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(125, 0, 125));
     ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(126, 0, 125));
     ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(164, 0, 125));   // an event pump that came back late
-    // a later capture also reserves the longest earlier burst capture: elapsed 35 + longest 90 reaches 125
+    // a later capture also reserves the longest earlier burst capture: elapsed 34 + longest 90 + the 1 ms margin reaches 125
     ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(35, 90, 125));
-    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(34, 90, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(34, 90, 125));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(33, 90, 125));
     // a capture with no cutoff (every capture outside the burst passes -1) always starts, whatever the clock reads
     ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(0, 0, -1));
     ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(3000, 0, -1));
     ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(3000, 90, -1));
+}
+
+// R6-BURST-CUTOFF-RESIDUE-1 r2 (luna A1 on c4d5d5f6): QElapsedTimer::elapsed() truncates to whole milliseconds, so the read immediately before the
+// capture can say 124 while the true time is 124.9 ms, and the capture then begins at 125 ms, the cutoff (cutoff 125, reserve 0: the first burst
+// capture). The decision keeps a margin of one whole millisecond: a read of N starts a capture only when N + reserve + 1 < cutoff, so the true start
+// time is below cutoff - 1 + 1 ms of truncation, i.e. before the cutoff, unless the thread is preempted for over a millisecond across the branch.
+TEST(VisualCaptureSourceDifference, ABurstCaptureNeverStartsWhenTheReadIsWithinOneMillisecondOfTheCutoff)
+{
+    ASSERT_EQ(1, vcsd::kCaptureStartMarginMs);
+    const qint64 cutoffMs = 125;
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(124, 0, cutoffMs));   // luna's input: read 124, the capture would begin at 125
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(123, 0, cutoffMs));    // true time below 124 ms: the start is before the cutoff
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(100, 24, cutoffMs));  // the margin adds to the reserve, it does not replace it
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(100, 23, cutoffMs));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(124, 0, -1));          // no cutoff: no margin either
 }
 
 // r7 (adversary r6 pass 3 A2 on 3663c8a3): the capture path pumps events after the play captures (the post-stop drain at the

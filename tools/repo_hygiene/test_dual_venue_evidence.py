@@ -20502,10 +20502,14 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         capture_at = lam.find("captureTopLevelWindowByPrintWindow(", gate_at)
         if capture_at < 0:
             return problems + ["the capture does not follow the gate"]
-        # between the read and the capture start only the capture timer may run (comments dropped, whitespace normalised): any other statement is a delay
+        # between the read and the capture start nothing may run (comments dropped, whitespace normalised): any statement there is a delay.
+        # r2 (luna A1 on c4d5d5f6): the capture timer now starts BEFORE the gate, so only the branch itself separates the read from the call.
         between = " ".join(re.sub(r"//[^\n]*", "", lam[gate_at + len(cls.BURST_START_GATE):capture_at]).split())
-        if between != "{ QElapsedTimer captureClock; captureClock.start(); grab.image =":
+        if between != "{ grab.image =":
             problems.append(f"code between the clock read and the capture start: {between!r}")
+        pre_gate = " ".join(re.sub(r"//[^\n]*", "", lam[:gate_at]).split())
+        if not pre_gate.endswith("QElapsedTimer captureClock; captureClock.start();"):
+            problems.append("the capture timer does not start immediately before the gate")
         if block.count("visualGrabs.append( grab );") != 1:
             problems.append("a capture is appended outside the gated branch")
         pre_forced = block[block.index("visualTailClock.start();"):block.index('grabVisual( QStringLiteral("play"), k, false );')]
@@ -20519,9 +20523,31 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             if not (0 <= before_at < call_at < refused_at < longest_at):
                 problems.append("the burst does not stop on a refused capture before it measures it")
         if "inline bool captureMayStartBeforeCutoff( qint64 nowMs, qint64 reserveMs, qint64 cutoffMs )" not in header \
-                or "return cutoffMs < 0 || nowMs + reserveMs < cutoffMs;" not in header:
-            problems.append("captureMayStartBeforeCutoff is not the strict before-the-cutoff decision")
+                or "return cutoffMs < 0 || nowMs + reserveMs + kCaptureStartMarginMs < cutoffMs;" not in header:
+            problems.append("captureMayStartBeforeCutoff is not the strict before-the-cutoff decision with the start margin")
+        # r2 (luna A1 on c4d5d5f6): QElapsedTimer::elapsed() truncates to whole ms, so a read of 124 can be 124.9 ms; the margin of one whole ms is what
+        # keeps a read of 124 against a 125 ms cutoff (reserve 0, the first burst capture) from starting a capture at 125 ms
+        if "constexpr qint64 kCaptureStartMarginMs = 1;" not in header:
+            problems.append("the capture start margin is not one whole millisecond")
         return problems
+
+    def test_r6_r2_burst_start_margin_refuses_a_read_one_ms_before_the_cutoff(self) -> None:
+        """luna A1 on c4d5d5f6: cutoff 125, reserve 0; the gate read 124 admitted and the capture could begin at 125. The header must carry the 1 ms margin,
+        and dropping it (or the timer moving back between the read and the capture) must be reported."""
+        src = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        header = (ROOT / "platform" / "qt" / "VisualCaptureSourceDifference.h").read_text(encoding="utf-8")
+        self.assertIn("constexpr qint64 kCaptureStartMarginMs = 1;", header)
+        self.assertIn("return cutoffMs < 0 || nowMs + reserveMs + kCaptureStartMarginMs < cutoffMs;", header)
+        no_margin = header.replace("nowMs + reserveMs + kCaptureStartMarginMs < cutoffMs;", "nowMs + reserveMs < cutoffMs;")
+        self.assertNotEqual(self.burst_start_gate_problems(src, no_margin), [])
+        zero_margin = header.replace("constexpr qint64 kCaptureStartMarginMs = 1;", "constexpr qint64 kCaptureStartMarginMs = 0;")
+        self.assertIn("the capture start margin is not one whole millisecond", self.burst_start_gate_problems(src, zero_margin))
+        gate_at = src.index(self.BURST_START_GATE)
+        timer = "QElapsedTimer captureClock;\n            captureClock.start();\n            "
+        timer_at = src.rindex(timer, 0, gate_at)
+        image_at = src.index("grab.image = captureTopLevelWindowByPrintWindow(", gate_at)
+        moved_back = src[:timer_at] + src[timer_at + len(timer):image_at] + "QElapsedTimer captureClock; captureClock.start();\n                " + src[image_at:]
+        self.assertTrue(any("between the clock read" in p for p in self.burst_start_gate_problems(moved_back, header)))
 
     def test_r6_burst_capture_start_rereads_the_clock_with_nothing_between_the_read_and_the_capture(self) -> None:
         src = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
@@ -20534,14 +20560,14 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         src = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
         header = (ROOT / "platform" / "qt" / "VisualCaptureSourceDifference.h").read_text(encoding="utf-8")
         gate_at = src.index(self.BURST_START_GATE)
-        timer_at = src.index("QElapsedTimer captureClock;", gate_at)
+        timer_at = src.index("grab.image = captureTopLevelWindowByPrintWindow(", gate_at)   # r2: the timer now starts before the gate
         delayed = src[:timer_at] + "sleepGuiThreadForSmokeRunner( 150 );\n                " + src[timer_at:]
         self.assertTrue(any("between the clock read" in p for p in self.burst_start_gate_problems(delayed, header)))
         pumped = src[:timer_at] + "qApp->processEvents( QEventLoop::AllEvents );\n                " + src[timer_at:]
         self.assertNotEqual(self.burst_start_gate_problems(pumped, header), [])
         uncut = src.replace(self.BURST_CALL, 'grabVisual( QStringLiteral("play_first_unbound"), visualBurstCount, false );')
         self.assertIn("the burst does not pass its cutoff and reserve to grabVisual", self.burst_start_gate_problems(uncut, header))
-        loose = header.replace("nowMs + reserveMs < cutoffMs;", "nowMs + reserveMs <= cutoffMs;")
+        loose = header.replace("nowMs + reserveMs + kCaptureStartMarginMs < cutoffMs;", "nowMs + reserveMs + kCaptureStartMarginMs <= cutoffMs;")
         self.assertNotEqual(self.burst_start_gate_problems(src, loose), [])
 
     @staticmethod

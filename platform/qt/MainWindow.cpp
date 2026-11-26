@@ -11874,11 +11874,13 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             grab.serial = static_cast<qulonglong>( m_lastPresentedRequestSerial );
             grab.playActive = ui->actionPlay->isChecked();
             grab.clip = visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject );
-            // R6-BURST-CUTOFF-RESIDUE-1: the clock read that decides the start is the last statement before it; only the capture timer follows
+            // R6-BURST-CUTOFF-RESIDUE-1: the clock read that decides the start is the last statement before it. r2 (luna A1 on c4d5d5f6): the capture
+            // timer starts before that read, so only the branch separates the read from the PrintWindow call, and the decision keeps a 1 ms margin
+            // (kCaptureStartMarginMs) for elapsed()'s whole-millisecond truncation
+            QElapsedTimer captureClock;
+            captureClock.start();
             if( visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ) )
             {
-                QElapsedTimer captureClock;
-                captureClock.start();
                 grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
                 grab.captureMs = static_cast<double>( captureClock.nsecsElapsed() ) / 1.0e6;
                 grab.capturedUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );

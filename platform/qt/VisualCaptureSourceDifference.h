@@ -90,10 +90,15 @@ inline bool isSourceBoundCaptureKind( const QString &kind )
  * the first forced play capture's target as cutoffMs and the longest burst capture so far as reserveMs: the capture starts only while that read plus
  * the reserve is strictly before the cutoff, so no burst capture starts at or after it (an admission check that read 124 ms followed by a read of
  * 125 ms refuses). Every other capture passes cutoffMs < 0: no cutoff, it always starts. Lives here, not in MainWindow.cpp, so console_tests can
- * call it (MainWindow.cpp is not linked there) and because the capture block is pinned to contain no `return`. */
+ * call it (MainWindow.cpp is not linked there) and because the capture block is pinned to contain no `return`.
+ * r2 (luna A1 on c4d5d5f6): QElapsedTimer::elapsed() truncates to whole milliseconds, so a read of 124 can be 124.9 ms and the capture that follows
+ * could begin at 125 ms, the cutoff, even with reserve 0 (the first burst capture). kCaptureStartMarginMs keeps one whole millisecond: a read of N
+ * starts a capture only when N + reserve + 1 < cutoff, so the true start is before the cutoff unless the GUI thread is preempted for more than a
+ * millisecond across the branch between that read and the PrintWindow call (the capture timer starts before the read, so nothing else runs there). */
+constexpr qint64 kCaptureStartMarginMs = 1;
 inline bool captureMayStartBeforeCutoff( qint64 nowMs, qint64 reserveMs, qint64 cutoffMs )
 {
-    return cutoffMs < 0 || nowMs + reserveMs < cutoffMs;
+    return cutoffMs < 0 || nowMs + reserveMs + kCaptureStartMarginMs < cutoffMs;
 }
 
 /* A frame's source_id in visual.json: 16 lowercase hex digits, zero-padded. */
