@@ -750,13 +750,24 @@ adapters and the primary display device. It does not say which adapter drives th
 Because the block copies the probe's own report and no hashed artifact carries it, `Test-DvReceiptValid` lists `DISPLAY_PATH_UNBOUND` among the
 `unbound` claims of a PASS / FAIL receipt that carries it, and a sheet-pair record lists `venue.displayPath` as unbound. It is never a verdict input.
 
+**The receipt text at the validator.** `ConvertFrom-Json` (object and `-AsHashtable`) keeps only the last of two same-name members, so a parsed
+receipt cannot show a first `venue` block that the strict reader types `malformed`. `Test-DvReceiptValid -ReceiptText <the text the receipt was
+parsed from>` therefore reads the text too (`Get-DvReceiptTextDisplayPathFacts`, `System.Text.Json`, the same name rule as the reader). The two
+file readers that pair receipts (`New-VenueSheetPair.ps1`, `New-VenueFlavorPair.ps1`), `Invoke-VenueBaseline.ps1` and `Write-DvReceipt` pass it.
+With the text: a PASS / FAIL receipt that names `venue` more than once, or one `venue` that names `displayPath` more than once, in any letter
+case, is `INVALID` with `DISPLAY_PATH_DUPLICATE_MEMBER` (it fails closed); and `DISPLAY_PATH_UNBOUND` is owed when ANY `venue` occurrence in the
+text holds a `displayPath` member, whatever else in the text is malformed. That rule looks only at the `venue` and `displayPath` member names, so a
+lone-surrogate string or member name elsewhere in the receipt owes no marker. A text that is not strict JSON, or whose root is not an object,
+says nothing about where a member sits: the validator keeps what the parsed object says. A caller that omits `-ReceiptText` is judged on the
+parsed object alone, as before.
+
 **Reader.** `Read-DvReceiptDisplayPath -ReceiptText <the receipt file's text>` reads with `System.Text.Json` and its strict default options
 (no comments, no trailing commas, double-quoted names and strings only, depth 64), every string exactly as written. There is no second reader,
 no `ConvertFrom-Json` fallback and no recovery rewrite. It returns `{ state; block; reason }` with `state` one of:
 
 * `present`: `block` is the typed block above.
 * `NO_SIGNAL`: no `venue` member, or a `venue` object with no `displayPath` member. That is every receipt written before this card, so a legacy
-  receipt reads as it did on fork/master. `Test-DvReceiptValid` does not read the block, and its status for every receipt is unchanged.
+  receipt reads as it did on fork/master. `Test-DvReceiptValid` does not read the block, and its status for a receipt that names `venue` once is unchanged.
 * `malformed`: any parse failure of the block. That covers a text that is not strict JSON, a root that is not an object, `venue` or `displayPath`
   twice in any letter case, a `venue` that is not an object, a block member not spelled `displayPath`, a block that is not an object (JSON
   `null` included), and a missing, unknown, doubled or wrongly typed field. So are a `schema`/`source` that is not the exact string, an empty

@@ -6519,7 +6519,11 @@ function Test-DvReceiptValid {
     #>
     # -OfflineLegSpecBytes (r8): offline test mode only -- the leg spec bytes the runner ran, so a paired-seek block is checked against a spec contract there
     # too (bound to subject.legSpecSha256); production ignores it and reads the committed spec.
-    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null)
+    # -ReceiptText (R3-RESIDUE-1 A1): the TEXT the receipt object was parsed from. ConvertFrom-Json keeps only the last of two same-name members, so a duplicate
+    # `venue` / `venue.displayPath` member is visible only in the text: with it, a PASS/FAIL receipt that names either twice is INVALID (DISPLAY_PATH_DUPLICATE_MEMBER),
+    # and DISPLAY_PATH_UNBOUND is owed when ANY venue occurrence in the text carries a displayPath member (Get-DvReceiptTextDisplayPathFacts). The file readers
+    # (Invoke-VenueBaseline, New-VenueSheetPair, New-VenueFlavorPair) and Write-DvReceipt pass it; a caller that omits it is judged on the parsed object, as before.
+    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null, [AllowNull()][AllowEmptyString()][string]$ReceiptText = '')
     $incomplete = [System.Collections.Generic.List[string]]::new()
     $invalid = [System.Collections.Generic.List[string]]::new()
     $outcome = [string](Get-DvProp $Receipt 'outcome')
@@ -6530,7 +6534,9 @@ function Test-DvReceiptValid {
     $unbound = @('CLIP_CONTENT_UNBOUND: subject.clipContentSha256 is computed by the local generator and written to no artifact the venue returns; it is recorded, never trusted',
                  'LEG_IDENTITY_UNBOUND: legId / legSpecSha256 name a committed spec, but no hashed artifact carries them; only the leg TYPE (summary.lookLeg), look flavor, backend, venue, clip and build are bound')
     # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2 (r1 adversary pass-3 A5): the display-path block copies the health probe's own report, which no hashed artifact carries
-    if (Test-DvReceiptCarriesDisplayPath $Receipt) { $unbound += 'DISPLAY_PATH_UNBOUND: venue.displayPath copies the health probe''s own report and is written to no hashed artifact; it is recorded, never a verdict input' }
+    if (Test-DvReceiptCarriesDisplayPath $Receipt -ReceiptText $ReceiptText) { $unbound += 'DISPLAY_PATH_UNBOUND: venue.displayPath copies the health probe''s own report and is written to no hashed artifact; it is recorded, never a verdict input' }
+    # R3-RESIDUE-1 A1: a duplicate member only the text can show fails closed (the strict reader types such a receipt malformed; the parsed object kept one of them)
+    if ((Get-DvReceiptTextDisplayPathFacts -ReceiptText $ReceiptText).duplicate) { $invalid.Add('DISPLAY_PATH_DUPLICATE_MEMBER: the receipt text names venue, or venue.displayPath, more than once; ConvertFrom-Json keeps only the last, so the receipt does not read the way the strict display-path reader reads it') }
 
     $subject = Get-DvProp $Receipt 'subject'
     $clipId = [string](Get-DvProp $subject 'clipId')
@@ -7782,7 +7788,11 @@ function Write-DvReceipt {
         # after collection, one that vanished or turned unreadable) is an evidence-validation failure, never a receipt-destination write failure: it is
         # re-thrown tagged DVE_EVIDENCE_VALIDATION_IO|<path>|<reason> (the path the .NET message quotes), and the runner writes the leg as a typed UNRESOLVED.
         # (r8: -LegSpecBytes, the spec the runner ran, is the paired-still contract in offline test mode only; production reads the committed spec)
-        try { $validity = Test-DvReceiptValid -Receipt $Receipt -RepoRoot $RepoRoot -AllowOfflineTestMode:$OfflineTestMode -OfflineLegSpecBytes $(if ($OfflineTestMode) { $LegSpecBytes } else { $null }) }
+        # R3-RESIDUE-1 A1: the validator also reads the TEXT this receipt serializes to (a dictionary with `venue` in two letter cases writes two members). A
+        # serialization failure leaves the text empty (the validator then judges the object alone) and surfaces, as before, at the write below.
+        $receiptText = ''
+        try { $receiptText = [string](ConvertTo-DvReceiptJson $Receipt 12) } catch { $receiptText = '' }
+        try { $validity = Test-DvReceiptValid -Receipt $Receipt -RepoRoot $RepoRoot -AllowOfflineTestMode:$OfflineTestMode -OfflineLegSpecBytes $(if ($OfflineTestMode) { $LegSpecBytes } else { $null }) -ReceiptText $receiptText }
         catch {
             $reason = ([string]$_.Exception.Message) -replace '\s+', ' '
             $where = $(if ($reason -match "'((?:[A-Za-z]:\\|\\\\)[^']+)'") { $Matches[1] } else { '(validator)' })
@@ -7822,12 +7832,14 @@ function Test-DvMemberNameIs {
 
 function Get-DvJsonMembersNamed {
     # The members of a System.Text.Json object element whose name matches -Name (Test-DvMemberNameIs). A name that cannot be read back (an escaped lone
-    # surrogate) throws: the caller's catch types the block malformed.
-    param([System.Text.Json.JsonElement]$Element, [string]$Name)
+    # surrogate) throws: the caller's catch types the block malformed. -SkipUnreadable (R3-RESIDUE-1 A1, Get-DvReceiptTextDisplayPathFacts) skips such a
+    # member instead: a name that cannot be read back is not `venue` or `displayPath`, so it neither matches nor hides a member that does.
+    param([System.Text.Json.JsonElement]$Element, [string]$Name, [switch]$SkipUnreadable)
     $hits = [System.Collections.Generic.List[object]]::new()
     foreach ($p in $Element.EnumerateObject()) {
-        $n = $p.Name
-        if ($null -eq $n) { throw 'a member name cannot be read back' }
+        $n = $null
+        try { $n = $p.Name } catch { $n = $null }
+        if ($null -eq $n) { if ($SkipUnreadable) { continue }; throw 'a member name cannot be read back' }
         if (Test-DvMemberNameIs ([string]$n) $Name) { $hits.Add($p) }
     }
     $hits.ToArray()   # unrolled to the caller, which collects it with @(): zero, one or more JsonProperty values
@@ -7878,15 +7890,55 @@ function Test-DvJsonTextReadable {
     $true
 }
 
+function Get-DvReceiptTextDisplayPathFacts {
+    <#
+    .SYNOPSIS
+    R3-RESIDUE-1 A1: what the receipt TEXT says about `venue` and `venue.displayPath`, read with System.Text.Json (the reader's own grammar). ConvertFrom-Json
+    (object and -AsHashtable) keeps only the LAST of two same-name members, so a parsed receipt cannot show a first `venue` block; the text can.
+    Returns [pscustomobject]@{ parsed; venueCount; carries; duplicate }:
+      parsed    -- the text is strict JSON with an object root. Not parsed (empty, not strict JSON, an array root): carries and duplicate stay $false, and the
+                   caller keeps what the parsed receipt object says (the text cannot say where a member sits).
+      venueCount-- the `venue` members at the root, in any letter case (Test-DvMemberNameIs), `venue` included.
+      carries   -- ANY venue occurrence that is an object holds a `displayPath` member (any letter case). This is the whole marker rule for a text reading
+                   that is malformed for ANOTHER reason: a lone-surrogate string or member name elsewhere in the receipt (an unreadable name is skipped, it
+                   is neither `venue` nor `displayPath`), a bad block, a duplicate. It never looks at what the block holds, so nothing outside `venue` owes it.
+      duplicate -- `venue` appears more than once, or one venue holds `displayPath` more than once.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$ReceiptText)
+    $facts = [pscustomobject]@{ parsed = $false; venueCount = 0; carries = $false; duplicate = $false }
+    if ([string]::IsNullOrEmpty($ReceiptText)) { return $facts }
+    $doc = $null
+    try { $doc = [System.Text.Json.JsonDocument]::Parse($ReceiptText, [System.Text.Json.JsonDocumentOptions]::new()) } catch { return $facts }
+    try {
+        $root = $doc.RootElement
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $facts }
+        $venues = @(Get-DvJsonMembersNamed -Element $root -Name 'venue' -SkipUnreadable)
+        $carries = $false; $duplicate = ($venues.Count -gt 1)
+        foreach ($v in $venues) {
+            if ($v.Value.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { continue }
+            $blocks = @(Get-DvJsonMembersNamed -Element $v.Value -Name 'displayPath' -SkipUnreadable).Count
+            if ($blocks -gt 0) { $carries = $true }
+            if ($blocks -gt 1) { $duplicate = $true }
+        }
+        $facts.parsed = $true; $facts.venueCount = $venues.Count; $facts.carries = $carries; $facts.duplicate = $duplicate
+    } catch { $facts = [pscustomobject]@{ parsed = $false; venueCount = 0; carries = $false; duplicate = $false } }
+    finally { $doc.Dispose() }
+    $facts
+}
+
 function Test-DvReceiptCarriesDisplayPath {
     # r1 adversary pass-3 A5: does the receipt's venue carry a displayPath member (any letter case)? Presence only, for the validator's UNBOUND list;
     # the block's content is read by Read-DvReceiptDisplayPath alone. r3 (sol r2 B1): `venue` is found by the reader's own name rule
     # (Test-DvMemberNameIs, via Get-DvObjectMembersNamed), so `Venue` in a case-sensitive dictionary owes the marker exactly as the reader's `present` says;
     # when a receipt names venue in two letter cases the reader types it malformed, and the marker is owed if ANY of them carries a displayPath member.
-    param($Receipt)
+    # R3-RESIDUE-1 A1: -ReceiptText is the text the receipt was parsed from. The parsed object keeps only the LAST of two same-name members, so the text is
+    # asked too (Get-DvReceiptTextDisplayPathFacts: ANY venue occurrence in the text carrying a displayPath member owes the marker, whatever else is
+    # malformed in it). A caller that omits it gets the object's answer alone, as before.
+    param($Receipt, [AllowNull()][AllowEmptyString()][string]$ReceiptText = '')
     foreach ($venue in @(Get-DvObjectMembersNamed $Receipt 'venue')) {
         if (@(Get-DvObjectMembersNamed $venue.Value 'displayPath').Count -gt 0) { return $true }
     }
+    if (-not [string]::IsNullOrEmpty($ReceiptText)) { if ((Get-DvReceiptTextDisplayPathFacts -ReceiptText $ReceiptText).carries) { return $true } }
     $false
 }
 

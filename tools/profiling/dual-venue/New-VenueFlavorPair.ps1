@@ -148,8 +148,10 @@ $stageParent = $(if ($stageParent) { Test-DvLocalReceiptRoot -Path $stageParent 
 if (-not $stageParent) {
     throw 'PAIR_OUTDIR_NEEDS_LOCAL_PARENT -OutDir must be a subdirectory of a .claude-state path (its staging is a sibling directory, and owner footage stays local)'
 }
-$classic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ClassicReceipt).Path) | ConvertFrom-Json
-$cinematic = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CinematicReceipt).Path) | ConvertFrom-Json
+$classicText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $ClassicReceipt).Path)
+$cinematicText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CinematicReceipt).Path)
+$classic = $classicText | ConvertFrom-Json
+$cinematic = $cinematicText | ConvertFrom-Json
 
 # HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r26 (sol r25 B2 sibling): receipt flavors compare ordinally and canonically (Test-DvLookFlavorSame), never the linguistic -cne
 if (-not (Test-DvLookFlavorSame 'classic' ([string]$classic.subject.lookFlavor)) -or -not (Test-DvLookFlavorSame 'cinematic' ([string]$cinematic.subject.lookFlavor))) {
@@ -164,7 +166,8 @@ if ([string]$classic.venue.name -cne [string]$cinematic.venue.name -or [string]$
 if ([string]$classic.scale.effectiveScale -cne [string]$cinematic.scale.effectiveScale) { throw "PAIR_SCALE_DIFFERS the receipts rendered at different effective scales ($(Get-DvScaleLabel -Factor $classic.scale.effectiveScale) vs $(Get-DvScaleLabel -Factor $cinematic.scale.effectiveScale))" }
 $film = $null
 if ($trio) {
-    $film = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FilmReceipt).Path) | ConvertFrom-Json
+    $filmText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $FilmReceipt).Path)
+    $film = $filmText | ConvertFrom-Json
     if (-not (Test-DvLookFlavorSame ([string]$ThirdFlavor) ([string]$film.subject.lookFlavor))) { throw "PAIR_FLAVORS_WRONG the third receipt must be the $ThirdFlavor flavor (got '$($film.subject.lookFlavor)')" }
     foreach ($f in 'buildManifestSha256', 'clipId', 'backend') {
         if ([string]$classic.subject.$f -cne [string]$film.subject.$f) { throw "PAIR_SUBJECT_DIFFERS the film receipt differs in subject.$f" }
@@ -221,7 +224,8 @@ function Read-Sliders($Receipt, [string]$EvDir) {
 }
 
 $sides = [ordered]@{ classic = $classic; cinematic = $cinematic }
-if ($trio) { $sides.film = $film }
+$sideTexts = @{ classic = $classicText; cinematic = $cinematicText }
+if ($trio) { $sides.film = $film; $sideTexts.film = $filmText }
 $evidenceDirs = @{}
 $listedFrames = @{}
 $sliders = @{}
@@ -230,7 +234,7 @@ foreach ($label in $sides.Keys) {
     $r = $sides[$label]
     if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
     # The evidence-bearing validator: admission re-derived from the committed blobs, the run from the hashed evidence. Nothing the receipt says is believed.
-    $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot
+    $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText ([string]$sideTexts[$label])   # the TEXT too (R3-RESIDUE-1 A1)
     if ($validity.status -cne 'ADVISORY') { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
     if ([string]$validity.legType -cne 'look') { throw "PAIR_NOT_A_LOOK_LEG receipt $($r.receiptId) is not a LOOK leg per its committed leg spec" }
     if ([string]$r.subject.clipId -cnotmatch '^[A-Za-z]\d{2}-\d{3,4}$') { throw 'PAIR_NOT_A_CONSENTED_CLIP only a consented clip id (never a fixture or a path) can be paired into a sheet' }

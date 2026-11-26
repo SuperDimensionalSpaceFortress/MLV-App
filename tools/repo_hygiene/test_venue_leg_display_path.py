@@ -812,6 +812,147 @@ class AdversaryPass5SessionDefaultsTests(unittest.TestCase):
         self.assertEqual(got["asarray-receipt"], "present")
 
 
+RECEIPT_TEXT_SCRIPT = r"""
+Import-Module '__MODULE__' -Force
+$B = '{"schema":"mlv-app/venue-display-path/v2","source":"health-probe","adapters":["Intel"],"firstAdapterDriverVersion":null,"primaryDisplayDevice":null}'
+$head = '{"outcome":"PASS","card":"C","legId":"L","subject":{"clipId":"x"},'
+function Probe($text) {
+    $o = [ordered]@{ state = [string](Read-DvReceiptDisplayPath -ReceiptText $text).state }
+    foreach ($rep in 'pscustomobject', 'asHashtable') {
+        $rec = $(if ($rep -eq 'asHashtable') { ConvertFrom-Json -AsHashtable $text } else { $text | ConvertFrom-Json })
+        foreach ($mode in 'text', 'legacy') {
+            try {
+                $v = $(if ($mode -eq 'text') { Test-DvReceiptValid -Receipt $rec -AllowOfflineTestMode -ReceiptText $text } else { Test-DvReceiptValid -Receipt $rec -AllowOfflineTestMode })
+                $o["$rep|$mode"] = [ordered]@{ status = [string]$v.status
+                    marker = @($v.unbound | Where-Object { $_ -like 'DISPLAY_PATH_UNBOUND*' }).Count
+                    dup = @($v.reasons | Where-Object { $_ -like 'DISPLAY_PATH_DUPLICATE_MEMBER*' }).Count }
+            } catch { $o["$rep|$mode"] = [ordered]@{ threw = $_.Exception.Message } }
+        }
+    }
+    $o
+}
+$cases = [ordered]@{
+    'first-venue-has-block' = $head + '"venue":{"name":"bachelor","displayPath":' + $B + '},"venue":{"name":"bachelor"}}'
+    'last-venue-has-block' = $head + '"venue":{"name":"bachelor"},"venue":{"name":"bachelor","displayPath":' + $B + '}}'
+    'escaped-second-venue-name' = $head + '"venue":{"name":"bachelor","displayPath":' + $B + '},"venue":{"name":"bachelor"}}'
+    'two-venues-no-block' = $head + '"venue":{"name":"bachelor"},"venue":{"name":"bachelor"}}'
+    'two-displaypath-members' = $head + '"venue":{"name":"bachelor","displayPath":' + $B + ',"displayPath":' + $B + '}}'
+    'lone-surrogate-elsewhere-no-block' = $head + '"actor":"\ud800","venue":{"name":"bachelor"}}'
+    'lone-surrogate-elsewhere-with-block' = $head + '"actor":"\ud800","venue":{"name":"bachelor","displayPath":' + $B + '}}'
+    'lone-surrogate-in-a-name-no-block' = $head + '"\udc00":1,"venue":{"name":"bachelor"}}'
+    'control-block' = $head + '"venue":{"name":"bachelor","displayPath":' + $B + '}}'
+    'control-no-block' = $head + '"venue":{"name":"bachelor"}}'
+    'comment-text-with-block' = $head + '"venue":{"name":"bachelor",/* c */"displayPath":' + $B + '}}'
+}
+$out = [ordered]@{}
+foreach ($k in $cases.Keys) { $out[$k] = Probe $cases[$k] }
+Write-Output ('CASES=' + (ConvertTo-Json -InputObject @(, $out) -Depth 6 -Compress))
+"""
+
+
+@requires_windows_pwsh
+class ResidueR1ReceiptTextTests(unittest.TestCase):
+    """R3-RESIDUE-1 r1, adversary A1 on 2fdb3e77 (DEFECT_CLASS: one receipt judged through ConvertFrom-Json while its sibling reads the text). ConvertFrom-Json
+    (object and -AsHashtable) keeps only the LAST of two same-name members, so the validator never saw a first `venue` block that the System.Text.Json reader
+    types malformed. Test-DvReceiptValid takes -ReceiptText, the text the receipt was parsed from; with it a duplicate `venue` or `displayPath` member fails
+    validation closed (DISPLAY_PATH_DUPLICATE_MEMBER, INVALID) and the DISPLAY_PATH_UNBOUND marker is owed when ANY venue occurrence in the text carries a
+    displayPath member. Without it the validator reads exactly as before."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        proc = run_pwsh(["-Command", RECEIPT_TEXT_SCRIPT.replace("__MODULE__", psq(MODULE))])
+        cls.got = cases_line(proc, 1, "receipt-text")[0]
+
+    def each_rep(self, case: str, mode: str = "text"):
+        for rep in ("pscustomobject", "asHashtable"):
+            yield rep, self.got[case][f"{rep}|{mode}"]
+
+    def test_a1_a_duplicate_venue_member_fails_validation_closed_whichever_one_carries_the_block(self) -> None:
+        for case in ("first-venue-has-block", "last-venue-has-block", "escaped-second-venue-name", "two-venues-no-block"):
+            self.assertEqual(self.got[case]["state"], "malformed", case)
+            for rep, v in self.each_rep(case):
+                with self.subTest(f"{case}|{rep}"):
+                    self.assertNotIn("threw", v, v)
+                    self.assertEqual(v["status"], "INVALID")
+                    self.assertEqual(v["dup"], 1, f"{case}|{rep}: DISPLAY_PATH_DUPLICATE_MEMBER reasons {v['dup']!r}")
+
+    def test_a1_a_duplicate_venue_with_a_block_in_any_occurrence_owes_the_marker(self) -> None:
+        for case in ("first-venue-has-block", "last-venue-has-block", "escaped-second-venue-name"):
+            for rep, v in self.each_rep(case):
+                with self.subTest(f"{case}|{rep}"):
+                    self.assertNotIn("threw", v, v)
+                    self.assertEqual(v["marker"], 1, f"{case}|{rep}: the text carries a displayPath member, DISPLAY_PATH_UNBOUND count {v['marker']!r}")
+
+    def test_a1_two_venues_with_no_block_owe_no_marker(self) -> None:
+        for rep, v in self.each_rep("two-venues-no-block"):
+            with self.subTest(rep):
+                self.assertNotIn("threw", v, v)
+                self.assertEqual(v["marker"], 0)
+
+    def test_a1_a_duplicate_displaypath_member_fails_validation_closed(self) -> None:
+        self.assertEqual(self.got["two-displaypath-members"]["state"], "malformed")
+        for rep, v in self.each_rep("two-displaypath-members"):
+            with self.subTest(rep):
+                self.assertNotIn("threw", v, v)
+                self.assertEqual((v["status"], v["dup"], v["marker"]), ("INVALID", 1, 1))
+
+    def test_a1_a_lone_surrogate_elsewhere_owes_no_spurious_marker_and_no_duplicate_reason(self) -> None:
+        for case in ("lone-surrogate-elsewhere-no-block", "lone-surrogate-in-a-name-no-block"):
+            self.assertEqual(self.got[case]["state"], "malformed", f"{case}: the reader cannot read the text back")
+            for rep, v in self.each_rep(case):
+                with self.subTest(f"{case}|{rep}"):
+                    self.assertNotIn("threw", v, v)
+                    self.assertEqual((v["marker"], v["dup"]), (0, 0), f"{case}|{rep}: {v}")
+
+    def test_a1_a_lone_surrogate_elsewhere_does_not_hide_a_block_that_is_there(self) -> None:
+        for rep, v in self.each_rep("lone-surrogate-elsewhere-with-block"):
+            with self.subTest(rep):
+                self.assertNotIn("threw", v, v)
+                self.assertEqual((v["marker"], v["dup"]), (1, 0))
+
+    def test_a1_controls_a_single_venue_reads_as_before(self) -> None:
+        for case, marker in (("control-block", 1), ("control-no-block", 0), ("comment-text-with-block", 1)):
+            for rep, v in self.each_rep(case):
+                with self.subTest(f"{case}|{rep}"):
+                    self.assertNotIn("threw", v, v)
+                    self.assertEqual((v["marker"], v["dup"]), (marker, 0))
+
+    def test_a1_a_caller_that_omits_the_text_keeps_todays_reading(self) -> None:
+        """Legacy callers (no -ReceiptText) get no duplicate reason and the marker from the parsed object alone."""
+        for case in self.got:
+            if case == "comment-text-with-block":
+                continue
+            for rep, v in self.each_rep(case, "legacy"):
+                with self.subTest(f"{case}|{rep}"):
+                    self.assertNotIn("threw", v, v)
+                    self.assertEqual(v["dup"], 0)
+        for rep, v in self.each_rep("last-venue-has-block", "legacy"):
+            self.assertEqual(v["marker"], 1, rep)   # ConvertFrom-Json kept the last venue: what a legacy caller has always seen
+
+    def test_a1_every_validator_caller_passes_the_text_it_parsed(self) -> None:
+        """SIBLING_SWEEP: the three file readers and Write-DvReceipt hand the validator the receipt text."""
+        module = MODULE.read_text(encoding="utf-8")
+        write = re.search(r"^function Write-DvReceipt \{.*?^\}", module, re.S | re.M).group(0)
+        self.assertRegex(write, r"Test-DvReceiptValid [^\n]*-ReceiptText", "Write-DvReceipt must pass the receipt text to the validator")
+        for name, count in (("Invoke-VenueBaseline.ps1", 1), ("New-VenueSheetPair.ps1", 1), ("New-VenueFlavorPair.ps1", 1)):
+            text = (DV / name).read_text(encoding="utf-8")
+            calls = re.findall(r"Test-DvReceiptValid -Receipt [^\n]*", text)
+            with self.subTest(name):
+                self.assertEqual(len(calls), count, calls)
+                for call in calls:
+                    self.assertIn("-ReceiptText", call, f"{name}: {call}")
+
+    def test_a1_the_validator_names_the_marker_rule_in_one_place(self) -> None:
+        module = MODULE.read_text(encoding="utf-8")
+        carries = re.search(r"^function Test-DvReceiptCarriesDisplayPath \{.*?^\}", module, re.S | re.M).group(0)
+        self.assertIn("-ReceiptText", carries)
+        self.assertIn("Get-DvReceiptTextDisplayPathFacts", carries)
+        facts = re.search(r"^function Get-DvReceiptTextDisplayPathFacts \{.*?^\}", module, re.S | re.M)
+        self.assertIsNotNone(facts, "Get-DvReceiptTextDisplayPathFacts is defined in DualVenueRunner.psm1")
+        self.assertIn("Test-DvMemberNameIs", facts.group(0))
+        self.assertNotIn("StringComparison", facts.group(0), "the facts reader must not carry its own case rule")
+
+
 class DocsTests(unittest.TestCase):
     def test_the_doc_does_not_attribute_the_historical_speed_change_to_an_adapter(self) -> None:
         """sol r2 DV-DISPLAY-PATH-MOTIVATION-ATTRIBUTION-1: the source investigation left the cause open."""
