@@ -520,6 +520,8 @@ $legExit = [int](Pick $env:FAKE_LEG_EXIT $k '0'); if ($legExit -ne 0) { exit $le
 "DVE_RECEIPT_SHA256=$((Get-FileHash -LiteralPath $rp -Algorithm SHA256).Hash)"
 # R2-NARROW-1 r2 (adversary-7c5bfe86.json A5): FAKE_LEG_STDERR_SHA per call = 1 then writes a DVE_RECEIPT_SHA256 line of zeroes to STDERR, after the real one on stdout
 if ((Pick $env:FAKE_LEG_STDERR_SHA $k '0') -eq '1') { [Console]::Error.WriteLine('DVE_RECEIPT_SHA256=' + ('0' * 64)) }
+# (adversary-baf2e69a.json A3) FAKE_LEG_STDERR_PATH per call = 1 then writes a DVE_RECEIPT_PATH line naming ANOTHER receipt to STDERR
+if ((Pick $env:FAKE_LEG_STDERR_PATH $k '0') -eq '1') { [Console]::Error.WriteLine('DVE_RECEIPT_PATH=' + (Join-Path $rdir 'another-receipt.json')) }
 if ((Pick $env:FAKE_LEG_SWAP_RECEIPT $k '0') -eq '1') {
     $swapRes = Join-Path $edir 'result.json'; Set-Content -LiteralPath $swapRes -Value '{"schema":"mlvapp-gui-smoke-result.v2","hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
     Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $swapRes -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
@@ -976,6 +978,17 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         [b] = self.batches()
         [l] = b["legs"]
         self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("QUIET_PRELOAD_OK", True, "quiet", False), l)
+
+    def test_r2n1_pass1_a3_a_receipt_path_line_on_stderr_never_replaces_the_one_the_leg_published_on_stdout(self) -> None:
+        # adversary-baf2e69a.json A3, its input: a qualifying quiet leg whose child prints DVE_RECEIPT_PATH and DVE_RECEIPT_SHA256 for its own receipt on stdout and then a DVE_RECEIPT_PATH line naming ANOTHER
+        # receipt on STDERR. RED on baf2e69a: the sha came from stdout but the path from stdout and stderr together (the last line won), so the host-load read was asked for the wrong path with the right
+        # digest, refused the pair, and a genuinely quiet counted leg became HOSTLOAD_PROVISIONAL. The path and the hash now come from the same stream, the child's stdout.
+        r = self.run_batch(self.specs[:1], FAKE_LEG_STDERR_PATH="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("QUIET_PRELOAD_OK", True, "quiet", False), l)
+        self.assertNotIn("another-receipt", str(l["receipt"]))
 
     def test_a_quiet_host_load_leaves_todays_counting_unchanged(self) -> None:
         r = self.run_batch(self.specs[:1])

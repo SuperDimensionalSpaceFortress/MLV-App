@@ -3052,11 +3052,12 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $legLines = @($text -split "`r?`n")
                 $o = $legLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
                 $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
-                $pl = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
+                # R2-NARROW-1 r2 (adversary-7c5bfe86.json A5, adversary-baf2e69a.json A3): the receipt PATH and its sha256 are read from the child's STDOUT alone (as Invoke-VenueChain does), the same stream, so a line on
+                # stderr can neither replace the hash the leg published nor name another receipt to pair with it
+                $legStdoutLines = @(([string]$lp.stdout) -split "`r?`n")
+                $pl = $legStdoutLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
                 $receipt = $(if ($pl -and $pl -match '^DVE_RECEIPT_PATH=(.+)$') { $Matches[1].Trim() } else { $null })
                 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes the child wrote ('' when it printed none: the read is unknown)
-                # R2-NARROW-1 r2 (adversary-7c5bfe86.json A5): the hash is read from the child's STDOUT alone (as Invoke-VenueChain does): a DVE_RECEIPT_SHA256 line on stderr must never replace the one the leg published
-                $legStdoutLines = @(([string]$lp.stdout) -split "`r?`n")
                 $rs = $legStdoutLines | Where-Object { $_ -cmatch '^DVE_RECEIPT_SHA256=[0-9A-Fa-f]{64}$' } | Select-Object -Last 1
                 $receiptSha = $(if ($rs) { $rs.Substring('DVE_RECEIPT_SHA256='.Length) } else { '' })
                 $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1

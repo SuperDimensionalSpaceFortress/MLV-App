@@ -533,14 +533,18 @@ function Get-HostLoadComparisonEvidence {
         [object]$BeforeSmoke,
         [object]$AfterSmoke,
         [AllowNull()][AllowEmptyString()][string]$BeforeText,
-        [AllowNull()][AllowEmptyString()][string]$AfterText
+        [AllowNull()][AllowEmptyString()][string]$AfterText,
+        # R2-NARROW-1 r2 (adversary-baf2e69a.json A2): -BeforeRefused / -AfterRefused say the comparator's own figure parser REFUSED that smoke text (Read-SmokeSourceOnce parseError), whatever the
+        # text judge read from it; a refused source never keeps a clean standing (the two parsers accept different depths)
+        [bool]$BeforeRefused = $false,
+        [bool]$AfterRefused = $false
     )
 
     $evidence = [ordered]@{}
     $failures = @()
     foreach ($leg in @(
-        [pscustomobject]@{ Name = "before"; Smoke = $BeforeSmoke; HasText = $PSBoundParameters.ContainsKey('BeforeText'); Text = $BeforeText },
-        [pscustomobject]@{ Name = "after"; Smoke = $AfterSmoke; HasText = $PSBoundParameters.ContainsKey('AfterText'); Text = $AfterText }
+        [pscustomobject]@{ Name = "before"; Smoke = $BeforeSmoke; HasText = $PSBoundParameters.ContainsKey('BeforeText'); Text = $BeforeText; Refused = $BeforeRefused },
+        [pscustomobject]@{ Name = "after"; Smoke = $AfterSmoke; HasText = $PSBoundParameters.ContainsKey('AfterText'); Text = $AfterText; Refused = $AfterRefused }
     )) {
         $legHostLoad = $null
         $smokeObj = $leg.Smoke
@@ -568,9 +572,12 @@ function Get-HostLoadComparisonEvidence {
         # snapshots (and every during sample) are collected = a real [bool] $true. A quiet/false block beside before.collected=false (a CimException), state
         # 'QUIET', provisional 0 or [false] all read state 'unknown' (or the declared state) and provisional, so the verdict is INCONCLUSIVE, never PASS.
         $judged = if ($leg.HasText) { ConvertFrom-VenueSmokeResultText -Text $leg.Text } else { ConvertFrom-VenueSmokeHostLoad -HostLoad $legHostLoad }
+        if ($leg.Refused -and -not [bool]$judged.provisional) {
+            $judged = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'the smoke JSON was refused by the comparator''s figure parser (see the failure list), so its host load cannot be told clean' }
+        }
         $legState = [string]$judged.state
         $legProvisional = [bool]$judged.provisional
-        $legReason = if ($null -eq $legHostLoad) {
+        $legReason = if ($null -eq $legHostLoad -and -not $leg.Refused) {
             "no hostLoad telemetry recorded in the smoke result"
         } else {
             [string]$judged.reason
@@ -1179,7 +1186,7 @@ foreach ($leg in @(
     }
 }
 # adversary-de8e3799.json A1: the host load is judged from each smoke file's own text (no root/hostLoad unrolling, a repeated member is unknown)
-$hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke -BeforeText $beforeSmokeText -AfterText $afterSmokeText
+$hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke -BeforeText $beforeSmokeText -AfterText $afterSmokeText -BeforeRefused ($null -ne $beforeSource.parseError) -AfterRefused ($null -ne $afterSource.parseError)
 $hostLoadEvidence = $hostLoadComparison.evidence
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a host-load refusal is no longer a failure (it read FAIL);
 # it is kept in hostLoadRefusals and makes the verdict INCONCLUSIVE (Get-GuiSmokeAbVerdict, below).

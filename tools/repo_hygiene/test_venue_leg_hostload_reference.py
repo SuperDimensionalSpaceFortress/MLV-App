@@ -102,6 +102,18 @@ class SmokeHostLoadStandingTests(unittest.TestCase):
         self.assertEqual(got["D"], "[]", p.stdout)
         self.assertEqual(got["D2"], "$.EXTRA", p.stdout)
 
+    def test_r2n1_pass1_a4_the_duplicate_scan_reads_every_depth_the_default_readers_accept(self) -> None:
+        # adversary-baf2e69a.json A4, its input: Q plus an extra root member of 128 nested arrays (depth 129, no duplicate). RED on baf2e69a: the scan capped total depth at 128 while the readers'
+        # default ConvertFrom-Json accepts 1023 arrays, so the bound leg reader read unknown for a valid document. The scan's cap is now the default reader's own (1024); a document deeper than
+        # either parser accepts is refused by the parsers. (The nesting is built in the pwsh body.)
+        quiet = json.dumps({"hostLoad": QUIET}).replace("'", "''")
+        p = run_ps(
+            f"$head = '{quiet[:-1]}'; "
+            "foreach ($n in 128, 1000) { $t = $head + ',\"extra\":' + (('[' * $n) + '0' + (']' * $n)) + '}'; $s = ConvertFrom-VenueSmokeResultText -Text $t; Write-Output ('N' + $n + '=' + $s.state + ',' + $s.provisional) }")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual((got["N128"], got["N1000"]), ("quiet,False", "quiet,False"), p.stdout)
+
     def test_d_a_missing_block_reads_unknown_not_quiet(self) -> None:
         s = self.standing(None)
         self.assertEqual((s["state"], s["provisional"], s["collected"]), ("unknown", True, False), s)
@@ -742,6 +754,25 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertEqual(got["INSIDE"], "READ3", "a read inside both ends still reads its three bytes: " + p.stdout)
         module = MODULE.read_text(encoding="utf-8")
         self.assertIn("clock = $workClock; clockEndSec = $workEndSec", module, "the one bounded file read hands its worker the caller's stopwatch and its end")
+
+    def test_r2n1_pass1_a1_the_workers_monotonic_end_comes_from_one_clock_sample_not_a_stale_remainder_plus_a_fresh_read(self) -> None:
+        # adversary-baf2e69a.json A1, its input: the caller samples "0.95 s left" of its shared stopwatch, is descheduled 0.75 s before the worker's end is computed, and the end was then taken as the FRESH clock
+        # read plus the STALE remainder (~1.75 s instead of 1.0 s), so a worker started in the gap still read after the real end. RED on baf2e69a: clockEndSec read ~1.8 here. The seam
+        # VenueTestReadSampleDelayMs stalls the caller right after its one clock sample (800 ms); the shared end (-EndSec 1.0) must be what the worker is handed, whatever the stall.
+        with tempfile.TemporaryDirectory() as d:
+            blob = Path(d) / "f.bin"
+            blob.write_bytes(b"abc")
+            body = (
+                "$vc = Get-Module VenueChain; & $vc { $script:VenueTestCaptureWorkerArg = $true; $script:VenueTestReadSampleDelayMs = 800 }; "
+                "$sw = [Diagnostics.Stopwatch]::StartNew(); "
+                f"$r = try {{ & $vc {{ param($p, $c) $null = Read-VenueFileBytesBounded -Path $p -TimeoutSec 5 -Clock $c -EndSec 1.0; 'OK' }} '{blob}' $sw }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('R=' + $r); "
+                "$a = & $vc { $script:VenueTestLastFileWorkerArg }; Write-Output ('END=' + [Math]::Round([double]$a.clockEndSec, 2)); "
+                "& $vc { $script:VenueTestCaptureWorkerArg = $false; $script:VenueTestReadSampleDelayMs = 0 }")
+            p = run_ps(body)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertLessEqual(float(got["END"]), 1.0, "the worker's monotonic end is the caller's shared end (1.0 s), not a stale remainder added to a later read: " + p.stdout)
+        self.assertGreater(float(got["END"]), 0.0, p.stdout)
 
     def test_r4n2_a4_the_reader_ends_by_the_absolute_utc_deadline_the_caller_hands_it(self) -> None:
         # adversary-6596e055.json A4, its input: the caller sampled "remaining = 1.25 s" as a number, was paused past the UTC deadline, and the reader started its own stopwatch then, so both reads

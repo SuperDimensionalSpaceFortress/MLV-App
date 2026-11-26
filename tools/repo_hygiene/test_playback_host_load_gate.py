@@ -4048,6 +4048,25 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             self.assertFalse(report["hostLoadEvidence"]["after"]["provisional"], "the clean leg still reads clean")
 
     @requires_pwsh
+    def test_r2n1_pass1_a2_a_smoke_file_the_figure_parser_refused_for_its_depth_leaves_no_clean_host_load_standing(self) -> None:
+        # adversary-baf2e69a.json A2, its input: Before holds a quiet hostLoad and an extra root member of exactly 100 nested arrays (depth 101: ConvertFrom-Json -Depth 100, the figure parser, refuses it), After a
+        # quiet hostLoad. RED on baf2e69a: the text judge (VenueChain's reader, default depth) read the same text quiet/collected, so the refused file kept a clean standing and the verdict was FAIL with no
+        # refusal. A source the figure parser refused never reads clean: its host load is unknown and the comparison INCONCLUSIVE.
+        quiet = json.loads(QUIET_SMOKE)["hostLoad"]
+        deep = 0
+        for _ in range(100):
+            deep = [deep]
+        with tempfile.TemporaryDirectory(prefix="r2n1-p1a2-") as tmp:
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+            before.write_text(json.dumps({"hostLoad": quiet, "extra": deep}), encoding="utf-8", newline="")
+            after.write_text(json.dumps({"hostLoad": quiet}), encoding="utf-8", newline="")
+            proc, report = self._compare(before, after, out)
+            self.assertIsNotNone(report, proc.stdout + proc.stderr)
+            self.assertEqual(report["verdict"], "INCONCLUSIVE", (report["verdict"], report["failures"]))
+            self.assertEqual(report["hostLoadEvidence"]["before"]["state"], "unknown", report["hostLoadEvidence"])
+            self.assertEqual(report["hostLoadEvidence"]["after"]["state"], "quiet", report["hostLoadEvidence"])
+
+    @requires_pwsh
     def test_r4n2_a7_a_one_element_root_array_is_not_unwrapped_into_a_figure_object(self) -> None:
         # adversary-6596e055.json A7, its input: Before is [{"playbackFps":{"smokePresentedFps":99},"hostLoad":{...quiet...}}] (a ONE-element root array), After is {}. RED on 077be843: ConvertFrom-Json
         # unwrapped the singleton into its member, so no parse error was recorded and the report published the invalid root's raw before-FPS 99 beside an INCONCLUSIVE verdict. -NoEnumerate keeps
