@@ -13235,7 +13235,9 @@ void MainWindow::playbackHandling(int timeDiff)
                                                             m_playRequiredSourceFrames ) ) return;
 
         //when on last frame (r32 fix iteration 2, adversary A1 + A2 on 03850f7b: under conform with Drop Frame and Loop the
-        //drop-frame engine owns the wrap from the last frame -- see playback_frame_range::outerLastFrameBranchHandlesTick)
+        //drop-frame engine owns the wrap from the last frame -- see playback_frame_range::outerLastFrameBranchHandlesTick;
+        //PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1, sol r10: so does EVERY Drop Frame Loop tick, so a
+        //stale playhead past Cut Out or on a one-frame cut goes through advanceDropFrameTick's correction contract, never a lap)
         if( playback_frame_range::outerLastFrameBranchHandlesTick(
                 ui->horizontalSliderPosition->value(), ui->spinBoxCutOut->value(),
                 ui->actionDropFrameMode->isChecked(), ui->actionLoop->isChecked(), playbackConformActive() ) )

@@ -3309,10 +3309,12 @@ TEST( PlaybackConformDropFrame, R32FixIteration2TheEngineOwnsTheConformedWrapFro
     using playback_frame_range::outerLastFrameBranchHandlesTick;
     ASSERT_FALSE( outerLastFrameBranchHandlesTick( 718, 720, true, true, true ) );    // not on the last frame: never
     ASSERT_FALSE( outerLastFrameBranchHandlesTick( 719, 720, true, true, true ) );    // conform + drop + loop: the engine's
-    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, true, true, false ) );    // no conform: unchanged
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1 (sol r10, pass8-A1 / pass9-A1): every Drop Frame Loop tick
+    // is the engine's, with or without conform and past the last frame too (its correction contract folds the start, no lap)
+    ASSERT_FALSE( outerLastFrameBranchHandlesTick( 719, 720, true, true, false ) );   // no conform: the engine's (r1)
     ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, false, true, true ) );    // normal (whole-frame) mode: unchanged
     ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, true, false, true ) );    // no Loop: stop on the last frame
-    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 900, 720, true, true, true ) );     // Cut Out moved below the playhead: cut-in
+    ASSERT_FALSE( outerLastFrameBranchHandlesTick( 900, 720, true, true, true ) );    // Cut Out moved below the playhead: the engine corrects it (r1)
     // A1's input: 718 painted, 718.8 + 0.24 -> 719.04 (719 now requested). 719 is accepted but its paint is withheld: while it is
     // not on screen no conformed tick crosses into the wrap (the debt is carried), and the outer branch does not wrap either.
     const int cutIn = 1, cutOut = 720;
@@ -3450,10 +3452,11 @@ TEST( PlaybackConformDropFrame, R33B1TheGenuineOutOfRangeRepairIsKept )
     ASSERT_EQ( 719.0, normalizeDropFramePosition( 900.6, full, 720, true, &out ) );
     ASSERT_TRUE( out );
     // a trimmed cut: Cut Out moved below the playhead (500.3 > 459 + 1) is out; the repair clamps to the CLIP, as before, and the
-    // outer last-frame branch then takes it back to cut-in
+    // drop-frame engine then corrects it into the cut (PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1: the
+    // outer last-frame branch no longer takes a Drop Frame Loop tick back to cut-in)
     ASSERT_EQ( 500.0, normalizeDropFramePosition( 500.3, trimmed, 720, true, &out ) );
     ASSERT_TRUE( out );
-    ASSERT_TRUE( playback_frame_range::outerLastFrameBranchHandlesTick( 500, 460, true, true, true ) );
+    ASSERT_FALSE( playback_frame_range::outerLastFrameBranchHandlesTick( 500, 460, true, true, true ) );
     // below the cut's first frame: out, truncated (the pre-r33 repair)
     ASSERT_EQ( 50.0, normalizeDropFramePosition( 50.7, trimmed, 720, true, &out ) );
     ASSERT_TRUE( out );

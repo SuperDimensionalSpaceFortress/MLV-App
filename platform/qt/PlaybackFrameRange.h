@@ -558,11 +558,22 @@ inline double normalizeDropFramePosition( double position, const CutRange & rang
 // Under conform with Drop Frame and Loop, a playhead exactly on the last frame is the drop-frame engine's: advanceDropFrameTick
 // wraps once the position is past it, phase kept, through conformDropFrameDelta's gate. A playhead PAST the last frame (Cut Out
 // moved below it) still goes to cut-in through the outer branch, as does every non-conform, non-drop or non-loop tick.
+//
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1 (sol r10 blocker on 9c454dd6, pass8-A1 / pass9-A1): EVERY
+// Drop Frame Loop tick is the drop-frame engine's, at any conform state and from any playhead. The outer branch booked a playhead
+// at or past the wrap point as one Loop lap of loopWrapWidth(slider, cut-in), plus one trace frame, and landed on cut-in. That
+// bypassed advanceDropFrameTick's correction contract (the r1 note above it). With Cut In 1 and Cut Out lowered to 50 under a
+// playhead at 100, it booked a width-101 lap where the contract rebases to 2, the start's phase in the cut, and counts only the
+// travel from there. On a terminal one-frame cut (1000..1000, slider 999) it booked a width-1 lap and a trace frame while the
+// picture held. advanceDropFrameTick corrects such a start (folds it onto its phase, or holds a zero-width cut's one frame) and
+// MainWindow hands the correction to the paint tracker as a rebase. Normal (whole-frame) mode has no drop-frame correction
+// contract and keeps the outer branch. So does Loop off, which stops playback on the last frame. Both are unchanged.
 inline bool outerLastFrameBranchHandlesTick( int sliderValue, int cutOutValue, bool dropFrameMode, bool loopEnabled,
                                              bool conformActive )
 {
+    (void)conformActive;   // r1: the Drop Frame Loop exclusion below no longer depends on conform
     if( sliderValue < cutOutValue - 1 ) return false;
-    if( dropFrameMode && loopEnabled && conformActive && sliderValue == cutOutValue - 1 ) return false;
+    if( dropFrameMode && loopEnabled ) return false;
     return true;
 }
 
