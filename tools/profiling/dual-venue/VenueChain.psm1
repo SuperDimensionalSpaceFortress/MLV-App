@@ -1235,6 +1235,10 @@ $script:VenueTestPreBeginDelayMs = 0
 # Test-only (VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2, adversary-d10f5241.json A2): Read-VenueFileBytesBounded sleeps this many ms after its read answered and before it judges the answer against
 # -EndUtc, as a caller suspended (or a wall clock stepped) inside the read does. Production leaves it 0.
 $script:VenueTestPostReadDelayMs = 0
+# Test-only (R2-RESIDUE-1 r1, adversary-3be19c39.json A2): Get-VenueLegHostLoad sleeps this many ms after Read-VenueFileBytesBounded handed it its bytes and before it classifies them, as a caller suspended
+# between the read's own end check and the classification is. Production leaves it 0.
+$script:VenueTestPostBytesDelayMs = 0
+$script:VenueTestPostReceiptBytesDelayMs = 0   # the same stall after the RECEIPT read (the export-exemption return acts on that answer)
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the worker of Read-VenueFileBytesBounded. It is handed the ABSOLUTE UTC end of the caller's budget (endUtcTicks, 0 = none) and
 # checks it before the existence probe and again before ReadAllBytes, so a read that was started in time still performs no I/O once the end has passed. (No apostrophe in the messages: this is single-quoted text.)
 $script:VenueFileReadWorkerText = 'param($a) $ErrorActionPreference = ''Stop''; if ($a.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$a.delayMs) }; if ($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) { throw ''the call end had passed before the read started; no file was touched'' }; if ($a.missingOk -and -not (Test-Path -LiteralPath $a.path -PathType Leaf)) { return }; if ($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) { throw ''the call end passed during the existence probe; the file was not read'' }; ,[IO.File]::ReadAllBytes($a.path)'
@@ -2011,6 +2015,7 @@ function Get-VenueLegHostLoad {
         $endArgs = @{}
         if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) { $endArgs['EndUtc'] = $CallDeadlineUtc.ToUniversalTime() }
         $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $budgetSec -Clock $readClock -EndSec $budgetSec @endArgs
+        if ($script:VenueTestPostReceiptBytesDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPostReceiptBytesDelayMs) }
         if ($PSBoundParameters.ContainsKey('ExpectReceiptSha256')) {
             $rcGot = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes))
             if ([string]::IsNullOrEmpty($ExpectReceiptSha256) -or -not [string]::Equals($rcGot, $ExpectReceiptSha256, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the bytes the figures were read from'; return $unknown }
@@ -2040,6 +2045,7 @@ function Get-VenueLegHostLoad {
         $evidence = Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))
         $result = Join-Path $evidence 'result.json'
         $bytes = Read-VenueFileBytesBounded -Path $result -TimeoutSec $budgetSec -MissingIsNull -Clock $readClock -EndSec $budgetSec @endArgs
+        if ($script:VenueTestPostBytesDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPostBytesDelayMs) }
         if ($null -eq $bytes) { return $unknown }
         $got =[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
         if (-not [string]::Equals($got, $want, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = "result.json does not match the receipt's evidence.resultJsonSha256"; return $unknown }

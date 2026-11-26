@@ -3788,8 +3788,8 @@ QUIET_SMOKE = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"colle
 
 def _extract_report_write_block(cmp_source: str) -> str:
     """The comparator's report-write block as it runs (MERGE-RESIDUE-1 r1): from the folder bookkeeping to the end of the cleanup `finally`."""
-    if "    $createdDirs = [System.Collections.Generic.List[string]]::new()\n" in cmp_source:
-        return _extract_block(cmp_source, "    $createdDirs = [System.Collections.Generic.List[string]]::new()\n", "-Force -ErrorAction Stop } else { break } } catch { break }", trailing_lines=3)
+    if "    $createdDirs = [System.Collections.Generic.List[" in cmp_source:
+        return _extract_block(cmp_source, "    $createdDirs = [System.Collections.Generic.List[", "                } catch { break }", trailing_lines=3)
     return _extract_block(cmp_source, "    $createdDir = $false\n    $tempOutput = $null", "if ([string]::Equals($cleanDir, $firstMissingDir", trailing_lines=3)   # the shape before R4-NARROW-1 r2 (adversary-ac722a96.json A3)
 
 
@@ -4340,6 +4340,65 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
             self.assertTrue(new.is_dir(), "the folder the other process made under the name is not this call's to remove\n" + proc.stdout + proc.stderr)
             self.assertTrue((out / "new-moved").is_dir())
+
+    @requires_windows_pwsh
+    def test_r2res_a3_the_cleanup_acts_on_the_folder_it_made_never_on_one_swapped_in_after_its_check(self) -> None:
+        # adversary-3be19c39.json A3 (blocker), its input: this call made `new`; the write is refused; the cleanup has verified the creation time and enumerated `new` empty, and THEN another process
+        # renames `new` aside and makes an empty `new` of its own. RED on 3be19c39: Remove-Item looked the path up again and deleted the other process's folder (the check, the listing and the delete were three
+        # path lookups). The seam SmokeTestBeforeDirCleanup is that swap. Now the cleanup acts on ONE handle opened when this call created the folder (no delete sharing, so the rename-aside is a sharing
+        # violation, and the delete is by that handle): a folder that is not this call's is never removed, and the one this call made still is.
+        with tempfile.TemporaryDirectory(prefix="r2res-a3-") as tmp:
+            before, after = Path(tmp) / "before.json", Path(tmp) / "after.json"
+            for p in (before, after):
+                p.write_text("{}", encoding="utf-8", newline="")
+            out = Path(tmp) / "out"
+            out.mkdir()
+            new = out / "new"
+            pre = (
+                "$script:SmokeTestBeforeDirCleanup = { param($p) try { Rename-Item -LiteralPath $p -NewName 'new-moved' -ErrorAction Stop; "
+                "Microsoft.PowerShell.Management\\New-Item -ItemType Directory -Path $p | Out-Null; Write-Output 'SWAP=yes' } catch { Write-Output 'SWAP=blocked' } }\n"
+                f"Remove-Item -LiteralPath '{before}'\n")
+            proc = _run_ps_file(_report_write_probe(tmp, before, after, new / "report.json", new, pre_block=pre))
+            self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
+            if "SWAP=yes" in proc.stdout:
+                self.assertTrue(new.is_dir(), "the folder another process put under the name is not this call's to remove\n" + proc.stdout + proc.stderr)
+            else:
+                self.assertIn("SWAP=blocked", proc.stdout, proc.stdout + proc.stderr)
+                self.assertFalse(new.exists(), "the folder this call made is still removed when nothing replaced it\n" + proc.stdout + proc.stderr)
+        block = _extract_report_write_block(COMPARE_SCRIPT.read_text(encoding="utf-8"))
+        self.assertNotIn("Remove-Item -LiteralPath $levelPath", block, "no second path lookup to delete a folder level")
+
+    @requires_windows_pwsh
+    def test_r2res_a4_the_report_is_the_bytes_this_call_wrote_and_a_failed_move_deletes_only_its_own_file(self) -> None:
+        # adversary-3be19c39.json A4, its input: between the temporary file being written and its move another process renames it aside and leaves {"fixture":"replacement"} under the same temporary name
+        # (the seam SmokeTestAfterTempWrite); then the same with a destination that denies the replacement. RED on 3be19c39: the move published the replacement, and on a refused move the finally deleted
+        # the replacement path. Now the temporary file is held open without sharing from its creation to its move (so the rename-aside is blocked) and is renamed and, on failure, deleted BY THAT HANDLE.
+        swap = ("$script:SmokeTestAfterTempWrite = { param($t) try { Move-Item -LiteralPath $t -Destination ($t + '.aside') -ErrorAction Stop; "
+                "[IO.File]::WriteAllText($t, '{\"fixture\":\"replacement\"}'); Write-Output 'SWAP=yes' } catch { Write-Output 'SWAP=blocked' }; %s }\n")
+        for label, deny in (("publish", False), ("refused", True)):
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix="r2res-a4-") as tmp:
+                before, after = Path(tmp) / "before.json", Path(tmp) / "after.json"
+                for p in (before, after):
+                    p.write_text("{}", encoding="utf-8", newline="")
+                out = Path(tmp) / "out"
+                out.mkdir()
+                report = out / "report.json"
+                hold = "$script:denyHold = [IO.File]::Open($script:resolvedOutput, 'Open', 'Read', 'None')" if deny else ""
+                if deny:
+                    report.write_text("old", encoding="utf-8", newline="")
+                proc = _run_ps_file(_report_write_probe(tmp, before, after, report, out, pre_block=swap % hold))
+                tmps = sorted(x.name for x in out.iterdir() if x.name.endswith(".tmp"))
+                if not deny:
+                    self.assertIn("RESULT=WRITTEN", proc.stdout, proc.stdout + proc.stderr)
+                    self.assertEqual(report.read_text(encoding="utf-8").strip(), '{"report":true}', "the report is the comparator's own bytes, never a replacement\n" + proc.stdout + proc.stderr)
+                else:
+                    self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
+                    if "SWAP=yes" in proc.stdout:
+                        self.assertEqual(len(tmps), 1, "the replacement file another process left is not this call's to delete\n" + proc.stdout + proc.stderr)
+                    else:
+                        self.assertEqual(tmps, [], "this call's own temporary file is removed\n" + proc.stdout + proc.stderr)
+        block = _extract_report_write_block(COMPARE_SCRIPT.read_text(encoding="utf-8"))
+        self.assertIn("RenameOver($tempHandle", block, "the Windows publish is by the held handle, never a second path lookup of the temporary name")
 
     @requires_pwsh
     def test_r4n2_p2_a6_a_smoke_file_the_figure_parser_refused_leaves_no_clean_host_load_standing(self) -> None:

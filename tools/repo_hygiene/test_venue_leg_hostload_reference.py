@@ -792,6 +792,53 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertEqual(got["B"], "unknown/True", "an answer seen after the absolute deadline is not acted on: " + p.stdout)
         self.assertIn("absolute end", got["BWHY"], p.stdout)
 
+    def test_r2res_a1_the_wait_for_a_read_ends_at_the_absolute_deadline_not_at_the_stopwatch_cap(self) -> None:
+        # adversary-3be19c39.json A1, its input: the absolute end is 4 s away, the stopwatch cap sampled before it (the budget the caller computed, and a wall clock stepped since) still says 20 s, and the
+        # share never answers (the worker sleeps 15 s: VenueTestFileReadDelayMs). RED on 3be19c39: WaitOne used the stopwatch cap alone and waited until the worker gave up (~15 s) -- ~11 s past the absolute
+        # end -- and the UTC check ran only after the wait. The wait is now cut to the absolute end (checked in slices on the wall clock), so the read is refused at ~4 s, and the abandoned worker is not joined.
+        with tempfile.TemporaryDirectory() as d:
+            blob = Path(d) / "f.bin"
+            blob.write_bytes(b"abc")
+            p = run_ps(
+                "$vc = Get-Module VenueChain; "
+                "& $vc { $script:VenueTestFileReadDelayMs = 15000 }; "
+                f"$t = [Diagnostics.Stopwatch]::StartNew(); $r = try {{ & $vc {{ param($f) $sw = [Diagnostics.Stopwatch]::StartNew(); Read-VenueFileBytesBounded -Path $f -TimeoutSec 20 -Clock $sw -EndSec 20 -EndUtc ([DateTime]::UtcNow.AddSeconds(4)) }} '{blob}'; 'READ' }} catch {{ 'THROWN ' + $_.Exception.Message }}; "
+                "Write-Output ('SEC=' + [Math]::Round($t.Elapsed.TotalSeconds, 1)); Write-Output ('R=' + $r); [Console]::Out.Flush(); [Environment]::Exit(0)")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertTrue(got["R"].startswith("THROWN"), p.stdout)
+        self.assertLess(float(got["SEC"]), 8.0, "the wait ended at the absolute end (about 4 s), not at the stopwatch cap or the late worker: " + p.stdout)
+        self.assertIn("absolute end", got["R"], p.stdout)
+
+    def test_r2res_a2_bytes_that_reach_classification_after_the_absolute_end_are_never_quiet_or_exempt(self) -> None:
+        # adversary-3be19c39.json A2, its input: a valid PASS receipt and matching quiet result.json, -CallDeadlineUtc 2.5 s away, and the caller suspended 3 s AFTER the read's own end check and
+        # BEFORE the bytes are classified (the seams VenueTestPostBytesDelayMs / VenueTestPostReceiptBytesDelayMs). RED on 3be19c39: Get-VenueLegHostLoad returned quiet / not-applicable after the end,
+        # so the caller could count the leg. The absolute end is checked again before a quiet or export-exempt answer is returned: unknown and provisional, never counted.
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            quiet = json.dumps({"hostLoad": QUIET})
+            sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            rid = "efefefef-efef-4fef-8fef-efefefefefef"
+            path = self.write_leg(Path(d), rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+            exp = self.write_leg(Path(d), "realexp-2", REAL_EXPORT_RECEIPT, None)
+            p = run_ps(
+                "$vc = Get-Module VenueChain; "
+                f"$a = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(2.5)); Write-Output ('A=' + $a.state + '/' + $a.provisional); "
+                f"$x = Get-VenueLegHostLoad -ReceiptPath '{exp}' -PlannedLegType 'export' -ReadTimeoutSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(2.5)); Write-Output ('X=' + $x.state + '/' + $x.applies); "
+                "& $vc { $script:VenueTestPostBytesDelayMs = 3000 }; "
+                f"$b = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(2.5)); Write-Output ('B=' + $b.state + '/' + $b.provisional); Write-Output ('BWHY=' + $b.reason); "
+                "& $vc { $script:VenueTestPostBytesDelayMs = 0; $script:VenueTestPostReceiptBytesDelayMs = 3000 }; "
+                f"$y = Get-VenueLegHostLoad -ReceiptPath '{exp}' -PlannedLegType 'export' -ReadTimeoutSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(2.5)); Write-Output ('Y=' + $y.state + '/' + $y.applies); Write-Output ('YWHY=' + $y.reason); "
+                "& $vc { $script:VenueTestPostReceiptBytesDelayMs = 0 }")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["A"], "quiet/False", "no stall: the read inside the deadline reads quiet: " + p.stdout)
+        self.assertEqual(got["X"], "not-applicable/False", "no stall: a planned export is exempt: " + p.stdout)
+        self.assertEqual(got["B"], "unknown/True", "bytes classified after the absolute end are never quiet: " + p.stdout)
+        self.assertIn("absolute end", got["BWHY"], p.stdout)
+        self.assertEqual(got["Y"], "unknown/True", "a receipt answer seen after the absolute end grants no export exemption: " + p.stdout)
+        self.assertIn("absolute end", got["YWHY"], p.stdout)
+
     def test_r2_pass2_a5_a7_a13_the_matrix_refuses_a_replaced_receipt_the_planner_refuses_a_duplicated_legtype_the_verdict_keeps_a_list(self) -> None:
         # adversary-b3d61554.json A5: the matrix drops the receipt whose bytes are not the ones the child published (as the baseline refuses them), so a replacement's outcome and
         # fps are never attributed to the planned leg. A7: a spec that declares legType twice is planned 'unknown', never 'export'. A13: the GUI verdict helper never unrolls a

@@ -1452,6 +1452,8 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
             $tempStream.Flush($true)
         }
         finally { $tempStream.Dispose() }
+        # test-only seam (R2-RESIDUE-1 r1, adversary-3be19c39.json A4): a script block a test sets to act in the gap between the temporary file being written and its publication; production leaves it unset
+        if ($null -ne $script:SmokeTestAfterTempWrite) { & $script:SmokeTestAfterTempWrite $tempOutput }
         [IO.File]::Move($tempOutput, $resolvedOutput, $true)
         $tempOutput = $null
         $wroteOutput = $true
@@ -1463,7 +1465,13 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
             # only the folder levels whose own creation this call succeeded (deepest first) are removed, and only while each is empty (a file another process put there is never ours to delete)
             for ($levelIndex = $createdDirs.Count - 1; $levelIndex -ge 0; $levelIndex--) {
                 $levelPath = $createdDirs[$levelIndex].Substring($createdDirs[$levelIndex].IndexOf('|') + 1)
-                try { if ("$([IO.Directory]::GetCreationTimeUtc($levelPath).Ticks)|$levelPath" -cne $createdDirs[$levelIndex]) { break }; if (@(Get-ChildItem -LiteralPath $levelPath -Force -ErrorAction Stop).Count -eq 0) { Remove-Item -LiteralPath $levelPath -Force -ErrorAction Stop } else { break } } catch { break }
+                try {
+                    if ("$([IO.Directory]::GetCreationTimeUtc($levelPath).Ticks)|$levelPath" -cne $createdDirs[$levelIndex]) { break }
+                    if (@(Get-ChildItem -LiteralPath $levelPath -Force -ErrorAction Stop).Count -ne 0) { break }
+                    # test-only seam (R2-RESIDUE-1 r1, adversary-3be19c39.json A3): a script block a test sets to act after the folder was checked and found empty and before it is deleted; production leaves it unset
+                    if ($null -ne $script:SmokeTestBeforeDirCleanup) { & $script:SmokeTestBeforeDirCleanup $levelPath }
+                    Remove-Item -LiteralPath $levelPath -Force -ErrorAction Stop
+                } catch { break }
             }
         }
     }
