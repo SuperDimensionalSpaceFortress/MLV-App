@@ -564,7 +564,8 @@ function Test-FpsCachedAnalysisBound {
     # ENVELOPE-PREEMPT-RESIDUE-1 r1 (adversary r1 A2): ORDINAL, not -cne: PowerShell's culture-aware compare ignores a soft hyphen, so 'candidate<U+00AD>Speed' matched 'candidateSpeed'
     if ($basis -isnot [string] -or -not [string]::Equals($basis, $ComparisonBasis, [StringComparison]::Ordinal)) { return $false }
     $evidence = Get-FaProp $Analysis 'evidence'
-    $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long] -or $v -is [int16] -or $v -is [byte]) }
+    # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 0e9672e5 A1): and FINITE: valid JSON 1e400 parses to +Infinity, and two different overflowing numbers then compare equal
+    $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long] -or $v -is [int16] -or $v -is [byte]) -and [double]::IsFinite([double]$v) }
     # The presented-fps delta must be a number on both sides (the diagnosis is undefined without it).
     $cached = Get-FaProp $evidence 'presentedFpsDeltaPercent'
     $judged = Get-FaProp (Get-FaProp $Compare 'presentedFps') 'deltaPercent'

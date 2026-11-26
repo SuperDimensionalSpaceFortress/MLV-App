@@ -263,7 +263,8 @@ function Get-ProofSpeedClaimAuthority {
     param([Parameter(Mandatory = $true)][string]$OverallStatus, [AllowNull()]$PlaybackSpeedVerdict, [AllowNull()]$SpeedCompare)
     $sectionStatus = if ($null -eq $PlaybackSpeedVerdict) { $null } else { $PlaybackSpeedVerdict.status }
     $presentedFps = Get-Field $SpeedCompare "presentedFps"
-    $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long]) }
+    # (adversary 0e9672e5 A1: and FINITE; valid JSON 1e400 parses to +Infinity, which is no measurement)
+    $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long]) -and [double]::IsFinite([double]$v) }
     $fpsMeasured = ($null -ne $presentedFps) -and (& $isNumber (Get-Field $presentedFps "baseline")) -and (& $isNumber (Get-Field $presentedFps "candidate"))
     $speed = ($OverallStatus -ceq "QUOTABLE_PASS") -and ($sectionStatus -is [string]) -and ($sectionStatus -ceq "PASS") -and $fpsMeasured
     $reason = if ($speed) { "" } elseif ($OverallStatus -cne "QUOTABLE_PASS") { "packet-not-quotable" } elseif (($sectionStatus -is [string]) -and ($sectionStatus -ceq "PASS")) { "presented-fps-not-measured" } else { "playback-speed-section-$(if ($sectionStatus -is [string] -and $sectionStatus) { $sectionStatus } else { 'missing' })" }

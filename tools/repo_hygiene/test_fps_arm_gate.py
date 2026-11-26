@@ -2332,8 +2332,11 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         )
         for label, ev, cmp in cases:
             body += f"Write-Host ('{label}=' + (Test-FpsCachedAnalysisBound -Analysis (A ({ev})) -Compare ({cmp}) -ComparisonBasis 'candidateSpeed'))\n"
+        # adversary 0e9672e5 A1 (sibling): two different overflowing JSON numbers both parse to +Infinity and compared equal
+        body += ("$inf = '{\"analysis\":{\"comparisonBasis\":\"candidateSpeed\",\"evidence\":{\"presentedFpsDeltaPercent\":1e400}},\"compare\":{\"presentedFps\":{\"deltaPercent\":1e500}}}' | ConvertFrom-Json\n"
+                 "Write-Host ('INFINITE=' + (Test-FpsCachedAnalysisBound -Analysis $inf.analysis -Compare $inf.compare -ComparisonBasis 'candidateSpeed'))\n")
         out = dict(line.split("=", 1) for line in self.ok(body).split())
-        self.assertEqual(out, {"TOLERANCE": "False", "STAGE": "False", "CANDIDATE_MS": "False", "EXACT": "True"})
+        self.assertEqual(out, {"TOLERANCE": "False", "STAGE": "False", "CANDIDATE_MS": "False", "EXACT": "True", "INFINITE": "False"})
 
     def test_p3_a6_speed_authority_needs_a_pass_section_one_authority_object_and_no_repeated_key(self) -> None:
         # adversary 835a5faf A6 / 8747fced A6: package and import granted speedQuotable from status + claimAuthority.speed alone: a REFUSED playbackSpeed section, singleton arrays and a
@@ -2370,11 +2373,13 @@ class EnvelopePreemptR1ResidueTests(_Probe):
                            ("STAGE_ONLY", "[pscustomobject]@{ avgRenderTotalMs = [pscustomobject]@{ baseline = 10; candidate = 9 } }"),
                            ("FPS_TEXT", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = '50'; candidate = '55' } }"),
                            ("FPS_ONE_SIDE", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = $null } }"),
+                           # adversary 0e9672e5 A1: valid JSON 1e400 parses to +Infinity, which passed the numeric-type check
+                           ("FPS_INFINITE", "('{\"presentedFps\":{\"baseline\":1e400,\"candidate\":55}}' | ConvertFrom-Json)"),
                            ("MEASURED", "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = 55.5 } }")):
             body += (f"$a = Get-ProofSpeedClaimAuthority -OverallStatus 'QUOTABLE_PASS' -PlaybackSpeedVerdict $pass -SpeedCompare ({cmp})\n"
                      f"Write-Host ('{label}=' + $a.speed + '|' + $a.speedRefusal)\n")
         out = dict(line.split("=", 1) for line in self.ok(body).split())
-        for label in ("EMPTY", "NULL", "STAGE_ONLY", "FPS_TEXT", "FPS_ONE_SIDE"):
+        for label in ("EMPTY", "NULL", "STAGE_ONLY", "FPS_TEXT", "FPS_ONE_SIDE", "FPS_INFINITE"):
             self.assertEqual(out[label], "False|presented-fps-not-measured", label)
         self.assertEqual(out["MEASURED"], "True|")
         self.assertIn("-PlaybackSpeedVerdict $playbackAbVerdict -SpeedCompare $playbackAbSpeedCompare", SUMMARIZER_SCRIPT.read_text(encoding="utf-8"))
@@ -2395,8 +2400,13 @@ class EnvelopePreemptR1ResidueTests(_Probe):
                      f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary 's.json' -MarkdownReport '{md}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
                      f"$left = if (Test-Path -LiteralPath '{js}') {{ [IO.File]::ReadAllText('{js}') }} else {{ 'none' }}\n"
                      f"Write-Host ('{label}=' + $res + '|' + $left)\n")
+        # adversary 0e9672e5 A2: the cleanup removes report FILES only; a directory given as the report path is kept (and the run is still a packaging error, no report was written)
+        keep = self.tmp / "keep"
+        body += (f"[IO.File]::WriteAllText('{fake}', 'exit 1')\n$null = New-Item -ItemType Directory -Path '{keep}'\n"
+                 f"try {{ $null = Invoke-ProofSummarizer -Repo '{repo}' -Summary 's.json' -MarkdownReport '{keep}' -JsonReport '{js}'; $res = 'OK' }} catch {{ $res = 'THREW' }}\n"
+                 f"Write-Host ('DIR=' + $res + '|' + (Test-Path -LiteralPath '{keep}' -PathType Container))\n")
         out = dict(line.split("=", 1) for line in self.ok(body).split())
-        self.assertEqual(out, {"REFUSES": "THREW|none", "WRITES": "OK|fresh"})
+        self.assertEqual(out, {"REFUSES": "THREW|none", "WRITES": "OK|fresh", "DIR": "THREW|True"})
 
     def test_p3_a1_a_purpose_free_plan_is_not_refused_by_a_stalled_arm_read(self) -> None:
         # adversary 835a5faf A1: a purpose-free plan whose arm read got no answer exited SPEC_READ_TIMEOUT item=1 before staging, where the base gave up on the optional ID read and returned

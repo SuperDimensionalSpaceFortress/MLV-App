@@ -113,7 +113,8 @@ function Invoke-ProofSummarizer {
     # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 8747fced A5): exit 1 also means the summarizer refused its input before writing (a repeated key), so a report an EARLIER run left here would be
     # packaged as this summary's. Both reports are removed first, and each must exist after its run.
     foreach ($stale in @($MarkdownReport, $JsonReport)) {
-        if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Force }
+        # (adversary 0e9672e5 A2: a FILE only; a directory given as the report path is left for the summarizer's own write to refuse)
+        if (Test-Path -LiteralPath $stale -PathType Leaf) { Remove-Item -LiteralPath $stale -Force }
     }
 
     & pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
