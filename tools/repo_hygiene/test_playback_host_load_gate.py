@@ -4407,6 +4407,42 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
         block = _extract_report_write_block(COMPARE_SCRIPT.read_text(encoding="utf-8"))
         self.assertIn("RenameOver($tempHandle", block, "the Windows publish is by the held handle, never a second path lookup of the temporary name")
 
+    @requires_windows_pwsh
+    def test_r2res2_a4_an_extended_length_report_path_with_absent_folders_is_published(self) -> None:
+        # adversary-f1221390.json A4, its input: -Output '\\?\<tmp>\new\deeper\report.json' with `new` absent. RED on f1221390: CreateDirectoryOwned treated the extended prefix as an ordinary UNC prefix and built
+        # \??\UNC\?\<tmp>\..., the wrong NT namespace, so the folder was never created and a valid report was never published. Each Win32 spelling (extended-length drive, extended-length UNC, device, UNC, drive)
+        # now maps to its own NT name.
+        with tempfile.TemporaryDirectory(prefix="r2res2-a4-") as tmp:
+            before, after = Path(tmp) / "before.json", Path(tmp) / "after.json"
+            for p in (before, after):
+                p.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            plain = Path(tmp) / "new" / "deeper" / "report.json"
+            proc = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", "\\\\?\\" + str(plain))
+            text = _flat_pwsh_text(proc.stdout + proc.stderr)
+            self.assertTrue(plain.is_file(), "the report is published under folders this call made through an extended-length path\n" + text)
+            self.assertIn("verdict", json.loads(plain.read_text(encoding="utf-8")), "the published file is the comparator's report")
+            self.assertEqual(sorted(x.name for x in plain.parent.iterdir()), ["report.json"], "no temporary file is left")
+
+    @requires_windows_pwsh
+    def test_r2res2_a6_a_failure_between_the_temp_handle_and_its_stream_closes_the_handle_and_removes_the_owned_folder(self) -> None:
+        # adversary-f1221390.json A6, its input: the temporary file's raw handle is created, then the FileStream wrapper cannot be built (the seam SmokeTestAfterTempHandle throws, as an allocation failure would),
+        # the report folder being one this call made. RED on f1221390: the finally requested the delete by handle but disposed only the (null) stream, so the handle stayed open, the delete stayed pending and
+        # the folder cleanup found the temporary file still there and left the owned folder. The raw handle is now closed in the finally before the folders are cleaned.
+        with tempfile.TemporaryDirectory(prefix="r2res2-a6-") as tmp:
+            before, after = Path(tmp) / "before.json", Path(tmp) / "after.json"
+            for p in (before, after):
+                p.write_text("{}", encoding="utf-8", newline="")
+            out = Path(tmp) / "out"
+            out.mkdir()
+            new = out / "new"
+            pre = "$script:SmokeTestAfterTempHandle = { throw 'injected wrapper failure' }\n"
+            proc = _run_ps_file(_report_write_probe(tmp, before, after, new / "report.json", new, pre_block=pre))
+            self.assertIn("RESULT=REFUSED", proc.stdout, proc.stdout + proc.stderr)
+            self.assertIn("injected wrapper failure", proc.stdout, proc.stdout + proc.stderr)
+            self.assertFalse(new.exists(), "the folder this call made is removed once its temporary file is gone\n" + proc.stdout + proc.stderr)
+        block = _extract_report_write_block(COMPARE_SCRIPT.read_text(encoding="utf-8"))
+        self.assertIn("$tempHandle.Dispose()", block, "the raw handle is closed by the cleanup, not only by a stream that may never have been built")
+
     @requires_pwsh
     def test_r4n2_p2_a6_a_smoke_file_the_figure_parser_refused_leaves_no_clean_host_load_standing(self) -> None:
         # adversary-ac722a96.json A6, its input: Before holds a quiet hostLoad and {"extra":{"x":1,"X":2}} (members differing only in case: the figure parser refuses the text), After a

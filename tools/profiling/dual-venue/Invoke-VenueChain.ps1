@@ -627,6 +627,8 @@ foreach ($leg in $plan) {
                 # (as the lease batch does): without it the reader's own default gave a stalled result.json a fresh 20 s past the deadline, so a final leg overran it and a baseline parent
                 # killed the chain with the result lost. Under 1 s left the read is not started and the standing is unknown (uncounted, the safe side).
                 $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType ([string]$leg.plannedLegType) -ExpectReceiptSha256 $receiptSha -ReadTimeoutSec 20.0 -CallDeadlineUtc $deadline
+                # R2-RESIDUE-1 r2 (adversary-f1221390.json A2): a standing this caller sees after its own -DeadlineUtc is never acted on, whatever the reader returned (the caller can be suspended after the reader's last check)
+                if ($deadline -le [DateTime]::UtcNow) { $hl = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'the standing was seen after the absolute end (-DeadlineUtc) and is never acted on'; applies = $true } }
                 $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 # a FOREIGN_FLOOR early exit in ANY probe of the leg (either phase, any attempt, GATE_BUSY retries included) leaves it contended: a later QUIET reading never promotes it to a counted class
                 $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET' -or $legPreFF -or $legReFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })

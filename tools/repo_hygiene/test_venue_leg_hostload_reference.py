@@ -839,6 +839,58 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertEqual(got["Y"], "unknown/True", "a receipt answer seen after the absolute end grants no export exemption: " + p.stdout)
         self.assertIn("absolute end", got["YWHY"], p.stdout)
 
+    def test_r2res2_a1_the_last_wait_slice_is_cut_to_the_wall_clock_remainder_not_a_full_quarter_second(self) -> None:
+        # adversary-f1221390.json A1, its input: the absolute end is a few hundred ms away on the (stepped) wall clock, the stopwatch cap is 20 s, and the worker is blocked for 3 s. RED on f1221390: each
+        # slice was min(0.25, stopwatch remainder), so the slice that began with, say, 50 ms of wall-clock room waited the full 0.25 s and the call returned up to 0.25 s past the end. The slice is now also
+        # cut to the wall-clock remainder read at its start. Three ends spaced 80 ms apart, so no phase of the 0.25 s slice hides the overrun; each must return within 120 ms of its own end (a 250 ms slice
+        # overshoots by 0.25 - (remainder mod 0.25), which exceeds 120 ms for at least one of them).
+        p = run_ps(
+            "$vc = Get-Module VenueChain; "
+            "& $vc { $r = Invoke-VenueBoundedRead -ScriptText 'param($a) 1' -Argument 'x' -TimeoutSec 5 }; "   # warm the runspace machinery so setup is not charged to a lead
+            "foreach ($lead in 0.9, 0.98, 1.06) { "
+            "$o = & $vc { param($lead) $script:VenueTestUtcStepSec = 20 - $lead; $end = [DateTime]::UtcNow.AddSeconds(20); $stepped = [DateTime]::UtcNow.AddSeconds($lead); "
+            "$r = Invoke-VenueBoundedRead -ScriptText 'param($a) Start-Sleep -Seconds 3; 1' -Argument 'x' -TimeoutSec 20 -EndUtc $end; "
+            "$over = ([DateTime]::UtcNow - $stepped).TotalSeconds; $script:VenueTestUtcStepSec = 0; ('' + [Math]::Round($over, 3) + '|' + $r.answered) } $lead; Write-Output ('OVER=' + $o) }; "
+            "[Console]::Out.Flush(); [Environment]::Exit(0)")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        rows = [l.split("=", 1)[1].split("|") for l in p.stdout.splitlines() if l.startswith("OVER=")]
+        self.assertEqual(len(rows), 3, p.stdout + p.stderr)
+        for over, answered in rows:
+            self.assertEqual(answered, "False", p.stdout)
+            self.assertLess(float(over), 0.12, "the wait ended at the wall-clock end, not a full slice past it: " + p.stdout)
+
+    def test_r2res2_a2_a_call_with_no_deadline_never_returns_quiet_or_exempt_past_its_own_read_budget(self) -> None:
+        # adversary-f1221390.json A2, its input: Get-VenueLegHostLoad -ReadTimeoutSec 1.5 and NO -CallDeadlineUtc over a valid receipt and result.json; the caller is suspended 2 s after the reads (the seams
+        # VenueTestPostBytesDelayMs / VenueTestPostReceiptBytesDelayMs). RED on f1221390: the closure that guards the quiet and export-exempt returns judged only a supplied UTC deadline, so a call with none
+        # (the baseline's, the leg's own) returned quiet / not-applicable past the shared read budget. The budget on the shared stopwatch is the end then. The chain and the batch also judge their own
+        # -DeadlineUtc where they consume the standing (pinned below).
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            quiet = json.dumps({"hostLoad": QUIET})
+            sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            rid = "f1f1f1f1-f1f1-4f1f-8f1f-f1f1f1f1f1f1"
+            path = self.write_leg(Path(d), rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+            exp = self.write_leg(Path(d), "realexp-3", REAL_EXPORT_RECEIPT, None)
+            p = run_ps(
+                "$vc = Get-Module VenueChain; "
+                f"$a = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 1.5; Write-Output ('A=' + $a.state + '/' + $a.provisional); "
+                f"$x = Get-VenueLegHostLoad -ReceiptPath '{exp}' -PlannedLegType 'export' -ReadTimeoutSec 1.5; Write-Output ('X=' + $x.state + '/' + $x.applies); "
+                "& $vc { $script:VenueTestPostBytesDelayMs = 2000 }; "
+                f"$b = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 1.5; Write-Output ('B=' + $b.state + '/' + $b.provisional); Write-Output ('BWHY=' + $b.reason); "
+                "& $vc { $script:VenueTestPostBytesDelayMs = 0; $script:VenueTestPostReceiptBytesDelayMs = 2000 }; "
+                f"$y = Get-VenueLegHostLoad -ReceiptPath '{exp}' -PlannedLegType 'export' -ReadTimeoutSec 1.5; Write-Output ('Y=' + $y.state + '/' + $y.applies); Write-Output ('YWHY=' + $y.reason); "
+                "& $vc { $script:VenueTestPostReceiptBytesDelayMs = 0 }")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["A"], "quiet/False", "no stall: reads quiet: " + p.stdout)
+        self.assertEqual(got["X"], "not-applicable/False", "no stall: a planned export is exempt: " + p.stdout)
+        self.assertEqual(got["B"], "unknown/True", "bytes classified after the read budget are never quiet: " + p.stdout)
+        self.assertIn("read budget", got["BWHY"], p.stdout)
+        self.assertEqual(got["Y"], "unknown/True", "an export answer seen after the read budget is not exempt: " + p.stdout)
+        for label, script in (("chain", "Invoke-VenueChain.ps1"), ("batch", "Invoke-VenueLeaseBatch.ps1")):
+            text = (DV_DIR / script).read_text(encoding="utf-8")
+            self.assertRegex(text, r"-CallDeadlineUtc \$deadline\r?\n\s+#[^\n]*\r?\n\s+if \(\$deadline -le \[DateTime\]::UtcNow\) \{ \$hl = \[pscustomobject\]@\{ state = 'unknown'; provisional = \$true", f"{label}: the standing is judged against -DeadlineUtc where it is consumed")
+
     def test_r2_pass2_a5_a7_a13_the_matrix_refuses_a_replaced_receipt_the_planner_refuses_a_duplicated_legtype_the_verdict_keeps_a_list(self) -> None:
         # adversary-b3d61554.json A5: the matrix drops the receipt whose bytes are not the ones the child published (as the baseline refuses them), so a replacement's outcome and
         # fps are never attributed to the planned leg. A7: a spec that declares legType twice is planned 'unknown', never 'export'. A13: the GUI verdict helper never unrolls a
@@ -883,7 +935,7 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         # adversary-fa329743.json A3/A4: the chain's scalar branch and the baseline judge the text they read for the plan; the batch records the type
         # judged from the preflight's bytes and never reopens the spec after the leg.
         drivers = {"Invoke-VenueChain.ps1": "$plannedType = Get-VenuePlannedLegType -SpecText $specText",
-                   "Invoke-VenueLeaseBatch.ps1": "$script:SpecPlannedLegType[$Path] = Get-VenuePlannedLegType -SpecText",
+                   "Invoke-VenueLeaseBatch.ps1": "$script:SpecPlannedLegType[$digestKey] = Get-VenuePlannedLegType -SpecText",   # (the key is master's ordinal digest key since the #903 merge: one file under two spellings is one key)
                    "Invoke-VenueBaseline.ps1": "plannedLegType = (Get-VenuePlannedLegType -SpecText $specText)",
                    # residue r2 (adversary-07b6a932.json A3): the matrix parent takes the planner's type (judged from the bytes the child is pinned to), never a re-read
                    "Invoke-VenueLeg.ps1": "$pePlanned = $(if ($null -ne $pe.PSObject.Properties['plannedLegType'])"}

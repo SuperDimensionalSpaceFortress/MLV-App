@@ -1303,8 +1303,11 @@ function Invoke-VenueBoundedRead {
             $absEnd = $EndUtc.ToUniversalTime()
             $waitClock = [Diagnostics.Stopwatch]::StartNew()
             while ($true) {
-                if ($absEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) { $absoluteEndHit = $true; break }
-                $slice = [Math]::Min(0.25, $waitSec - $waitClock.Elapsed.TotalSeconds)
+                # R2-RESIDUE-1 r2 (adversary-f1221390.json A1): the slice is the least of 0.25 s, the stopwatch remainder AND the wall-clock remainder to the absolute end, both read at the start of THIS
+                # slice, so a wall clock that stepped (or a caller suspended) since the last look cannot leave a full 0.25 s wait past the end
+                $utcLeftSec = ($absEnd.AddSeconds(-$script:VenueTestUtcStepSec) - [DateTime]::UtcNow).TotalSeconds
+                if ($utcLeftSec -le 0) { $absoluteEndHit = $true; break }
+                $slice = [Math]::Min([Math]::Min(0.25, $waitSec - $waitClock.Elapsed.TotalSeconds), $utcLeftSec)
                 if ($slice -le 0) { break }
                 if ($async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($slice))) { $answeredInTime = $true; break }
             }
@@ -2034,8 +2037,10 @@ function Get-VenueLegHostLoad {
         # R2-RESIDUE-1 r1 (adversary-3be19c39.json A2): the read's own end check runs before its bytes are handed back, so a caller suspended after it reached the classification (and the export exemption) past
         # the absolute end and returned a quiet or exempt answer the caller then counted. $pastEnd is asked again right before either of those two answers is returned.
         $absEnd = $(if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) { $CallDeadlineUtc.ToUniversalTime() } else { $null })
-        $pastEnd = { $null -ne $absEnd -and $absEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow }
-        $lateReason = 'an answer classified after the caller''s absolute end is never acted on'
+        # R2-RESIDUE-1 r2 (adversary-f1221390.json A2): the end is the absolute deadline when one was given AND the shared read budget ($budgetSec on $readClock) always: a call with no -CallDeadlineUtc (the
+        # baseline, the leg's own read) that was suspended after its last read past -ReadTimeoutSec classified and returned quiet or exempt just the same
+        $pastEnd = { ($null -ne $absEnd -and $absEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) -or $readClock.Elapsed.TotalSeconds -gt $budgetSec }
+        $lateReason = 'an answer classified after the caller''s absolute end or its read budget is never acted on'
         $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $budgetSec -Clock $readClock -EndSec $budgetSec @endArgs
         if ($script:VenueTestPostReceiptBytesDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPostReceiptBytesDelayMs) }
         if ($PSBoundParameters.ContainsKey('ExpectReceiptSha256')) {

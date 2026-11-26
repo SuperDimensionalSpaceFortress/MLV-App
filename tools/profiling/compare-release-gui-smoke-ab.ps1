@@ -109,7 +109,12 @@ public static class MlvSmokeOwnedFsV1 {
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int infoClass, IntPtr buffer, uint size);
     public static SafeFileHandle CreateDirectoryOwned(string fullPath) {
-        string nt = fullPath.StartsWith(@"\\") ? @"\??\UNC\" + fullPath.Substring(2) : @"\??\" + fullPath;
+        // adversary-f1221390.json A4: the NT spelling of every Win32 form: \\?\UNC\s\x and \\?\C:\x (extended-length) and \\.\ (device) already carry their own prefix, \\s\x is UNC, C:\x is a drive path
+        string nt;
+        if (fullPath.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase)) { nt = @"\??\UNC\" + fullPath.Substring(8); }
+        else if (fullPath.StartsWith(@"\\?\") || fullPath.StartsWith(@"\\.\")) { nt = @"\??\" + fullPath.Substring(4); }
+        else if (fullPath.StartsWith(@"\\")) { nt = @"\??\UNC\" + fullPath.Substring(2); }
+        else { nt = @"\??\" + fullPath; }
         IntPtr text = Marshal.StringToHGlobalUni(nt);
         IntPtr name = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(UNICODE_STRING)));
         try {
@@ -1552,6 +1557,8 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         # rename it aside or swap a file under its name; it is renamed over the report BY THIS HANDLE (never a second lookup of the temporary name) and, if anything fails first, deleted BY THE HANDLE.
         if ($ownedFs) {
             $tempHandle = [MlvSmokeOwnedFsV1]::CreateTempFile($tempOutput)
+            # test-only seam (R2-RESIDUE-1 r2, adversary-f1221390.json A6): a script block a test sets to fail between the raw handle and its stream wrapper; production leaves it unset
+            if ($null -ne $script:SmokeTestAfterTempHandle) { & $script:SmokeTestAfterTempHandle }
             $tempStream = [IO.FileStream]::new($tempHandle, [IO.FileAccess]::Write, 4096, $false)
         }
         else { $tempStream = [IO.FileStream]::new($tempOutput, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None) }
@@ -1569,6 +1576,9 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         # a refused or failed write removes the temporary file BY ITS OWN HANDLE (Windows), so a different file another process put under the temporary name is never touched; the handle is closed after
         if ($null -ne $tempHandle -and -not $wroteOutput) { try { [MlvSmokeOwnedFsV1]::DeleteByHandle($tempHandle) } catch { } }
         if ($null -ne $tempStream) { try { $tempStream.Dispose() } catch { } }
+        # adversary-f1221390.json A6: the raw handle is closed here too (a stream that was never built, or one that does not own it, leaves it open): the delete requested above completes only when the last handle
+        # closes, so the folder cleanup below must run after it. A handle the stream already closed is a no-op.
+        if ($null -ne $tempHandle) { try { $tempHandle.Dispose() } catch { } }
         if ($null -ne $tempOutput -and -not $ownedFs) { try { Remove-Item -LiteralPath $tempOutput -Force -ErrorAction Stop } catch { } }
         if (-not $wroteOutput) {
             # only the folder levels whose own creation this call succeeded (deepest first) are removed, and only while each is empty (a file another process put there is never ours to delete)
