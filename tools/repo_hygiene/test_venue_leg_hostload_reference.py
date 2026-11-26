@@ -85,6 +85,23 @@ class SmokeHostLoadStandingTests(unittest.TestCase):
         s = self.standing(QUIET)
         self.assertEqual((s["state"], s["provisional"], s["collected"]), ("quiet", False, True), s)
 
+    def test_r2n1_a6_the_duplicate_scan_reads_every_depth_the_json_readers_accept(self) -> None:
+        # adversary-7c5bfe86.json A6 (R2-NARROW-1 r2), its input: an otherwise passing smoke result with a root member `extra` holding 64 nested arrays (depth 65). RED on 7c5bfe86: JsonDocument.Parse
+        # was called with its default depth limit of 64, so the scan threw and a valid, duplicate-free quiet result read unknown. ConvertFrom-Json -Depth 100 (the readers' own parser) accepts it, so the
+        # scan must too; a real duplicate under that depth is still found. (The nesting is built in the pwsh body, not here.)
+        deep = "$deep = ('[' * 64) + '0' + (']' * 64); "
+        quiet = json.dumps({"hostLoad": QUIET}).replace("'", "''")
+        p = run_ps(
+            deep + f"$t = '{quiet[:-1]}' + ',\"extra\":' + $deep + '}}'; "
+            "$s = ConvertFrom-VenueSmokeResultText -Text $t; Write-Output ('S=' + $s.state + ',' + $s.provisional); "
+            "$d = Find-VenueJsonDuplicateMember -Text $t -All; Write-Output ('D=[' + $d + ']'); "
+            "$t2 = $t.Substring(0, $t.Length - 1) + ',\"EXTRA\":1}'; $d2 = Find-VenueJsonDuplicateMember -Text $t2; Write-Output ('D2=' + $d2)")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["S"], "quiet,False", p.stdout)
+        self.assertEqual(got["D"], "[]", p.stdout)
+        self.assertEqual(got["D2"], "$.EXTRA", p.stdout)
+
     def test_d_a_missing_block_reads_unknown_not_quiet(self) -> None:
         s = self.standing(None)
         self.assertEqual((s["state"], s["provisional"], s["collected"]), ("unknown", True, False), s)
@@ -703,6 +720,28 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertEqual(got["FUTURE"], "READ3", "a read inside its end still reads its three bytes: " + p.stdout)
         module = MODULE.read_text(encoding="utf-8")
         self.assertEqual(module.count("endUtcTicks = "), 1, "the one bounded file read hands its worker the end")
+
+    def test_r2n1_a4_the_file_read_worker_also_ends_by_the_callers_monotonic_clock_when_the_wall_clock_was_stepped_back(self) -> None:
+        # adversary-7c5bfe86.json A4 (R2-NARROW-1 r2), its input: the worker was handed only a projected UTC tick end. A wall clock stepped back after the caller computed it leaves that end far in the
+        # future, so both worker checks saw time left and the file was read after the shared monotonic end. RED on 7c5bfe86: the worker read its three bytes (READ3) with the stopwatch past its end.
+        # Now the worker is also handed the caller's stopwatch and its end (clock, clockEndSec) and refuses to touch the file when EITHER end has passed.
+        with tempfile.TemporaryDirectory() as d:
+            blob = Path(d) / "f.bin"
+            blob.write_bytes(b"abc")
+            body = (
+                "$vc = Get-Module VenueChain; $w = & $vc { $script:VenueFileReadWorkerText }; $sb = [scriptblock]::Create([string]$w); "
+                "$future = [DateTime]::UtcNow.AddSeconds(600).Ticks; $sw = [Diagnostics.Stopwatch]::StartNew(); [Threading.Thread]::Sleep(400); "
+                f"$r1 = try {{ $x = & $sb @{{ path = '{blob}'; missingOk = $false; delayMs = 0; endUtcTicks = $future; clock = $sw; clockEndSec = 0.1 }}; 'READ' + @($x).Count }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('STEPPED=' + $r1); "
+                f"$r2 = try {{ $x = & $sb @{{ path = '{blob}'; missingOk = $true; delayMs = 0; endUtcTicks = $future; clock = $sw; clockEndSec = 0.1 }}; 'READ' + @($x).Count }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('STEPPEDMISSINGOK=' + $r2); "
+                f"$r3 = try {{ $x = & $sb @{{ path = '{blob}'; missingOk = $false; delayMs = 0; endUtcTicks = $future; clock = $sw; clockEndSec = 60 }}; 'READ' + @($x).Count }} catch {{ 'THROWN ' + $_.Exception.Message }}; Write-Output ('INSIDE=' + $r3)")
+            p = run_ps(body)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        for key in ("STEPPED", "STEPPEDMISSINGOK"):
+            self.assertTrue(got[key].startswith("THROWN") and "call end" in got[key], (key, p.stdout))
+        self.assertEqual(got["INSIDE"], "READ3", "a read inside both ends still reads its three bytes: " + p.stdout)
+        module = MODULE.read_text(encoding="utf-8")
+        self.assertIn("clock = $workClock; clockEndSec = $workEndSec", module, "the one bounded file read hands its worker the caller's stopwatch and its end")
 
     def test_r4n2_a4_the_reader_ends_by_the_absolute_utc_deadline_the_caller_hands_it(self) -> None:
         # adversary-6596e055.json A4, its input: the caller sampled "remaining = 1.25 s" as a number, was paused past the UTC deadline, and the reader started its own stopwatch then, so both reads

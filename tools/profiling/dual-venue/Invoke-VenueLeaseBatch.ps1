@@ -1554,6 +1554,11 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
     if ($specRead.state -ceq 'TIMEOUT') { return 'SPEC_READ_TIMEOUT', "'$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc (or the guard's budget); no claim or lease is taken on it" }
     $spec = $(if ($specRead.state -ceq 'OK') { try { [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate } catch { $null } } else { $null })
     if ($null -eq $spec -or $spec -isnot [System.Management.Automation.PSCustomObject]) { return 'LEG_SPEC_INVALID', "'$Path' is not a JSON object" }
+    # R2-NARROW-1 r2 (adversary-7c5bfe86.json A7): a spec the strict reader cannot type (a member repeated in any spelling) is refused here, before any claim, as the set planner already refuses it (DVE_LEGSET_INVALID).
+    # The shape check and the export budget read these bytes last-wins; the host-load classification takes the strict reader's answer ('unknown'): one set of bytes must never be planned as one thing and classified as another.
+    if ([string]::Equals((Get-VenuePlannedLegType -SpecText ([Text.Encoding]::UTF8.GetString($specRead.bytes).TrimStart([char]0xFEFF))), 'unknown', [StringComparison]::Ordinal)) {
+        return 'LEG_SPEC_INVALID', "'$Path' cannot be run: its legType cannot be judged by the strict spec reader (a member repeated in any spelling): a spec whose legType is ambiguous is never planned or run"
+    }
     # r19 (sol r18 B1 sibling): the bytes this shape check judged, so the budget preflight can prove it judged the same ones (Get-ExportBudgetRefusal)
     # r20: and the third element of a '' answer, so the content guard compares THESE bytes with the judged ones (one read, after master's own typed refusals)
     $judgedSha = Get-BytesSha256 $specRead.bytes
@@ -1666,6 +1671,10 @@ function Get-ScalarLegShapeRefusal([string]$Path) {
     try { $spec = [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return "the leg spec is not valid JSON ($($_.Exception.Message -replace '\s+', ' '))" }
     try { $refusal = Get-DvLegSpecShapeRefusal -Spec $spec } catch { return "the leg spec cannot be shape-checked ($($_.Exception.Message -replace '\s+', ' '))" }
+    # R2-NARROW-1 r2 (adversary-7c5bfe86.json A7, sibling of Get-LegSpecRefusal): a spec the strict reader cannot type (a member repeated in any spelling) is refused on the scalar route too, before any claim
+    if ($null -eq $refusal -and [string]::Equals((Get-VenuePlannedLegType -SpecText ([Text.Encoding]::UTF8.GetString($specRead.bytes).TrimStart([char]0xFEFF))), 'unknown', [StringComparison]::Ordinal)) {
+        return "the leg spec cannot be run: its legType cannot be judged by the strict spec reader (a member repeated in any spelling): a spec whose legType is ambiguous is never planned or run"
+    }
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
 
@@ -3046,7 +3055,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $pl = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
                 $receipt = $(if ($pl -and $pl -match '^DVE_RECEIPT_PATH=(.+)$') { $Matches[1].Trim() } else { $null })
                 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes the child wrote ('' when it printed none: the read is unknown)
-                $rs = $legLines | Where-Object { $_ -cmatch '^DVE_RECEIPT_SHA256=[0-9A-Fa-f]{64}$' } | Select-Object -Last 1
+                # R2-NARROW-1 r2 (adversary-7c5bfe86.json A5): the hash is read from the child's STDOUT alone (as Invoke-VenueChain does): a DVE_RECEIPT_SHA256 line on stderr must never replace the one the leg published
+                $legStdoutLines = @(([string]$lp.stdout) -split "`r?`n")
+                $rs = $legStdoutLines | Where-Object { $_ -cmatch '^DVE_RECEIPT_SHA256=[0-9A-Fa-f]{64}$' } | Select-Object -Last 1
                 $receiptSha = $(if ($rs) { $rs.Substring('DVE_RECEIPT_SHA256='.Length) } else { '' })
                 $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
                 $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })

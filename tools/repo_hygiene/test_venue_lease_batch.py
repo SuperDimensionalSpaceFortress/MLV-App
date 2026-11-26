@@ -518,6 +518,8 @@ $legExit = [int](Pick $env:FAKE_LEG_EXIT $k '0'); if ($legExit -ne 0) { exit $le
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (A5): like the real leg, the sha256 of the receipt bytes it wrote; FAKE_LEG_SWAP_RECEIPT per call = 1 then swaps in a
 # quiet receipt + result.json pair that binds itself (the adversary's input), which the batch must read unknown
 "DVE_RECEIPT_SHA256=$((Get-FileHash -LiteralPath $rp -Algorithm SHA256).Hash)"
+# R2-NARROW-1 r2 (adversary-7c5bfe86.json A5): FAKE_LEG_STDERR_SHA per call = 1 then writes a DVE_RECEIPT_SHA256 line of zeroes to STDERR, after the real one on stdout
+if ((Pick $env:FAKE_LEG_STDERR_SHA $k '0') -eq '1') { [Console]::Error.WriteLine('DVE_RECEIPT_SHA256=' + ('0' * 64)) }
 if ((Pick $env:FAKE_LEG_SWAP_RECEIPT $k '0') -eq '1') {
     $swapRes = Join-Path $edir 'result.json'; Set-Content -LiteralPath $swapRes -Value '{"schema":"mlvapp-gui-smoke-result.v2","hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
     Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $swapRes -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
@@ -964,6 +966,16 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         [b] = self.batches()
         [l] = b["legs"]
         self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("HOSTLOAD_PROVISIONAL", False, "unknown", True), l)
+
+    def test_r2n1_a5_a_receipt_sha_line_on_stderr_never_replaces_the_one_the_leg_published_on_stdout(self) -> None:
+        # adversary-7c5bfe86.json A5 (R2-NARROW-1 r2), its input: a qualifying quiet leg (pre-load 5, collected quiet host load) whose child prints the true DVE_RECEIPT_SHA256 on stdout and then
+        # a DVE_RECEIPT_SHA256 line of 64 zeroes on STDERR. RED on 7c5bfe86: stdout and stderr were read together, the last line won, the true hash was discarded, the genuine receipt was refused and the
+        # leg was HOSTLOAD_PROVISIONAL (uncounted). The hash is now taken from the child's stdout alone (as Invoke-VenueChain does), so the leg is counted.
+        r = self.run_batch(self.specs[:1], FAKE_LEG_STDERR_SHA="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("QUIET_PRELOAD_OK", True, "quiet", False), l)
 
     def test_a_quiet_host_load_leaves_todays_counting_unchanged(self) -> None:
         r = self.run_batch(self.specs[:1])
@@ -3830,6 +3842,16 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 p.write_text(json.dumps({**base, **extra}), encoding="utf-8")
                 self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(p, "B", a)]), "LEG_SPEC_INVALID item=2 ")
 
+    def test_r2n1_a7_plan_a_spec_the_strict_reader_cannot_type_is_refused_before_the_claim_and_the_lease(self) -> None:
+        # adversary-7c5bfe86.json A7 (R2-NARROW-1 r2), the -LegPlan route (Get-LegSpecRefusal): a spec declaring legType twice (both shapes valid by the last member) is refused whole-plan, typed, before any claim
+        a = self.commit_a
+        base = json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-bad", "backends": ["cpu"], "scaleFactor": 1})
+        for case, tail in (("dup-speed-speed", ', "legType": "speed", "legType": "speed"}'), ("dup-export-speed", ', "legType": "export", "legType": "speed"}')):
+            with self.subTest(case=case):
+                p = self.case / "fx-bad.json"
+                p.write_text(base[:-1] + tail, encoding="utf-8")
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(p, "B", a)]), "LEG_SPEC_INVALID item=2 ")
+
     def test_r4_a1_a_valid_opt_out_and_scale_still_run(self) -> None:
         # the added preflight is the leg process's own predicates, no stricter: a well-formed opt-out, scale and playSeconds are accepted
         p = self.case / "fx-ok.json"
@@ -5743,6 +5765,25 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 for p in (self.events, self.claim_path):
                     p.unlink(missing_ok=True)
                 spec = self.case / f"shape-{case}.json"
+                spec.write_text(text, encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_r2n1_a7_a_spec_the_strict_reader_cannot_type_is_refused_before_the_claim(self) -> None:
+        # adversary-7c5bfe86.json A7 (R2-NARROW-1 r2), its input: a leg spec that declares `legType` twice. The shape check and the export budget read it last-wins (ConvertFrom-Json keeps the
+        # LAST member), the strict reader (Get-VenuePlannedLegType: a repeated member in any spelling is 'unknown') refuses to type it, so one set of bytes was planned as one thing and classified as
+        # another. RED on 7c5bfe86: the batch took a claim and ran the leg. The set planner already refuses such bytes (DVE_LEGSET_INVALID); the scalar and plan routes now refuse them too, typed,
+        # before any claim.
+        base = self._valid_leg_spec_text()
+        # (the schema's legType enum is speed | look | export; both cases are valid shapes by the last member, so only the strict reader tells them apart from a clean spec)
+        for case, text in (("dup-speed-speed", base[:-1] + ', "legType": "speed", "legType": "speed"}'), ("dup-export-speed", base[:-1] + ', "legType": "export", "legType": "speed"}')):
+            with self.subTest(case=case):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                spec = self.case / f"dup-{case}.json"
                 spec.write_text(text, encoding="utf-8")
                 r = self.run_batch([spec])
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)

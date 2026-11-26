@@ -1241,7 +1241,9 @@ $script:VenueTestPostBytesDelayMs = 0
 $script:VenueTestPostReceiptBytesDelayMs = 0   # the same stall after the RECEIPT read (the export-exemption return acts on that answer)
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the worker of Read-VenueFileBytesBounded. It is handed the ABSOLUTE UTC end of the caller's budget (endUtcTicks, 0 = none) and
 # checks it before the existence probe and again before ReadAllBytes, so a read that was started in time still performs no I/O once the end has passed. (No apostrophe in the messages: this is single-quoted text.)
-$script:VenueFileReadWorkerText = 'param($a) $ErrorActionPreference = ''Stop''; if ($a.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$a.delayMs) }; if ($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) { throw ''the call end had passed before the read started; no file was touched'' }; if ($a.missingOk -and -not (Test-Path -LiteralPath $a.path -PathType Leaf)) { return }; if ($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) { throw ''the call end passed during the existence probe; the file was not read'' }; ,[IO.File]::ReadAllBytes($a.path)'
+# R2-NARROW-1 r2 (adversary-7c5bfe86.json A4): the worker is handed the caller's STOPWATCH and its end too (clock, clockEndSec), and refuses when EITHER end has passed: a wall clock stepped back after the UTC end
+# was projected leaves that end far in the future, while the stopwatch cannot step.
+$script:VenueFileReadWorkerText = 'param($a) $ErrorActionPreference = ''Stop''; if ($a.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$a.delayMs) }; if (($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) -or ($null -ne $a.clock -and $a.clock.Elapsed.TotalSeconds -ge $a.clockEndSec)) { throw ''the call end had passed before the read started; no file was touched'' }; if ($a.missingOk -and -not (Test-Path -LiteralPath $a.path -PathType Leaf)) { return }; if (($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) -or ($null -ne $a.clock -and $a.clock.Elapsed.TotalSeconds -ge $a.clockEndSec)) { throw ''the call end passed during the existence probe; the file was not read'' }; ,[IO.File]::ReadAllBytes($a.path)'
 
 function Complete-VenueProcess {
     <#
@@ -1353,12 +1355,15 @@ function Read-VenueFileBytesBounded {
     $boundSec = [Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))
     $waitSec = $(if ($null -ne $Clock) { [Math]::Min([double]$boundSec, $EndSec - $Clock.Elapsed.TotalSeconds) } else { $boundSec })
     $endTicks = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $waitSec)).Ticks
+    # R2-NARROW-1 r2 (adversary-7c5bfe86.json A4): the same end on the MONOTONIC clock (the caller's stopwatch, or one started now), handed to the worker beside the UTC tick end
+    $workClock = $(if ($null -ne $Clock) { $Clock } else { [Diagnostics.Stopwatch]::StartNew() })
+    $workEndSec = $workClock.Elapsed.TotalSeconds + [Math]::Max(0.0, $waitSec)
     if ($PSBoundParameters.ContainsKey('EndUtc')) {
         $absoluteEnd = $EndUtc.ToUniversalTime()
         if ($absoluteEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: the caller's absolute end had already passed; nothing was started" }
         if ($absoluteEnd.Ticks -lt $endTicks) { $endTicks = $absoluteEnd.Ticks }
     }
-    $workerArg = @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs; endUtcTicks = $endTicks }
+    $workerArg = @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs; endUtcTicks = $endTicks; clock = $workClock; clockEndSec = $workEndSec }
     # R2-RESIDUE-1 r1 (adversary-3be19c39.json A1): the absolute end reaches the WAIT too (-EndUtc), not only the worker's pre-I/O check
     $endArgs = $(if ($PSBoundParameters.ContainsKey('EndUtc')) { @{ EndUtc = $EndUtc } } else { @{} })
     $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd @endArgs }
@@ -1804,7 +1809,11 @@ function Find-VenueJsonDuplicateMember {
     # name (case-insensitive, as PowerShell property lookup is) at the root or anywhere under a root hostLoad member, or $null when there is none.
     # adversary-90151822.json A2: -All walks the whole document (the receipt: a repeated export or evidence member must not pick the export branch or the hash).
     param([Parameter(Mandatory)][string]$Text, [switch]$All)
-    $doc = [System.Text.Json.JsonDocument]::Parse($Text)
+    # R2-NARROW-1 r2 (adversary-7c5bfe86.json A6): JsonDocument.Parse defaults to a depth limit of 64, while every reader's own parser (ConvertFrom-Json -Depth 100) accepts 100; a valid, duplicate-free
+    # document nested 65..100 deep threw here and read unknown. The scan accepts at least what the parsers do (a document the parsers refuse is refused by them).
+    $docOptions = [System.Text.Json.JsonDocumentOptions]::new()
+    $docOptions.MaxDepth = 128
+    $doc = [System.Text.Json.JsonDocument]::Parse($Text, $docOptions)
     try {
         $walk = $null
         $walk = {
