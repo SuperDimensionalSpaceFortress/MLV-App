@@ -4311,14 +4311,15 @@ function Get-DvVisualVerdict {
     is equally wrong in both A/B arms (M16-1457: mean luma 6.9/255, 84% near-black) used to be a plain OK. The reason quotes the three numbers and the band
     limits they broke. Without -ExposureBand, or without the three medians, nothing is judged on exposure and every verdict is what it was.
     UNPACED-VISUAL-MIDPLAY-CAPTURE-1: NOT_A_MOTION_WITNESS -- fewer than two distinct display frames across the judged play frames
-    (-AppDistinctDisplayFrames 0 or 1): the strip shows one timeline position (or none the app named), so it cannot witness motion during playback,
-    whatever its pictures show. Measured on an unpaced Play, which holds its last required frame through the capture tail (MainWindow.cpp
+    (-AppDistinctDisplayFrames 0 or 1): their labels carry one display frame number (or none), so they cannot witness motion during playback,
+    whatever their pictures show (the number only: visual.json carries no clip token, so one number is not claimed to be one timeline position). Measured on an unpaced Play, which holds its last required frame through the capture tail (MainWindow.cpp
     playbackHandling, pinnedUnpacedHoldReached), so every play capture carried display frame 479. Counted (the measured window closed before the tail,
     so the speed numbers are untouched) and surfaced, never OK. Judged right after CAPTURE_BLANK, so it outranks the frozen verdicts (which need two or
     more display frames, so they are disjoint from it), PARTIAL_FREEZE, CAPTURE_UNBOUND, VISUAL_DIVERGENCE, EXPOSURE_OUT_OF_RANGE and the known-identical
     waiver (the app's own rule needs two display frames for known-identical). Generic on the display-frame fact, not on a leg flag: a paced leg stuck on
     one frame is no motion witness either. -SoleDisplayFrame (optional) is that one frame's number and -LabelledPlayFrames (optional) how many judged frames
-    carry a valid frame number; the reason quotes both and speaks of the judged frames only, never of the whole strip (r1 adversary A1).
+    carry a valid frame number (1..PlayFrames when one number is declared; anything else is not known); the reason quotes both and speaks of the judged
+    frames only, never of the whole strip (r1 adversary A1).
     #>
     param([bool]$Requested, [bool]$Captured, [int]$PlayFrames, [int]$DistinctContentHashes, [int]$AppDistinctDisplayFrames, [int]$FlatPlayFrames,
           $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold,
@@ -4331,21 +4332,24 @@ function Get-DvVisualVerdict {
     if ($ObserverPaintedPlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ObserverPaintedPlayFrames unforced play frame(s) were taken after a forced paint their predecessor did not see, or do not record how many forced paints preceded them (forced_paints_before), leaving $PlayFrames judged: a forced paint stays on screen when the display's own paint is stuck, so those pictures cannot tell a moving display from a frozen one: no visual assessment" } }
     if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $PlayFrames play frame(s) were captured" } }
     if ($FlatPlayFrames -ge $PlayFrames) { return [pscustomobject]@{ verdict = 'CAPTURE_BLANK'; counted = $true; reason = 'every play frame''s viewport is flat: the capture shows no picture, so it judges nothing' } }
-    # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: one timeline position (or none) across the judged play frames witnesses no motion, whatever the pictures show.
+    # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: one display frame number (or none) across the judged play frames witnesses no motion, whatever the pictures show.
     # r1 adversary A1: the reason says only what the JUDGED frames establish -- how many carry a frame number (-LabelledPlayFrames, when the caller
     # counted them), the one number they carry -- and never describes the whole strip (unjudged tiles, forced ones say, may carry other labels).
     # r1 adversary pass 2 A1: the claim is about the LABELS (display_frame), never about the pictures: a picture may be an older paint than its label.
     # Pass 2 A2: -LabelledPlayFrames counts only as a whole number in 0..PlayFrames (Get-DvFrameNumber; never a throw); anything else is not known, and
     # an unknown count never reads as "all".
+    # r2 (r1 adversary pass 3 A2): every branch speaks of the label NUMBER only, never of a timeline position: visual.json carries no clip token, so
+    # clip A frame 479 and clip B frame 479 are one number and two positions. r2 (pass 3 A3): a count that contradicts -AppDistinctDisplayFrames (no
+    # labelled frame while one display frame is declared) is not known either, so a caller-supplied tuple cannot make the reason say "0 of".
     if ($AppDistinctDisplayFrames -lt 2) {
         $sole = Get-DvFrameNumber $SoleDisplayFrame
         $labelled = Get-DvFrameNumber $LabelledPlayFrames
-        if ($null -ne $labelled -and $labelled -gt $PlayFrames) { $labelled = $null }
-        $frameText = $(if ($null -ne $sole) { "display frame $sole" } else { 'one display frame' })
-        $position = $(if ($AppDistinctDisplayFrames -le 0) { "none of the $PlayFrames judged play frames carries a valid display frame label: their labels name no timeline position" }
-                      elseif ($null -eq $labelled) { "the valid display frame labels among the $PlayFrames judged play frames all name ${frameText}: their labels name one timeline position at most" }
-                      elseif ($labelled -lt $PlayFrames) { "$labelled of the $PlayFrames judged play frames are labelled $frameText and the other $($PlayFrames - $labelled) carry no valid display frame label: their labels name one timeline position at most" }
-                      else { "all $PlayFrames judged play frames are labelled ${frameText}: their labels name one timeline position" })
+        if ($null -ne $labelled -and ($labelled -gt $PlayFrames -or $labelled -lt 1)) { $labelled = $null }
+        $numberText = $(if ($null -ne $sole) { "display frame number $sole" } else { 'one display frame number' })
+        $position = $(if ($AppDistinctDisplayFrames -le 0) { "none of the $PlayFrames judged play frames carries a valid display frame number" }
+                      elseif ($null -eq $labelled) { "the valid display frame numbers among the $PlayFrames judged play frames are all ${numberText}: one display frame number across them at most" }
+                      elseif ($labelled -lt $PlayFrames) { "$labelled of the $PlayFrames judged play frames carry $numberText and the other $($PlayFrames - $labelled) carry no valid display frame number: one display frame number across them at most" }
+                      else { "all $PlayFrames judged play frames carry ${numberText}: one display frame number across them" })
         return [pscustomobject]@{ verdict = 'NOT_A_MOTION_WITNESS'; counted = $true; reason = "${position} ($DistinctContentHashes distinct picture(s) among them), so they cannot witness motion during playback (one known cause: an unpaced Play holds its last required frame through the capture tail)" }
     }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
@@ -4557,7 +4561,10 @@ function Read-DvVisualCaptures {
         # (the verdict reason comes first, then the notes that some saved play frames were not judged, then the masking and repeat notes, then the strip failure;
         # a PARTIAL_FREEZE reason already says what the repeat note says, so the note stays in repeatedPlayFramesNote only)
         # PLAYBACK-SOURCE-FRAME-IDENTITY-1: the source-difference cross-check note follows the not-judged note.
-        $notes = (@($notJudgedNote, $crossCheckNote, $observerNote, $maskNote, $(if ($v.verdict -cne 'PARTIAL_FREEZE') { $repeatNote }), $exposureNote, $stripNote) | Where-Object { $_ }) -join '; '
+        # UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2 (r1 adversary pass 3 A1): a NOT_A_MOTION_WITNESS reason never carries the masking or repeat note: over one
+        # held display frame the hold, not a force-paint, explains the one unforced picture (the forced set was taken half a tail earlier)
+        $noMotion = ($v.verdict -ceq 'NOT_A_MOTION_WITNESS')
+        $notes = (@($notJudgedNote, $crossCheckNote, $observerNote, $(if (-not $noMotion) { $maskNote }), $(if ($v.verdict -cne 'PARTIAL_FREEZE' -and -not $noMotion) { $repeatNote }), $exposureNote, $stripNote) | Where-Object { $_ }) -join '; '
         # a NOT_CAPTURED leg whose strip also failed keeps both: the capture count, any step reason from before the strip, then the strip failure
         if ($v.verdict -ceq 'NOT_CAPTURED' -and $stripNote) { $block.reason = (@($v.reason, $reasonBeforeStrip, $stripNote) | Where-Object { $_ }) -join '; ' }
         elseif ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
@@ -4717,7 +4724,8 @@ function Read-DvVisualCaptures {
         # (never pre-set as block.reason, r2 fable H2: that displaced a NOT_CAPTURED verdict's own reason; the finish clause appends it to every reason)
         if ($bandInfo.note) { $exposureNote = $bandInfo.note }
     }
-    if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1) {
+    # r2 (r1 adversary pass 3 A1): only when the judged frames carry two or more display frame numbers: one held number explains one picture by itself
+    if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1 -and [int]$block.appDistinctDisplayFrames -ge 2) {
         $maskNote = "the forced play captures show $($block.forcedPlayDistinctContentHashes) distinct pictures where the unforced ones show one: the force-paint would have masked this"
         if (-not $block.reason) { $block.reason = $maskNote }
     }

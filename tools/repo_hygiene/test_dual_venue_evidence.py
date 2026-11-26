@@ -11004,32 +11004,35 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                 self.assertEqual((out["verdict"], out["counted"]), (verdict, verdict != "FROZEN_DISPLAY"), out["reason"])
                 if verdict == "NOT_A_MOTION_WITNESS":
                     self.assertIn(f"({distinct} distinct picture(s) among them), so they cannot witness motion during playback", out["reason"])
-                    self.assertIn("none of the 6 judged play frames carries a valid display frame label: their labels name no timeline position" if app == 0
-                                  else "the valid display frame labels among the 6 judged play frames all name one display frame: their labels name one timeline position at most",
-                                  out["reason"])
+                    self.assertIn("none of the 6 judged play frames carries a valid display frame number" if app == 0
+                                  else "the valid display frame numbers among the 6 judged play frames are all one display frame number: one display frame number "
+                                       "across them at most", out["reason"])
                     self.assertNotIn("the strip shows", out["reason"], "r1 adversary A1: the reason speaks of the judged frames, never of the whole strip")
-                    self.assertNotIn("they show", out["reason"], "r1 adversary pass 2 A1: the labels name a position; the pictures are not claimed to show one")
+                    self.assertNotIn("they show", out["reason"], "r1 adversary pass 2 A1: the labels carry a number; the pictures are not claimed to show one")
+                    self.assertNotIn("timeline position", out["reason"], "r1 adversary pass 3 A2: one number is not one timeline position (no clip token)")
         # the reason quotes the one frame when the caller names it (the reader does); a value that is not a frame number is not quoted
         out = self.visual_verdict("known-identical", 6, 0, 2, app=1, extra="-SoleDisplayFrame 479 ")
         self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS")
-        self.assertIn("the valid display frame labels among the 6 judged play frames all name display frame 479: their labels name one timeline position at most "
+        self.assertIn("the valid display frame numbers among the 6 judged play frames are all display frame number 479: one display frame number across them at most "
                       "(2 distinct picture(s) among them)", out["reason"])
-        self.assertIn("all name one display frame", self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 1.5 ")["reason"])
+        self.assertIn("are all one display frame number", self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 1.5 ")["reason"])
         out = self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 479 -LabelledPlayFrames 6 ")
-        self.assertIn("all 6 judged play frames are labelled display frame 479: their labels name one timeline position (2 distinct", out["reason"])
+        self.assertIn("all 6 judged play frames carry display frame number 479: one display frame number across them (2 distinct", out["reason"])
         # r1 adversary A1: when only some judged frames carry a frame number, the reason says how many, never "all"
         out = self.visual_verdict("unknown", 2, 0, 2, app=1, extra="-SoleDisplayFrame 479 -LabelledPlayFrames 1 ")
         self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS")
-        self.assertIn("1 of the 2 judged play frames are labelled display frame 479 and the other 1 carry no valid display frame label: their labels name one timeline "
-                      "position at most", out["reason"])
+        self.assertIn("1 of the 2 judged play frames carry display frame number 479 and the other 1 carry no valid display frame number: one display frame number "
+                      "across them at most", out["reason"])
         self.assertNotIn("all 2", out["reason"])
-        # r1 adversary pass 2 A2: a count that is not a whole number in 0..PlayFrames is not known, never "all", never "-1 of", never a throw
-        for bad in ("$null", "-1", "1.5", "2147483648", "3", "'1'"):
+        # r1 adversary pass 2 A2: a count that is not a whole number in 1..PlayFrames is not known, never "all", never "-1 of", never a throw.
+        # r1 adversary pass 3 A3 (its input verbatim): -LabelledPlayFrames 0 beside one declared display frame contradicts it, so it is not known either:
+        # on 59b7ceee the reason said "0 of the 2 judged play frames are labelled display frame 479 and the other 2 carry no valid display frame label".
+        for bad in ("$null", "-1", "1.5", "2147483648", "3", "'1'", "0"):
             with self.subTest(labelled=bad):
                 out = self.visual_verdict("unknown", 2, 0, 2, app=1, extra=f"-SoleDisplayFrame 479 -LabelledPlayFrames {bad} ")
                 self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
-                self.assertTrue(out["reason"].startswith("the valid display frame labels among the 2 judged play frames all name display frame 479: their labels name "
-                                                         "one timeline position at most"), out["reason"])
+                self.assertTrue(out["reason"].startswith("the valid display frame numbers among the 2 judged play frames are all display frame number 479: one display "
+                                                         "frame number across them at most"), out["reason"])
                 self.assertNotIn(" of the 2", out["reason"])
 
     def test_the_visual_gate_ranks_not_a_motion_witness_after_blank_and_before_the_paused_and_exposure_verdicts(self) -> None:
@@ -11308,8 +11311,9 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True), out["reason"])
         self.assertEqual((out["frozenJudgedOn"], out["playFrames"], out["appDistinctDisplayFrames"], out["distinctContentHashes"]), ("play_unbound", 6, 1, 2))
         self.assertEqual(out["observerPaintedPlayFrames"], 0)
-        self.assertTrue(out["reason"].startswith("all 6 judged play frames are labelled display frame 479: their labels name one timeline position "
+        self.assertTrue(out["reason"].startswith("all 6 judged play frames carry display frame number 479: one display frame number across them "
                                                  "(2 distinct picture(s) among them)"), out["reason"])
+        self.assertNotIn("timeline position", out["reason"])
         for mode in ("ok", "paired-ok"):
             with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
                 _, out = self.read_visual_mode(mode, d)
@@ -11345,13 +11349,13 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
 
         out = read(keep_two({0: 479, 3: -1}))
         self.assertEqual((out["verdict"], out["counted"], out["playFrames"], out["appDistinctDisplayFrames"]), ("NOT_A_MOTION_WITNESS", True, 2, 1), out["reason"])
-        self.assertTrue(out["reason"].startswith("1 of the 2 judged play frames are labelled display frame 479 and the other 1 carry no valid display frame label: "
-                                                 "their labels name one timeline position at most"), out["reason"])
+        self.assertTrue(out["reason"].startswith("1 of the 2 judged play frames carry display frame number 479 and the other 1 carry no valid display frame number: "
+                                                 "one display frame number across them at most"), out["reason"])
         self.assertNotIn("all 2", out["reason"])
         out = read(keep_two({0: -1, 3: -1}))
         self.assertEqual((out["verdict"], out["appDistinctDisplayFrames"]), ("NOT_A_MOTION_WITNESS", 0), out["reason"])
-        self.assertTrue(out["reason"].startswith("none of the 2 judged play frames carries a valid display frame label: their labels name no timeline position"), out["reason"])
-        self.assertNotIn("show one timeline position", out["reason"])
+        self.assertTrue(out["reason"].startswith("none of the 2 judged play frames carries a valid display frame number ("), out["reason"])
+        self.assertNotIn("timeline position", out["reason"])
 
         def moving_forced(visual):
             for f in visual["frames"]:
@@ -11359,7 +11363,7 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                     f["display_frame"] = 467 + 2 * f["index"]
         out = read(moving_forced)
         self.assertEqual((out["verdict"], out["frozenJudgedOn"], out["appDistinctDisplayFrames"]), ("NOT_A_MOTION_WITNESS", "play_unbound", 1), out["reason"])
-        self.assertTrue(out["reason"].startswith("all 6 judged play frames are labelled display frame 479: their labels name one timeline position"), out["reason"])
+        self.assertTrue(out["reason"].startswith("all 6 judged play frames carry display frame number 479: one display frame number across them"), out["reason"])
         self.assertNotIn("strip", out["reason"].split(";")[0], "the verdict reason speaks of the judged frames, never of the strip whose forced tiles move")
 
         # r1 adversary pass 2 A1 (introduced, major): forced tiles labelled and painted 478, unforced labelled 479 with 0-2 painted 899 (an older paint) and
@@ -11375,9 +11379,9 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         out = read(older_paint)
         self.assertEqual((out["verdict"], out["counted"], out["appDistinctDisplayFrames"], out["distinctContentHashes"]), ("NOT_A_MOTION_WITNESS", True, 1, 2), out["reason"])
         first = out["reason"].split(";")[0]
-        self.assertTrue(first.startswith("all 6 judged play frames are labelled display frame 479: their labels name one timeline position (2 distinct picture(s) among them)"),
+        self.assertTrue(first.startswith("all 6 judged play frames carry display frame number 479: one display frame number across them (2 distinct picture(s) among them)"),
                         first)
-        for overclaim in ("they show", "pictures show", "the strip shows", "show one timeline position"):
+        for overclaim in ("they show", "pictures show", "the strip shows", "timeline position"):
             self.assertNotIn(overclaim, first)
 
         # r1 adversary pass 2 A4: a held tail whose judged pictures are blank is CAPTURE_BLANK, judged first (the held-tail docs say "unless an earlier verdict applies")
@@ -11392,6 +11396,75 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             self.assertEqual((out["verdict"], out["appDistinctDisplayFrames"]), ("CAPTURE_BLANK", 1), out["reason"])
         doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
         self.assertIn("unless an earlier verdict\n(`CAPTURE_BLANK`, say) applies", doc)
+
+    @requires_windows_imaging
+    def test_a_no_motion_reason_claims_no_masking_and_no_timeline_position(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2, the r1 adversary pass 3 inputs verbatim (both introduced, major, on 59b7ceee).
+        A1: forced play 0/1 at display frames 477/478 with distinct pictures X/Y; unforced 0, 1, 2 at 479 with forced_paints_before 2, 0 and 1 showing one
+        picture Z and 2 with viewport null; no paused comparison. The hold explains the one unforced picture, so the reason never says the force-paint
+        would have masked it (59b7ceee appended "the force-paint would have masked this" to the NOT_A_MOTION_WITNESS reason).
+        A2: two usable unforced captures, both display_frame 479, no source_id, two distinct pictures, play_active true then false (a clip change between
+        the grabs: clip A frame 479, then clip B frame 479). One number is not one timeline position, so the reason never says "timeline position"."""
+        def read(edit, pngs=()):
+            with tempfile.TemporaryDirectory(prefix="vis-held-p3-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", "held-end-frame")
+                if pngs:
+                    proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(f"New-VisPng '{art / 'visual' / name}' {seed} 60 0 $false" for name, seed in pngs)])
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                vj = art / "visual" / "visual.json"
+                visual = json.loads(vj.read_text(encoding="utf-8"))
+                edit(visual)
+                vj.write_text(json.dumps(visual), encoding="utf-8")
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                          "| ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                return out
+
+        def a1(visual):
+            kept = []
+            for f in visual["frames"]:
+                f.pop("source_id", None)
+                if f["kind"] == "play" and f["index"] in (0, 1):
+                    f.update({"display_frame": 477 + f["index"], "forced_paints_before": f["index"]})
+                elif f["kind"] == "play_unbound" and f["index"] in (0, 1, 2):
+                    f.update({"display_frame": 479, "forced_paints_before": 2})
+                    if f["index"] == 2:
+                        f["viewport"] = None
+                elif f["kind"] in ("play", "play_unbound", "paused"):
+                    continue
+                kept.append(f)
+            visual["frames"] = kept
+        # forced X/Y: two distinct pictures (the fixture's unforced 0..2 already share one picture, Z)
+        out = read(a1, pngs=(("play-0.png", 3), ("play-1.png", 4)))
+        self.assertEqual((out["verdict"], out["counted"], out["frozenJudgedOn"], out["playFrames"], out["appDistinctDisplayFrames"], out["distinctContentHashes"],
+                          out["forcedPlayDistinctContentHashes"], out["viewportUnavailablePlayFrames"]),
+                         ("NOT_A_MOTION_WITNESS", True, "play_unbound", 2, 1, 1, 2, 1), out["reason"])
+        self.assertNotIn("masked", out["reason"], "the hold, not a force-paint, explains one unforced picture over one held display frame")
+        self.assertIn("1 saved play frame(s) have no usable viewport rectangle and were not judged; the other 2 were", out["reason"], "the factual notes stay")
+        self.assertNotIn("timeline position", out["reason"])
+
+        def a2(visual):
+            kept = []
+            for f in visual["frames"]:
+                f.pop("source_id", None)
+                if f["kind"] == "play_unbound" and f["index"] in (0, 3):
+                    f.update({"index": 0 if f["index"] == 0 else 1, "display_frame": 479, "forced_paints_before": 6, "play_active": f["index"] == 0})
+                elif f["kind"] in ("play", "play_unbound", "paused"):
+                    continue
+                kept.append(f)
+            visual["frames"] = kept
+        out = read(a2)
+        self.assertEqual((out["verdict"], out["counted"], out["playFrames"], out["appDistinctDisplayFrames"], out["distinctContentHashes"]),
+                         ("NOT_A_MOTION_WITNESS", True, 2, 1, 2), out["reason"])
+        self.assertTrue(out["reason"].startswith("all 2 judged play frames carry display frame number 479: one display frame number across them (2 distinct picture(s)"),
+                        out["reason"])
+        self.assertNotIn("timeline position", out["reason"], "one number across them, not one position: visual.json carries no clip token")
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        row = next(line for line in doc.splitlines() if line.startswith("| `NOT_A_MOTION_WITNESS` |"))
+        self.assertIn("never of a timeline position", row)
+        self.assertNotIn("name one timeline position", row)
+        self.assertIn("never beside `NOT_A_MOTION_WITNESS`", doc)
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;
