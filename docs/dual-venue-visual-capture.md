@@ -127,9 +127,15 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
 | `CAPTURE_UNBOUND` | a capture the divergence compares is not shown bound to its label: on a binding build (either side carries `label_bound`), the stop OR the paused capture's `label_bound` is false or missing; the stop-vs-paused difference then compares two moments | yes, and the detail says so |
 | `VISUAL_DIVERGENCE` | the playback frame is further than the threshold from its paused full-quality re-render | yes, and the detail says so |
 | `CAPTURE_BLANK` | every play frame's viewport is flat (std < 1): the capture judges nothing | yes |
+| `NOT_A_MOTION_WITNESS` | not blank, but the judged play frames carry fewer than two distinct display frames (`appDistinctDisplayFrames` 0 or 1): the strip shows one timeline position, so it cannot witness motion during playback, whatever its pictures show. Judged after `NOT_REQUESTED`, `VISUAL_ASSESSMENT_UNAVAILABLE`, `NOT_CAPTURED` and right after `CAPTURE_BLANK`, so it outranks `FROZEN_DISPLAY` / `FROZEN_DISPLAY_SUSPECTED` (disjoint anyway: they need two or more display frames), `PARTIAL_FREEZE`, `CAPTURE_UNBOUND`, `VISUAL_DIVERGENCE`, `EXPOSURE_OUT_OF_RANGE` and the known-identical waiver; generic on the display-frame fact, not on a leg flag; the reason names the count and the one frame | yes, and the detail says so (the measured window closed before the tail, so the speed numbers are untouched); a self-heal pre-launch with it is `INVALID` |
 | `NOT_CAPTURED` / `NOT_REQUESTED` | nothing published (an old build, a failed run) / the spec opts out | yes |
 | `EXPOSURE_OUT_OF_RANGE` | none of the verdicts above, but the leg's median luma, near-black fraction or clipped fraction is outside its band (see Exposure above); the reason quotes the three numbers and the band | yes, and the detail says so (a flag, never an exclusion; judged after every other verdict; a self-heal pre-launch may show it too, where every other non-OK verdict still makes the leg `INVALID`) |
 | `OK` | none of the above | yes |
+
+Known limit (UNPACED-VISUAL-MIDPLAY-CAPTURE-1): an unpaced Play holds its last required frame through the capture tail (`MainWindow.cpp`
+`playbackHandling`, `playback_frame_range::pinnedUnpacedHoldReached`), so an unpaced visual leg's strip is the end frame (every judged play
+tile carried display frame 479 on the 2026-11-25 every-frame CUDA legs) and reads `NOT_A_MOTION_WITNESS`; releasing that hold only while the
+tail runs, after the measured session closes, is the follow-up card UNPACED-VISUAL-TAIL-HOLD-RELEASE-1.
 
 `sourceDifference` is derived from the app's own per-frame records over the SAME frames the picture is judged over (the play
 frames with a content hash): `Get-DvVisualSourceDifference` applies the app's rule (next section) to those frames' `source_id`, so

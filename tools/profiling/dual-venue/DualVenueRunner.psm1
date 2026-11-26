@@ -2708,7 +2708,8 @@ function Test-DvVisualTwinName {
     <#
     .SYNOPSIS
     M16-1457-VENUE-BASELINE-DRIFT-1 r6 (sol r5 B1, luna r5 B1): is this leg id or spec file name a VISUAL TWIN (its id carries the word `visual` between hyphens)? A twin is the
-    capture-on copy of a speed arm: its fps is observer-perturbed (the capture tail keeps playing unpaced past the measured window), so it is never a measured matrix speed cell.
+    capture-on copy of a speed arm: its fps is observer-perturbed (the capture tail runs in the same session as the measured window), so it is never a measured matrix speed cell.
+    (UNPACED-VISUAL-MIDPLAY-CAPTURE-1: an unpaced Play does NOT keep playing past the measured window; it holds its last required frame through the capture tail.)
     Judged on the RESOLVED spec's own identity (its legId and its file leaf), never on the spelling of the reference that reached it, and case-folded (Windows resolves
     `LEGS\X.JSON` to the file `legs/x.json`).
     #>
@@ -4307,17 +4308,34 @@ function Get-DvVisualVerdict {
     else the absolute fallback band). Counted and surfaced like VISUAL_DIVERGENCE, never an exclusion, and judged after every other verdict: a picture that
     is equally wrong in both A/B arms (M16-1457: mean luma 6.9/255, 84% near-black) used to be a plain OK. The reason quotes the three numbers and the band
     limits they broke. Without -ExposureBand, or without the three medians, nothing is judged on exposure and every verdict is what it was.
+    UNPACED-VISUAL-MIDPLAY-CAPTURE-1: NOT_A_MOTION_WITNESS -- fewer than two distinct display frames across the judged play frames
+    (-AppDistinctDisplayFrames 0 or 1): the strip shows one timeline position (or none the app named), so it cannot witness motion during playback,
+    whatever its pictures show. Measured on an unpaced Play, which holds its last required frame through the capture tail (MainWindow.cpp
+    playbackHandling, pinnedUnpacedHoldReached), so every play capture carried display frame 479. Counted (the measured window closed before the tail,
+    so the speed numbers are untouched) and surfaced, never OK. Judged right after CAPTURE_BLANK, so it outranks the frozen verdicts (which need two or
+    more display frames, so they are disjoint from it), PARTIAL_FREEZE, CAPTURE_UNBOUND, VISUAL_DIVERGENCE, EXPOSURE_OUT_OF_RANGE and the known-identical
+    waiver (the app's own rule needs two display frames for known-identical). Generic on the display-frame fact, not on a leg flag: a paced leg stuck on
+    one frame is no motion witness either. -SoleDisplayFrame (optional) is that one frame's number, quoted in the reason.
     #>
     param([bool]$Requested, [bool]$Captured, [int]$PlayFrames, [int]$DistinctContentHashes, [int]$AppDistinctDisplayFrames, [int]$FlatPlayFrames,
           $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold,
           [ValidateSet('known-differ', 'known-identical', 'unknown')][string]$SourceDifference = 'unknown', [int]$ViewportUnavailablePlayFrames = 0, $LabelBound = $null,
           $PausedLabelBound = $null, [int]$ObserverPaintedPlayFrames = 0, [int]$RepeatedPlayFrames = 0,
-          $ExposureMedianLuma = $null, $ExposureMedianNearBlackFraction = $null, $ExposureMedianClippedFraction = $null, $ExposureBand = $null, [string]$ExposureBandSource = '')
+          $ExposureMedianLuma = $null, $ExposureMedianNearBlackFraction = $null, $ExposureMedianClippedFraction = $null, $ExposureBand = $null, [string]$ExposureBandSource = '',
+          $SoleDisplayFrame = $null)
     if (-not $Requested) { return [pscustomobject]@{ verdict = 'NOT_REQUESTED'; counted = $true; reason = 'the leg spec opts out of window captures' } }
     if ($ViewportUnavailablePlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ViewportUnavailablePlayFrames play frame(s) have no usable viewport rectangle (visual.json), leaving $PlayFrames judged, so the picture cannot be told from the window's timecode and chrome: no visual assessment" } }
     if ($ObserverPaintedPlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ObserverPaintedPlayFrames unforced play frame(s) were taken after a forced paint their predecessor did not see, or do not record how many forced paints preceded them (forced_paints_before), leaving $PlayFrames judged: a forced paint stays on screen when the display's own paint is stuck, so those pictures cannot tell a moving display from a frozen one: no visual assessment" } }
     if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $PlayFrames play frame(s) were captured" } }
     if ($FlatPlayFrames -ge $PlayFrames) { return [pscustomobject]@{ verdict = 'CAPTURE_BLANK'; counted = $true; reason = 'every play frame''s viewport is flat: the capture shows no picture, so it judges nothing' } }
+    # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: one timeline position (or none) across the judged play frames witnesses no motion, whatever the pictures show
+    if ($AppDistinctDisplayFrames -lt 2) {
+        $sole = Get-DvFrameNumber $SoleDisplayFrame
+        $position = $(if ($AppDistinctDisplayFrames -le 0) { "none of the $PlayFrames judged play frames carries a display frame number" }
+                      elseif ($null -ne $sole) { "the $PlayFrames judged play frames all carry display frame $sole" }
+                      else { "the $PlayFrames judged play frames all carry one display frame" })
+        return [pscustomobject]@{ verdict = 'NOT_A_MOTION_WITNESS'; counted = $true; reason = "${position} ($DistinctContentHashes distinct picture(s)): the strip shows one timeline position, so it cannot witness motion during playback (an unpaced Play holds its last required frame through the capture tail)" }
+    }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
         return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them and the source frames are known to differ" }
     }
@@ -4511,8 +4529,11 @@ function Read-DvVisualCaptures {
     $reasonBeforeStrip = $null   # the step reason standing when the strip failed (a NOT_CAPTURED leg keeps it between the capture count and the strip failure)
     $exposureNote = $null    # set when the exposure band file could not be used (missing / malformed): reported beside the verdict, never silently OK
     # the exposure inputs of the verdict, read from the block when the verdict is taken (all $null until the judged frames are measured)
+    # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: the one display frame every judged play frame carries, when they carry exactly one ($null otherwise); quoted by NOT_A_MOTION_WITNESS
+    $soleDisplayFrame = $null
     $exposureArgs = { @{ ExposureMedianLuma = $block.exposureMedianLuma; ExposureMedianNearBlackFraction = $block.exposureMedianNearBlackFraction
-                         ExposureMedianClippedFraction = $block.exposureMedianClippedFraction; ExposureBand = $block.exposureBand; ExposureBandSource = [string]$block.exposureBandSource } }
+                         ExposureMedianClippedFraction = $block.exposureMedianClippedFraction; ExposureBand = $block.exposureBand; ExposureBandSource = [string]$block.exposureBandSource
+                         SoleDisplayFrame = $soleDisplayFrame } }
     $finish = {
         $exArgs = & $exposureArgs
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
@@ -4663,7 +4684,9 @@ function Read-DvVisualCaptures {
     }
     $block.distinctContentHashes = @($play | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
     # r5 (sol r3 key class sweep): the same display frames reach here; a value that is not a frame number (Get-DvFrameNumber) is not counted, never a throw
-    $block.appDistinctDisplayFrames = @($play | ForEach-Object { Get-DvFrameNumber $_.displayFrame } | Where-Object { $null -ne $_ } | Sort-Object -Unique).Count
+    $judgedDisplayFrames = @($play | ForEach-Object { Get-DvFrameNumber $_.displayFrame } | Where-Object { $null -ne $_ } | Sort-Object -Unique)
+    $block.appDistinctDisplayFrames = $judgedDisplayFrames.Count
+    if ($judgedDisplayFrames.Count -eq 1) { $soleDisplayFrame = $judgedDisplayFrames[0] }
     $block.flatPlayFrames = @($play | Where-Object { $null -ne $_.viewportStd -and [double]$_.viewportStd -lt $script:VisualFlatViewportStd }).Count
     # VISUAL-GATE-EXPOSURE-FLOOR-1: the leg's exposure is the MEDIAN over the judged play frames (the same population as the picture), judged against the
     # clip's band (exposure-bands.json) or the absolute fallback. An unusable band file is reported (exposureBandNote, and the reason), never a silent OK.

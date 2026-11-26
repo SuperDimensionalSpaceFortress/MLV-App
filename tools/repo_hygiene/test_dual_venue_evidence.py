@@ -305,7 +305,8 @@ DRIFT_W10_LEGS = {"legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json": None,
                   "legs/m16-1457-drift-t16-w10-unpaced-fullscreen-s1.json": None}
 # r5 (sol r4 BLOCKER: the cited arms had no opened strip): the visual twin of each w10 arm. Each is its w10 counterpart with only legId changed and the capture opt-out removed
 # (visualCapture / visualCaptureOptOutReason absent = the speed-leg default, on), so the same build keeps the picture the arm produced. A twin's fps is observer-perturbed (the
-# capture tail keeps playing unpaced past the measured window) and never stands in for its untraced speed leg.
+# capture tail runs in the same session) and never stands in for its untraced speed leg. (UNPACED-VISUAL-MIDPLAY-CAPTURE-1: an unpaced Play holds its last required frame
+# through the capture tail rather than playing on, so such a twin's strip reads NOT_A_MOTION_WITNESS: it shows the arm's end picture, not motion.)
 DRIFT_VISUAL_LEGS = {"legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json": None,
                      "legs/m16-1457-drift-t1-cool-w10-visual-unpaced-fullscreen-s1.json": "0x00003",
                      "legs/m16-1457-drift-t1-hot-w10-visual-unpaced-fullscreen-s1.json": "0x00030",
@@ -9565,15 +9566,19 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     frozen-source-partial-unsaved (frames 0-4 over source A; frame 5 over source B was never saved; the app's record "differ"),
     frozen-source-partial-noviewport (the same, but frame 5 was saved without a viewport rectangle), frozen-source-partial-differ (frames 0-4 over
     five different sources; frame 5 never saved; "differ"), frozen-source-ids-only (frames 0-4 over five different sources; frame 5 never saved and
-    has no source id, so the app records nothing), frozen-upper-source-id (every source id in upper-case hex, which is not the app's form; "differ")."""
+    has no source id, so the app records nothing), frozen-upper-source-id (every source id in upper-case hex, which is not the app's form; "differ").
+    UNPACED-VISUAL-MIDPLAY-CAPTURE-1 mode held-end-frame, shaped like the saved L3 app-visual.json (every-frame unpaced CUDA leg a0fc462a): six forced play
+    captures (forced_paints_before 0..5) then six unforced (forced_paints_before 6), every play entry play_active with display_frame 479 and ONE source_id
+    (an unpaced Play held its last required frame through the tail), no source_difference record, and two distinct pictures among the unforced."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     calls = []
+    held = mode == "held-end-frame"
     frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport",
                       "frozen-source-partial-unsaved", "frozen-source-partial-noviewport", "frozen-source-partial-differ", "frozen-source-ids-only",
-                      "frozen-upper-source-id")
-    paired = mode in ("paired-ok", "masked", "partial-freeze")
+                      "frozen-upper-source-id", "held-end-frame")
+    paired = mode in ("paired-ok", "masked", "partial-freeze", "held-end-frame")
     bound = mode in ("bound", "bound-paused-unbound", "bound-paused-missing")
     viewport = None if mode == "noviewport" else VIEWPORT
     source_difference = {"frozen": "differ", "frozen-partial": "differ", "frozen-identical": "identical",
@@ -9605,7 +9610,7 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
         if paired:
             # (seed, bias): bias 30 marks a frame of the unforced half (later than every forced capture's frame); masked repeats forced play 5's paint
-            unforced_seed, unforced_bias = {"masked": (5, 0), "partial-freeze": (min(k, 2), 30)}.get(mode, (k, 30))
+            unforced_seed, unforced_bias = {"masked": (5, 0), "partial-freeze": (min(k, 2), 30), "held-end-frame": (1 if k < 3 else 2, 0)}.get(mode, (k, 30))
             calls.append(f"New-VisPng '{dest / f'play-unbound-{k}.png'}' {unforced_seed} {60 + k * 10} {unforced_bias} $false")
     if bound:
         calls.append(f"New-VisPng '{dest / 'stop-unbound.png'}' 5 120 40 $false")
@@ -9633,17 +9638,22 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
             for f in frames:
                 if f["kind"] in ("play", "play_unbound"):
                     f["source_id"] = f"{f['display_frame']:016x}"
+        if held:
+            # L3: the held end frame -- one display frame and one source id on every play capture, forced and unforced
+            for f in frames:
+                if f["kind"] in ("play", "play_unbound"):
+                    f.update({"display_frame": 479, "source_id": "da6d7160d64f797a"})
     if bound:
         frames.append({"kind": "stop_unbound", "index": 0, "file": "stop-unbound.png", "display_frame": 612, "serial": 912, "painted_serial": 911,
                        "painted_serial_valid": True, "label_bound": False, "label_bound_basis": "gl_viewport_paint", "play_active": False, "viewport": viewport,
                        "saved": True, "reason": ""})
-    stop = {"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""}
+    stop = {"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 479 if held else 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""}
     if mode == "lagged" or bound:
         stop.update({"serial": 912, "painted_serial": 911 if mode == "lagged" else 912, "painted_serial_valid": True, "label_bound": bound})
     if bound:
         stop["label_bound_basis"] = "pixmap_item_by_construction"
     frames.append(stop)
-    paused = {"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
+    paused = {"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 479 if held else 612, "settled": True, "settled_frame": 479 if held else 612, "play_active": False,
               "viewport": viewport, "saved": True, "reason": ""}
     if mode in ("bound", "bound-paused-unbound"):
         paused.update({"serial": 913, "painted_serial": 913 if mode == "bound" else 912, "painted_serial_valid": True, "label_bound": mode == "bound",
@@ -10541,8 +10551,25 @@ class VisualExposureFloorTests(unittest.TestCase):
         self.assertEqual(len(calls), 2, "the measured run's read and the self-heal pre-launch read")
         for call in calls:
             self.assertIn("-ClipId ([string]$spec.clipId)", call)
-        self.assertIn("'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE')) {", runner, "counted for speed and surfaced in the detail, like a divergence")
+        # (UNPACED-VISUAL-MIDPLAY-CAPTURE-1 appended NOT_A_MOTION_WITNESS to the same list: the pinned tail now ends with it)
+        self.assertIn("'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE', 'NOT_A_MOTION_WITNESS')) {", runner, "counted for speed and surfaced in the detail, like a divergence")
         self.assertNotIn("EXPOSURE_OUT_OF_RANGE", runner.split("elseif ($receipt.visual.verdict -cin")[0], "never an exclusion: the FROZEN_DISPLAY branch does not name it")
+
+    def test_the_visual_leg_runner_counts_and_surfaces_a_strip_that_is_no_motion_witness(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1: NOT_A_MOTION_WITNESS (every judged play frame carries one display frame: an unpaced Play held its last
+        required frame through the capture tail) is in the measured run's counted-and-surfaced list, never the FROZEN_DISPLAY exclusion, and the
+        self-heal pre-launch rule (anything but OK / EXPOSURE_OUT_OF_RANGE is INVALID) refuses it without naming it (fail closed)."""
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        gate = re.search(r"\} elseif \(\$receipt\.visual\.verdict -cin @\(([^)]*)\)\) \{", runner)
+        self.assertIsNotNone(gate, "the counted-and-surfaced -cin list of the measured run's visual gate")
+        self.assertIn("'NOT_A_MOTION_WITNESS'", re.findall(r"'[A-Z_]+'", gate.group(1)))
+        self.assertNotIn("NOT_A_MOTION_WITNESS", runner.split("elseif ($receipt.visual.verdict -cin")[0], "counted: the FROZEN_DISPLAY exclusion does not name it")
+        self.assertIn("$detail += \"; $($receipt.visual.verdict) (counted for speed, surfaced for review): $($receipt.visual.reason)\"", runner)
+        self.assertIn("elseif ([string]$entry.verdict -cne 'OK' -and [string]$entry.verdict -cne 'EXPOSURE_OUT_OF_RANGE') {", runner,
+                      "a self-heal pre-launch held on one frame is INVALID through the generic rule")
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        self.assertIn("| `NOT_A_MOTION_WITNESS` |", doc)
+        self.assertIn("UNPACED-VISUAL-TAIL-HOLD-RELEASE-1", doc)
 
     DARK_PNG_PS = r"""
 Add-Type -AssemblyName System.Drawing
@@ -10911,7 +10938,9 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
     def test_the_visual_gate_freezes_diverges_and_blanks_only_on_its_own_evidence(self) -> None:
         rows = [  # requested, captured, play, distinct, appDistinct, flat, mad, samePosition -> verdict, counted
             ("$true", "$true", 6, 6, 6, 0, "2.0", "$true", "OK", True),
-            ("$true", "$true", 6, 1, 1, 0, "2.0", "$true", "OK", True),            # the app itself presented one frame: a stall, not a frozen display
+            # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: this row read OK, which encoded the defect: one display frame across the play frames is no motion witness
+            # (an unpaced Play holds its last required frame through the capture tail: every L3/L4/L5 play capture carried display frame 479)
+            ("$true", "$true", 6, 1, 1, 0, "2.0", "$true", "NOT_A_MOTION_WITNESS", True),
             ("$true", "$true", 6, 1, 6, 6, "$null", "$false", "CAPTURE_BLANK", True),
             ("$true", "$true", 6, 6, 6, 0, "30.0", "$true", "VISUAL_DIVERGENCE", True),
             ("$true", "$true", 6, 6, 6, 0, "30.0", "$false", "OK", True),           # not the same timeline position: the difference judges nothing
@@ -10953,12 +10982,75 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                   "-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true | ConvertTo-Json -Compress")
         self.assertEqual((proc.returncode, out["verdict"]), (0, "FROZEN_DISPLAY_SUSPECTED"), "ViewportUnavailablePlayFrames defaults to 0")
 
-    def visual_verdict(self, src, play, unavailable, distinct, repeats=None, extra=""):
+    def test_the_visual_gate_says_not_a_motion_witness_when_the_play_frames_carry_one_display_frame(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1: an unpaced Play holds its last required frame through the capture tail (MainWindow.cpp playbackHandling,
+        pinnedUnpacedHoldReached), so all 12 play captures of the every-frame CUDA legs carried display_frame 479 and the gate fell through to OK. Fewer than
+        two distinct display frames across the judged play frames is NOT_A_MOTION_WITNESS (counted, surfaced), whatever the source difference and the
+        number of pictures; two display frames judge as before."""
+        rows = [  # source difference, distinct pictures, app distinct display frames -> verdict
+            ("known-differ", 1, 1, "NOT_A_MOTION_WITNESS"), ("known-differ", 2, 1, "NOT_A_MOTION_WITNESS"),
+            ("unknown", 1, 1, "NOT_A_MOTION_WITNESS"), ("unknown", 2, 1, "NOT_A_MOTION_WITNESS"),
+            ("known-identical", 1, 1, "NOT_A_MOTION_WITNESS"), ("known-identical", 2, 1, "NOT_A_MOTION_WITNESS"),
+            (None, 2, 1, "NOT_A_MOTION_WITNESS"),
+            ("known-differ", 1, 0, "NOT_A_MOTION_WITNESS"), ("unknown", 2, 0, "NOT_A_MOTION_WITNESS"), ("known-identical", 6, 0, "NOT_A_MOTION_WITNESS"),
+            # two display frames: unchanged
+            ("known-differ", 1, 2, "FROZEN_DISPLAY"), ("unknown", 1, 2, "FROZEN_DISPLAY_SUSPECTED"), ("known-identical", 1, 2, "OK"),
+            ("known-differ", 2, 2, "OK"), ("unknown", 2, 2, "OK"),
+        ]
+        for src, distinct, app, verdict in rows:
+            with self.subTest(source=src, distinct=distinct, app=app):
+                out = self.visual_verdict(src, 6, 0, distinct, app=app)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, verdict != "FROZEN_DISPLAY"), out["reason"])
+                if verdict == "NOT_A_MOTION_WITNESS":
+                    self.assertIn("the strip shows one timeline position, so it cannot witness motion during playback", out["reason"])
+                    self.assertIn(f"({distinct} distinct picture(s))", out["reason"])
+                    self.assertIn("none of the 6 judged play frames carries a display frame number" if app == 0
+                                  else "the 6 judged play frames all carry one display frame", out["reason"])
+        # the reason quotes the one frame when the caller names it (the reader does); a value that is not a frame number is not quoted
+        out = self.visual_verdict("known-identical", 6, 0, 2, app=1, extra="-SoleDisplayFrame 479 ")
+        self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS")
+        self.assertIn("the 6 judged play frames all carry display frame 479 (2 distinct picture(s))", out["reason"])
+        self.assertIn("all carry one display frame", self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 1.5 ")["reason"])
+
+    def test_the_visual_gate_ranks_not_a_motion_witness_after_blank_and_before_the_paused_and_exposure_verdicts(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 precedence: NOT_REQUESTED, VISUAL_ASSESSMENT_UNAVAILABLE, NOT_CAPTURED and CAPTURE_BLANK outrank it; it outranks
+        CAPTURE_UNBOUND, VISUAL_DIVERGENCE, EXPOSURE_OUT_OF_RANGE and PARTIAL_FREEZE (each shown winning with two display frames)."""
+        band = "-ExposureBand ([pscustomobject]@{ minMedianLuma = 20; maxMedianLuma = 220; maxNearBlackFraction = 0.5; maxClippedFraction = 0.01 }) "
+        dark = "-ExposureMedianLuma 3.0 -ExposureMedianNearBlackFraction 0.9 -ExposureMedianClippedFraction 0.0 " + band
+        cases = [  # (description, command tail, app distinct display frames, expected)
+            ("blank outranks", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -FlatPlayFrames 6", 1, "CAPTURE_BLANK"),
+            ("not captured outranks", "-Requested $true -Captured $true -PlayFrames 1 -DistinctContentHashes 1 -FlatPlayFrames 0", 1, "NOT_CAPTURED"),
+            ("not captured, nothing saved", "-Requested $true -Captured $false -PlayFrames 0 -DistinctContentHashes 0 -FlatPlayFrames 0", 0, "NOT_CAPTURED"),
+            ("unavailable outranks", "-Requested $true -Captured $true -PlayFrames 1 -DistinctContentHashes 1 -FlatPlayFrames 0 -ViewportUnavailablePlayFrames 5", 1,
+             "VISUAL_ASSESSMENT_UNAVAILABLE"),
+            ("not requested outranks", "-Requested $false -Captured $false -PlayFrames 0 -DistinctContentHashes 0 -FlatPlayFrames 0", 0, "NOT_REQUESTED"),
+            ("outranks unbound", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -LabelBound $false -PausedLabelBound $true", 1,
+             "NOT_A_MOTION_WITNESS"),
+            ("unbound with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -LabelBound $false -PausedLabelBound $true", 2,
+             "CAPTURE_UNBOUND"),
+            ("outranks divergence", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 30 -SamePosition $true -Threshold 6", 1,
+             "NOT_A_MOTION_WITNESS"),
+            ("divergence with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 30 -SamePosition $true -Threshold 6", 2,
+             "VISUAL_DIVERGENCE"),
+            ("outranks exposure", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 " + dark, 1, "NOT_A_MOTION_WITNESS"),
+            ("exposure with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 " + dark, 2, "EXPOSURE_OUT_OF_RANGE"),
+            ("outranks partial freeze", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 3 -FlatPlayFrames 0 -SourceDifference known-differ -RepeatedPlayFrames 3", 1,
+             "NOT_A_MOTION_WITNESS"),
+            ("partial freeze with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 3 -FlatPlayFrames 0 -SourceDifference known-differ -RepeatedPlayFrames 3", 2,
+             "PARTIAL_FREEZE"),
+        ]
+        for name, tail, app, verdict in cases:
+            with self.subTest(name):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict {tail} -AppDistinctDisplayFrames {app} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True), out["reason"])
+
+    def visual_verdict(self, src, play, unavailable, distinct, repeats=None, extra="", app=6):
         """One Get-DvVisualVerdict call over `play` judged (viewport) play frames; src None omits -SourceDifference (the default); repeats None omits
-        -RepeatedPlayFrames (the default, 0)."""
+        -RepeatedPlayFrames (the default, 0); app is -AppDistinctDisplayFrames (6 unless a row says otherwise)."""
         src_arg = f"-SourceDifference {src} " if src else ""
         repeats_arg = f"-RepeatedPlayFrames {repeats} " if repeats is not None else ""
-        proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames 6 "
+        proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames {app} "
                                   f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true {src_arg}{repeats_arg}{extra}-ViewportUnavailablePlayFrames {unavailable} | ConvertTo-Json -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return out
@@ -10983,6 +11075,10 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         # more repeats is the partial one
         ("PARTIAL_FREEZE", "FROZEN_DISPLAY"): [("known-differ", 6, 0, 1, 5, "FROZEN_DISPLAY"), ("known-differ", 6, 0, 3, 3, "PARTIAL_FREEZE"),
                                                ("known-differ", 5, 1, 2, 2, "PARTIAL_FREEZE")],
+        # UNPACED-VISUAL-MIDPLAY-CAPTURE-1 (rows add repeats, extra, app distinct display frames): one picture over a known-differ source is FROZEN_DISPLAY
+        # only while the app presented two or more frames; on one display frame it is no motion witness (disjoint, so the display-frame count decides)
+        ("NOT_A_MOTION_WITNESS", "FROZEN_DISPLAY"): [("known-differ", 6, 0, 1, None, "", 1, "NOT_A_MOTION_WITNESS"), ("known-differ", 6, 0, 1, None, "", 2, "FROZEN_DISPLAY"),
+                                                     ("known-differ", 6, 0, 1, None, "", 0, "NOT_A_MOTION_WITNESS")],
     }
 
     def test_every_new_visual_verdict_is_paired_with_every_excluding_verdict(self) -> None:
@@ -10990,7 +11086,7 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         body = text[text.index("function Get-DvVisualVerdict {"):text.index("function New-DvVisualStrip {")]
         excluding = set(re.findall(r"verdict = '([A-Z_]+)'; counted = \$false", body))
         self.assertTrue(excluding, "the verdict function names no counted = $false verdict (the pairing check lost its subject)")
-        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE", "PARTIAL_FREEZE"):
+        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE", "PARTIAL_FREEZE", "NOT_A_MOTION_WITNESS"):
             for ex in sorted(excluding):
                 with self.subTest(new=new, excluding=ex):
                     rows = self.NEW_VISUAL_VERDICT_PAIRINGS.get((new, ex))
@@ -11181,6 +11277,24 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             self.assertEqual((out["frozenJudgedOn"], out["forcedPlayDistinctContentHashes"]), ("play", None),
                              "a build without unforced play captures is judged on its play captures, as before")
             self.assertNotIn("playForcedUnforcedDifferFrames", out)
+
+    @requires_windows_imaging
+    def test_the_visual_reader_says_not_a_motion_witness_for_a_held_end_frame(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1: the saved L3 shape (every play capture at display_frame 479 over one source id, two pictures among the six
+        judged unforced ones) read OK on c6ec83ae; it is NOT_A_MOTION_WITNESS, counted, and the reason names the six judged frames and frame 479. The
+        moving fixtures stay OK."""
+        with tempfile.TemporaryDirectory(prefix="vis-held-") as d:
+            _, out = self.read_visual_mode("held-end-frame", d)
+        self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True), out["reason"])
+        self.assertEqual((out["frozenJudgedOn"], out["playFrames"], out["appDistinctDisplayFrames"], out["distinctContentHashes"]), ("play_unbound", 6, 1, 2))
+        self.assertEqual(out["observerPaintedPlayFrames"], 0)
+        self.assertTrue(out["reason"].startswith("the 6 judged play frames all carry display frame 479 (2 distinct picture(s)): the strip shows one timeline position"),
+                        out["reason"])
+        for mode in ("ok", "paired-ok"):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
+                _, out = self.read_visual_mode(mode, d)
+                self.assertEqual(out["verdict"], "OK", out["reason"])
+                self.assertGreaterEqual(out["appDistinctDisplayFrames"], 2)
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;

@@ -1276,8 +1276,9 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     if ($receipt.visual.verdict -ceq 'FROZEN_DISPLAY') {
         $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY: $($receipt.visual.reason). A leg whose display did not change is not counted, whatever its cadence numbers say"
         $outcome = 'INVALID'
-    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE', 'CAPTURE_UNBOUND', 'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE')) {
+    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE', 'CAPTURE_UNBOUND', 'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE', 'NOT_A_MOTION_WITNESS')) {
         # VISUAL-GATE-EXPOSURE-FLOOR-1: a picture outside its exposure band (too dark / clipped in BOTH arms passes every other check) is counted and surfaced the same way.
+        # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: so is a strip whose judged play frames carry one display frame (an unpaced Play held its last required frame through the tail).
         # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: a single picture over an unknown source, and a leg with no viewport rectangle, are counted and surfaced like a divergence)
         # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: an unbound paused-instant capture is surfaced the same way (counted; its difference judges nothing).
         # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5: so is a partial freeze over source frames known to differ (counted; the display's paint stopped part-way).
