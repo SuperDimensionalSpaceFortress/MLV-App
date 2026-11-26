@@ -24,6 +24,12 @@ RUNNER = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 PWSH = shutil.which("pwsh")
 
+# CI-FLAKE-GUI-SMOKE-STALL-BUDGET-TIMING-1 r6 (sol r5 B2, B3): the two numbers a probe's pass condition used to read off the real clock. A fixture that
+# states a deadline or a limit in real milliseconds is judged by when the host schedules it; these are the "no limit given" ceiling of the module
+# (3600000 ms), so no real scheduling delay of a test run can reach them.
+_MARKER_LIMIT_MS = 3600000
+_BUDGET_LEFT_DEADLINE_MS = 3600000
+
 _PRELUDE = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module $env:GS_MODULE -Force
@@ -208,9 +214,9 @@ function Trip([scriptblock]$Mutate, [int]$Window = 1200) {
     while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) {
         Start-Sleep -Milliseconds 150
         if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
-        if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$sw.ElapsedMilliseconds }
+        if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$w.LastProgressMs }
     }
-    if ($tripped) { $sinceArm = [int]$sw.ElapsedMilliseconds - $armedAt }
+    if ($tripped) { $sinceArm = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $armedAt }
     if ($held) { $held.Dispose() }
     Stop-GuiSmokeLogProgressWatch -Watch $w
     [pscustomobject]@{ tripped = $tripped; sinceArmMs = $sinceArm }
@@ -276,7 +282,7 @@ $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 1000 -ProbeOpenDelayMs
 $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $armedAt = -1
 while ($sw.ElapsedMilliseconds -lt 9000 -and -not $tripped) {
     if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
-    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$sw.ElapsedMilliseconds }
+    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$w.LastProgressMs }
     Start-Sleep -Milliseconds 150
 }
 $stillPending = ($null -ne $w.Pending)
@@ -325,10 +331,10 @@ $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 3000 -ProbeOpenDelayMs
 $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $armedAt = -1
 while ($sw.ElapsedMilliseconds -lt 12000 -and -not $tripped) {
     if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
-    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$sw.ElapsedMilliseconds }
+    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$w.LastProgressMs }
     Start-Sleep -Milliseconds 100
 }
-$ms = [int]$sw.ElapsedMilliseconds
+$ms = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp)
 Stop-GuiSmokeLogProgressWatch -Watch $w
 [pscustomobject]@{ tripped = $tripped; armedAt = $armedAt; ms = $ms } | ConvertTo-Json -Compress
 """)
@@ -363,9 +369,9 @@ while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) {
     }
     Start-Sleep -Milliseconds 100
     if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
-    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$sw.ElapsedMilliseconds }
+    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$w.LastProgressMs }
 }
-if ($tripped) { $sinceArm = [int]$sw.ElapsedMilliseconds - $armedAt }
+if ($tripped) { $sinceArm = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $armedAt }
 if ($held) { $held.Dispose() }
 Stop-GuiSmokeLogProgressWatch -Watch $w
 [pscustomobject]@{ tripped = $tripped; sinceArmMs = $sinceArm } | ConvertTo-Json -Compress
@@ -385,9 +391,9 @@ $sw = [Diagnostics.Stopwatch]::StartNew(); $tripped = $false; $armedAt = -1; $si
 while ($sw.ElapsedMilliseconds -lt 15000 -and -not $tripped) {
     Start-Sleep -Milliseconds 150
     if (Test-GuiSmokeLogProgressStalled -Watch $w) { $tripped = $true }
-    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$sw.ElapsedMilliseconds }
+    if ($w.Armed -and $armedAt -lt 0) { $armedAt = [int]$w.LastProgressMs }
 }
-if ($tripped) { $sinceArm = [int]$sw.ElapsedMilliseconds - $armedAt }
+if ($tripped) { $sinceArm = [int](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w.LaunchTimestamp) - $armedAt }
 $held.Dispose(); Stop-GuiSmokeLogProgressWatch -Watch $w
 [pscustomobject]@{ tripped = $tripped; sinceArmMs = $sinceArm } | ConvertTo-Json -Compress
 """)
@@ -598,8 +604,11 @@ class FixtureInputsAreNotLeftToTheCallerOrTheRealClock(unittest.TestCase):
         polls = [ln for ln in source.splitlines() if ln.startswith("function Poll-Until(")]
         self.assertEqual(2, len(polls), "the two marker fixtures")
         for line in polls:
-            self.assertIn("$launchBudget.ElapsedMilliseconds -lt 25000", line)
+            # r6 (sol r5 B3): 90 s is the bound on a hang (the probe subprocess is cut at 180 s); L is no longer derived from it
+            self.assertIn("$launchBudget.ElapsedMilliseconds -lt 90000", line)
             self.assertNotIn("StartNew", line, "a stopwatch of its own restarts the cap at every stage")
+        # r6 (sol r5 H1): and no member of the shared stopwatch but its reading is used anywhere in either fixture (Restart, Reset, Stop)
+        self.assertEqual([], TheLoadAllowanceEndsOnTheGuiSmokeMarker._marker_budget_violations(TheLoadAllowanceEndsOnTheGuiSmokeMarker._marker_fixture_sources()))
 
 
 def _runner_snippet(start_marker: str, end_marker: str) -> str:
@@ -1282,27 +1291,39 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
         self.assertEqual("process_no_progress", out["outcome"], "a caller that passes no -LifetimeBudgetMs is not judged")
 
     @staticmethod
-    def _budget_left_control(first_probe_delay_ms: int) -> dict:
-        # r4 (sol r3 B1): the control arms the watch FIRST, then measures the quiet verdict. A first probe that outruns its 2000 ms wait sets Hung, so the old
+    def _budget_left_control(first_probe_delay_ms: int, first_wait_ms: int = 2000, clock: tuple[int, int] | None = None) -> dict:
+        # r4 (sol r3 B1): the control arms the watch FIRST, then measures the quiet verdict. A first probe that outruns its wait sets Hung, so the old
         # five-call loop spent its retries at zero wait and could end unarmed (or arm on the very poll that was meant to be the quiet one, P = that poll's
         # reading, and read false). Every retry now waits on the pending probe (bounded: 30 s a call, five calls) before it polls
+        # r6 (sol r5 B2, H2): the deadline is _BUDGET_LEFT_DEADLINE_MS, which no real arming time can spend, and -clock=(arming, quiet) puts the module's
+        # launch clock at those two readings (constant between them) so a test can place the arming and the quiet verdict where it wants them.
+        # first.armed / first.hung record the state the FIRST call left, so a test that forces a miss can prove it entered the retry branch
+        install = quiet = ""
+        if clock is not None:
+            install = ("$m = Get-Module gui-smoke-process-boundary\n$global:Now = [double]%d\n"
+                       "& $m { function script:Get-GuiSmokeSinceLaunchMs { param([Nullable[int64]]$LaunchTimestamp = $null) return $global:Now } }" % clock[0])
+            quiet = "$global:Now = [double]%d" % clock[1]
         return run_ps(r"""
 $dir = Join-Path $env:GS_TMP 'spentbudget'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 500) -NoNewline
-$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs 2000 -ProbeDelayMs %d
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs @WAIT@ -ProbeDelayMs @DELAY@
+@INSTALL@
 # the verdict of the call that ARMED the watch (P = that call's reading, so a window of 50 ms has not run out yet)
-$arm = $null
+$arm = $null; $first = $null
 for ($i = 0; $i -lt 5 -and -not $w.Armed; $i++) {
     if ($null -ne $w.Pending) { [void]$w.Pending.Finished.WaitOne(30000) }
-    $arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 20000)
+    $arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs @D@)
+    if ($null -eq $first) { $first = [pscustomobject]@{ armed = [bool]$w.Armed; hung = [bool]$w.Hung } }
 }
 if ($null -ne $w.Pending) { [void]$w.Pending.Finished.WaitOne(30000) }
+@QUIET@
 Start-Sleep -Milliseconds 300
 $w.ProbeDelayMs = 1500
-$stalledWithBudgetLeft = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 20000)
+$stalledWithBudgetLeft = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs @D@)
 Stop-GuiSmokeLogProgressWatch -Watch $w
-[pscustomobject]@{ arm = $arm; armed = [bool]$w.Armed; stalledWithBudgetLeft = $stalledWithBudgetLeft } | ConvertTo-Json -Compress
-""" % first_probe_delay_ms)
+[pscustomobject]@{ arm = $arm; armed = [bool]$w.Armed; stalledWithBudgetLeft = $stalledWithBudgetLeft; first = $first } | ConvertTo-Json -Compress
+""".replace("@WAIT@", str(first_wait_ms)).replace("@DELAY@", str(first_probe_delay_ms)).replace("@D@", str(_BUDGET_LEFT_DEADLINE_MS))
+            .replace("@INSTALL@", install).replace("@QUIET@", quiet))
 
     def _assert_the_budget_left_control(self, out: dict) -> None:
         self.assertFalse(out["arm"])
@@ -1310,9 +1331,18 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         self.assertTrue(out["stalledWithBudgetLeft"], "with budget left a quiet armed watch still reports the stall")
 
     def test_a_first_probe_that_outruns_its_wait_still_arms_before_the_quiet_control_is_measured(self) -> None:
-        # r4: the loaded-runner input made deterministic. The first probe lists its log 2500 ms after it starts, past the 2000 ms wait of the call that
-        # started it: that call is unarmed and the watch is Hung, which is the state the old control then burned its four retries in at zero wait
-        self._assert_the_budget_left_control(self._budget_left_control(2500))
+        # r4: the loaded-runner input made deterministic. The first probe lists its log after the wait of the call that started it: that call is unarmed and
+        # the watch is Hung, which is the state the old control then burned its four retries in at zero wait. r6 (sol r5 H2): the miss is forced by a 50 ms
+        # wait against a 4000 ms listing (3950 ms of margin; 500 ms before), and the control proves the first call really missed
+        out = self._budget_left_control(4000, first_wait_ms=50)
+        self.assertFalse(out["first"]["armed"], "the forced miss never happened: the first call armed the watch, so the retry branch was not exercised")
+        self.assertTrue(out["first"]["hung"], "the first call left a probe still running past its wait")
+        self._assert_the_budget_left_control(out)
+
+    def test_the_budget_left_control_is_not_spent_by_an_arming_that_lands_just_before_its_deadline(self) -> None:
+        # r6 (sol r5 B2): arming at 19750 ms since launch, then the 300 ms quiet setup crosses 20000 ms. The module is right to return false at a spent
+        # deadline, so the control's deadline must be one no real arming time can spend. The two readings are placed on the module's launch clock.
+        self._assert_the_budget_left_control(self._budget_left_control(0, clock=(19750, 20050)))
 
     def test_the_probe_returns_no_stall_verdict_once_the_whole_budget_is_spent(self) -> None:
         # the adversary's input, scaled down: the watch is armed and quiet beyond its window, then a probe that blocks past the whole budget returns
@@ -1786,10 +1816,11 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
 $dir = Join-Path $env:GS_TMP 'marker'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $log = Join-Path $dir 'mlvapp-1.log'
 Set-Content -LiteralPath $log -Value 'start'
-$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs 30000 -ProbeWaitMs 1000
-# r4 (sol r3 H1): every stage polls against ONE budget from the watch's launch (25 s of L = 30 s), so the stages cannot add up to a P + 800 past L (E = -1)
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs @LIMIT@ -ProbeWaitMs 1000
+# r4 (sol r3 H1): every stage polls against ONE budget from the watch's launch, so the stages cannot add up. r6 (sol r5 B3): L is the module's no-limit ceiling
+# (_MARKER_LIMIT_MS), so no poll that the host resumes late can credit a growth past it (E = -1); the budget is only the bound on a hang
 $launchBudget = [Diagnostics.Stopwatch]::StartNew()
-function Poll-Until([scriptblock]$Done) { while (-not (& $Done) -and $launchBudget.ElapsedMilliseconds -lt 25000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
+function Poll-Until([scriptblock]$Done) { while (-not (& $Done) -and $launchBudget.ElapsedMilliseconds -lt 90000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
 Poll-Until { $w.Armed -and $null -eq $w.Pending }
 $len0 = [int64]$w.Files['mlvapp-1.log']
 Add-Content -LiteralPath $log -Value '[2026-11-19T10:00:01.000Z] [info] [0x1a2b] a plain growth record without the marker (main.cpp:1)'
@@ -1808,7 +1839,7 @@ Start-Sleep -Milliseconds 1000
 $stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w)
 Stop-GuiSmokeLogProgressWatch -Watch $w
 [pscustomobject]@{ plain = $plain; half = $half; marked = $marked; stalled = $stalled } | ConvertTo-Json -Compress -Depth 4
-""")
+""".replace("@LIMIT@", str(_MARKER_LIMIT_MS)))
         plain, marked = out["plain"], out["marked"]
         self.assertEqual("LOADING", plain["phase"], "growth without gui_smoke. keeps the watch LOADING")
         # adversary 0a7510a1 A1: the window in force is the silence that runs out at E (E - P), not the load allowance from the launch
@@ -1820,6 +1851,67 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
         self.assertAlmostEqual(marked["p"] + 800, marked["expiry"], delta=0.01, msg="once LOADED, E = P + W (it is below L here)")
         self.assertTrue(out["stalled"], "a LOADED log silent past P + W is a stall")
 
+    def test_a_growth_credited_late_in_the_launch_leaves_an_expiry_under_the_marker_fixtures_limit(self) -> None:
+        # r6 (sol r5 B3): a poll the host resumes at 30100 ms since launch credits its growth there (P = 30100). The marker fixtures' own L is placed on the
+        # module's launch clock at that reading: with L = 30000 the expiry is past L and is -1 (no silence expiry), which the fixtures' assertions reject
+        # although the module is right. The reading is scripted, so no real scheduling decides it.
+        out = run_ps(r"""
+$m = Get-Module gui-smoke-process-boundary
+$dir = Join-Path $env:GS_TMP 'markerlate'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$log = Join-Path $dir 'mlvapp-1.log'
+Set-Content -LiteralPath $log -Value 'start'
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs @LIMIT@ -ProbeWaitMs 1000
+$global:Now = [double]100
+& $m { function script:Get-GuiSmokeSinceLaunchMs { param([Nullable[int64]]$LaunchTimestamp = $null) return $global:Now } }
+function Poll-Stage([scriptblock]$Done) { $sw = [Diagnostics.Stopwatch]::StartNew(); while (-not (& $Done) -and $sw.ElapsedMilliseconds -lt 60000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
+Poll-Stage { $w.Armed -and $null -eq $w.Pending }
+$len0 = [int64]$w.Files['mlvapp-1.log']
+$global:Now = [double]30100
+Add-Content -LiteralPath $log -Value '[2026-11-19T10:00:01.000Z] [info] [0x1a2b] a plain growth record without the marker (main.cpp:1)'
+Poll-Stage { [int64]$w.Files['mlvapp-1.log'] -gt $len0 -and $null -eq $w.Pending }
+Stop-GuiSmokeLogProgressWatch -Watch $w
+[pscustomobject]@{ p = [double]$w.LastProgressMs; expiry = [double]$w.ExpiryMs; phase = [string]$w.Phase } | ConvertTo-Json -Compress
+""".replace("@LIMIT@", str(_MARKER_LIMIT_MS)))
+        self.assertEqual(30100, out["p"], "the growth was credited at the scripted reading")
+        self.assertEqual("LOADING", out["phase"])
+        self.assertEqual(30900, out["expiry"], "E = max(WL, P + W) must be a real expiry: with L = %d it is %s (-1 = past L)" % (_MARKER_LIMIT_MS, out["expiry"]))
+
+    # r6 (sol r5 H1): the fixtures' one shared budget is only a bound on a hang, but a per-stage reset inside Poll-Until must still be caught
+    @staticmethod
+    def _marker_budget_violations(fixture_sources: list[str]) -> list[str]:
+        found = []
+        for index, source in enumerate(fixture_sources):
+            lines = [ln for ln in source.splitlines() if ln.startswith("function Poll-Until(")]
+            if len(lines) != 1:
+                found.append("fixture %d: expected one Poll-Until, found %d" % (index, len(lines)))
+                continue
+            if "$launchBudget.ElapsedMilliseconds -lt" not in lines[0]:
+                found.append("fixture %d: Poll-Until is not bounded by the shared $launchBudget" % index)
+            if source.count("$launchBudget = [Diagnostics.Stopwatch]::StartNew()") != 1:
+                found.append("fixture %d: the shared stopwatch is not started exactly once" % index)
+            # any member of the shared stopwatch other than the reading restarts, resets or stops it
+            for member in re.findall(r"\$launchBudget\.(?!ElapsedMilliseconds\b)(\w+)", source):
+                found.append("fixture %d: $launchBudget.%s changes the shared stopwatch" % (index, member))
+            if "StartNew" in lines[0]:
+                found.append("fixture %d: Poll-Until starts a stopwatch of its own" % index)
+        return found
+
+    @staticmethod
+    def _marker_fixture_sources() -> list[str]:
+        import inspect
+        return [inspect.getsource(getattr(TheLoadAllowanceEndsOnTheGuiSmokeMarker, name)) for name in (
+            "test_the_gui_smoke_marker_switches_the_watch_to_loaded_and_the_leg_window",
+            "test_gui_smoke_bytes_inside_another_record_do_not_end_the_load_allowance")]
+
+    def test_a_per_stage_reset_of_the_shared_marker_budget_is_caught(self) -> None:
+        sources = self._marker_fixture_sources()
+        self.assertEqual([], self._marker_budget_violations(sources), "the shipped marker fixtures share one budget")
+        self.assertEqual(2, len(sources))
+        for member in ("Restart()", "Reset()", "Stop()"):
+            mutated = [s.replace("function Poll-Until([scriptblock]$Done) { while", "function Poll-Until([scriptblock]$Done) { $launchBudget.%s; while" % member) for s in sources]
+            self.assertNotEqual(sources, mutated)
+            self.assertTrue(self._marker_budget_violations(mutated), "a $launchBudget.%s inside Poll-Until passed the guard" % member)
+
     def test_gui_smoke_bytes_inside_another_record_do_not_end_the_load_allowance(self) -> None:
         """adversary 81e7f8b2 A1 (major): CrashForensics logs the start-up run_metadata record with the whole command line, so an owner input whose path
         holds `gui_smoke.` put those bytes in the log at start-up and switched the watch to LOADED before the silent load. The marker is a RECORD whose
@@ -1828,10 +1920,10 @@ Stop-GuiSmokeLogProgressWatch -Watch $w
 $dir = Join-Path $env:GS_TMP 'metadatapath'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
 $log = Join-Path $dir 'mlvapp-1.log'
 Set-Content -LiteralPath $log -Value '[2026-11-19T10:00:00.000Z] [info] [0x1a2b] run_metadata={"command_line":["MLVApp.exe","--gui-smoke-play","X:\\owner-input\\gui_smoke.night\\take"]} (CrashForensics.cpp:904)'
-$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs 30000 -ProbeWaitMs 1000
-# r4 (sol r3 H1): every stage polls against ONE budget from the watch's launch (25 s of L = 30 s), so the stages cannot add up to a P + 800 past L (E = -1)
+$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 800 -LoadWindowMs 20000 -LimitMs @LIMIT@ -ProbeWaitMs 1000
+# r4 (sol r3 H1) / r6 (sol r5 B3): one budget for every stage, and L is the module's no-limit ceiling (_MARKER_LIMIT_MS), see the fixture above
 $launchBudget = [Diagnostics.Stopwatch]::StartNew()
-function Poll-Until([scriptblock]$Done) { while (-not (& $Done) -and $launchBudget.ElapsedMilliseconds -lt 25000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
+function Poll-Until([scriptblock]$Done) { while (-not (& $Done) -and $launchBudget.ElapsedMilliseconds -lt 90000) { [void](Test-GuiSmokeLogProgressStalled -Watch $w); Start-Sleep -Milliseconds 50 } }
 Poll-Until { $w.Armed -and $null -eq $w.Pending -and [int64]$w.Files['mlvapp-1.log'] -ge 0 }
 $len0 = [int64]$w.Files['mlvapp-1.log']
 # the same bytes later in the start-up, mid-record (a message that quotes the path)
@@ -1844,7 +1936,7 @@ Poll-Until { [int64]$w.Files['mlvapp-1.log'] -gt $len1 -and $null -eq $w.Pending
 $marked = [string]$w.Phase
 Stop-GuiSmokeLogProgressWatch -Watch $w
 [pscustomobject]@{ start = $start; marked = $marked } | ConvertTo-Json -Compress -Depth 4
-""")
+""".replace("@LIMIT@", str(_MARKER_LIMIT_MS)))
         self.assertEqual("LOADING", out["start"]["phase"], "the bytes gui_smoke. inside a start-up record (an input path) ended the load allowance")
         self.assertAlmostEqual(max(20000, out["start"]["p"] + 800), out["start"]["expiry"], delta=0.01, msg="the load allowance still holds")
         self.assertEqual("LOADED", out["marked"], "the app's own gui_smoke.launch_only record still ends the load")
@@ -1959,7 +2051,15 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
     # needs). At 10000 a runner that doubled 3100 ms of pwsh start-up and first observation armed at P = 8200, P + W = 10200 > L, and both `fits`
     # cases rightly returned `timeout`. The `fits` cases end at E (about P + 2000), so the wider allowance costs them nothing; only the `cannot run
     # out by L` pair runs to H.
-    _FITS_ALLOW_MS = 16000
+    # r6 (sol r5 B1, B4): the `fits` cases take 60000 (H = 62000, L = 60000: the watch may arm up to 58000 ms after launch for the 2000 ms window, 29x what the
+    # stub's own sleep needs and 4x the r4 margin, which a first observation at 14200 ms had already spent). They end at E (about P + 2000), so the
+    # allowance costs them no time. The wider H would have let a late stall verdict through the old `verdict <= H - 1000` bound, so the verdict is now
+    # judged against E itself (_VERDICT_LATENCY_MS). The `cannot run out by L` pair runs to H and keeps the r4 allowance (_DERIVED_ALLOW_MS).
+    _FITS_ALLOW_MS = 60000
+    _DERIVED_ALLOW_MS = 16000
+    # one probe wait (the runner's 1000 ms) after E, plus 1000 ms for the host to schedule the verdict poll; the merge base accepted a verdict no later than
+    # H - 1000 for an E no later than H - 2000, and rejected 2400 ms after an E of 5000
+    _VERDICT_LATENCY_MS = 2000
 
     def _run(self, sample_ms: int, override_ms: int = 0, allow_ms: int = 6000, setup_ms: int = 0) -> dict:
         # r3 (adversary 77606b95 A2): the override is always set ("0" is no override: the harness reads it as [int]0), so a GS_OVERRIDE_MS inherited from
@@ -1978,8 +2078,12 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
                          "%s: the silence watchdog armed late never fired before the hard deadline (the loop ended at %s ms since launch)" % (branch, out["loopEndMs"]))
         self.assertGreaterEqual(out["expiryMs"], 0, branch)
         self.assertLessEqual(out["expiryMs"], hard - margin, "%s: the expiry, in ms since launch, is later than H - M" % branch)
-        # the verdict follows one probe (at most ProbeWaitMs = M - 1000) after E: it lands no later than H - 1000
+        # the verdict follows one probe (at most ProbeWaitMs = M - 1000) after E: it lands no later than H - 1000 ...
         self.assertLessEqual(out["loopEndMs"], hard - 1000, "%s: the stall verdict, in ms since launch, is later than H - M + ProbeWaitMs" % branch)
+        # ... and, whatever allowance widened H, no later than one probe wait (plus scheduling) after E itself
+        self.assertLessEqual(out["loopEndMs"] - out["expiryMs"], self._VERDICT_LATENCY_MS,
+                             "%s: the stall verdict came %s ms after the expiry (E = %s ms, the loop ended at %s ms since launch)"
+                             % (branch, out["loopEndMs"] - out["expiryMs"], out["expiryMs"], out["loopEndMs"]))
         self.assertTrue(out["timedOut"])
         self.assertEqual(124, out["exitCode"])
         self.assertFalse(out["alive"])
@@ -2001,18 +2105,34 @@ class NoSilenceExpiryIsLaterThanTheLimitWhateverTimeTheWatchArms(unittest.TestCa
     def test_a_late_arming_with_a_window_that_fits_expires_by_h_minus_m_in_the_host_load_branch(self) -> None:
         self._assert_fires_before_the_deadline(self._run(500, override_ms=2000, allow_ms=self._FITS_ALLOW_MS), "host-load", hard=2000 + self._FITS_ALLOW_MS)
 
-    def test_a_watch_armed_four_times_later_than_the_stub_needs_still_expires_by_h_minus_m_in_the_log_only_branch(self) -> None:
-        # r4: 8500 ms of runner setup arms the watch at about 8.7 s (the old L - W was 8000): the expiry, in ms since launch, is still at most H - M
-        self._assert_fires_before_the_deadline(self._run(0, override_ms=2000, allow_ms=self._FITS_ALLOW_MS, setup_ms=8500), "log-only", hard=2000 + self._FITS_ALLOW_MS)
+    # r6 (sol r5 B1): 14200 ms of runner setup arms the watch at about 14.4 s, past the 14000 ms that the r4 allowance (L - W = 14000) could take. The first
+    # observation is the fixture's input, so it is placed beyond what that margin accepted and the allowance must hold it
+    _LATE_ARMING_SETUP_MS = 14200
 
-    def test_a_watch_armed_four_times_later_than_the_stub_needs_still_expires_by_h_minus_m_in_the_host_load_branch(self) -> None:
-        self._assert_fires_before_the_deadline(self._run(500, override_ms=2000, allow_ms=self._FITS_ALLOW_MS, setup_ms=8500), "host-load", hard=2000 + self._FITS_ALLOW_MS)
+    def test_a_watch_armed_seven_times_later_than_the_stub_needs_still_expires_by_h_minus_m_in_the_log_only_branch(self) -> None:
+        # the expiry, in ms since launch, is still at most H - M however late the first observation was
+        self._assert_fires_before_the_deadline(self._run(0, override_ms=2000, allow_ms=self._FITS_ALLOW_MS, setup_ms=self._LATE_ARMING_SETUP_MS), "log-only",
+                                               hard=2000 + self._FITS_ALLOW_MS)
+
+    def test_a_watch_armed_seven_times_later_than_the_stub_needs_still_expires_by_h_minus_m_in_the_host_load_branch(self) -> None:
+        self._assert_fires_before_the_deadline(self._run(500, override_ms=2000, allow_ms=self._FITS_ALLOW_MS, setup_ms=self._LATE_ARMING_SETUP_MS), "host-load",
+                                               hard=2000 + self._FITS_ALLOW_MS)
+
+    def test_a_late_stall_verdict_is_rejected_whatever_allowance_the_fixture_carries(self) -> None:
+        # r6 (sol r5 B4): the allowance that makes a late arming fit also widened the old `verdict by H - 1000` bound to 17000 ms, so a verdict 2400 ms
+        # after E (7400 against E = 5000), which the merge base rejected (7000), passed. The latency is now measured from E, not from the allowance.
+        hard = 2000 + self._FITS_ALLOW_MS
+        base = {"hardLimitMs": hard, "armed": True, "outcome": "process_no_progress", "expiryMs": 5000, "loopEndMs": 5800, "timedOut": True, "exitCode": 124, "alive": False}
+        self._assert_fires_before_the_deadline(dict(base), "in time", hard=hard)
+        for loop_end in (7400, 9000, hard - 1000):
+            with self.assertRaises(AssertionError, msg="a stall verdict %d ms after E was accepted" % (loop_end - 5000)):
+                self._assert_fires_before_the_deadline(dict(base, loopEndMs=loop_end), "late", hard=hard)
 
     def test_a_late_arming_whose_window_cannot_run_out_by_l_is_left_to_the_deadline_in_the_log_only_branch(self) -> None:
-        self._assert_the_deadline_decides(self._run(0, allow_ms=self._FITS_ALLOW_MS), "log-only", hard=2000 + self._FITS_ALLOW_MS)
+        self._assert_the_deadline_decides(self._run(0, allow_ms=self._DERIVED_ALLOW_MS), "log-only", hard=2000 + self._DERIVED_ALLOW_MS)
 
     def test_a_late_arming_whose_window_cannot_run_out_by_l_is_left_to_the_deadline_in_the_host_load_branch(self) -> None:
-        self._assert_the_deadline_decides(self._run(500, allow_ms=self._FITS_ALLOW_MS), "host-load", hard=2000 + self._FITS_ALLOW_MS)
+        self._assert_the_deadline_decides(self._run(500, allow_ms=self._DERIVED_ALLOW_MS), "host-load", hard=2000 + self._DERIVED_ALLOW_MS)
 
 
 @unittest.skipUnless(PWSH, "pwsh not on PATH")
