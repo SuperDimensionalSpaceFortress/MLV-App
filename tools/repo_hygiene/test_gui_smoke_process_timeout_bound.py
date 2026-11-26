@@ -1243,10 +1243,14 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
         for after_wait in ("20000", "20300", "50000"):
             with self.subTest(reading_after_the_probe_wait=after_wait):
                 out = scripted(self, "19800, 19800, " + after_wait, 20000)
+                # the arming poll's own result (the old test's `$arm`): armed, and no verdict while arming
+                self.assertTrue(out["armed"], "the watch armed before the scripted readings began")
+                self.assertFalse(out["armPollStalled"], "the poll that arms the watch must not return a stall verdict")
                 self.assertTrue(out["started"], "the probe started with budget left")
                 self.assertFalse(out["stalled"], "a probe that returned after the whole budget was spent must not pass a stall verdict: the whole budget decides")
         # control on the same quiet armed watch: with a whole ms of budget left the stall is still reported
         control = scripted(self, "19800, 19800, 19999", 20000)
+        self.assertFalse(control["armPollStalled"], "the poll that arms the watch must not return a stall verdict")
         self.assertTrue(control["stalled"], "with budget left a quiet armed watch still reports the stall")
 
     def test_every_runner_site_that_breaks_on_a_stall_verdict_judges_the_whole_budget(self) -> None:
@@ -1278,9 +1282,13 @@ $dir = Join-Path $env:GS_TMP 'scriptedclock'; New-Item -ItemType Directory -Forc
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 500) -NoNewline
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs 2000
 # armed on the real clock (P is well under a second after the watch's own launch), so E = P + 50 is long past at every scripted reading below
+$armPollStalled = $false
 for ($i = 0; $i -lt 5 -and (-not $w.Armed -or $null -ne $w.Pending); $i++) {
     if ($null -ne $w.Pending) { [void]$w.Pending.Finished.WaitOne(30000) }
-    [void](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 3600000)
+    $wasArmed = [bool]$w.Armed
+    $pollStalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 3600000)
+    # the poll(s) that arm the watch return no verdict (P and the verdict share one reading, so E = P + 50 is ahead of it): kept, not discarded
+    if (-not $wasArmed -and $pollStalled) { $armPollStalled = $true }
 }
 if (-not $w.Armed -or $null -ne $w.Pending) { throw 'the arming probe did not finish' }
 # P is pinned to the launch (adversary 2e95fdc8 A2): a parent descheduled during the real arming poll would otherwise credit P late, and E = P + 50 could land past a scripted reading
@@ -1300,7 +1308,7 @@ $global:ScriptedLast = [double]0
 $stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs %d)
 $started = $null -ne $w.Pending
 Stop-GuiSmokeLogProgressWatch -Watch $w
-[pscustomobject]@{ stalled = $stalled; started = $started } | ConvertTo-Json -Compress
+[pscustomobject]@{ stalled = $stalled; started = $started; armed = [bool]$w.Armed; armPollStalled = $armPollStalled } | ConvertTo-Json -Compress
 """ % (readings, deadline_ms))
 
     def test_a_probe_wait_cut_to_the_deadline_that_ends_half_a_ms_short_of_it_passes_no_stall_verdict(self) -> None:
