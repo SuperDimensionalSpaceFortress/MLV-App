@@ -49,6 +49,7 @@ from pathlib import Path
 
 from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, write_synthetic_mlv
 from tools.repo_hygiene.test_leg_play_seconds_within_clip import KNOWN_CLIP_SOURCE
+from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -1887,6 +1888,9 @@ class RunnerHarness:
         shutil.copyfile(ROOT / "tools" / "profiling" / "gui-smoke-length-gate.ps1", root / "tools" / "profiling" / "gui-smoke-length-gate.ps1")
         # the ONE display-identity parser the runner reads the app's window placement with (DUAL-VENUE-DISPLAY-MATRIX-1)
         shutil.copyfile(ROOT / "tools" / "profiling" / "gui-smoke-display-identity.ps1", root / "tools" / "profiling" / "gui-smoke-display-identity.ps1")
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 R3-MERGE-CI-RESIDUE-1 (hosted run 45898529737): the lease-batch runner imports `(Split-Path -Parent $here) 'FpsArmGate.psm1'` at load time, one
+        # folder above dual-venue/. Every neighbouring-folder module the runner scripts and modules read is DERIVED from their text and copied to the same relative place.
+        copy_cross_tree_modules(DV / "Invoke-VenueLeaseBatch.ps1", dv)
         for name, old, new in mutations:
             path = dv / name
             text = path.read_text(encoding="utf-8")
