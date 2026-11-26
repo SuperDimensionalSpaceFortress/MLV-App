@@ -1784,7 +1784,16 @@ int diso_get_preview(uint16_t * image_data, uint16_t width, uint16_t height, int
     {
         scratch->last_regression_ms = (mlv_stage_timing_now() - regression_start) * 1000.0;
     }
-    
+
+    /* EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 r4 (adversary 25ae968d A6): when no histogram point passes the
+     * outlier filter above, data_num and weight are 0, the means are 0/0 (NaN), and so are a and b. Rowscaling
+     * with them writes undefined pixels and returned 1, which llrawproc.c reports as APPLIED. No fit is no
+     * preview: return 0 before the rowscale, so the frame stays as decoded and the run is NOT_APPLIED. */
+    if( !(weight > 0) || !isfinite(a) || !isfinite(b) )
+    {
+        return 0;
+    }
+
     //TODO: what's a better way to pick a value for this?
     uint16_t shadow = (uint16_t)(black + 1 / (a * a) + b);
     const double rowscale_start = mlv_stage_timing_now();

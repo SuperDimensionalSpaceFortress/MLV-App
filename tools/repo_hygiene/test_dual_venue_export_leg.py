@@ -4682,14 +4682,14 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
         early.insert(early.index(p(0)), w(0))
         twice = list(base)
         twice.insert(twice.index(w(5)) + 1, w(5))
-        missing = [l for l in base if l != w(7)]
+        missing = [l for l in base if l != w(479)]   # (fix 1: a missing write mid-clip now first reads as the next frame's render inside frame 7's, A4)
         b3 = [i for i, l in enumerate(base) if l.startswith("[mlv-stage-timing] frame=3 ") and i > 40]
         b4 = [i for i, l in enumerate(base) if l.startswith("[mlv-stage-timing] frame=4 ") and i > 40]
         swapped = base[:b3[0]] + base[b4[0]:b4[-1] + 1] + base[b3[0]:b3[-1] + 1] + base[b4[-1] + 1:]
         after = list(base)
         after.insert(after.index(w(0)) + 1, "[mlv-stage-timing] frame=0 stage=raw_uint16_copy ms=0.001")
         stray = base[:3] + ["[mlv-stage-timing] frame=9999 stage=raw_uint16_copy ms=0.001"] + base[3:]
-        rows = (early, "export_pipe_write for frame 0 before that frame's processed16_total"), (twice, "export_pipe_write for frame 5 twice"),(missing, "frame 7 is recorded but never written"), \
+        rows = (early, "export_pipe_write for frame 0 before that frame's processed16_total"), (twice, "export_pipe_write for frame 5 twice"),(missing, "frame 479 is recorded but never written"), \
                (swapped, "frame 3 after frame 4 was written (the one frame loop writes frames in rising order)"), \
                (after, "raw_uint16_copy for frame 0 after that frame's export_pipe_write"), (stray,"frame 9999 is recorded but never written")
         self.assertEqual(len(swapped), len(base))
@@ -4737,6 +4737,85 @@ class ExportRenderDualIsoAppliedSignalTests(unittest.TestCase):
         self.assertTrue(any(p.startswith("EXPORT_STAGE_WINDOW_MISMATCH: DUALISO_OUTCOME_WINDOW_MISMATCH: ") for p in got[1]["problems"]), got[1])
         self.assertEqual(got[2]["outcome"], "INVALID", got[2])
         self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "outcome marker" in p and "0.500" in p for p in got[2]["problems"]), got[2])
+
+    # ---- r4 fix iteration 1: adversary 25ae968d (adversary-25ae968d.json) A1-A5 (A6 is native: DualIsoAppliedOutcome.PreviewWithNoRegressionSampleIsNotApplied)
+    @staticmethod
+    def r4_cut(first: int, n: int, prefix: str = "", outcome="applied") -> dict:
+        """A cut of n frames from 0-based frame `first`: the clean applied log renumbered, its own RENDER_START / RENDER_VERIFIED / DONE, and the shipped criteria."""
+        log = re.sub(r"frame=(\d+)", lambda m: f"frame={int(m.group(1)) + first}", piped_stage_log(n, outcome=outcome))
+        start = (f"[BATCH] RENDER_START view-0 codec=prores container=mov source=1920x1080 output=1920x1080 scaled=false fps=24 frames={n} cutIn={first + 1} "
+                 f"cutOut={first + n} out=view-0.mov")
+        batch = "\n".join([start, verified_line(n, "1920x1080"), f"[BATCH] DONE view-0 exported={n} skipped=0 elapsed=60.0"]) + "\n"
+        return prores_case(maxFrames=n, dualIsoExpected=True, stage=prefix + log, batch=batch,
+                           criteria=[{"metric": "framesExported", "op": "eq", "value": n}, {"metric": "exportFramesFailed", "op": "eq", "value": 0},
+                                     {"metric": "stageFramesSeen", "op": "eq", "value": n}, {"metric": "dualIsoClassAgrees", "op": "eq", "value": True},
+                                     {"metric": "renderPipeTimed", "op": "eq", "value": True}])
+
+    def test_r4_25ae968d_a1_an_earlier_decodes_timings_are_never_summed_into_the_render(self) -> None:
+        """A1: the real prefix's start-up decodes (frame 0 raw_uint16 35.695 ms) were summed into frames 0 and 1: the 480-frame mean raw_uint16 read 9.155890, and a
+        24-frame cut read INVALID on containment. The render's own figures alone are summed: raw_uint16 9.0, llrawproc 31.0 on both, and both PASS."""
+        proc, got = evidence_cases([self.ctl(self.r4_log("m16-1243")), self.r4_cut(0, 24, self.r4_prefix("m16-1243"))])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g in got:
+            self.assertEqual(g["problems"], [], g)
+            self.assertEqual(g["outcome"], "PASS", g)
+            self.assertEqual((g["stages"]["rows"]["raw_uint16"]["meanMs"], g["stages"]["rows"]["llrawproc"]["meanMs"]), (9.0, 31.0), g["stages"]["rows"])
+
+    def test_r4_25ae968d_a2_a_start_up_decode_of_frames_outside_the_cut_is_no_unwritten_frame(self) -> None:
+        """A2: the real m16-1243 prefix decodes frames 0 and 1, and the cut cutIn=101 cutOut=124 renders and writes frames 100..123 only: read INVALID (frame 0 never
+        written, another window). A start-up-only frame outside the written frames is a cache thread's alone. A lone stray record outside them stays refused."""
+        stray = "[mlv-stage-timing] frame=7 stage=raw_uint16_copy ms=0.001\n"
+        proc, got = evidence_cases([self.r4_cut(100, 24, self.r4_prefix("m16-1243")), self.r4_cut(100, 24, stray)])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["problems"], [], got[0])
+        self.assertEqual(got[0]["outcome"], "PASS", got[0])
+        self.assertEqual(got[1]["outcome"], "INVALID", got[1])
+        self.assertTrue(any("frame 7 is recorded but never written" in p for p in got[1]["problems"]), got[1]["problems"])
+
+    def test_r4_25ae968d_a3_a_render_with_no_decode_of_its_own_never_takes_the_start_up_marker(self) -> None:
+        """A3: frame N's render decode removed (its raw_uint16 .. marker), so the last raw_uint16 before its total is a start-up decode's, and that marker decided the
+        frame (PASS). Frame 1: its only decode comes before frame 0's write, and the loop decodes a frame only after writing the one before. Frame 0 (no write before
+        it): its debayered_frame cannot hold the start-up decode. Both INVALID."""
+        clean = self.r4_log("m16-1243").splitlines()
+        def strip(f: int, debayer: str | None = None) -> list:
+            body = [l for i, l in enumerate(clean) if not (i >= 20 and l.startswith(f"[mlv-stage-timing] frame={f} stage=") and
+                                                          re.search(r" stage=(raw_uint16\S*|llrawproc\S*) ", l))]
+            if debayer is not None:
+                body = [l.replace("stage=debayered_frame ms=40.000", f"stage=debayered_frame ms={debayer}") if l.startswith(f"[mlv-stage-timing] frame={f} ") else l for l in body]
+            return body
+        proc, got = evidence_cases([self.ctl("\n".join(strip(1)) + "\n"), self.ctl("\n".join(strip(0, "0.500")) + "\n")])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        for g, frame in zip(got, ("1", "0")):
+            self.assertEqual(g["outcome"], "INVALID", g)
+            self.assertTrue(any(p.startswith("EXPORT_RECORD_INVALID") and "carry no decode of their own render" in p and f"frame {frame}" in p for p in g["problems"]), g["problems"])
+
+    def test_r4_25ae968d_a4_one_frames_render_inside_anothers_is_refused(self) -> None:
+        """A4: every frame 1 render record (processed16_total too) moved between frame 0's processed16_total and its write read PASS. The loop's render and write are one
+        thread's, so the render-only records are one block per frame."""
+        base = piped_stage_log(480, outcome="applied").splitlines()
+        f1 = [l for l in base if l.startswith("[mlv-stage-timing] frame=1 ") and " stage=export_pipe_write " not in l]
+        rest = [l for l in base if l not in f1]
+        w0 = rest.index("[mlv-stage-timing] frame=0 stage=export_pipe_write ms=10.000")
+        moved = rest[:w0] + f1 + rest[w0:]
+        proc, got = evidence_cases([self.ctl("\n".join(moved) + "\n")])
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got[0]["outcome"], "INVALID", got[0])
+        self.assertTrue(any("frame loop's order" in p and "while frame 0's render is not yet written" in p for p in got[0]["problems"]), got[0]["problems"])
+
+    def test_r4_25ae968d_a5_the_digraph_define_is_a_directive(self) -> None:
+        """A5: '%:define MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED ...' is a C directive ('%:' is the digraph of '#'); the lexer skipped it and read the build older."""
+        header = ('#define MLV_STAGE_EXPORT_PIPE_WRITE "export_pipe_write"\n'
+                  '%:define MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED "llrawproc_dual_iso_applied"\n  %: undef MLV_STAGE_EXPORT_PIPE_WRITE\n')
+        with tempfile.TemporaryDirectory() as d:
+            repo = Path(d) / "repo"
+            sha = ExportRenderPipeTimingTests.header_commit(repo, header)
+            script = ("$m = Get-Module DualVenueRunner\n$o = [ordered]@{}\n"
+                      f"$o['pipe'] = & $m {{ param($r, $id) Get-DvRenderPipeBuildClass -BuildId $id -RepoRoot $r }} '{repo}' '{sha}'\n"
+                      f"$o['signal'] = & $m {{ param($r, $id) Get-DvRenderPipeBuildClass -BuildId $id -RepoRoot $r -Macro 'MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED' }} '{repo}' '{sha}'\n"
+                      "$o | ConvertTo-Json -Compress")
+            proc, got = run_pwsh_json(script)
+        self.assertIsNotNone(got, proc.stdout[-3000:] + proc.stderr[-3000:])
+        self.assertEqual(got, {"pipe": "older", "signal": "emits"})
 
 
 if __name__ == "__main__":

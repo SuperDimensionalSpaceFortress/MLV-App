@@ -548,6 +548,14 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     * **Outcome.** A rendered frame's dual-ISO outcome comes from the runs of its *render's* decode. That decode starts at the frame's last `raw_uint16` record before
       its `processed16_total`. A marker from an earlier decode of the frame (a cache-thread prefetch) is still held to every marker rule, but it never makes the frame
       `DUALISO_OUTCOME_MIXED`, and it never rescues a render that did not apply. Two runs inside the render's own decode that disagree are still `mixed`.
+    * **Fix 1 (adversary `25ae968d`).** An earlier decode's timings are never summed into the frame's stage figures (A1). An earlier decode ends at its last
+      `llrawproc` record, dual-ISO record or marker before the render's `raw_uint16`. A frame carrying only a whole decode run (`raw_uint16` and `llrawproc`), outside
+      the written frames, is a start-up decode of a cache thread. It is skipped by the order and kept out of the sums; a lone stray record is still refused (A2).
+      The render decode must come after the write that precedes its `processed16_total`, because the loop decodes a frame only after writing the one before. It must
+      also fit inside its `debayered_frame`. Otherwise the frame has no decode of its own render: `EXPORT_RECORD_INVALID` (A3). The render-only records
+      (`debayered_frame`, `processing`, `processed16_cache_store`, `processed16_total`, `export_scale`, `export_pipe_write`) are one block per frame (A4). `%:` is read as
+      `#` in `StageTiming.h` (A5). In `dualiso.c`, a preview with no regression sample (weight 0, so `a` and `b` are NaN) returns 0 before the rowscale: `NOT_APPLIED`,
+      and the frame stays as decoded (A6).
     From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
     so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
     `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).

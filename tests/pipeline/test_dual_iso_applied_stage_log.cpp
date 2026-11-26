@@ -208,6 +208,36 @@ TEST(DualIsoAppliedOutcome, PreviewModeReportsWhetherTheRowscaleApplied)
     ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_ATTEMPTED), run_dual_iso_outcome(fixture, true, source, out));
 }
 
+// r4 (adversary 25ae968d A6): constant rows repeating lo, lo, hi, hi pass the interlace detection, but every
+// histogram is one bin, so no point passes diso_get_preview's outlier filter: weight 0, a and b NaN. That run
+// rowscaled with NaN and returned 1 (APPLIED). No fit is no preview: NOT_APPLIED, and the frame stays as decoded.
+TEST(DualIsoAppliedOutcome, PreviewWithNoRegressionSampleIsNotApplied)
+{
+    MlvPipelineFixture fixture;
+    open_dual_iso_outcome_fixture(fixture);
+    llrpSetDualIsoMode(fixture.video(), 2);
+    const int black = fixture.video()->RAWI.raw_info.black_level;
+    const int white = fixture.video()->RAWI.raw_info.white_level;
+    const uint16_t lo = static_cast<uint16_t>(black + (white - black) / 5);
+    const uint16_t hi = static_cast<uint16_t>(black + 2 * (white - black) / 5);
+    const int width = fixture.width();
+    std::vector<uint16_t> rows(static_cast<std::size_t>(width) * static_cast<std::size_t>(fixture.height()));
+    for (std::size_t i = 0; i < rows.size(); ++i)
+    {
+        const std::size_t y = i / static_cast<std::size_t>(width);
+        rows[i] = (y % 4 < 2) ? lo : hi;
+    }
+    std::vector<uint16_t> out;
+    fixture.video()->llrawproc->diso_pattern = 0;
+    const int outcome = run_dual_iso_outcome(fixture, false, rows, out);
+    if (outcome != LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED)
+    {
+        std::fprintf(stderr, "outcome=%d lo=%d hi=%d pattern=%d\n", outcome, lo, hi, fixture.video()->llrawproc->diso_pattern);
+    }
+    ASSERT_EQ(static_cast<int>(LLRP_DUAL_ISO_OUTCOME_NOT_APPLIED), outcome);
+    ASSERT_TRUE(out == rows);   // no rowscale ran: the frame is the decode
+}
+
 TEST(DualIsoAppliedOutcome, ResetIsUnknownAndSaveRestoreRoundTripsTheOutcome)
 {
     MlvPipelineFixture fixture;

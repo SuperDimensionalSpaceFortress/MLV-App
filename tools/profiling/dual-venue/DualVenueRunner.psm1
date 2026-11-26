@@ -5608,7 +5608,8 @@ function Get-DvRenderPipeMarkerState {
     $code = [regex]::Replace($code, '//[^\r\n]*', '')
     $directives = [System.Collections.Generic.List[object]]::new()
     foreach ($line in ($code -split '\r?\n')) {
-        $m = [regex]::Match($line, '^[ \t]*#[ \t]*([A-Za-z_]+)(.*)$')
+        # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 r4 fix 1, adversary 25ae968d A5: '%:' is the C digraph of '#', so '%:define' is a directive too)
+        $m = [regex]::Match($line, '^[ \t]*(?:#|%:)[ \t]*([A-Za-z_]+)(.*)$')
         if ($m.Success) { $directives.Add(@($m.Groups[1].Value, $m.Groups[2].Value.Trim())) }
     }
     $literal = { param($arg) if ($arg -match '^\(?[ \t]*0+[ \t]*\)?$') { 'off' } elseif ($arg -match '^\(?[ \t]*[1-9][0-9]*[ \t]*\)?$') { 'on' } else { 'unknown' } }
@@ -5719,6 +5720,8 @@ function Test-DvExportStageLogRecords {
     # llrawproc, llrawproc_dual_iso, the outcome marker -- are one thread's, in that order, so a marker is bound to the previous record OF ITS FRAME, never to the
     # previous line. Cleared on a malformed line, as $prev is: that record's frame is not known.)
     $prevByFrame = [hashtable]::new([StringComparer]::Ordinal)
+    $tabled = [System.Collections.Generic.List[object]]::new()     # r4 fix 1: every tabled per-frame record, summed after the loop
+    $llrFrames = [hashtable]::new([StringComparer]::Ordinal)       # r4 fix 1: the frames that carry any llrawproc record (any decode)
     $lineNo = 0
     foreach ($line in ($Text -split "`r?`n")) {
         $lineNo++
@@ -5749,16 +5752,84 @@ function Test-DvExportStageLogRecords {
                 # (r4, both r3 Bachelor legs on 04004b4e: the cache threads interleave frames, so a dual-ISO record is paired with the previous record OF ITS FRAME, as the
                 # marker is above, never with the physically previous line; $before stays the line-adjacent record for nothing else)
                 if ($s -ceq 'llrawproc_dual_iso') { $dualRecs.Add([pscustomobject]@{ frame = $f; msText = $hit.Groups['ms'].Value; line = $lineNo; after = $beforeSame; lineAfter = $before }) }
-                $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $ms } else { $ms })
-                # (r5, sol r4 B4: and the EXACT [decimal] sum beside it, which the containment means read: a double keeps about 15 digits, so 3500001.000000401 read as
-                # 3500001.0000004 and passed a limit it is past)
-                $perStageD[$s][$f] = $(if ($perStageD[$s].ContainsKey($f)) { $perStageD[$s][$f] + $msD } else { $msD })
-                $recCount[$s][$f] = 1 + $(if ($recCount[$s].ContainsKey($f)) { $recCount[$s][$f] } else { 0 })
+                if ($s -ceq 'llrawproc') { $llrFrames[$f] = $true }
+                # (r4 fix 1, adversary 25ae968d A1: the figure is summed AFTER the loop, once the frame's render decode is known, so an earlier decode's timings stay out)
+                $tabled.Add([pscustomobject]@{ stage = $s; frame = $f; ms = $ms; msD = $msD; line = $lineNo })
             }
         }
         if ($null -ne $why) { $bad.Add("line ${lineNo} $why") }
     }
     if ($bad.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($bad.Count) stage-timing record(s) do not conform (first: $($bad[0]))") }
+    # (EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1 r4: the MLV cache threads decode frames and run llrawproc on them, without dual-ISO and with no render, beside the frame loop
+    # -- frames 0..11 of m16-1243 and 0..31 of m16-1456 before the first write, on 04004b4e -- and the loop's render then decodes each such frame AGAIN, from its own
+    # raw_uint16 record (a cache hit still notes it). That render decode is the one its processed16_total closes and its pipe write exports. So a frame's RENDER DECODE
+    # starts at its last raw_uint16 record before its first processed16_total, and every record of that frame before it is an earlier decode's.
+    # r4 fix 1, adversary 25ae968d A1: an earlier decode's timings are no work of the measured render, so they are never summed into the frame's stage figures.
+    # A2: a frame that carries ONLY decode records (raw_uint16*, llrawproc, llrawproc_dual_iso, an outcome marker), no processed16_total, and lies outside the frames the
+    # loop wrote (a start-up decode of frames before or after the declared cut) is a cache thread's frame alone: kept out of the sums and out of the order's
+    # every-frame-is-written rule. A decode-only frame INSIDE the written frames is still a frame the loop never wrote.
+    # A3: the render's debayered_frame contains its decode (the reader's own nesting: raw_uint16 and llrawproc inside debayered_frame), so a frame whose render-decode
+    # raw_uint16 plus llrawproc does not fit inside its debayered_frame (processed16_total when it has none) has no decode of its own render: EXPORT_RECORD_INVALID.)
+    $isDecodeStage = { param($s) $s -ceq 'raw_uint16' -or $s.StartsWith('raw_uint16_', [StringComparison]::Ordinal) -or $s -ceq 'llrawproc' -or $s -ceq 'llrawproc_dual_iso' -or $script:ExportDualIsoOutcomeWord.ContainsKey($s) }
+    $p16Line = [hashtable]::new([StringComparer]::Ordinal)
+    foreach ($r in $seq) { if ($r.stage -ceq 'processed16_total' -and -not $p16Line.ContainsKey($r.frame)) { $p16Line[$r.frame] = $r.line } }
+    # (r4 fix 1, adversary 25ae968d A3: and the loop thread decodes frame N only after it wrote the frame before, so the render decode is the frame's last raw_uint16
+    # AFTER the last pipe write that precedes its processed16_total. A frame whose decodes all lie before that write has none of its own render: every one of them
+    # is an earlier decode's, its markers decide nothing (the frame then reads unmarked), and the frame is typed below.)
+    $writeLines = @($seq | Where-Object { $_.stage -ceq 'export_pipe_write' } | ForEach-Object { $_.line })
+    $renderWindowFrom = [hashtable]::new([StringComparer]::Ordinal)
+    foreach ($f in @($p16Line.Keys)) { $from = 0; foreach ($wl in $writeLines) { if ($wl -lt $p16Line[$f] -and $wl -gt $from) { $from = $wl } }; $renderWindowFrom[$f] = $from }
+    $renderDecodeLine = [hashtable]::new([StringComparer]::Ordinal)   # the frame's last raw_uint16 record inside that window, before its first processed16_total
+    $decodedBeforeP16 = [hashtable]::new([StringComparer]::Ordinal)
+    foreach ($r in $seq) {
+        if ($r.stage -cne 'raw_uint16' -or -not $p16Line.ContainsKey($r.frame) -or $r.line -ge $p16Line[$r.frame]) { continue }
+        $decodedBeforeP16[$r.frame] = $r.line
+        if ($r.line -gt $renderWindowFrom[$r.frame]) { $renderDecodeLine[$r.frame] = $r.line }
+    }
+    $noRenderDecode = @($decodedBeforeP16.Keys | Where-Object { -not $renderDecodeLine.ContainsKey($_) } | Sort-Object { [int64]$_ })
+    foreach ($f in $noRenderDecode) { $renderDecodeLine[$f] = $p16Line[$f] }   # every decode record before the total is then an earlier decode's (the earlierEnd rule below)
+    if ($noRenderDecode.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($noRenderDecode.Count) frame(s) carry no decode of their own render: every raw_uint16 of the frame comes before the pipe write that precedes its processed16_total, and the one frame loop decodes a frame only after it wrote the one before (first: frame $($noRenderDecode[0]))") }
+    $writtenFrames = @($seq | Where-Object { $_.stage -ceq 'export_pipe_write' } | ForEach-Object { [int64]$_.frame })
+    $startupOnly = [hashtable]::new([StringComparer]::Ordinal)
+    if ($writtenFrames.Count -gt 0) {
+        $wLo = ($writtenFrames | Measure-Object -Minimum).Minimum; $wHi = ($writtenFrames | Measure-Object -Maximum).Maximum
+        $nonDecode = [hashtable]::new([StringComparer]::Ordinal); $hasRaw = [hashtable]::new([StringComparer]::Ordinal)
+        foreach ($r in $seq) { if (-not (& $isDecodeStage $r.stage)) { $nonDecode[$r.frame] = $true } elseif ($r.stage -ceq 'raw_uint16') { $hasRaw[$r.frame] = $true } }
+        # (a whole decode run, raw_uint16 and llrawproc both, as a cache thread writes it; a lone stray record of a frame outside the cut is no such run and stays refused)
+        foreach ($r in $seq) {
+            if (-not $nonDecode.ContainsKey($r.frame) -and $hasRaw.ContainsKey($r.frame) -and $llrFrames.ContainsKey($r.frame) -and ([int64]$r.frame -lt $wLo -or [int64]$r.frame -gt $wHi)) { $startupOnly[$r.frame] = $true }
+        }
+    }
+    # an earlier decode ENDS with its llrawproc run (llrawproc, llrawproc_dual_iso, its marker): every record of the frame up to the last such record before the render
+    # decode's raw_uint16 is the earlier decode's (a decode's own disk_read / decompress may be noted before or after its raw_uint16)
+    $earlierEnd = [hashtable]::new([StringComparer]::Ordinal)
+    foreach ($r in $seq) {
+        if (-not $renderDecodeLine.ContainsKey($r.frame) -or $r.line -ge $renderDecodeLine[$r.frame]) { continue }
+        if ($r.stage -ceq 'llrawproc' -or $r.stage -ceq 'llrawproc_dual_iso' -or $script:ExportDualIsoOutcomeWord.ContainsKey($r.stage)) { $earlierEnd[$r.frame] = $r.line }
+    }
+    $isEarlierDecode = { param($f, $line) $startupOnly.ContainsKey($f) -or ($earlierEnd.ContainsKey($f) -and $line -le $earlierEnd[$f]) }
+    $earlierDecodeRecords = 0
+    foreach ($t in $tabled) {
+        if (& $isEarlierDecode $t.frame $t.line) { $earlierDecodeRecords++; continue }
+        $s = $t.stage; $f = $t.frame
+        $perStage[$s][$f] = $(if ($perStage[$s].ContainsKey($f)) { $perStage[$s][$f] + $t.ms } else { $t.ms })
+        # (r5, sol r4 B4: and the EXACT [decimal] sum beside it, which the containment means read: a double keeps about 15 digits, so 3500001.000000401 read as
+        # 3500001.0000004 and passed a limit it is past)
+        $perStageD[$s][$f] = $(if ($perStageD[$s].ContainsKey($f)) { $perStageD[$s][$f] + $t.msD } else { $t.msD })
+        $recCount[$s][$f] = 1 + $(if ($recCount[$s].ContainsKey($f)) { $recCount[$s][$f] } else { 0 })
+    }
+    $uncontained = [System.Collections.Generic.List[string]]::new()
+    foreach ($f in @($renderDecodeLine.Keys | Sort-Object { [int64]$_ })) {
+        $decode = [decimal]0
+        foreach ($t in $tabled) {
+            if ($t.frame -ceq $f -and $t.line -lt $p16Line[$f] -and ($t.stage -ceq 'raw_uint16' -or $t.stage -ceq 'llrawproc') -and -not (& $isEarlierDecode $t.frame $t.line)) { $decode += $t.msD }
+        }
+        $parentName = $(if ($perStageD['debayered_frame'].ContainsKey($f)) { 'debayered_frame' } else { 'processed16_total' })
+        if (-not $perStageD[$parentName].ContainsKey($f)) { continue }
+        $parent = [decimal]$perStageD[$parentName][$f]
+        if ($decode -gt $parent * $script:ExportStageContainToleranceD + $script:ExportStageContainSlackD + $script:ExportStageContainEpsilonD) { $uncontained.Add("frame $f decodes $decode ms (raw_uint16 + llrawproc from line $($renderDecodeLine[$f])) inside a $parent ms $parentName") }
+    }
+    if ($uncontained.Count -gt 0) { $problems.Add("EXPORT_RECORD_INVALID: $($uncontained.Count) frame(s) carry no decode of their own render: the last decode before processed16_total does not fit inside that render's debayered_frame, so it is an earlier decode's (first: $($uncontained[0]))") }
     # r8 (adversary r7 A2, Dot): a frame's repeated records for one stage are SUMMED above, and the sum is the value every mean, median and share reads, so it is a timing too:
     # two lines that each conform can add up past the ceiling, and Get-DvExportStageRow would then drop that frame without a word (a stage with no sample, a share of null,
     # and the frame still counted by the window check). Each accumulated per-frame value is held to the same domain as one record, per stage that carries it.
@@ -5786,7 +5857,7 @@ function Test-DvExportStageLogRecords {
     # per-frame counts above, every llrawproc run then has its own dual-ISO figure. (A frame with no llrawproc at all keeps the r1 rule: its dual-ISO leaf stands in for it in the sum groups.)
     $unpaired = [System.Collections.Generic.List[string]]::new()
     foreach ($d in $dualRecs) {
-        if (-not $perStage['llrawproc'].ContainsKey($d.frame)) { continue }
+        if (-not $llrFrames.ContainsKey($d.frame)) { continue }   # (r4 fix 1: a frame with an llrawproc record in ANY decode, summed or not)
         $a = $d.after
         if ($null -eq $a -or $a.stage -cne 'llrawproc' -or $a.frame -cne $d.frame) { $unpaired.Add("line $($d.line) frame $($d.frame) does not follow an llrawproc record of that frame"); continue }
         $child = [decimal]::Parse($d.msText, [Globalization.CultureInfo]::InvariantCulture); $parent = [decimal]::Parse($a.msText, [Globalization.CultureInfo]::InvariantCulture)
@@ -5811,11 +5882,8 @@ function Test-DvExportStageLogRecords {
     # DECODED AGAIN after it -- a raw_uint16 record of that frame after the marker's llrawproc_dual_iso record and before the frame's first processed16_total -- reports an
     # earlier decode's run, not the exported one: it is still held to every rule here (shape, place, figure) and still marks its dual-ISO record, but its word is not
     # the frame's outcome. Every run of the render's own decode keeps deciding it, so two runs there that disagree are still 'mixed'. A frame with no
-    # processed16_total, or with no raw_uint16 before it, keeps every marker's word, as before.)
-    $p16Line = [hashtable]::new([StringComparer]::Ordinal)
-    foreach ($r in $seq) { if ($r.stage -ceq 'processed16_total' -and -not $p16Line.ContainsKey($r.frame)) { $p16Line[$r.frame] = $r.line } }
-    $renderDecodeLine = [hashtable]::new([StringComparer]::Ordinal)   # the frame's last raw_uint16 record before its first processed16_total
-    foreach ($r in $seq) { if ($r.stage -ceq 'raw_uint16' -and $p16Line.ContainsKey($r.frame) -and $r.line -lt $p16Line[$r.frame]) { $renderDecodeLine[$r.frame] = $r.line } }
+    # processed16_total, or with no raw_uint16 before it, keeps every marker's word, as before. r4 fix 1: "an earlier decode" is the one test the sums use,
+    # $isEarlierDecode above, so a start-up-only frame's markers never decide a frame either.)
     $otherRunMarkers = 0
     foreach ($o in $outcomeRecs) {
         $a = $o.after
@@ -5826,7 +5894,7 @@ function Test-DvExportStageLogRecords {
         if ($o.msText -cnotmatch $zeroMs) { $outcomeBad.Add("line $($o.line) records $($o.stage) at $($o.msText) ms; an outcome marker is a 0.000 record, never a timing"); continue }
         if ($script:ExportDualIsoOutcomeWord[$o.stage] -ceq 'not_attempted' -and $a.msText -cnotmatch $zeroMs) { $outcomeBad.Add("line $($o.line) records $($o.stage) for frame $($o.frame) after a $($a.msText) ms llrawproc_dual_iso record (line $($a.line)); llrawproc.c times dual-ISO only inside an attempt, so a timed run that did not attempt it is no producer outcome"); continue }
         $markedDualLines[$a.line] = $true
-        if ($renderDecodeLine.ContainsKey($o.frame) -and $a.line -lt $renderDecodeLine[$o.frame]) { $otherRunMarkers++; continue }
+        if (& $isEarlierDecode $o.frame $a.line) { $otherRunMarkers++; continue }
         $word = $script:ExportDualIsoOutcomeWord[$o.stage]
         $outcomes[$o.frame] = $(if (-not $outcomes.ContainsKey($o.frame) -or $outcomes[$o.frame] -ceq $word) { $word } else { 'mixed' })
     }
@@ -5845,9 +5913,18 @@ function Test-DvExportStageLogRecords {
     # its processed16_total, one processed16_total, at most one scale and before the write, nothing of that frame after its processed16_total but its scale and write,
     # nothing after its write, and every frame that has a record is written. The WRITES are that one loop's, so they still come once each, in rising frame order.)
     if (@($seq | Where-Object { $_.stage -ceq 'export_pipe_write' -or $_.stage -ceq 'export_scale' }).Count -gt 0) {
-        $order = $null; $fst = [hashtable]::new([StringComparer]::Ordinal); $lastWritten = $null
+        # (r4 fix 1, adversary 25ae968d A4: the stages only the loop's own render and write note -- debayered_frame, processing, processed16_cache_store,
+        # processed16_total, export_scale, export_pipe_write; no cache-thread decode notes one -- are that ONE thread's, so they are held as one block per frame: from
+        # a frame's first such record to its write, no such record of another frame. A2: a start-up-only frame (above) is a cache thread's alone and is skipped.)
+        $foreground = @('debayered_frame', 'processing', 'processed16_cache_store', 'processed16_total', 'export_scale', 'export_pipe_write')
+        $order = $null; $fst = [hashtable]::new([StringComparer]::Ordinal); $lastWritten = $null; $fgOpen = $null
         foreach ($r in $seq) {
+            if ($startupOnly.ContainsKey($r.frame)) { continue }
             $at = "line $($r.line) records $($r.stage) for frame $($r.frame)"
+            if ($foreground -ccontains $r.stage) {
+                if ($null -ne $fgOpen -and $fgOpen -cne $r.frame) { $order = "$at while frame $fgOpen's render is not yet written (the one frame loop renders, scales and writes one frame at a time)"; break }
+                $fgOpen = $(if ($r.stage -ceq 'export_pipe_write') { $null } else { $r.frame })
+            }
             $st = $fst[$r.frame]
             if ($null -eq $st) { $st = @{ p16 = $false; scale = $false; written = $false }; $fst[$r.frame] = $st }
             $isWrite = $r.stage -ceq 'export_pipe_write'; $isScale = $r.stage -ceq 'export_scale'
@@ -6495,7 +6572,8 @@ function Test-DvExportReceiptValid {
                 $claim = [string](Get-DvProp $files $name)
                 $file = Join-Path (Join-Path $dir 'export') $name
                 if ($claim -cnotmatch '^[0-9a-f]{64}$' -or -not (Test-Path -LiteralPath $file -PathType Leaf)) { $Incomplete.Add("EVIDENCE_ABSENT: export/$name is not in the evidence"); continue }
-                $b = [IO.File]::ReadAllBytes($file)
+                # (r4, advisory 25ae968d A8: a listed file that cannot be read is typed, never a throw out of the validator)
+                try { $b = [IO.File]::ReadAllBytes($file) } catch { $Incomplete.Add("EVIDENCE_ABSENT: export/$name could not be read ($($_.Exception.GetType().Name))"); continue }
                 if ((Get-DvSha256OfBytes $b) -cne $claim) { $Invalid.Add("EVIDENCE_HASH_MISMATCH: export/$name does not hash to the sha256 the receipt claims"); continue }
                 $texts[$name] = ConvertTo-DvText $b
             }
