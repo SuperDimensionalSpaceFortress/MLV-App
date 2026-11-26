@@ -1643,7 +1643,9 @@ if ($legPlanMode) {
         # the same rule as a location the guard gave up on (RunOutputAliased); stderr carries the typed line. The code stays LEG_PLAN_UNREADABLE.
         if ($planRead.state -ceq 'TIMEOUT') { $script:RunOutputAliased = $true; Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' could not be read within the time left before -DeadlineUtc" }
         # r14 (sol r13 B4): a plan that repeats a key (a `purpose` written twice) is LEG_PLAN_UNREADABLE, never the last value the parser kept
-        $doc = try { if ($planRead.state -cne 'OK') { throw [string]$planRead.error }; $planText = [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$planRead.bytes), $true).ReadToEnd(); Assert-FpsJsonNoRepeatedKey $planText $planPath -AllowArrayRoot; $planText | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 (sol r16 + key3 fable r16): only the PARSE-LEVEL rules run here (a repeated key, unparsable text). The raw SHAPE rules (an array under a receipt-envelope
+        # name, the depth-256 cap) run after every per-item check below, so a null or non-object entry is still BAD_ITEM_SHAPE item=<n> at its original position, as at the merge base.
+        $doc = try { if ($planRead.state -cne 'OK') { throw [string]$planRead.error }; $planText = [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$planRead.bytes), $true).ReadToEnd(); Assert-FpsJsonNoRepeatedKey $planText $planPath -ParseLevelOnly; $planText | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
         # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
         $rawItems = $null
         if ($doc -is [array]) { $rawItems = $doc }
@@ -1689,6 +1691,9 @@ if ($legPlanMode) {
         if ($planPurposeDeclared) { $planPurpose = $doc.PSObject.Properties['purpose'].Value }
         $purposeRefusal = Get-FpsLegPlanRefusal -Purpose $planPurpose -Items @($items | ForEach-Object { [pscustomobject]@{ item = $_.item; arm = $_.telemetryArm } }) -Declared:$planPurposeDeclared
         if ($purposeRefusal[0]) { Stop-PlanRefused ([string]$purposeRefusal[0]) ([int]$purposeRefusal[1]) ([string]$purposeRefusal[2]) }
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1: the raw shape rules the parse-level read above deferred (r15 A1: an array under a receipt-envelope name; the depth-256 cap), now that every item has
+        # passed its own checks. Still before any build staging read, claim or lease; a bare-array plan root is allowed (the reader above shape-checks its entries).
+        try { Assert-FpsJsonNoRepeatedKey $planText $planPath -AllowArrayRoot } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' has a shape the raw JSON check refuses: $($_.Exception.Message)" }
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
         foreach ($it in $items) {

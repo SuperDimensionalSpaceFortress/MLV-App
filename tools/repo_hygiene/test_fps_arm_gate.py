@@ -175,6 +175,54 @@ class ArmClassifierTests(_Probe):
         self.assertEqual(out, ["DEFAULT_LIST=PROBLEM", "LIST_NULL=NONE", "LIST_ONLY_NULL=NONE", "LIST_DUP=PROBLEM", "LIST_ENVELOPE=PROBLEM", "SCALAR=PROBLEM", "BAD=PROBLEM", "OBJECT=NONE",
                                "ASSERT_OK=NONE", "ASSERT_STRICT=THREW"])
 
+    def test_envelope_preempt_residue_parse_level_only_keeps_repeats_and_drops_the_shape_rules(self) -> None:
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 (sol r16 + key3 fable r16): the lease batch's plan read runs this BEFORE its positional BAD_ITEM_SHAPE check, so the shape rules (envelope array, root
+        # kind, the depth-256 cap) must not fire here; they run after the item checks without the switch. A repeated key and unparsable text stay problems (parse-level defects). The
+        # receipt readers' default call is unchanged: the same inputs without the switch are still problems (KEEP item 3).
+        deep = "[" * 257 + "null" + "]" * 257
+        shape_inputs = {
+            "NESTED_ENVELOPE": '[[{"proof":[]}]]',
+            "LEGS_NESTED_ENVELOPE": '{"legs":[[{"proof":[]}]]}',
+            "TOP_ENVELOPE": '{"legs":[null],"proof":[]}',
+            "HOST_SIBLING": '[null,{"host":[]}]',
+            "DEEP257": deep,
+            "SCALAR": '"plan"',
+        }
+        parse_inputs = {"DUP": '[null,{"k":1,"k":2}]', "CASEDUP": '[null,{"a":1,"A":2}]', "DUPLEGS": '{"legs":[null],"legs":[null]}', "BAD": "[oops"}
+        body = ""
+        for label, text in {**shape_inputs, **parse_inputs}.items():
+            for mode, flag in (("PLO", " -ParseLevelOnly"), ("STRICT", " -AllowArrayRoot"), ("DEFAULT", "")):
+                body += f"$p = Get-FpsJsonRepeatedKeyProblem '{text}'{flag}\nWrite-Host ('{label}_{mode}=' + $(if ($null -eq $p) {{ 'NONE' }} else {{ 'PROBLEM' }}))\n"
+        body += "try { Assert-FpsJsonNoRepeatedKey '{\"legs\":[null],\"proof\":[]}' 'plan.json' -ParseLevelOnly; Write-Host 'ASSERT_PLO=NONE' } catch { Write-Host 'ASSERT_PLO=THREW' }\n"
+        body += "try { Assert-FpsJsonNoRepeatedKey '{\"proof\":[]}' 'receipt.json'; Write-Host 'ASSERT_RECEIPT=NONE' } catch { Write-Host ('ASSERT_RECEIPT=' + $_.Exception.Message.Split(':')[0]) }\n"
+        out = dict(line.split("=", 1) for line in self.ok(body).split())
+        want = {}
+        for label in shape_inputs:
+            want[f"{label}_PLO"] = "NONE"
+            # -AllowArrayRoot lifts only the root rule: every shape input is still a problem for the strict post-item call and for the receipt default
+            want[f"{label}_STRICT"] = "PROBLEM"
+            want[f"{label}_DEFAULT"] = "PROBLEM"
+        for label in parse_inputs:
+            for mode in ("PLO", "STRICT", "DEFAULT"):
+                want[f"{label}_{mode}"] = "PROBLEM"
+        want.update({"ASSERT_PLO": "NONE", "ASSERT_RECEIPT": "FPS_JSON_REPEATED_KEY"})
+        self.assertEqual(out, want)
+
+    def test_envelope_preempt_residue_a_receipt_reader_still_refuses_an_envelope_array(self) -> None:
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 KEEP item 3: only the lease batch's plan read defers the shape rules. A receipt reader (Read-SmokeJson, Read-JsonRecords) still refuses a record whose
+        # `launch` envelope is an array, exactly as at 23b2d55d; the same record with an object envelope is read.
+        launch = '{"environment":' + LIGHT_ENV_JSON + ',"arguments":' + PRODUCER_ARGS_JSON + '}'
+        wrapped = self.tmp / "launch-array.json"
+        wrapped.write_text('{"schema":"x","launch":[' + launch + ']}', encoding="utf-8")
+        plain = self.tmp / "launch-object.json"
+        plain.write_text('{"schema":"x","launch":' + launch + '}', encoding="utf-8")
+        body = _extract_functions(COMPARE_SMOKE_AB_SCRIPT, ["Read-SmokeJson"]) + "\n" + _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Read-JsonRecords"]) + "\n"
+        for label, call in (("SMOKE_ENVELOPE", f"Read-SmokeJson '{wrapped}'"), ("PERF_ENVELOPE", f"Read-JsonRecords '{wrapped}'"),
+                            ("SMOKE_PLAIN", f"Read-SmokeJson '{plain}'"), ("PERF_PLAIN", f"Read-JsonRecords '{plain}'")):
+            body += f"try {{ $null = @({call}); Write-Host '{label}=READ' }} catch {{ Write-Host ('{label}=REFUSED:' + [string]($_.Exception.Message -match 'is an array, but')) }}\n"
+        out = self.ok(body).split()
+        self.assertEqual(out, ["SMOKE_ENVELOPE=REFUSED:True", "PERF_ENVELOPE=REFUSED:True", "SMOKE_PLAIN=READ", "PERF_PLAIN=READ"])
+
     def test_r15_a1_the_readers_refuse_a_wrapped_record_before_the_parser_unwraps_it(self) -> None:
         # r15 (adversary r14 pass 18 A1 and siblings): compare-release-gui-smoke-ab.ps1 Read-SmokeJson and compare-machine-perf.ps1 Read-JsonRecords (whole document and JSONL line) refuse
         # a singleton-array root; the same record unwrapped is read.

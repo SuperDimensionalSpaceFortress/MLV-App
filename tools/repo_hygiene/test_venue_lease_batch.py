@@ -3639,6 +3639,46 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                     doc = {"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": legs} if container == "object" else legs
                     self.assert_whole_plan_refused(self.write_raw_plan(doc), f"BAD_ITEM_SHAPE item={n} ")
 
+    def write_plan_text(self, text: str) -> Path:
+        p = self.case / "plan.json"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_envelope_preempt_residue_a_bad_entry_beside_an_envelope_array_or_deep_nesting_keeps_its_position(self) -> None:
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 (sol r16 + key3 fable r16 blocker): the raw check's envelope-array rule and depth-256 cap ran BEFORE the positional item check, so these plans were
+        # LEG_PLAN_UNREADABLE with no item; the merge base c6ec83ae refuses each BAD_ITEM_SHAPE item=1. Now the shape rules run after every per-item check, so any per-item refusal the
+        # merge base gave (BAD_ITEM_SHAPE and the field checks alike) keeps its code and position.
+        ok_a = json.dumps(self.item(self.specs[0], "A", self.commit_a))
+        cases = {
+            "array entry holding an envelope array": ('[[{"proof":[]}]]', "BAD_ITEM_SHAPE item=1 "),
+            "same, object container": ('{"legs":[[{"proof":[]}]]}', "BAD_ITEM_SHAPE item=1 "),
+            "null entry beside a top-level envelope array": ('{"legs":[null],"proof":[]}', "BAD_ITEM_SHAPE item=1 "),
+            "null entry before an object holding an envelope array": ('[null,{"host":[]}]', "BAD_ITEM_SHAPE item=1 "),
+            "a 257-deep nested null": ("[" * 257 + "null" + "]" * 257, "BAD_ITEM_SHAPE item=1 "),
+            "valid item then a null, envelope array beside": ('{"legs":[' + ok_a + ',null],"proof":[]}', "BAD_ITEM_SHAPE item=2 "),
+            "valid item then an item whose envelope is an array": ('[' + ok_a + ',{"launch":[1]}]', "BAD_SOURCE_COMMIT item=2 "),
+        }
+        for label, (text, want) in cases.items():
+            with self.subTest(case=label):
+                self.assert_whole_plan_refused(self.write_plan_text(text), want)
+
+    def test_envelope_preempt_residue_repeated_keys_and_the_deferred_shape_rules_still_refuse_the_plan(self) -> None:
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 KEEP: a repeated key is a parse-level defect and stays LEG_PLAN_UNREADABLE ahead of any item check (the r14 rule). The deferred shape rules still
+        # refuse a plan whose every item passes: an array under an envelope name, and nesting past depth 256, are LEG_PLAN_UNREADABLE before any staging read, claim or lease.
+        ok_a = json.dumps(self.item(self.specs[0], "A", self.commit_a))
+        schema = '"schema":"mlv-app/venue-lease-leg-plan/v1"'
+        cases = {
+            "repeated key beside a null entry": '[null,{"a":1,"A":2}]',
+            "repeated key in a valid item": '[' + ok_a[:-1] + ',"arm":"B"}]',
+            "repeated legs container": '{' + schema + ',"legs":[null],"legs":[' + ok_a + ']}',
+            "envelope array beside valid items": '{' + schema + ',"legs":[' + ok_a + '],"proof":[]}',
+            "envelope array inside a valid item": '[' + ok_a[:-1] + ',"inputs":["x"]}]',
+            "nesting past depth 256 beside valid items": '{' + schema + ',"legs":[' + ok_a + '],"deep":' + "[" * 257 + "1" + "]" * 257 + '}',
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                self.assert_whole_plan_refused(self.write_plan_text(text), "LEG_PLAN_UNREADABLE")
+
     def test_a_legs_value_that_is_not_an_array_is_refused_not_wrapped_into_a_one_item_plan(self) -> None:
         one = self.item(self.specs[0], "A", self.commit_a)
         schema = "mlv-app/venue-lease-leg-plan/v1"
