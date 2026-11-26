@@ -28,6 +28,13 @@ from tools.repo_hygiene.test_dual_venue_evidence import (
 MODULE = DV / "DualVenueRunner.psm1"
 SCHEMA = "mlv-app/venue-display-path/v2"
 DOC = ROOT / "docs" / "dual-venue-evidence.md"
+# r1 adversary pass-1 A7: every harness temp dir carries an apostrophe, so a path is always quoted for a PowerShell single-quoted literal (psq)
+TMP_PREFIX = "dvp-o'neil-"
+
+
+def psq(path) -> str:
+    """A path as the body of a PowerShell single-quoted literal (a ' doubles)."""
+    return str(path).replace("'", "''")
 
 GOOD_BLOCK_TEXT = ('{"schema": "mlv-app/venue-display-path/v2", "source": "health-probe", '
                    '"adapters": ["Intel(R) Iris(R) Xe Graphics", "NVIDIA GeForce RTX 3060 Laptop GPU"], '
@@ -64,10 +71,10 @@ def with_block(block_text: str, venue_extra: str = "", root_extra: str = "") -> 
     return text
 
 
-def read_texts(texts: list[str], reader: str = "Read-DvReceiptDisplayPath") -> list[dict]:
+def read_texts(texts: list[str], reader: str = "Read-DvReceiptDisplayPath", prefix: str | None = None) -> list[dict]:
     """Run THE reader over each text in one pwsh; returns per text {state, reason, block, adapterTypes, threw}. The texts travel in a UTF-8 file read
     with System.Text.Json (never ConvertFrom-Json, so the harness itself cannot reinterpret a text)."""
-    with tempfile.TemporaryDirectory() as d:
+    with tempfile.TemporaryDirectory(prefix=prefix) as d:
         cases = Path(d) / "cases.json"
         cases.write_text(json.dumps(texts, ensure_ascii=True), encoding="utf-8")
         script = (
@@ -98,8 +105,8 @@ def cfj_reads(texts: list[str]) -> list[dict]:
             f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{cases}'))\n"
             "$out = @(foreach ($e in $doc.RootElement.EnumerateArray()) {\n"
             "  try { $o = $e.GetString() | ConvertFrom-Json; $b = $o.venue.displayPath\n"
-            "        [ordered]@{ ok = $true; device = [string]$b.primaryDisplayDevice; adapter0Type = $(if (@($b.adapters).Count -gt 0) { @($b.adapters)[0].GetType().FullName } else { $null }) } }\n"
-            "  catch { [ordered]@{ ok = $false; device = $null; adapter0Type = $null } }\n"
+            "        [ordered]@{ ok = $true; device = [string]$b.primaryDisplayDevice; adapterTypes = @(@($b.adapters) | ForEach-Object { $_.GetType().FullName }) } }\n"
+            "  catch { [ordered]@{ ok = $false; device = $null; adapterTypes = @() } }\n"
             "})\n"
             "Write-Output ('CASES=' + (ConvertTo-Json -InputObject $out -Depth 5 -Compress))\n"
         )
@@ -138,7 +145,9 @@ class GrammarParityA3Tests(unittest.TestCase):
     def test_the_premise_convertfrom_json_reads_these_texts_differently(self) -> None:
         self.assertTrue(self.cfj[0]["ok"])
         self.assertEqual(self.cfj[0]["device"], "\\\\.\\DISPLAY2", "premise: ConvertFrom-Json keeps the LAST of two same-name keys")
-        self.assertEqual(self.cfj[1]["adapter0Type"], "System.String")  # adapters[0] is the Intel name; the time text is adapters[1]
+        # r1 adversary pass-1 A5: the premise reads the TIME text (adapters[1]): ConvertFrom-Json makes it a [datetime], the reader keeps the text
+        self.assertEqual(self.cfj[1]["adapterTypes"], ["System.String", "System.DateTime"],
+                         "premise: ConvertFrom-Json reads a time-looking adapter name as a [datetime]")
 
     def test_each_grammar_difference_reads_malformed(self) -> None:
         for (label, _, want), got in zip(A3_ROWS, self.got):
@@ -342,6 +351,68 @@ class VenueLegWritesTheBlockTests(RunnerHarness, unittest.TestCase):
         self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
         self.assertEqual(receipt["outcome"], "VENUE_UNHEALTHY")
         self.assertEqual(receipt["venue"]["displayPath"]["adapters"], ["NVIDIA GeForce RTX 4090"])
+
+
+def extra_field(name_json: str, value_json: str) -> str:
+    return with_block(GOOD_BLOCK_TEXT[:-1] + ", " + name_json + ": " + value_json + "}")
+
+
+# r1 adversary pass-1 (5609f280). A1/A2: PowerShell's -ceq / -cne / -cnotcontains compare by CULTURE, which ignores a NUL, a soft hyphen (U+00AD) or a
+# combining grapheme joiner (U+034F), so an altered schema, source or field name compared equal. A3: ConvertFrom-Json turns a probe's escaped lone
+# surrogate into U+FFFD, so the writer copied a text that is not the one reported.
+A1_ROWS = [
+    ("a NUL inside the schema", with_block(GOOD_BLOCK_TEXT.replace("mlv-app/venue", "mlv\\u0000-app/venue"))),
+    ("a soft hyphen inside the schema", with_block(GOOD_BLOCK_TEXT.replace("mlv-app/venue", "mlv\\u00ad-app/venue"))),
+    ("a soft hyphen inside the source", with_block(GOOD_BLOCK_TEXT.replace('"health-probe"', '"health\\u00ad-probe"'))),
+    ("a NUL inside the source", with_block(GOOD_BLOCK_TEXT.replace('"health-probe"', '"health\\u0000-probe"'))),
+]
+A2_ROWS = [
+    ("an extra sche<NUL>ma holding a lone surrogate", extra_field('"sche\\u0000ma"', '{"anything": "\\ud800"}')),
+    ("an extra sou<SHY>rce", extra_field('"sou\\u00adrce"', '"x"')),
+    ("an extra ada<NUL>pters", extra_field('"ada\\u0000pters"', "[]")),
+    ("an extra firstAdapterDriver<SHY>Version", extra_field('"firstAdapterDriver\\u00adVersion"', "null")),
+    ("an extra primaryDisplay<CGJ>Device", extra_field('"primaryDisplay\\u034fDevice"', "null")),
+]
+A3_READER_ROWS = [
+    ("an escaped U+FFFD adapter name", with_block(GOOD_BLOCK_TEXT.replace("Intel(R) Iris(R) Xe Graphics", "Intel\\ufffd"))),
+    ("a raw U+FFFD driver version", with_block(GOOD_BLOCK_TEXT.replace("31.0.101.5186", "31.0�"))),
+    ("an escaped U+FFFD display device", with_block(GOOD_BLOCK_TEXT.replace("DISPLAY1", "DISPLAY\\ufffd"))),
+]
+
+
+@requires_windows_pwsh
+class AdversaryPass1Tests(unittest.TestCase):
+    """r1 adversary pass-1 on 5609f280: A1, A2, A3 (introduced majors) and the in-scope advisories A4, A7 (A5 is the premise row above)."""
+
+    def test_a1_a2_a3_altered_text_reads_malformed(self) -> None:
+        rows = A1_ROWS + A2_ROWS + A3_READER_ROWS
+        for (label, _), got in zip(rows, read_texts([t for _, t in rows])):
+            with self.subTest(label):
+                self.assertIsNone(got["threw"], got["threw"])
+                self.assertEqual(got["state"], "malformed", f"{label}: read {got['state']} ({got['reason']})")
+
+    def test_a3_a_lone_surrogate_in_the_probe_writes_no_block(self) -> None:
+        rows = [dict(HEALTHY_PROBE, gpuNames=["\ud800"]), dict(HEALTHY_PROBE, driverVersion="\ud800"), dict(HEALTHY_PROBE, displayDevice="\ud800"),
+                dict(HEALTHY_PROBE, gpuNames=["NVIDIA �"])]
+        for i, g in enumerate(writer_round_trip(rows)):
+            with self.subTest(i=i):
+                self.assertIsNone(g["threw"])
+                self.assertFalse(g["wrote"], "a probe text ConvertFrom-Json could not give back as reported is never present evidence")
+                self.assertEqual(g["state"], "NO_SIGNAL")
+
+    def test_a4_a_rank_two_gpu_names_array_writes_no_block(self) -> None:
+        script = (
+            f"Import-Module '{psq(MODULE)}' -Force\n"
+            "$g = [string[,]]::new(2, 2); $g[0, 0] = 'A'; $g[0, 1] = 'B'; $g[1, 0] = 'C'; $g[1, 1] = 'D'\n"
+            "$b = New-DvDisplayPathBlock -Probe @{ gpuNames = $g; driverVersion = $null; displayDevice = $null }\n"
+            "Write-Output ('OUT=' + ($null -eq $b))\n"
+        )
+        proc = run_pwsh(["-Command", script])
+        self.assertIn("OUT=True", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_a7_a_temp_path_with_an_apostrophe_still_reaches_the_reader(self) -> None:
+        got = read_texts([with_block(GOOD_BLOCK_TEXT)], prefix=TMP_PREFIX)[0]
+        self.assertEqual(got["state"], "present", got["reason"])
 
 
 class DocsTests(unittest.TestCase):
