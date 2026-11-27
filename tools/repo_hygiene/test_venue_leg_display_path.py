@@ -61,6 +61,28 @@ GOOD_BLOCK = {"schema": SCHEMA, "source": "health-probe",
               "firstAdapterDriverVersion": "31.0.101.5186", "primaryDisplayDevice": "\\\\.\\DISPLAY1"}
 
 
+# VENUE-LEG-DISPLAY-STATE-FIELDS-1: the v3 block is the v2 block plus `displayState`, eight { value, unknown } readings.
+SCHEMA_V3 = "mlv-app/venue-display-path/v3"
+STATE_FIELDS = ["displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate", "displays", "windowsBuild", "windowsUbr", "lastBootUtc", "hotfixCount"]
+UNKNOWN_REASONS = ["CIM_ERROR", "CIM_TIMEOUT", "CIM_EMPTY", "NO_ACTIVE_OUTPUT", "REGISTRY_ERROR", "DEADLINE", "NOT_REPORTED", "MALFORMED"]
+NOT_REPORTED_STATE = {f: {"value": None, "unknown": "NOT_REPORTED"} for f in STATE_FIELDS}
+GOOD_STATE = {
+    "displayAdapterName": {"value": "Intel(R) Iris(R) Xe Graphics", "unknown": None},
+    "displayAdapterDriverVersion": {"value": "31.0.101.5186", "unknown": None},
+    "displayAdapterDriverDate": {"value": "2024-05-14", "unknown": None},
+    "displays": {"value": [{"adapter": "Intel(R) Iris(R) Xe Graphics", "width": 3840, "height": 2400, "refreshHz": 59}], "unknown": None},
+    "windowsBuild": {"value": "26200", "unknown": None},
+    "windowsUbr": {"value": 10075, "unknown": None},
+    "lastBootUtc": {"value": "2026-11-21T07:12:09Z", "unknown": None},
+    "hotfixCount": {"value": 5, "unknown": None},
+}
+
+
+def v3(block: dict, state: dict | None = None) -> dict:
+    """A v2 block as the v3 block the writer now writes for it: same five fields, schema v3, `displayState` last."""
+    return dict(block, schema=SCHEMA_V3, displayState=NOT_REPORTED_STATE if state is None else state)
+
+
 def legacy_receipt() -> dict:
     """A receipt in fork/master's shape (New-DvReceipt's skeleton fields that matter here): no `venue.displayPath`."""
     return {
@@ -329,11 +351,12 @@ class RoundTripTests(unittest.TestCase):
         # the writer reads the probe line with System.Text.Json, so a time-looking device name is copied as the text the probe printed
         timeish = dict(HEALTHY_PROBE, displayDevice="2026-11-24T00:00:00Z")
         got = writer_round_trip([bachelor, nulls, one, timeish])
+        # VENUE-LEG-DISPLAY-STATE-FIELDS-1: the writer writes the v3 block; these probes carry no `displayState`, so every reading is typed NOT_REPORTED
         want = [
-            GOOD_BLOCK,
-            {"schema": SCHEMA, "source": "health-probe", "adapters": ["Microsoft Basic Display Adapter"], "firstAdapterDriverVersion": None, "primaryDisplayDevice": None},
-            {"schema": SCHEMA, "source": "health-probe", "adapters": ["NVIDIA GeForce RTX 4090"], "firstAdapterDriverVersion": "32.0.1", "primaryDisplayDevice": "\\\\.\\DISPLAY2"},
-            {"schema": SCHEMA, "source": "health-probe", "adapters": ["NVIDIA GeForce RTX 4090"], "firstAdapterDriverVersion": "32.0.1", "primaryDisplayDevice": "2026-11-24T00:00:00Z"},
+            v3(GOOD_BLOCK),
+            v3({"schema": SCHEMA, "source": "health-probe", "adapters": ["Microsoft Basic Display Adapter"], "firstAdapterDriverVersion": None, "primaryDisplayDevice": None}),
+            v3({"schema": SCHEMA, "source": "health-probe", "adapters": ["NVIDIA GeForce RTX 4090"], "firstAdapterDriverVersion": "32.0.1", "primaryDisplayDevice": "\\\\.\\DISPLAY2"}),
+            v3({"schema": SCHEMA, "source": "health-probe", "adapters": ["NVIDIA GeForce RTX 4090"], "firstAdapterDriverVersion": "32.0.1", "primaryDisplayDevice": "2026-11-24T00:00:00Z"}),
         ]
         self.assertEqual(len(got), len(want))
         for i, (g, w) in enumerate(zip(got, want)):
@@ -372,8 +395,8 @@ class VenueLegWritesTheBlockTests(RunnerHarness, unittest.TestCase):
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=probe, extra=["-HealthOnly"])
         self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
         self.assertEqual(receipt["venue"]["displayPath"],
-                         {"schema": SCHEMA, "source": "health-probe", "adapters": ["NVIDIA GeForce RTX 4090", "Microsoft Basic Display Adapter"],
-                          "firstAdapterDriverVersion": "32.0.1", "primaryDisplayDevice": "\\\\.\\DISPLAY2"})
+                         v3({"schema": SCHEMA, "source": "health-probe", "adapters": ["NVIDIA GeForce RTX 4090", "Microsoft Basic Display Adapter"],
+                             "firstAdapterDriverVersion": "32.0.1", "primaryDisplayDevice": "\\\\.\\DISPLAY2"}))
         files = sorted(self.receipts.rglob("*.json"), key=lambda f: f.stat().st_mtime_ns)
         got = read_texts([files[-1].read_text(encoding="utf-8")])[0]
         self.assertEqual(got["state"], "present", got["reason"])
@@ -1031,6 +1054,613 @@ class ResidueR1ReceiptTextTests(unittest.TestCase):
         self.assertIsNotNone(facts, "Get-DvReceiptTextDisplayPathFacts is defined in DualVenueRunner.psm1")
         self.assertIn("Test-DvMemberNameIs", facts.group(0))
         self.assertNotIn("StringComparison", facts.group(0), "the facts reader must not carry its own case rule")
+
+
+# ---------------------------------------------------------------------------------------------------------------------------------------------
+# VENUE-LEG-DISPLAY-STATE-FIELDS-1: the v3 block's `displayState` (the display-driving adapter, driver, each active display's mode, Windows build + UBR,
+# last boot, hotfix count). Written from the probe's own CIM reads, typed unknown (never a guess) when a read fails, times out or returns nothing, read by
+# the one strict reader, and a v2 receipt reads exactly as before.
+# ---------------------------------------------------------------------------------------------------------------------------------------------
+GOOD_V3 = v3(GOOD_BLOCK, GOOD_STATE)
+
+
+def probe_with_state(state, **over) -> dict:
+    probe = dict(HEALTHY_PROBE, **over)
+    probe["displayState"] = state
+    return probe
+
+
+def run_fragment(scenarios: list[dict]) -> list[dict]:
+    """Run the health probe's display-state fragment (New-DvDisplayStateProbeText) once per scenario, with Get-CimInstance and Get-ItemProperty shadowed
+    by test doubles, and return per scenario { line: the `DVE_PROBE=` line a probe would print, seen: the -OperationTimeoutSec the hotfix read was given }.
+    A scenario: gpus [{name, ver, date yyyyMMdd|None, w, h, hz}], gpuErr None|'timeout'|'error', os {build, boot yyyyMMddHHmmss}|None,
+    quick 'ok'|'throw'|'timeout'|'empty', reg 'ok'|'throw'|'text', budget None|<seconds>; optional: budgetText <a budget override handed over as text>,
+    zone <Windows time-zone id of the HOST to simulate: the driver date (and, with bootKind 'local', the boot time) reach the fragment as LOCAL-kind values in that zone>,
+    offsetMin <the DMTF UTC offset in minutes the driver date was reported with, default 0>."""
+    with tempfile.TemporaryDirectory(prefix=TMP_PREFIX) as d:
+        cases = Path(d) / "scenarios.json"
+        cases.write_text(json.dumps(scenarios, ensure_ascii=True), encoding="utf-8")
+        script = (
+            # adversary pass sol r2 A2: a CimException reports a WBEM timeout in its ErrorData (error_Code 0x80041069 = 2147749993) while NativeErrorCode reads `Failed`
+            "class FakeCimException : System.Exception { [string]$NativeErrorCode = 'Failed'; [object]$ErrorData\n"
+            "  FakeCimException([string]$m, [object]$data) : base($m) { $this.ErrorData = $data } }\n"
+            f"Import-Module '{psq(MODULE)}' -Force\n"
+            "$fragment = New-DvDisplayStateProbeText\n"
+            "function Get-CimInstance { [CmdletBinding()] param([string]$ClassName, [int]$OperationTimeoutSec)\n"
+            "  $script:seen = $OperationTimeoutSec\n"
+            "  switch ($script:quick) {\n"
+            "    'ok' { 1..5 | ForEach-Object { [pscustomobject]@{ HotFixID = \"KB$_\" } } }\n"
+            "    'throw' { throw 'the CIM provider failed' }\n"
+            "    'timeout' { throw [System.TimeoutException]::new('the operation timed out') }\n"
+            "    'wbem-timeout' { throw [FakeCimException]::new('The WS-Management service cannot complete the operation', [pscustomobject]@{ error_Code = [uint32]2147749993; CIMStatusCode = 1 }) }\n"
+            "    'empty' { } } }\n"
+            "function Get-ItemProperty { [CmdletBinding()] param([string]$LiteralPath, [string]$Name)\n"
+            "  $script:regCalled = $true\n"
+            "  switch ($script:reg) { 'ok' { [pscustomobject]@{ UBR = 10075 } } 'text' { [pscustomobject]@{ UBR = 'not a number' } } 'throw' { throw 'no such value' } } }\n"
+            "function Invoke-Scenario($s) {\n"
+            "  $script:seen = $null; $script:regCalled = $false; $script:quick = [string]$s.quick; $script:reg = [string]$s.reg\n"
+            "  if ($null -ne $s.budget) { $dsBudgetSec = [double]$s.budget }\n"
+            # r3 (opus key r1 hardening a): a budget override handed over as TEXT, the way a harness may, is not cast here
+            "  if ($null -ne $s.budgetText) { $dsBudgetSec = [string]$s.budgetText }\n"
+            "  $inv = [Globalization.CultureInfo]::InvariantCulture\n"
+            # r3 (opus key r1 blocker): `zone` is a Windows time-zone id naming the HOST the double pretends to run on. CIM hands the fragment a LOCAL-kind DateTime, the
+            # driver's instant shown in the host's zone; .NET cannot build a Local-kind value for another zone, so the double builds the wall-clock value of that zone and
+            # stamps it Local, and hands the fragment the zone through $dsLocalZone (a test seam: production never sets it). `offsetMin` is the DMTF UTC offset the
+            # driver date was reported with (default 0 = `20240514000000.000000-000`). Neither depends on the zone the test runs in.
+            "  $dsLocalZone = $null\n"
+            "  $zone = $null\n"
+            "  if ($s.zone) { $zone = [TimeZoneInfo]::FindSystemTimeZoneById([string]$s.zone); $dsLocalZone = $zone }\n"
+            "  $offsetMin = $(if ($null -ne $s.offsetMin) { [int]$s.offsetMin } else { 0 })\n"
+            "  $probe = [ordered]@{}\n"
+            "  $os = $null\n"
+            "  $bootUtc = $(if ($null -ne $s.os) { [datetime]::SpecifyKind([datetime]::ParseExact([string]$s.os.boot, 'yyyyMMddHHmmss', $inv), 'Utc') } else { $null })\n"
+            "  if ($null -ne $bootUtc -and $zone -and $s.bootKind -eq 'local') { $bootUtc = [datetime]::SpecifyKind([TimeZoneInfo]::ConvertTimeFromUtc($bootUtc, $zone), 'Local') }\n"
+            "  if ($null -ne $s.os) { $os = [pscustomobject]@{ BuildNumber = $s.os.build; LastBootUpTime = $bootUtc } }\n"
+            "  $gpus = @($s.gpus | ForEach-Object { [pscustomobject]@{ Name = $_.name; DriverVersion = $_.ver;\n"
+            "      DriverDate = $(if (-not $_.date) { $null } elseif ($zone) { [datetime]::SpecifyKind([TimeZoneInfo]::ConvertTimeFromUtc([datetime]::SpecifyKind([datetime]::ParseExact([string]$_.date, 'yyyyMMdd', $inv).AddMinutes(-$offsetMin), 'Utc'), $zone), 'Local') } else { [datetime]::ParseExact([string]$_.date, 'yyyyMMdd', $inv) });\n"
+            "      CurrentHorizontalResolution = $_.w; CurrentVerticalResolution = $_.h; CurrentRefreshRate = $_.hz } })\n"
+            "  $gpuErr = @()\n"
+            "  if ($s.gpuErr -eq 'timeout') { $gpuErr = @([System.Management.Automation.ErrorRecord]::new([System.TimeoutException]::new('t'), 'e', [System.Management.Automation.ErrorCategory]::OperationTimeout, $null)) }\n"
+            "  if ($s.gpuErr -eq 'wbem-timeout') { $gpuErr = @([System.Management.Automation.ErrorRecord]::new([FakeCimException]::new('x', [pscustomobject]@{ error_Code = [uint32]2147749993 }), 'e', [System.Management.Automation.ErrorCategory]::OperationTimeout, $null)) }\n"
+            "  if ($s.gpuErr -eq 'error') { $gpuErr = @([System.Management.Automation.ErrorRecord]::new([System.InvalidOperationException]::new('x'), 'e', [System.Management.Automation.ErrorCategory]::InvalidOperation, $null)) }\n"
+            "  . ([scriptblock]::Create($fragment))\n"
+            "  $wrap = [ordered]@{ gpuNames = @('Probe Adapter'); driverVersion = '1.0'; displayDevice = 'D'; displayState = $probe.displayState }\n"
+            "  [ordered]@{ line = ('DVE_PROBE=' + ($wrap | ConvertTo-Json -Compress -Depth 6)); seen = $script:seen; regCalled = $script:regCalled; budget = $dsBudgetSec; budgetType = $(if ($null -ne $dsBudgetSec) { $dsBudgetSec.GetType().Name } else { $null }) }\n"
+            "}\n"
+            f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{psq(cases)}'))\n"
+            "$out = @(foreach ($e in $doc.RootElement.EnumerateArray()) { Invoke-Scenario ($e.GetRawText() | ConvertFrom-Json) })\n"
+            "Write-Output ('CASES=' + (ConvertTo-Json -InputObject $out -Depth 4 -Compress))\n"
+        )
+        proc = run_pwsh(["-Command", script])
+    return cases_line(proc, len(scenarios), "display-state fragment")
+
+
+INTEL = {"name": "Intel(R) Iris(R) Xe Graphics", "ver": "31.0.101.5186", "date": "20240514", "w": 3840, "h": 2400, "hz": 59}
+NVIDIA_HEADLESS = {"name": "NVIDIA GeForce RTX 3060 Laptop GPU", "ver": "32.0.15.6094", "date": "20240601", "w": None, "h": None, "hz": None}
+SCENARIO_OK = {"gpus": [NVIDIA_HEADLESS, INTEL], "gpuErr": None, "os": {"build": "26200", "boot": "20261121071209"}, "quick": "ok", "reg": "ok", "budget": None}
+
+
+def state_of(line: str) -> dict:
+    """The writer's v3 block's displayState for one `DVE_PROBE=` line."""
+    got = writer_round_trip([line + "\n"])[0]
+    assert got["state"] == "present", got
+    return got["block"]["displayState"]
+
+
+@requires_windows_pwsh
+class DisplayStateFragmentTests(unittest.TestCase):
+    """The probe fragment: what it records for a healthy venue and what it records when a read fails, times out, returns nothing or has no budget left."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        def sc(**over):
+            return dict(SCENARIO_OK, **over)
+        cls.names = ["healthy", "no-controller-error", "no-controller-timeout", "no-controller-empty", "no-active-mode", "quick-throws", "quick-times-out",
+                     "quick-empty", "registry-throws", "registry-text", "no-budget", "no-os", "no-driver-date", "two-active",
+                     "partial-then-timeout", "headless-only-then-error", "partial-then-error-active",
+                     "wbem-quick-timeout", "wbem-controller-timeout", "refresh-sentinel", "width-sentinel", "budget-override-60",
+                     "no-refresh-first-then-good", "sentinel-first-then-good", "no-refresh-only", "no-refresh-then-no-resolution",
+                     # r3 (opus key r1 blocker, catalogue row DT-01 cim-datetime-local-shift)
+                     "date-utc-6-host", "date-utc-8-host-winter", "date-utc-plus-9-host", "date-utc-host", "date-dmtf-offset-minus-360-utc-6-host", "date-unspecified-kind",
+                     "boot-local-kind-utc-6-host", "boot-local-kind-utc-plus-9-host",
+                     # r3 (opus key r1 hardening a): a budget override handed over as text
+                     "budget-text-100", "budget-text-5", "budget-text-junk", "budget-text-nan", "budget-text-negative", "budget-number-5"]
+        cls.rows = run_fragment([
+            sc(),
+            sc(gpus=[], gpuErr="error"),
+            sc(gpus=[], gpuErr="timeout"),
+            sc(gpus=[], gpuErr=None),
+            sc(gpus=[NVIDIA_HEADLESS]),
+            sc(quick="throw"),
+            sc(quick="timeout"),
+            sc(quick="empty"),
+            sc(reg="throw"),
+            sc(reg="text"),
+            sc(budget=0),
+            sc(os=None),
+            sc(gpus=[dict(INTEL, date=None)]),
+            sc(gpus=[INTEL, dict(INTEL, name="Second Adapter", w=1920, h=1080, hz=60)]),
+            # adversary pass sol r1 A4: the enumeration returned objects AND recorded an error: the result is incomplete, so it is never published
+            sc(gpus=[NVIDIA_HEADLESS], gpuErr="timeout"),
+            sc(gpus=[NVIDIA_HEADLESS], gpuErr="error"),
+            sc(gpus=[INTEL], gpuErr="error"),
+            sc(quick="wbem-timeout"),
+            sc(gpus=[], gpuErr="wbem-timeout"),
+            # adversary pass sol r2 A1: uint32 0xFFFFFFFF is the documented "optimal refresh rate" sentinel; a signed conversion of it throws
+            sc(gpus=[dict(INTEL, hz=4294967295)]),
+            sc(gpus=[dict(INTEL, w=4294967295)]),
+            sc(budget=60),
+            # adversary pass sol r3 A1: the active controller needs width, height AND refresh (the docs' rule), so a first controller with no usable refresh is skipped
+            sc(gpus=[dict(INTEL, name="A", ver="1", date="20240101", w=1920, h=1080, hz=0), dict(INTEL, name="B", ver="2", date="20240201", w=3840, h=2400, hz=60)]),
+            sc(gpus=[dict(INTEL, name="A", ver="1", date="20240101", w=1920, h=1080, hz=4294967295), dict(INTEL, name="B", ver="2", date="20240201", w=3840, h=2400, hz=60)]),
+            sc(gpus=[dict(INTEL, hz=0)]),
+            sc(gpus=[dict(INTEL, hz=0), NVIDIA_HEADLESS]),
+            # r3 DT-01: CIM gives a LOCAL-kind DateTime. The driver DMTF `20240514000000.000000-000` read on a UTC-6 host shows as 2024-05-13 evening
+            sc(zone="Central Standard Time"),
+            sc(gpus=[dict(INTEL, date="20240114")], zone="Pacific Standard Time"),
+            sc(zone="Tokyo Standard Time"),
+            sc(zone="UTC"),
+            sc(zone="Central Standard Time", gpus=[dict(INTEL, date="20240514")], offsetMin=-360),
+            sc(),
+            sc(zone="Central Standard Time", os={"build": "26200", "boot": "20261121071209"}, bootKind="local"),
+            sc(zone="Tokyo Standard Time", os={"build": "26200", "boot": "20261121071209"}, bootKind="local"),
+            sc(budgetText="100"), sc(budgetText="5"), sc(budgetText="not a number"), sc(budgetText="NaN"), sc(budgetText="-3"), sc(budget=5),
+        ])
+        cls.states = {n: state_of(r["line"]) for n, r in zip(cls.names, cls.rows)}
+
+    def unknown(self, name: str, *fields: str, why: str) -> None:
+        for f in fields:
+            self.assertEqual(self.states[name][f], {"value": None, "unknown": why}, f"{name}: {f}")
+
+    def test_a_healthy_venue_records_every_field(self) -> None:
+        got = self.states["healthy"]
+        self.assertEqual(got, GOOD_STATE)
+
+    def test_the_display_driving_adapter_is_the_one_with_a_current_mode_not_the_first_listed(self) -> None:
+        got = self.states["healthy"]
+        self.assertEqual(got["displayAdapterName"]["value"], INTEL["name"], "the headless NVIDIA adapter listed first drives no display")
+        self.assertEqual(got["displays"]["value"], [{"adapter": INTEL["name"], "width": 3840, "height": 2400, "refreshHz": 59}])
+
+    def test_two_active_displays_are_both_listed(self) -> None:
+        self.assertEqual(self.states["two-active"]["displays"]["value"],
+                         [{"adapter": INTEL["name"], "width": 3840, "height": 2400, "refreshHz": 59},
+                          {"adapter": "Second Adapter", "width": 1920, "height": 1080, "refreshHz": 60}])
+
+    def test_a_video_controller_read_that_failed_times_out_or_returned_nothing_is_a_typed_unknown(self) -> None:
+        adapter_fields = ("displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate", "displays")
+        self.unknown("no-controller-error", *adapter_fields, why="CIM_ERROR")
+        self.unknown("no-controller-timeout", *adapter_fields, why="CIM_TIMEOUT")
+        self.unknown("no-controller-empty", *adapter_fields, why="CIM_EMPTY")
+        self.unknown("no-active-mode", *adapter_fields, why="NO_ACTIVE_OUTPUT")
+        # the OS-level readings are untouched by it
+        self.assertEqual(self.states["no-controller-error"]["windowsBuild"], GOOD_STATE["windowsBuild"])
+
+    def test_the_hotfix_read_that_throws_times_out_or_returns_nothing_is_a_typed_unknown_and_nothing_else_changes(self) -> None:
+        self.unknown("quick-throws", "hotfixCount", why="CIM_ERROR")
+        self.unknown("quick-times-out", "hotfixCount", why="CIM_TIMEOUT")
+        self.unknown("quick-empty", "hotfixCount", why="CIM_EMPTY")
+        for name in ("quick-throws", "quick-times-out", "quick-empty"):
+            rest = {k: v for k, v in self.states[name].items() if k != "hotfixCount"}
+            self.assertEqual(rest, {k: v for k, v in GOOD_STATE.items() if k != "hotfixCount"}, name)
+
+    def test_the_hotfix_read_is_bounded_by_its_own_operation_timeout_inside_the_budget(self) -> None:
+        seen = self.rows[self.names.index("healthy")]["seen"]
+        self.assertIsNotNone(seen, "the hotfix read must pass -OperationTimeoutSec")
+        self.assertTrue(1 <= seen <= 15, f"the hotfix read's operation timeout is {seen} s; it must be 1..15")
+
+    def test_a_read_with_no_budget_left_is_never_started(self) -> None:
+        self.unknown("no-budget", "hotfixCount", "windowsUbr", why="DEADLINE")
+        row = self.rows[self.names.index("no-budget")]
+        self.assertIsNone(row["seen"], "the CIM class was read although the budget was spent")
+        self.assertFalse(row["regCalled"], "adversary pass sol r1 A3: the registry was read although the budget was spent")
+
+    def test_a_wbem_timeout_carried_in_the_error_data_is_cim_timeout(self) -> None:
+        """adversary pass sol r2 A2: NativeErrorCode reads `Failed` and there is no TimeoutException; the timeout is in ErrorData.error_Code (0x80041069)."""
+        self.unknown("wbem-quick-timeout", "hotfixCount", why="CIM_TIMEOUT")
+        self.unknown("wbem-controller-timeout", "displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate", "displays", why="CIM_TIMEOUT")
+
+    def test_an_out_of_range_controller_number_never_nulls_the_whole_state(self) -> None:
+        """adversary pass sol r2 A1: a refresh rate of 4294967295 (uint32 sentinel) must not make a signed conversion throw and drop all eight readings."""
+        got = self.states["refresh-sentinel"]
+        # adversary pass sol r3 A1: a controller with no usable refresh is not an active controller (the docs' rule), so no adapter is chosen from it
+        self.unknown("refresh-sentinel", "displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate", why="NO_ACTIVE_OUTPUT")
+        self.assertEqual(got["displays"], {"value": None, "unknown": "CIM_EMPTY"}, "a controller with a resolution and no usable refresh rate lists no guessed display")
+        for f in ("windowsBuild", "windowsUbr", "lastBootUtc", "hotfixCount"):
+            self.assertEqual(got[f], GOOD_STATE[f], f)
+        wide = self.states["width-sentinel"]
+        self.unknown("width-sentinel", "displayAdapterName", "displays", why="NO_ACTIVE_OUTPUT")
+        self.assertEqual(wide["windowsBuild"], GOOD_STATE["windowsBuild"])
+
+    def test_the_active_controller_is_the_first_with_width_height_and_refresh_all_usable(self) -> None:
+        """adversary pass sol r3 A1: [A: 1920x1080 refresh 0] then [B: 3840x2400 @60] publishes B's name, driver, date and mode, as docs/dual-venue-evidence.md says."""
+        for name in ("no-refresh-first-then-good", "sentinel-first-then-good"):
+            got = self.states[name]
+            self.assertEqual(got["displayAdapterName"], {"value": "B", "unknown": None}, name)
+            self.assertEqual(got["displayAdapterDriverVersion"], {"value": "2", "unknown": None}, name)
+            self.assertEqual(got["displayAdapterDriverDate"], {"value": "2024-02-01", "unknown": None}, name)
+            self.assertEqual(got["displays"], {"value": [{"adapter": "B", "width": 3840, "height": 2400, "refreshHz": 60}], "unknown": None}, name)
+            for f in ("windowsBuild", "windowsUbr", "lastBootUtc", "hotfixCount"):
+                self.assertEqual(got[f], GOOD_STATE[f], f"{name}: {f}")
+
+    def test_a_sample_whose_controllers_have_no_usable_refresh_is_typed_not_guessed(self) -> None:
+        """hub ruling 20261127T0957Z: an all-no-refresh sample is NO_ACTIVE_OUTPUT for the adapter fields and CIM_EMPTY for `displays`; a sample whose only other
+        controller reports no resolution at all reads the same."""
+        for name in ("no-refresh-only", "no-refresh-then-no-resolution"):
+            self.unknown(name, "displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate", why="NO_ACTIVE_OUTPUT")
+            self.unknown(name, "displays", why="CIM_EMPTY")
+            self.assertEqual(self.states[name]["windowsBuild"], GOOD_STATE["windowsBuild"])
+
+    def test_the_test_override_cannot_widen_the_budget_past_30_seconds(self) -> None:
+        """adversary pass sol r2 A4 (minor): a pre-set budget above 30 s is clamped to 30."""
+        text = MODULE.read_text(encoding="utf-8")
+        frag = re.search(r"function New-DvDisplayStateProbeText \{.*?^\}", text, re.S | re.M).group(0)
+        self.assertIn("[math]::Min(30.0, $dsBudgetN)", frag)
+        self.assertEqual(self.states["budget-override-60"], GOOD_STATE)
+
+    def budget_of(self, name: str) -> tuple:
+        row = self.rows[self.names.index(name)]
+        return row["budget"], row["budgetType"]
+
+    def test_a_budget_override_handed_over_as_text_is_a_number_and_is_clamped_like_one(self) -> None:
+        """opus key r1 hardening a (advisory A1 of the r2 adversary pass): '100' compared as text (`'100' -gt 30` is false) escaped the 30 s clamp."""
+        self.assertEqual(self.budget_of("budget-text-100"), (30, "Double"))
+        self.assertEqual(self.budget_of("budget-text-5"), (5, "Double"))
+        self.assertEqual(self.budget_of("budget-number-5"), (5, "Double"))
+        self.assertEqual(self.budget_of("budget-override-60"), (30, "Double"))
+        # an override that is no number, or NaN (every comparison with NaN is false, so it would never run out), is the 30 s default; a negative one is no budget at all
+        self.assertEqual(self.budget_of("budget-text-junk"), (30, "Double"))
+        self.assertEqual(self.budget_of("budget-text-nan"), (30, "Double"))
+        self.assertEqual(self.budget_of("budget-text-negative"), (0, "Double"))
+        self.unknown("budget-text-negative", "hotfixCount", "windowsUbr", why="DEADLINE")
+        self.assertEqual(self.states["budget-text-100"], GOOD_STATE)
+        self.assertEqual(self.states["budget-text-5"], GOOD_STATE)
+
+    def test_the_driver_date_is_the_calendar_date_the_driver_reports_on_any_host_zone(self) -> None:
+        """opus key r1 BLOCKER, catalogue row DT-01 (cim-datetime-local-shift). CIM hands the fragment a LOCAL-kind DateTime. The driver's DMTF value
+        `20240514000000.000000-000` read on a UTC-6 host shows as the evening of 2024-05-13, and formatting that value gave `2024-05-13`. The double builds
+        the Local-kind value of the simulated host zone and hands the fragment that zone ($dsLocalZone), so the row is red on a UTC runner too."""
+        for name in ("date-utc-6-host", "date-utc-plus-9-host", "date-utc-host", "date-dmtf-offset-minus-360-utc-6-host", "date-unspecified-kind"):
+            with self.subTest(name):
+                self.assertEqual(self.states[name]["displayAdapterDriverDate"], {"value": "2024-05-14", "unknown": None})
+                self.assertEqual(self.states[name], GOOD_STATE)
+        self.assertEqual(self.states["date-utc-8-host-winter"]["displayAdapterDriverDate"], {"value": "2024-01-14", "unknown": None})
+
+    def test_the_last_boot_time_is_the_utc_instant_on_any_host_zone(self) -> None:
+        """DT-01 sibling: `lastBootUtc` is the other CIM DateTime the fragment formats; it was already converted, now through the same one seam."""
+        for name in ("boot-local-kind-utc-6-host", "boot-local-kind-utc-plus-9-host"):
+            with self.subTest(name):
+                self.assertEqual(self.states[name]["lastBootUtc"], {"value": "2026-11-21T07:12:09Z", "unknown": None})
+                self.assertEqual(self.states[name], GOOD_STATE)
+
+    def test_every_cim_datetime_the_fragment_formats_goes_through_the_one_utc_conversion(self) -> None:
+        """DT-01 sweep: no `.ToString('yyyy` on a CIM DateTime outside the one helper's result."""
+        text = MODULE.read_text(encoding="utf-8")
+        frag = re.search(r"function New-DvDisplayStateProbeText \{.*?^\}", text, re.S | re.M).group(0)
+        self.assertIn("function ConvertTo-DsUtc", frag)
+        self.assertNotIn("$first.DriverDate.ToString", frag)
+        self.assertIn("ConvertTo-DsUtc $first.DriverDate", frag)
+        self.assertIn("ConvertTo-DsUtc $os.LastBootUpTime", frag)
+        self.assertEqual(len(re.findall(r"\.ToString\('yyyy", frag)), 2, "the driver date and the boot time are the only two DateTime formats")
+
+    def test_an_error_beside_returned_controllers_is_never_published_as_display_state(self) -> None:
+        """adversary pass sol r1 A4: a controller enumeration that returned objects but also recorded an error (a timeout, say) is incomplete: the four
+        adapter readings carry the failure, not NO_ACTIVE_OUTPUT and not a partial list. The OS readings are untouched."""
+        adapter_fields = ("displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate", "displays")
+        self.unknown("partial-then-timeout", *adapter_fields, why="CIM_TIMEOUT")
+        self.unknown("headless-only-then-error", *adapter_fields, why="CIM_ERROR")
+        self.unknown("partial-then-error-active", *adapter_fields, why="CIM_ERROR")
+        self.assertEqual(self.states["partial-then-error-active"]["windowsBuild"], GOOD_STATE["windowsBuild"])
+
+    def test_the_registry_ubr_failing_or_not_a_number_is_a_typed_unknown(self) -> None:
+        self.unknown("registry-throws", "windowsUbr", why="REGISTRY_ERROR")
+        self.unknown("registry-text", "windowsUbr", why="REGISTRY_ERROR")
+
+    def test_an_absent_operating_system_record_is_a_typed_unknown(self) -> None:
+        self.unknown("no-os", "windowsBuild", "lastBootUtc", why="CIM_EMPTY")
+
+    def test_a_driver_with_no_date_is_a_typed_unknown(self) -> None:
+        self.unknown("no-driver-date", "displayAdapterDriverDate", why="CIM_EMPTY")
+        self.assertEqual(self.states["no-driver-date"]["displayAdapterName"]["value"], INTEL["name"])
+
+    def test_the_fragment_reads_nothing_beyond_one_cim_class_and_one_registry_value(self) -> None:
+        text = (MODULE.read_text(encoding="utf-8"))
+        frag = re.search(r"function New-DvDisplayStateProbeText \{.*?^\}", text, re.S | re.M).group(0)
+        body = frag[frag.index("@'"):]
+        for banned in ("Start-Process", "Invoke-WebRequest", "Invoke-RestMethod", "Invoke-Expression", "Invoke-Command", "Set-", "Remove-", "Out-File", "Add-Content",
+                       "New-Item", "Stop-", "Restart-", "Register-", "Enable-", "Disable-", "pwsh", "powershell", "net.exe", "wmic", "reg.exe", "dxdiag"):
+            self.assertNotIn(banned, body, f"the display-state fragment must stay a read: {banned}")
+        self.assertEqual(re.findall(r"Get-CimInstance -ClassName (\w+)", body), ["Win32_QuickFixEngineering"],
+                         "the fragment makes exactly one CIM read of its own; the rest comes from the probe's reads")
+        self.assertIn("-OperationTimeoutSec", body)
+        self.assertEqual(re.findall(r"Get-ItemProperty -LiteralPath '([^']+)'", body), ["HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion"])
+
+
+@requires_windows_pwsh
+class DisplayStateProbeJobTests(unittest.TestCase):
+    def test_the_health_probe_job_carries_the_fragment_between_its_reads_and_its_one_output_line(self) -> None:
+        script = ("$p = New-DvHealthProbeJobText -AgentRoot 'C:\\mlvtmp\\mlv-agent'\n"
+                  "$f = New-DvDisplayStateProbeText\n"
+                  "$tok = $null; $err = $null; [void][System.Management.Automation.Language.Parser]::ParseInput($p, [ref]$tok, [ref]$err)\n"
+                  "[ordered]@{ embeds = $p.Contains($f); parseErrors = @($err).Count; gpuAt = $p.IndexOf('$gpus = @(Get-CimInstance'); fragAt = $p.IndexOf($f);\n"
+                  "  printAt = $p.IndexOf('DVE_PROBE='); errVar = $p.Contains('-ErrorVariable gpuErr'); depth6 = $p.Contains('-Compress -Depth 6');\n"
+                  "  lines = @([regex]::Matches($p, 'Write-Output')).Count } | ConvertTo-Json -Compress\n")
+        proc = run_pwsh(["-Command", "Import-Module '" + psq(MODULE) + "' -Force\n" + script])
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(out["embeds"])
+        self.assertEqual(out["parseErrors"], 0)
+        self.assertTrue(0 < out["gpuAt"] < out["fragAt"] < out["printAt"])
+        self.assertTrue(out["errVar"], "the probe's own video-controller read keeps its error, so a failed read is typed CIM_ERROR and not CIM_EMPTY")
+        self.assertTrue(out["depth6"], "the nested readings need a deeper ConvertTo-Json than the old -Depth 4")
+        self.assertEqual(out["lines"], 1, "the probe still prints ONE line")
+
+
+@requires_windows_pwsh
+class DisplayStateWriterTests(unittest.TestCase):
+    """New-DvDisplayPathBlock: the v3 block's readings, copied as the probe reported them, typed when they cannot be."""
+
+    def test_a_probe_with_every_reading_writes_every_value(self) -> None:
+        got = writer_round_trip([probe_with_state(GOOD_STATE, gpuNames=GOOD_BLOCK["adapters"], driverVersion="31.0.101.5186", displayDevice="\\\\.\\DISPLAY1")])[0]
+        self.assertEqual(got["state"], "present", got["reason"])
+        self.assertEqual(got["block"], GOOD_V3)
+        self.assertEqual(list(got["block"].keys()), ["schema", "source", "adapters", "firstAdapterDriverVersion", "primaryDisplayDevice", "displayState"])
+        self.assertEqual(list(got["block"]["displayState"].keys()), STATE_FIELDS)
+
+    def test_each_new_field_is_written_alone(self) -> None:
+        """one subtest per field: a block that lacks it, or carries it wrong, fails here (the RED row on a base without the field)."""
+        got = writer_round_trip([probe_with_state(GOOD_STATE)])[0]
+        self.assertEqual(got["state"], "present", got["reason"])
+        for f in STATE_FIELDS:
+            with self.subTest(field=f):
+                self.assertEqual(got["block"].get("displayState", {}).get(f), GOOD_STATE[f])
+
+    def test_a_probe_with_no_display_state_types_every_field_not_reported(self) -> None:
+        for probe in (dict(HEALTHY_PROBE), probe_with_state(None)):
+            got = writer_round_trip([probe])[0]
+            self.assertEqual(got["state"], "present", got["reason"])
+            self.assertEqual(got["block"]["displayState"], NOT_REPORTED_STATE)
+
+    def test_every_typed_unknown_reason_round_trips(self) -> None:
+        for reason in UNKNOWN_REASONS:
+            with self.subTest(reason=reason):
+                state = {f: {"value": None, "unknown": reason} for f in STATE_FIELDS}
+                got = writer_round_trip([probe_with_state(state)])[0]
+                self.assertEqual(got["state"], "present", got["reason"])
+                self.assertEqual(got["block"]["displayState"], state)
+
+    def test_a_reading_the_probe_reports_wrongly_is_malformed_and_only_that_one(self) -> None:
+        def with_(f, reading):
+            return dict(GOOD_STATE, **{f: reading})
+        bad = {
+            "displayAdapterName": [{"value": 7, "unknown": None}, {"value": "x", "unknown": "CIM_ERROR"}, {"value": None, "unknown": None}, {"value": "", "unknown": None},
+                                   {"value": None, "unknown": "SOMETHING_ELSE"}, {"value": "x", "unknown": None, "extra": 1}, {"value": "x"}, "x", None, {"value": "a?b", "unknown": None}],
+            "displayAdapterDriverDate": [{"value": "2024-13-45", "unknown": None}, {"value": "14/05/2024", "unknown": None}],
+            "displays": [{"value": [], "unknown": None}, {"value": [{"adapter": "x", "width": 0, "height": 1, "refreshHz": 1}], "unknown": None},
+                         {"value": [{"adapter": "x", "width": 1, "height": 1}], "unknown": None}, {"value": "1920x1080", "unknown": None},
+                         {"value": [{"adapter": "x", "width": 1.5, "height": 1, "refreshHz": 1}], "unknown": None}],
+            # adversary pass sol r1 A1: a trailing LF is not a digit (a `$`-anchored match accepts it)
+            "windowsBuild": [{"value": 26200, "unknown": None}, {"value": "26200.1", "unknown": None}, {"value": "26200\n", "unknown": None}],
+            "windowsUbr": [{"value": -1, "unknown": None}, {"value": "10075", "unknown": None}, {"value": 1.5, "unknown": None}],
+            "lastBootUtc": [{"value": "2026-11-21 07:12:09", "unknown": None}, {"value": "2026-11-21T07:12:09+00:00", "unknown": None}],
+            "hotfixCount": [{"value": -3, "unknown": None}, {"value": True, "unknown": None}],
+        }
+        rows = [(f, r) for f, readings in bad.items() for r in readings]
+        got = writer_round_trip([probe_with_state(with_(f, r)) for f, r in rows])
+        for (f, r), g in zip(rows, got):
+            with self.subTest(field=f, reading=r):
+                self.assertEqual(g["state"], "present", g["reason"])
+                state = g["block"]["displayState"]
+                self.assertEqual(state[f], {"value": None, "unknown": "MALFORMED"})
+                self.assertEqual({k: v for k, v in state.items() if k != f}, {k: v for k, v in GOOD_STATE.items() if k != f}, "every other reading is kept")
+
+    def test_a_display_state_that_is_not_an_object_or_is_doubled_is_malformed_on_every_field(self) -> None:
+        for probe in (probe_with_state("up"), probe_with_state([1, 2]), "DVE_PROBE=" + json.dumps(dict(HEALTHY_PROBE)).replace("}", ', "displayState": null, "DisplayState": {}}', 1) + "\n"):
+            got = writer_round_trip([probe])[0]
+            with self.subTest(probe=str(probe)[:60]):
+                self.assertEqual(got["state"], "present", got["reason"])
+                self.assertEqual(got["block"]["displayState"], {f: {"value": None, "unknown": "MALFORMED"} for f in STATE_FIELDS})
+
+    def test_a_field_the_probe_leaves_out_is_not_reported_and_the_rest_are_kept(self) -> None:
+        part = {k: v for k, v in GOOD_STATE.items() if k not in ("windowsUbr", "hotfixCount")}
+        got = writer_round_trip([probe_with_state(part)])[0]
+        state = got["block"]["displayState"]
+        self.assertEqual(state["windowsUbr"], {"value": None, "unknown": "NOT_REPORTED"})
+        self.assertEqual(state["hotfixCount"], {"value": None, "unknown": "NOT_REPORTED"})
+        self.assertEqual(state["windowsBuild"], GOOD_STATE["windowsBuild"])
+
+    def test_a_time_looking_text_stays_the_text_the_probe_printed(self) -> None:
+        got = writer_round_trip([probe_with_state(GOOD_STATE)])[0]
+        self.assertEqual(got["block"]["displayState"]["lastBootUtc"]["value"], "2026-11-21T07:12:09Z")
+        self.assertEqual(got["block"]["displayState"]["displayAdapterDriverDate"]["value"], "2024-05-14")
+
+
+@requires_windows_pwsh
+class DisplayStateEscapeTests(RunnerHarness, unittest.TestCase):
+    """Control and line-separator characters in an adapter or display name are escaped, never written raw into a record line."""
+
+    NASTY = {"nl": "A\nB", "cr": "A\rB", "tab": "A\tB", "nul": "A\x00B", "esc": "A\x1bB", "nel": "A\x85B", "ls": "A\u2028B", "ps": "A\u2029B", "del": "A\x7fB"}
+
+    def test_a_name_with_a_control_or_separator_is_escaped_in_every_name_field(self) -> None:
+        rows = list(self.NASTY.items())
+        probes = [probe_with_state(dict(GOOD_STATE, displayAdapterName={"value": bad, "unknown": None},
+                                        displays={"value": [{"adapter": bad, "width": 1, "height": 1, "refreshHz": 1}], "unknown": None}),
+                                   gpuNames=[bad], displayDevice=bad, driverVersion=bad) for _, bad in rows]
+        got = writer_round_trip(probes)
+        for (name, bad), g in zip(rows, got):
+            with self.subTest(name):
+                self.assertEqual(g["state"], "present", g["reason"])
+                escaped = "A\\u%04xB" % ord(bad[1])
+                block = g["block"]
+                self.assertEqual(block["adapters"], [escaped])
+                self.assertEqual(block["primaryDisplayDevice"], escaped)
+                self.assertEqual(block["firstAdapterDriverVersion"], escaped)
+                self.assertEqual(block["displayState"]["displayAdapterName"]["value"], escaped)
+                self.assertEqual(block["displayState"]["displays"]["value"][0]["adapter"], escaped)
+                for text in (block["adapters"][0], block["primaryDisplayDevice"], block["displayState"]["displayAdapterName"]["value"]):
+                    self.assertFalse(re.search(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]", text), "no raw control or line-separator character survives")
+
+    def test_a_leg_receipt_file_holds_no_raw_separator_from_a_name(self) -> None:
+        self.make_harness()
+        bad = "Name\u2028With\u2029Sep\x85\x0b"
+        probe = probe_with_state(GOOD_STATE, gpuNames=[bad, "Plain"], displayDevice=bad)
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=probe, extra=["-HealthOnly"])
+        self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+        files = sorted(self.receipts.rglob("*.json"), key=lambda f: f.stat().st_mtime_ns)
+        text = files[-1].read_text(encoding="utf-8")
+        self.assertFalse(re.search(r"[\x0b\x0c\x85\u2028\u2029]", text), "the receipt file holds a raw line separator")
+        self.assertIn("Name\\u2028With\\u2029Sep\\u0085\\u000b", receipt["venue"]["displayPath"]["adapters"][0])
+        self.assertEqual(read_texts([text])[0]["state"], "present")
+
+    def test_the_reader_refuses_a_v3_block_that_still_holds_a_raw_separator(self) -> None:
+        for name, bad in self.NASTY.items():
+            for where in ("adapters", "primaryDisplayDevice", "firstAdapterDriverVersion", "displayAdapterName", "displays"):
+                block = json.loads(json.dumps(GOOD_V3))
+                if where == "adapters":
+                    block["adapters"] = [bad]
+                elif where in ("primaryDisplayDevice", "firstAdapterDriverVersion"):
+                    block[where] = bad
+                elif where == "displayAdapterName":
+                    block["displayState"]["displayAdapterName"]["value"] = bad
+                else:
+                    block["displayState"]["displays"]["value"][0]["adapter"] = bad
+                with self.subTest(name=name, where=where):
+                    got = read_texts([with_block(json.dumps(block))])[0]
+                    self.assertEqual(got["state"], "malformed", got)
+
+
+@requires_windows_pwsh
+class DisplayStateReaderTests(unittest.TestCase):
+    """Read-DvReceiptDisplayPath: strict and single. A v3 block reads typed; every deviation is malformed; a v2 block reads exactly as before."""
+
+    def read(self, block_text: str) -> dict:
+        return read_texts([with_block(block_text)])[0]
+
+    def test_a_v3_block_reads_present_and_gives_back_what_was_written(self) -> None:
+        got = self.read(json.dumps(GOOD_V3))
+        self.assertEqual(got["state"], "present", got["reason"])
+        self.assertEqual(got["block"], GOOD_V3)
+        self.assertEqual(list(got["block"].keys()), ["schema", "source", "adapters", "firstAdapterDriverVersion", "primaryDisplayDevice", "displayState"])
+
+    def test_a_v3_block_whose_every_reading_is_unknown_reads_present(self) -> None:
+        for reason in UNKNOWN_REASONS:
+            with self.subTest(reason):
+                got = self.read(json.dumps(v3(GOOD_BLOCK, {f: {"value": None, "unknown": reason} for f in STATE_FIELDS})))
+                self.assertEqual(got["state"], "present", got["reason"])
+
+    def test_a_v2_block_reads_exactly_as_before(self) -> None:
+        got = self.read(json.dumps(GOOD_BLOCK))
+        self.assertEqual((got["state"], got["reason"], got["block"]), ("present", None, GOOD_BLOCK))
+        self.assertNotIn("displayState", got["block"])
+
+    def test_v2_verdicts_are_unchanged_for_every_v2_deviation(self) -> None:
+        def mut(**kw):
+            b = dict(GOOD_BLOCK)
+            b.update(kw)
+            return json.dumps(b)
+        no_driver = {k: v for k, v in GOOD_BLOCK.items() if k != "firstAdapterDriverVersion"}
+        rows = [
+            (mut(displayState=NOT_REPORTED_STATE), "malformed", "the block carries an unknown field"),
+            (mut(extra=1), "malformed", "the block carries an unknown field"),
+            (json.dumps(no_driver), "malformed", "the block has no firstAdapterDriverVersion"),
+            (mut(schema="mlv-app/venue-display-path/v1"), "malformed", "schema is not mlv-app/venue-display-path/v2"),
+            (mut(schema="mlv-app/venue-display-path/v4"), "malformed", "schema is not mlv-app/venue-display-path/v2"),
+            (mut(source="elsewhere"), "malformed", "source is not health-probe"),
+            (mut(adapters=[]), "malformed", "adapters is empty (a sample with no video controller is a failed read)"),
+            (mut(adapters=["a?b"]), "malformed", "an adapter carries U+FFFD or '?'"),
+            (mut(primaryDisplayDevice="a?b"), "malformed", "primaryDisplayDevice carries U+FFFD or '?'"),
+            (mut(adapters=["A\u2028B"]), "present", None),   # a v2 block's names are read as they always were: only v3 refuses a raw separator
+        ]
+        got = read_texts([with_block(t) for t, _, _ in rows])
+        for (text, state, reason), g in zip(rows, got):
+            with self.subTest(text[:90]):
+                self.assertEqual((g["state"], g["reason"]), (state, reason))
+
+    def test_a_v3_block_that_leaves_out_or_adds_a_member_is_malformed(self) -> None:
+        def block(f):
+            b = json.loads(json.dumps(GOOD_V3))
+            f(b)
+            return json.dumps(b)
+        rows = [
+            (block(lambda b: b.pop("displayState")), "the block has no displayState"),
+            (block(lambda b: b.update(displayState=None)), "displayState is not an object"),
+            (block(lambda b: b.update(displayState={})), "displayState has no displayAdapterName"),
+            (block(lambda b: b["displayState"].pop("hotfixCount")), "displayState has no hotfixCount"),
+            (block(lambda b: b["displayState"].update(extra={"value": 1, "unknown": None})), "displayState carries an unknown field"),
+            (block(lambda b: b["displayState"].update(HotfixCount=b["displayState"]["hotfixCount"])), "displayState names a field more than once"),
+            (block(lambda b: b.update(extra=1)), "the block carries an unknown field"),
+            (block(lambda b: b.update(schema="mlv-app/venue-display-path/v2")), "the block carries an unknown field"),
+        ]
+        got = read_texts([with_block(t) for t, _ in rows])
+        for (text, reason), g in zip(rows, got):
+            with self.subTest(reason):
+                self.assertEqual((g["state"], g["reason"]), ("malformed", reason))
+
+    def test_a_v3_reading_that_is_untyped_is_malformed(self) -> None:
+        bad = [
+            ("displayAdapterName", {"value": "x", "unknown": "CIM_ERROR"}), ("displayAdapterName", {"value": None, "unknown": None}),
+            ("displayAdapterName", {"value": None, "unknown": "GUESS"}), ("displayAdapterName", {"value": "x"}), ("displayAdapterName", {"value": "x", "unknown": None, "why": "y"}),
+            ("displayAdapterName", "x"), ("displayAdapterName", {"value": "", "unknown": None}), ("displayAdapterName", {"value": "a?b", "unknown": None}),
+            ("displayAdapterDriverDate", {"value": "2024-02-30", "unknown": None}), ("lastBootUtc", {"value": "2026-11-21T07:12:09", "unknown": None}),
+            ("windowsBuild", {"value": "26200\n", "unknown": None}), ("displayAdapterDriverDate", {"value": "2024-05-14\n", "unknown": None}),
+            ("lastBootUtc", {"value": "2026-11-21T07:12:09Z\n", "unknown": None}),
+            ("windowsBuild", {"value": "", "unknown": None}), ("windowsUbr", {"value": -1, "unknown": None}), ("windowsUbr", {"value": 1.5, "unknown": None}),
+            ("windowsUbr", {"value": "10075", "unknown": None}), ("hotfixCount", {"value": 2147483648, "unknown": None}),
+            ("displays", {"value": [], "unknown": None}), ("displays", {"value": [{"adapter": "x", "width": 0, "height": 1, "refreshHz": 1}], "unknown": None}),
+            ("displays", {"value": [{"adapter": "x", "width": 1, "height": 1, "refreshHz": 1, "x": 1}], "unknown": None}),
+            ("displays", {"value": [{"adapter": "x", "width": 1, "height": 1, "refreshHz": 1}] * 65, "unknown": None}),
+            ("displays", {"value": "1920x1080", "unknown": None}),
+        ]
+        texts = []
+        for f, reading in bad:
+            b = json.loads(json.dumps(GOOD_V3))
+            b["displayState"][f] = reading
+            texts.append(with_block(json.dumps(b)))
+        got = read_texts(texts)
+        for (f, reading), g in zip(bad, got):
+            with self.subTest(field=f, reading=str(reading)[:60]):
+                self.assertEqual(g["state"], "malformed", g)
+                self.assertTrue(g["reason"].startswith(f), g["reason"])
+
+    def test_a_doubled_reading_member_is_malformed(self) -> None:
+        text = json.dumps(GOOD_V3).replace('"hotfixCount": {"value": 5, "unknown": null}', '"hotfixCount": {"value": 5, "value": 6, "unknown": null}')
+        self.assertNotEqual(text, json.dumps(GOOD_V3))
+        got = read_texts([with_block(text)])[0]
+        self.assertEqual(got["state"], "malformed", got)
+
+    def test_one_reader_only_the_reader_decides(self) -> None:
+        module = MODULE.read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"^function Read-DvReceiptDisplayPath\b", module, re.M)), 1)
+        for fn in ("Read-DvDisplayState", "Read-DvDisplayReading"):
+            body = re.search(rf"^function {fn} \{{.*?^\}}", module, re.S | re.M).group(0)
+            self.assertNotIn("ConvertFrom-Json", body, f"{fn}: no second grammar")
+        self.assertNotIn("ConvertFrom-Json", re.search(r"^function ConvertTo-DvDisplayStateFromProbe \{.*?^\}", module, re.S | re.M).group(0))
+
+
+@requires_windows_pwsh
+class DisplayStateEndToEndTests(RunnerHarness, unittest.TestCase):
+    """The probe fragment -> the probe's printed line -> the leg's receipt file -> the reader."""
+
+    def test_a_failed_read_reaches_the_receipt_as_a_typed_unknown(self) -> None:
+        rows = run_fragment([SCENARIO_OK, dict(SCENARIO_OK, quick="timeout"), dict(SCENARIO_OK, gpus=[], gpuErr="error")])
+        self.make_harness()
+        for i, (row, hot, name) in enumerate(zip(rows, (5, None, 5), (INTEL["name"], INTEL["name"], None))):
+            with self.subTest(i=i):
+                state = json.loads(row["line"][len("DVE_PROBE="):])["displayState"]
+                probe = dict(HEALTHY_PROBE, displayState=state)
+                proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), probe=probe, extra=["-HealthOnly"])
+                self.assertIsNotNone(receipt, proc.stdout + proc.stderr)
+                block = receipt["venue"]["displayPath"]
+                self.assertEqual(block["schema"], SCHEMA_V3)
+                self.assertEqual(block["displayState"]["hotfixCount"], {"value": hot, "unknown": None if hot is not None else "CIM_TIMEOUT"})
+                self.assertEqual(block["displayState"]["displayAdapterName"], {"value": name, "unknown": None if name else "CIM_ERROR"})
+                files = sorted(self.receipts.rglob("*.json"), key=lambda f: f.stat().st_mtime_ns)
+                self.assertEqual(read_texts([files[-1].read_text(encoding="utf-8")])[0]["state"], "present")
+
+
+class DisplayStateDocsTests(unittest.TestCase):
+    def test_the_doc_names_the_v3_block_its_fields_and_the_typed_reasons(self) -> None:
+        text = DOC.read_text(encoding="utf-8")
+        for needle in ("VENUE-LEG-DISPLAY-STATE-FIELDS-1", SCHEMA_V3, "displayState", *STATE_FIELDS, *UNKNOWN_REASONS):
+            self.assertIn(needle, text)
 
 
 class DocsTests(unittest.TestCase):

@@ -1605,7 +1605,7 @@ $cfg = Get-Content -LiteralPath $env:DVE_STUB -Raw | ConvertFrom-Json
 Add-Content -LiteralPath $cfg.log -Value $JobId
 if ($JobId -like '*-health') {
     if ($cfg.healthMode -eq 'unresolved') { throw 'UNRESOLVED: stub health probe never returned' }
-    return [pscustomobject]@{ exitCode = 0; stdout = ('DVE_PROBE=' + ($cfg.probe | ConvertTo-Json -Compress)) }
+    return [pscustomobject]@{ exitCode = 0; stdout = ('DVE_PROBE=' + ($cfg.probe | ConvertTo-Json -Compress -Depth 8)) }
 }
 # DUAL-VENUE-DISPLAY-MATRIX-1: a leg-set run submits many legs through one stub, each with its own artifacts (artifactsByLeg: a job-id fragment -> that leg's artifacts path)
 if ($cfg.PSObject.Properties['artifactsByLeg']) { foreach ($p in $cfg.artifactsByLeg.PSObject.Properties) { if ($JobId -like ('*' + $p.Name + '*')) { $cfg.artifactsAgentPath = $p.Value } } }
