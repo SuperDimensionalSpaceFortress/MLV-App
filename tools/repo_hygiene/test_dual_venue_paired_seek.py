@@ -811,7 +811,9 @@ class PairedSeekListlessProvenanceTests(PairedStillsHarness, unittest.TestCase):
 PREFLIGHT_PROBE = r"""
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $args[0] 'DualVenueRunner.psm1') -Force
-$ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $args[0] 'Invoke-VenueLeaseBatch.ps1'), [ref]$null, [ref]$null)
+# R2-NARROW-1 r5 (CI red on 42b0c117, adversary-7c5bfe86.json A7): Get-LegSpecRefusal calls Get-VenuePlannedLegType, which the batch script gets from the VenueChain module it imports at its top (Invoke-VenueLeaseBatch.ps1:272); the probe loads only the script's functions, so it imports the module the same way
+Import-Module (Join-Path $args[0] 'VenueChain.psm1') -Force -DisableNameChecking
+$ast =[System.Management.Automation.Language.Parser]::ParseFile((Join-Path $args[0] 'Invoke-VenueLeaseBatch.ps1'), [ref]$null, [ref]$null)
 # EXPORT-VENUE-LEG-1 r20: Get-LegSpecRefusal plus every function of the script it calls, transitively (r19's bounded read: Read-SpecBytesWithin,
 # Get-SpecReadBoundSec, Get-BytesSha256), so the probe runs the shipped function as the batch runs it and never a copy that lost a helper
 $defs = @{}

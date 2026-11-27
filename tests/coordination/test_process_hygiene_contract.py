@@ -27,6 +27,13 @@ NEUTRAL_RECEIPT = REPO_ROOT / "tests" / "fixtures" / "receipts" / "neutral_look_
 SEALED_REAL_CLIP_RECEIPT = REPO_ROOT / "receipts" / "sealed-real-clip-ab-71d9f494-20260820.json"
 STDOUT_SENTINEL = "EXCLUSIVE_STDOUT_SENTINEL"
 STDERR_SENTINEL = "EXCLUSIVE_STDERR_SENTINEL"
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r4: the one clean host load the GUI A/B comparer accepts (its canonical
+# predicate: state == "quiet" AND provisional == false). A GUI A/B fixture that is not about host load
+# carries it on both legs, so its verdict is decided by what the test is about.
+# r6 (sol r5 B1): the comparer now judges the block by the venue reader's strict rule, which also needs the before and after
+# snapshots collected (a real true), as the shipped smoke writes them.
+QUIET_HOST_LOAD = {"state": "quiet", "provisional": False, "reason": "fixture: fully measured quiet host",
+                   "before": {"collected": True}, "after": {"collected": True}}
 
 
 @pytest.mark.skipif(os.name != "nt", reason="MLV-App process ownership is Windows-specific")
@@ -808,6 +815,11 @@ def test_gui_smoke_ab_requires_same_last_presented_frame(tmp_path: Path) -> None
                         },
                         "colorArtifactScan": {"verdict": "clear-heuristic"},
                     },
+                    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r4: a fully measured, quiet host load on both
+                    # legs. Without it the leg reads not collected and, since r3 (sol r2 B1), the
+                    # verdict is INCONCLUSIVE; this test pins that a measured pair which is not
+                    # frame-locked still reads FAIL.
+                    "hostLoad": QUIET_HOST_LOAD,
                     "validation": {
                         "ok": True,
                         "launchOnlyProbe": False,
@@ -932,6 +944,10 @@ def test_gui_smoke_ab_rejects_same_build_identity(tmp_path: Path) -> None:
                         "visualState": state,
                         "colorArtifactScan": {"verdict": "clear-heuristic"},
                     },
+                    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r4: a fully measured, quiet host load on both
+                    # legs, so the same-arm refusal alone makes the verdict FAIL (an unmeasured
+                    # pair reads INCONCLUSIVE since r3, sol r2 B1).
+                    "hostLoad": QUIET_HOST_LOAD,
                     "validation": {
                         "ok": True,
                         "launchOnlyProbe": False,

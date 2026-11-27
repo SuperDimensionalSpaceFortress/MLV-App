@@ -7,6 +7,7 @@
 #include "../../platform/qt/GpuPresentTailWindow.h"
 #include "../../platform/qt/PlaybackNativePaceGuard.h"
 #include "../../platform/qt/PlaybackSlipHistogram.h"
+#include "../../platform/qt/PlaybackFrameRange.h"
 
 #include <cmath>
 #include <string>
@@ -971,4 +972,458 @@ TEST(GpuPresentTailWindow, AnUnswappedPaintNeverPairsWithALaterWindowsSwap)
     w.close( 350 * kMs, true, dropped );
     ASSERT_EQ( 0, dropped.qt_paint_swaps );
     ASSERT_NEAR( 0.0, dropped.qt_paint_swap_max_ms, 1e-12 );
+}
+
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (fable r9 H6 for corrections): a stale drop-frame start folded from 0 onto the cut's
+// first position 40 is a correction, not an advance. MainWindow notes it before the tick's own move, so the DropTick path books
+// only the tick's travel (0 here), frames 0..39 get no deadline, and advance-since-present stays 0. The summary's residual books
+// the 40-frame move under Other, as it books a seek.
+TEST(PlaybackSlipHistogram, R1ATimelineCorrectionIsNotAnAdvance)
+{
+    SlipHistogram h;
+    h.reset( 0, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    ASSERT_EQ( 40, h.timelinePosition() );
+    h.noteTimelineMove( AdvancePath::DropTick, 40, 100.0, 0.0, 0.0 );
+    ASSERT_EQ( 0, h.timelineAdvanceSincePresent() );                   // 4279b9ee: 40
+    for( int f = 0; f < 40; ++f ) ASSERT_FALSE( h.frameHasDeadline( f ) );
+    const Summary s = h.finish( 200.0, 40 );
+    ASSERT_EQ( 0LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::DropTick )] );   // 4279b9ee: 40
+    ASSERT_EQ( 40LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::Other )] );
+    // real travel after the correction is still an advance: 40 -> 41 books 1 and sets frame 40's deadline
+    h.noteTimelineMove( AdvancePath::DropTick, 41, 140.0, 1.0, 0.0 );
+    ASSERT_EQ( 1, h.timelineAdvanceSincePresent() );
+    ASSERT_TRUE( h.frameHasDeadline( 40 ) );
+}
+
+// r1 iteration 1 (adversary pass 1 A1 on fc9e3e93): cut 1..50, slider 10, stale drop position 120, a 1.2-frame tick. The fold to 22 is a
+// correction with no lap, so MainWindow's path is DropTick (it picks LoopWrap only when the tick lapped): the real step 22 -> 23 books
+// 1 frame of DropTick advance, sets frame 22's deadline and leaves advance-since-present 1 (fc9e3e93 took LoopWrap: 0, no deadline).
+TEST(PlaybackSlipHistogram, R1Iter1TheRealStepAfterAZeroLapFoldIsADropTickAdvance)
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 120.0, 1.2, 1, 50, true );
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( tick.correctedStart ) );
+    h.noteTimelineMove( playback_frame_range::dropFrameTickLapped( tick ) ? AdvancePath::LoopWrap : AdvancePath::DropTick,
+                        static_cast<int>( tick.position ), 50.0, tick.appliedFrames, 0.0 );
+    ASSERT_EQ( 1, h.timelineAdvanceSincePresent() );                   // fc9e3e93: 0
+    ASSERT_TRUE( h.frameHasDeadline( 22 ) );                           // fc9e3e93: false
+    const Summary s = h.finish( 100.0, 23 );
+    ASSERT_EQ( 1LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::DropTick )] );   // fc9e3e93: 0
+    ASSERT_EQ( 0LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::LoopWrap )] );   // fc9e3e93: 1
+}
+
+// ---- PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1 on 7de55386): the PRESENT side of a correction ----
+// A position correction contributes zero playback travel, zero slips and zero startup catch-up. r1 kept it out of the timeline's
+// DropTick path; the display endpoint, the start-relative measures and the rates after the first present still counted it.
+namespace
+{
+PresentSample r2Present( int frame, double ms, int timeline, int correctionsLanded = 0, bool rebase = false, int rebaseFrame = 0,
+                         bool rebaseLapped = false )
+{
+    PresentSample p;
+    p.displayFrame = frame;
+    p.presentMs = ms;
+    p.timelinePosition = timeline;
+    p.correctionsLanded = correctionsLanded;
+    p.rebase = rebase;
+    p.rebaseFrame = rebaseFrame;
+    p.rebaseLapped = rebaseLapped;
+    return p;
+}
+} // namespace
+
+// A1's input exactly: 24 fps, Drop Frame and Loop on, cut 1..50, frame 10 presented, Cut In raised to 41, an 8 ms tick granting 0.192
+// frames, frame 40 presented (the hand-off's landing: it crossed the correction and rebases to 40).
+TEST(PlaybackSlipHistogram, R2ACorrectionLandingIsNeitherSlipsNorTimelineTravel)
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 10.0, 0.192, 41, 50, true );
+    ASSERT_TRUE( tick.corrected );
+    ASSERT_EQ( 40, static_cast<int>( tick.position ) );
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.notePresent( r2Present( 10, 100.0, 10 ) );
+    h.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( tick.correctedStart ) );
+    h.noteTimelineMove( AdvancePath::DropTick, static_cast<int>( tick.position ), 108.0, tick.appliedFrames, 0.0 );
+    ASSERT_EQ( 30, h.correctedFrames() );                                // 3c0290cd: 0
+    h.notePresent( r2Present( 40, 141.7, 40, 1, true, 40 ) );
+    const Summary s = h.finish( 150.0, 40 );
+    ASSERT_EQ( 0LL, s.slipsTotal );                                      // 3c0290cd: 29
+    ASSERT_EQ( 0, s.slipEvents );
+    ASSERT_EQ( 0, s.wraps );
+    ASSERT_EQ( 0, s.repeats );
+    ASSERT_EQ( 0, s.startupCatchupFrames );
+    ASSERT_EQ( 0, s.timelineFramesAfterFirst );                          // 3c0290cd: 30
+    ASSERT_NEAR( 0.0, s.timelineAfterFirstRawFps, 1e-12 );               // 3c0290cd: 30 frames over 50 ms
+    // the residual still books the move under Other, as a seek (r1's contract)
+    ASSERT_EQ( 30LL, (long long)s.advanceByPath[static_cast<int>( AdvancePath::Other )] );
+}
+
+// A correction BEFORE the first present (legacy startup on): the first present lands it (consumed-count step, no rebase on a first
+// present). Neither the startup catch-up nor the first present's timeline delta counts the 30 correction frames, and the wait credit is
+// the wall time since Play alone.
+TEST(PlaybackSlipHistogram, R2ACorrectionBeforeTheFirstPresentIsNotStartupCatchUp)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 40, 8.0, 0.192, 0.0 );
+    h.notePresent( r2Present( 40, 50.0, 40, 1 ) );
+    h.noteTimelineMove( AdvancePath::DropTick, 41, 92.0, 1.0, 0.0 );
+    h.notePresent( r2Present( 41, 92.0, 41 ) );
+    const Summary s = h.finish( 100.0, 41 );
+    ASSERT_EQ( 0, s.startupCatchupFrames );                              // 3c0290cd: 30
+    ASSERT_EQ( 0, s.timelineDeltaAtFirstPresent );                       // 3c0290cd: 30
+    ASSERT_EQ( 1, s.startupWaitCreditFrames );                           // 50 ms at 24 fps; 3c0290cd: 0
+    ASSERT_EQ( 0LL, s.slipsTotal );
+    ASSERT_EQ( 1, s.timelineFramesAfterFirst );
+}
+
+// The first present shows the frame requested BEFORE the correction (it does not land it); the second present lands it. The first
+// present's timeline-ahead-of-display jump is not a 29-frame catch-up, and the landing is no slip.
+TEST(PlaybackSlipHistogram, R2AnUnlandedCorrectionIsNotTheFirstPresentsJump)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 40, 8.0, 0.192, 0.0 );
+    h.notePresent( r2Present( 10, 50.0, 40 ) );
+    h.notePresent( r2Present( 40, 92.0, 40, 1, true, 40 ) );
+    const Summary s = h.finish( 100.0, 40 );
+    ASSERT_EQ( 0, s.startupCatchupFrames );                              // 3c0290cd: 29
+    ASSERT_EQ( 0LL, s.slipsTotal );
+    ASSERT_EQ( 0, s.timelineDeltaAtFirstPresent );                       // 3c0290cd: 30
+    ASSERT_EQ( 0, s.timelineFramesAfterFirst );
+}
+
+// A BACKWARD correction (Loop-off clamp 100 -> 49 on cut 1..50) is not a wrap, a repeat or travel.
+TEST(PlaybackSlipHistogram, R2ABackwardCorrectionLandingIsNotAWrap)
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 100.0, 0.192, 1, 50, false );
+    ASSERT_TRUE( tick.corrected );
+    SlipHistogram h;
+    h.reset( 100, 24.0 );
+    h.notePresent( r2Present( 100, 50.0, 100 ) );
+    h.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( tick.correctedStart ) );
+    h.noteTimelineMove( AdvancePath::DropTick, static_cast<int>( tick.position ), 58.0, tick.appliedFrames, 0.0 );
+    ASSERT_EQ( -51, h.correctedFrames() );                               // 3c0290cd: 0
+    h.notePresent( r2Present( 49, 92.0, 49, 1, true, 49 ) );
+    const Summary s = h.finish( 100.0, 49 );
+    ASSERT_EQ( 0, s.wraps );                                             // 3c0290cd: 1
+    ASSERT_EQ( 0, s.repeats );
+    ASSERT_EQ( 0LL, s.slipsTotal );
+    ASSERT_EQ( 0, s.timelineFramesAfterFirst );                          // 3c0290cd: 51
+}
+
+// A landing whose engine LAPPED after the correction (stale 100 + 60 on cut 1..50 with Loop: rebase 2, one 49-wide lap, frame 13) is a
+// wrap, as a lap's landing is in the base, never 11 (rebased) or 2 (unrebased) slips.
+TEST(PlaybackSlipHistogram, R2ALandingThatLappedAfterTheCorrectionIsAWrap)
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 100.0, 60.0, 1, 50, true );
+    ASSERT_TRUE( tick.corrected );
+    ASSERT_EQ( 1, tick.wrapLaps );
+    ASSERT_EQ( 13, static_cast<int>( tick.position ) );
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.notePresent( r2Present( 10, 50.0, 10 ) );
+    h.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( tick.correctedStart ) );
+    h.noteTimelineMove( AdvancePath::LoopWrap, 13, 58.0, tick.appliedFrames, 0.0 );
+    h.notePresent( r2Present( 13, 92.0, 13, 1, true, 2, true ) );
+    const Summary s = h.finish( 100.0, 13 );
+    ASSERT_EQ( 1, s.wraps );                                             // 3c0290cd: 0
+    ASSERT_EQ( 0LL, s.slipsTotal );                                      // 3c0290cd: 2
+}
+
+// Controls: without a correction a forward step is still slips and timeline travel; a landing that also skipped real frames after the
+// correction books those (40 -> 45: 4 slips, 5 frames of travel), never the correction.
+TEST(PlaybackSlipHistogram, R2WithoutACorrectionAForwardStepIsStillSlipsAndARealSkipAfterALandingIsToo)
+{
+    SlipHistogram plain;
+    plain.reset( 10, 24.0 );
+    plain.notePresent( r2Present( 10, 50.0, 10 ) );
+    plain.noteTimelineMove( AdvancePath::DropTick, 40, 58.0, 30.0, 0.0 );
+    plain.notePresent( r2Present( 40, 92.0, 40 ) );
+    const Summary p = plain.finish( 100.0, 40 );
+    ASSERT_EQ( 29LL, p.slipsTotal );
+    ASSERT_EQ( 30, p.timelineFramesAfterFirst );
+    ASSERT_EQ( 0, plain.correctedFrames() );
+
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.notePresent( r2Present( 10, 50.0, 10 ) );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 58.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 45, 92.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 100.0, 45 );
+    ASSERT_EQ( 4LL, s.slipsTotal );                                      // 3c0290cd: 34; c4fa34c3: 5 (adversary pass 3 A1)
+    ASSERT_EQ( 5, s.timelineFramesAfterFirst );                          // 3c0290cd: 35
+    // r2 iteration 1 (adversary pass 3 A1 on c4fa34c3): the landing rebases to the correction's frame itself, as the paint tracker
+    // does, and a landing ON it is neither a slip nor a repeat
+    ASSERT_EQ( 0, s.repeats );
+}
+
+// r2 iteration 1 (adversary pass 3 A3 on c4fa34c3): the correction sum is 64-bit. One Play on a 1,000,100-frame clip, Cut In alternated
+// between 1,000,001 and 1,000,002, a seek to 0 before each of 2,148 correction ticks: the sum is 2,148,001,074 (c4fa34c3's int
+// overflowed), and the travel at the first present (1,000,001 - 2,148,001,074) is exact.
+TEST(PlaybackSlipHistogram, R2Iter1TheCorrectionSumIsSixtyFourBit)
+{
+    SlipHistogram h;
+    h.reset( 0, 24.0 );
+    int position = 0;
+    for( int i = 0; i < 2148; ++i )
+    {
+        h.noteTimelineMove( AdvancePath::Other, 0, i * 8.0 );
+        position = 1000000 + ( i % 2 );
+        h.noteTimelineCorrection( position );
+    }
+    ASSERT_EQ( 2148001074LL, (long long)h.correctedFrames() );          // c4fa34c3: -2146966222 (int wrap)
+    h.notePresent( r2Present( position, 20000.0, position, 2148 ) );      // its request crossed every correction
+    const Summary s = h.finish( 20100.0, position );
+    ASSERT_EQ( 2147001073, s.timelineDeltaAtFirstPresent );
+    ASSERT_EQ( 0, s.timelineFramesAfterFirst );
+    ASSERT_EQ( 0, s.startupCatchupFrames );
+}
+
+// r2 iteration 2 (adversary pass 4 A3 on b30cd3a1): real skips after a correction belong to the rebased interval; the first present's
+// earlier jump (timeline 15 over display 10: frames 11..14) cannot cover them. Play at 0 ms, start 10, 24 fps; the first present at
+// 210 ms shows 10 with the timeline at 15; 15 is corrected to 40, five frames are granted, and 45 lands the correction. The four
+// frames 41..44 are slips; the jump's four frames are startup catch-up passed before the correction.
+TEST(PlaybackSlipHistogram, R2Iter2TheFirstPresentsJumpNeverCoversARebasedInterval)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineMove( AdvancePath::DropTick, 15, 200.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 15 ) );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 240.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 45, 250.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 260.0, 45 );
+    ASSERT_EQ( 4LL, s.slipsTotal );                                      // b30cd3a1: 0
+    ASSERT_EQ( 1, s.slipEvents );
+    ASSERT_EQ( 4, s.startupCatchupFrames );                              // the jump's own frames, passed before the correction
+}
+
+// r2 iteration 2 (adversary pass 4 A2 on b30cd3a1): a pinned measured Play stops by writing the PRESENTED frame back to the slider. A
+// correction its request never crossed leaves the timeline with that write: request 480 at correction stamp 0, Cut In raised so the
+// early advance corrects 480 to 1000, then the pinned stop writes 480 back. The travel is 480 (the base's), never 480 - 520 = -40.
+TEST(PlaybackSlipHistogram, R2Iter2APinnedStopUndoesTheCorrectionsItsFrameNeverCrossed)
+{
+    SlipHistogram h;
+    h.reset( 0, 24.0 );
+    h.noteTimelineMove( AdvancePath::DropTick, 1, 40.0, 1.0, 0.0 );
+    h.notePresent( r2Present( 0, 40.0, 1 ) );
+    h.noteTimelineMove( AdvancePath::DropTick, 480, 20000.0, 479.0, 0.0 );
+    h.notePresent( r2Present( 480, 20000.0, 480 ) );                      // requested before the correction
+    h.noteTimelineCorrection( 1000 );
+    h.noteTimelineMove( AdvancePath::DropTick, 1000, 20008.0, 0.192, 0.0 );
+    h.noteTimelinePinnedToDisplay( 480 );
+    ASSERT_EQ( 0LL, (long long)h.correctedFrames() );                    // b30cd3a1: 520
+    ASSERT_EQ( 480, h.timelineTravel( 480 ) );                           // b30cd3a1: -40
+    const Summary s = h.finish( 20010.0, 480 );
+    ASSERT_EQ( 479, s.timelineFramesAfterFirst );                        // b30cd3a1: 39
+    // a correction the presented frame DID cross stays out: the same run where 1000 was presented before the pin
+    SlipHistogram landed;
+    landed.reset( 0, 24.0 );
+    landed.noteTimelineMove( AdvancePath::DropTick, 1, 40.0, 1.0, 0.0 );
+    landed.notePresent( r2Present( 0, 40.0, 1 ) );
+    landed.noteTimelineMove( AdvancePath::DropTick, 480, 20000.0, 479.0, 0.0 );
+    landed.notePresent( r2Present( 480, 20000.0, 480 ) );
+    landed.noteTimelineCorrection( 1000 );
+    landed.noteTimelineMove( AdvancePath::DropTick, 1000, 20008.0, 0.192, 0.0 );
+    landed.notePresent( r2Present( 1000, 20040.0, 1000, 1, true, 1000 ) );
+    landed.noteTimelinePinnedToDisplay( 1000 );
+    ASSERT_EQ( 520LL, (long long)landed.correctedFrames() );
+    ASSERT_EQ( 480, landed.timelineTravel( 1000 ) );
+}
+
+// r3 (escalated adversary pass 5 A1 on 2a3371ff): the first present's jump is spent apart from a rebased interval only when the
+// landed correction was made AFTER the first present. Here the correction 10 -> 40 came BEFORE it: the first present's jump (the
+// timeline 45 over the display 10, with the 30-frame correction taken out: frames 41..44) IS the rebased interval's own travel, so
+// it covers the landing's four skips once, as startup catch-up, and nothing is a slip.
+TEST(PlaybackSlipHistogram, R3AJumpMeasuredAfterTheCorrectionCoversTheRebasedInterval)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 200.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 45 ) );                          // requested before the correction: unlanded
+    h.notePresent( r2Present( 45, 250.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 260.0, 45 );
+    ASSERT_EQ( 0LL, s.slipsTotal );                                      // 2a3371ff: 4
+    ASSERT_EQ( 0, s.slipEvents );                                        // 2a3371ff: 1
+    ASSERT_EQ( 4, s.startupCatchupFrames );                              // booked once, never twice
+    ASSERT_EQ( 0, s.timelineFramesAfterFirst );
+}
+
+// r3 sibling: two corrections, one before the first present and one after it, both landed by the second present. The rebase is to
+// the LAST one's frame, made after the first present, so the jump (measured before it) never covers the rebased interval: pass 4
+// A3's rule. Start 10; corrected to 40 and granted to 45; the first present shows 10; corrected to 60 and granted to 65; 65 lands
+// both (rebase 60): 61..64 are four slips, and the jump's four frames are startup catch-up.
+TEST(PlaybackSlipHistogram, R3TheLastLandedCorrectionDecidesWhetherTheJumpIsSpentApart)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 200.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 45 ) );
+    h.noteTimelineCorrection( 60 );
+    h.noteTimelineMove( AdvancePath::DropTick, 65, 240.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 65, 250.0, 65, 2, true, 60 ) );
+    const Summary s = h.finish( 260.0, 65 );
+    ASSERT_EQ( 4LL, s.slipsTotal );
+    ASSERT_EQ( 1, s.slipEvents );
+    ASSERT_EQ( 4, s.startupCatchupFrames );
+    // and the landing of only the EARLIER correction (stamp 1) keeps the base rule: the jump covers 41..44
+    SlipHistogram early;
+    early.reset( 10, 24.0 );
+    early.setPlayStart( 0.0 );
+    early.noteTimelineCorrection( 40 );
+    early.noteTimelineMove( AdvancePath::DropTick, 45, 200.0, 5.0, 0.0 );
+    early.notePresent( r2Present( 10, 210.0, 45 ) );
+    early.noteTimelineCorrection( 60 );
+    early.notePresent( r2Present( 45, 250.0, 60, 1, true, 40 ) );
+    const Summary e = early.finish( 260.0, 60 );
+    ASSERT_EQ( 0LL, e.slipsTotal );                                      // 2a3371ff: 4
+    ASSERT_EQ( 4, e.startupCatchupFrames );
+}
+
+// r3 sibling: a pinned stop that drops the unlanded corrections also drops them from the first present's count, so a correction
+// made after the pin (index 0 again) is still known to follow the first present. The jump is spent apart: 41..44 are slips.
+TEST(PlaybackSlipHistogram, R3APinnedStopKeepsTheFirstPresentsCorrectionCountInRange)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 30 );
+    h.noteTimelineMove( AdvancePath::DropTick, 35, 200.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 35 ) );                          // the correction to 30 is unlanded here
+    h.noteTimelinePinnedToDisplay( 10 );                                  // and dropped by the pin: the timeline is back on 10
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 240.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 45, 250.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 260.0, 45 );
+    ASSERT_EQ( 4LL, s.slipsTotal );                                      // green on 2a3371ff; the r3 rule without the pin clamp: 0
+    ASSERT_EQ( 4, s.startupCatchupFrames );
+}
+
+// r3 iteration 1 (adversary pass 6 A2 on f8d80862, its input verbatim): the jump covers only the frames it passed AFTER the landed
+// correction. 10 -> 15 is travelled, 15 is corrected to 40 and 0.2 is granted, the first present shows 10 with the timeline at 40:
+// its jump 11..14 was passed BEFORE the correction, so it never covers 41..44, which the second present (45, landing rebase 40)
+// skips: four slips, one event, and the jump's four frames are startup catch-up.
+TEST(PlaybackSlipHistogram, R3Iter1TheJumpCoversOnlyTheTravelAfterTheLandedCorrection)
+{
+    SlipHistogram h;
+    h.reset( 10, 25.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineMove( AdvancePath::DropTick, 15, 200.0, 5.0, 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 40, 208.0, 0.2, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 40 ) );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 408.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 45, 440.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 450.0, 45 );
+    ASSERT_EQ( 4LL, s.slipsTotal );                                      // f8d80862: 0
+    ASSERT_EQ( 1, s.slipEvents );                                        // f8d80862: 0
+    ASSERT_EQ( 4, s.startupCatchupFrames );
+    // split travel: 10 -> 12 before the correction to 40, 40 -> 43 after it; first present 10 at timeline 43. The jump (11, 12 and
+    // 41, 42: four frames) covers only the two passed after the correction: 45 landing rebase 40 skips 41..44, two of them slips.
+    SlipHistogram split;
+    split.reset( 10, 25.0 );
+    split.setPlayStart( 0.0 );
+    split.noteTimelineMove( AdvancePath::DropTick, 12, 100.0, 2.0, 0.0 );
+    split.noteTimelineCorrection( 40 );
+    split.noteTimelineMove( AdvancePath::DropTick, 43, 200.0, 3.0, 0.0 );
+    split.notePresent( r2Present( 10, 210.0, 43 ) );
+    split.noteTimelineMove( AdvancePath::DropTick, 45, 408.0, 2.0, 0.0 );
+    split.notePresent( r2Present( 45, 440.0, 45, 1, true, 40 ) );
+    const Summary t = split.finish( 450.0, 45 );
+    ASSERT_EQ( 2LL, t.slipsTotal );
+    ASSERT_EQ( 4, t.startupCatchupFrames );
+}
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1 (adversary pass 10 A2 on 87a6d64b), its input: a pure repeat of
+// the first frame before the present that lands the correction does not spend the first present's jump. 10 corrected to 40 and
+// granted to 45 before the first present, which shows 10; a duplicate of 10; then 45 lands the correction. 87a6d64b booked the
+// jump's four frames (41..44) as four slips (m_presents == 3 passed neither first-present guard); they are startup catch-up.
+TEST(PlaybackSlipHistogram, R10ARepeatedFirstFrameKeepsTheFirstPresentsJumpForTheLanding)
+{
+    SlipHistogram h;
+    h.reset( 10, 24.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 200.0, 5.0, 0.0 );
+    h.notePresent( r2Present( 10, 210.0, 45 ) );
+    h.notePresent( r2Present( 10, 220.0, 45 ) );
+    h.notePresent( r2Present( 45, 250.0, 45, 1, true, 40 ) );
+    const Summary s = h.finish( 260.0, 45 );
+    ASSERT_EQ( 0LL, s.slipsTotal );                                      // 87a6d64b: 4
+    ASSERT_EQ( 0, s.slipEvents );                                        // 87a6d64b: 1
+    ASSERT_EQ( 4, s.startupCatchupFrames );                              // 87a6d64b: 0
+    // the same shape without the repeat is unchanged (the second present lands it)
+    SlipHistogram once;
+    once.reset( 10, 24.0 );
+    once.setPlayStart( 0.0 );
+    once.noteTimelineCorrection( 40 );
+    once.noteTimelineMove( AdvancePath::DropTick, 45, 200.0, 5.0, 0.0 );
+    once.notePresent( r2Present( 10, 210.0, 45 ) );
+    once.notePresent( r2Present( 45, 250.0, 45, 1, true, 40 ) );
+    const Summary u = once.finish( 260.0, 45 );
+    ASSERT_EQ( 0LL, u.slipsTotal );
+    ASSERT_EQ( 4, u.startupCatchupFrames );
+    // a repeat AFTER the display moved closes the window as before: a later skip is a slip
+    SlipHistogram moved;
+    moved.reset( 10, 24.0 );
+    moved.noteTimelineMove( AdvancePath::DropTick, 13, 100.0, 3.0, 0.0 );
+    moved.notePresent( r2Present( 10, 110.0, 13 ) );                     // jump 11..12
+    moved.notePresent( r2Present( 13, 150.0, 13 ) );                     // spends the jump
+    moved.noteTimelineMove( AdvancePath::DropTick, 16, 190.0, 3.0, 0.0 );
+    moved.notePresent( r2Present( 13, 192.0, 16 ) );                     // a repeat of 13
+    moved.notePresent( r2Present( 16, 230.0, 16 ) );                     // 14..15 skipped
+    const Summary v = moved.finish( 240.0, 16 );
+    ASSERT_EQ( 2LL, v.slipsTotal );
+    ASSERT_EQ( 2, v.startupCatchupFrames );
+}
+
+// R10-OUTER-BRANCH-RESIDUE-1 r2 (adversary pass 11 A3 on 6ff14cd4, its input): 200 frames at 25 fps, Drop Frame and Loop on, start
+// frame 10. Cut In is raised to 41 before frame 10 is ready: the 8 ms tick requests 40 at 40.2 (the correction 10 -> 40), the 192 ms
+// tick requests 45, and the first present shows 10 with the timeline at 45 (its jump is 41..44, passed after the correction). Frame
+// 40 then lands the rebase ON 40, and frame 45 skips 41..44. 6ff14cd4 closed the first-present window on the landing, so the jump's
+// four frames were four slips; the landing shows none of the jump, so they are startup catch-up.
+TEST(PlaybackSlipHistogram, R2ARebaseLandingOnItsFrameKeepsTheFirstPresentsJumpForTheNextMove)
+{
+    SlipHistogram h;
+    h.reset( 10, 25.0 );
+    h.setPlayStart( 0.0 );
+    h.noteTimelineCorrection( 40 );
+    h.noteTimelineMove( AdvancePath::DropTick, 40, 8.0, 0.2, 0.0 );
+    h.noteTimelineMove( AdvancePath::DropTick, 45, 192.0, 4.8, 0.0 );
+    h.notePresent( r2Present( 10, 200.0, 45 ) );                          // requested before the correction: unlanded
+    h.notePresent( r2Present( 40, 205.0, 45, 1, true, 40 ) );             // lands the rebase ON 40
+    h.notePresent( r2Present( 45, 210.0, 45 ) );                          // skips 41..44
+    const Summary s = h.finish( 220.0, 45 );
+    ASSERT_EQ( 0LL, s.slipsTotal );                                      // 6ff14cd4: 4
+    ASSERT_EQ( 0, s.slipEvents );                                        // 6ff14cd4: 1
+    ASSERT_EQ( 4, s.startupCatchupFrames );                              // 6ff14cd4: 0
+    ASSERT_EQ( 0, s.repeats );
+    ASSERT_EQ( 0, s.wraps );
+    // a rebase landing that MOVES from its frame (45 landing rebase 40) still spends the window: a later skip is a slip
+    SlipHistogram moved;
+    moved.reset( 10, 25.0 );
+    moved.setPlayStart( 0.0 );
+    moved.noteTimelineCorrection( 40 );
+    moved.noteTimelineMove( AdvancePath::DropTick, 45, 192.0, 5.0, 0.0 );
+    moved.notePresent( r2Present( 10, 200.0, 45 ) );
+    moved.notePresent( r2Present( 45, 240.0, 45, 1, true, 40 ) );         // spends the jump 41..44
+    moved.noteTimelineMove( AdvancePath::DropTick, 48, 360.0, 3.0, 0.0 );
+    moved.notePresent( r2Present( 48, 400.0, 48 ) );                      // 46..47 skipped
+    const Summary t = moved.finish( 410.0, 48 );
+    ASSERT_EQ( 2LL, t.slipsTotal );
+    ASSERT_EQ( 4, t.startupCatchupFrames );
 }

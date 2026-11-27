@@ -2860,10 +2860,12 @@ bool MainWindow::playbackTargetPresentOutstanding( int target )
 // current target is still coming (playbackTargetPresentOutstanding). The conformed tick holds only then
 // (playback_frame_range::conformTargetPresented). The render thread is asked only under conform and only while the target is
 // not the frame drawFrameReady last accepted.
-bool MainWindow::conformTargetPresentOutstanding()
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (adversary pass 3 A2 on c4fa34c3): \a position is the tick's CORRECTED start (the
+// gate's own position), never the stale m_newPosDropMode a fold or clamp is about to move off.
+bool MainWindow::conformTargetPresentOutstanding( double position )
 {
     if( !m_pRenderThread || !playbackConformActive() ) return false;
-    const int target = static_cast<int>( m_newPosDropMode );
+    const int target = static_cast<int>( position );
     if( target < 0 || m_lastPresentedPlaybackFrame == static_cast<long long>( target ) ) return false;
     return playbackTargetPresentOutstanding( target );
 }
@@ -2872,10 +2874,11 @@ bool MainWindow::conformTargetPresentOutstanding()
 // still to come -- drawFrameReady has not dispatched it yet (its early advance runs before the inline present or the enqueue),
 // or the non-inline prep queue still holds it. A pending task can be replaced by the next enqueue, so the engine must not move
 // past it. Nothing pending (the present happened, or the frame was dropped) means nothing is coming.
-bool MainWindow::conformAcceptedTargetPresentPending()
+// r2 (adversary pass 3 A2 on c4fa34c3): \a position is the tick's corrected start, as for conformTargetPresentOutstanding.
+bool MainWindow::conformAcceptedTargetPresentPending( double position )
 {
     if( !playbackConformActive() ) return false;
-    const long long target = static_cast<long long>( m_newPosDropMode );
+    const long long target = static_cast<long long>( position );
     if( target < 0 || m_lastPresentedPlaybackFrame != target ) return false;
     if( m_playbackPresentDispatchFrame == target ) return true;
     // fix iteration 1 (adversary A1 on e052947c): handed to a GL surface whose deferred paint has not drawn it yet
@@ -2965,6 +2968,14 @@ static int mlvappStartPlaybackTimer( QObject *owner, double framerate )
                               timerType );
 }
 
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: the fps meter and drop-frame tick clock (monotonic, never the wall clock).
+static QElapsedTimer mlvappMonotonicNow()
+{
+    QElapsedTimer now;
+    now.start();
+    return now;
+}
+
 void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 {
     const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::TimerFrame );
@@ -2972,18 +2983,18 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     // No render starts during a Look Assist analysis. m_frameChanged stays set, so the first tick after landing draws.
     if( m_lookAssistPump.sessionOpen() ) return;
 
-    static QTime lastTime;              //Last Time a picture was rendered
-    static QTime lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
+    static QElapsedTimer lastTime;              //Last Time a picture was rendered (monotonic)
+    static QElapsedTimer lastDrawTime;          //Last Time a frame was DRAWN (fps meter only; lastTime is re-armed on idle ticks)
     static int timeDiff = 0;           //TimeDiff between 2 rendered frames in Playback
 
     //Zero the fps meter when paused, before the first draw, or stalled. Runs on EVERY tick, including
     //the still-drawing early returns below: a busy render must not leave the previous fps on screen.
     //Touches only the meter state, never lastTime, so drop-frame pacing is unchanged.
-    const auto resetFpsMeterIfIdle = [this]( const QTime & now )
+    const auto resetFpsMeterIfIdle = [this]( const QElapsedTimer & now )
     {
         const bool hasDraw = lastDrawTime.isValid();
         if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,
-                                                     hasDraw ? lastDrawTime.msecsTo( now ) : 0 ) )
+                                                     hasDraw ? playback_fps_meter::stampAgeMs( lastDrawTime, now ) : 0 ) )
         {
             const QString playbackFpsText = playback_conform::playbackFpsStatusText(
                 0.0, getMlvFramerate( m_pMlvObject ), getPlaybackFramerate() );
@@ -2993,8 +3004,8 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 m_lastPlaybackFpsStatusText = playbackFpsText;
             }
             m_playbackFpsEmaFrameMs = 0.0;
-            m_lastPlaybackFpsStatusUpdateTime = QTime();
-            lastDrawTime = QTime();
+            m_lastPlaybackFpsStatusUpdateTime.invalidate();
+            lastDrawTime.invalidate();
         }
     };
 
@@ -3023,7 +3034,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                         .arg( ui->horizontalSliderPosition->value() ),
                     true );
             }
-            resetFpsMeterIfIdle( QTime::currentTime() );
+            resetFpsMeterIfIdle( mlvappMonotonicNow() );
             //On setup slider priority
             if( !ui->actionPlay->isChecked() )
             {
@@ -3040,21 +3051,29 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
     if( !m_exportQueue.empty() ) return;
 
     //Time measurement
-    QTime nowTime = QTime::currentTime();
-    timeDiff = lastTime.msecsTo( nowTime );
+    QElapsedTimer nowTime = mlvappMonotonicNow();
+    timeDiff = playback_fps_meter::stampAgeMs( lastTime, nowTime );
     // An early predictive tick is rounded up to a frame period, and a render-thread stall is never one giant
     // catch-up step. The round-up alone outran native pace on a fast GPU: playbackHandling()'s
     // m_playbackPaceGuard is the ceiling (PlaybackNativePaceGuard.h).
     timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff, getPlaybackFramerate(), predictivePlaybackAdvance,
                                                            ui->actionPlay->isChecked(), hadPendingAdvance );
+    // r5 (pass 8 A3 on c37d6fd5, pass 9 A1 on 22c93691): the fps meter gate, the present trace and both interaction logs
+    // read the shaped tick, as on the base; the cap below bounds only the frame request (playbackHandling).
+    const int shapedTickMs = timeDiff;
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1): one tick never asks the drop-frame loop for more frames than
+    // it can count (a long suspension at a high source rate); every ordinary tick is unchanged.
+    // r4 (pass 5 A2): only the Drop Frame request reads the tick as frames, so Normal mode keeps its whole tick (fps meter).
+    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, ui->actionDropFrameMode->isChecked() ? getPlaybackFramerate() : 0.0 );
 
     //Playback
     const bool frameChangedBeforePlayback = m_frameChanged;
     const int positionBeforePlayback = ui->horizontalSliderPosition->value();
-    const double tracePositionBefore = m_newPosDropMode;
     playbackHandling( timeDiff );
+    // r7 (sol r6 on 9f3f5ebd): the trace reads the tick's applied grant, so whole laps landing back on the start still advance,
+    // and a stale start folded into the cut with no grant does not (r7 iteration 2, adversary pass 13 A1 on 80079007).
     if( m_playbackPresentTrace.active() )
-        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, timeDiff );
+        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, m_playbackTickAppliedFrames, shapedTickMs );
     if( frameChangedBeforePlayback )
     {
         invalidateGpuPreviewProcessingConfigCache();
@@ -3065,7 +3084,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
             QStringLiteral("timer_frame.playback_handled"),
             QStringLiteral("play_checked=%1 time_diff_ms=%2 position_before=%3 position_after=%4 frame_changed=%5 dont_draw=%6 opening=%7")
                 .arg( bool01( ui->actionPlay->isChecked() ) )
-                .arg( timeDiff )
+                .arg( shapedTickMs )
                 .arg( positionBeforePlayback )
                 .arg( ui->horizontalSliderPosition->value() )
                 .arg( bool01( m_frameChanged ) )
@@ -3116,7 +3135,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
                 QStringLiteral("play_checked=%1 position=%2 time_diff_ms=%3")
                     .arg( bool01( ui->actionPlay->isChecked() ) )
                     .arg( ui->horizontalSliderPosition->value() )
-                    .arg( timeDiff ),
+                    .arg( shapedTickMs ),
                 true );
         }
         drawFrame( !m_skipImmediateTimecodeLabel );
@@ -3125,15 +3144,15 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
 
         //fps measurement: draw-to-draw interval. lastTime is re-armed on every idle poll tick (it
         //feeds the drop-frame elapsed time), so it cannot serve here -- see playback_fps_meter::smoothedFrameMs.
-        const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;
+        const int measuredFrameMs = playback_fps_meter::stampAgeMs( lastDrawTime, nowTime );
         lastDrawTime = nowTime;
-        if( timeDiff != 0 )
+        if( shapedTickMs != 0 )
         {
             m_playbackFpsEmaFrameMs =
                 playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );
             const bool shouldUpdateFpsText =
                 !m_lastPlaybackFpsStatusUpdateTime.isValid()
-                || m_lastPlaybackFpsStatusUpdateTime.msecsTo( nowTime ) >= 250;
+                || playback_fps_meter::stampAgeMs( m_lastPlaybackFpsStatusUpdateTime, nowTime ) >= 250;
             if( shouldUpdateFpsText && m_playbackFpsEmaFrameMs > 0.0 )
             {
                 const double smoothedFps = 1000.0 / m_playbackFpsEmaFrameMs;
@@ -3169,7 +3188,7 @@ void MainWindow::timerFrameEvent( bool predictivePlaybackAdvance )
         //An idle poll tick between two draws is normal while playing (8 ms poll, ~42 ms frame
         //period at 24 fps): only paused or stalled playback zeroes the fps meter.
         resetFpsMeterIfIdle( nowTime );
-        lastTime = QTime::currentTime(); //do that for calculation of timeDiff for DropFrameMode;
+        lastTime = nowTime; //do that for calculation of timeDiff for DropFrameMode (the tick's own stamp: ages telescope);
 
     }
 }
@@ -7892,6 +7911,7 @@ void MainWindow::drawFrame( bool updateTimecodeLabel )
     PresentationRequestContext requestContext;
     requestContext.requestSerial = requestSerial;
     requestContext.engineWrapsAtRequest = m_playbackWrapRecorder.engineWraps;   // r17 adversary A1: see presentationLoopWraps
+    requestContext.engineCorrectionsAtRequest = m_playbackWrapRecorder.engineCorrections;   // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1
     requestContext.sceneWidth = sceneWidth;
     requestContext.sceneHeight = sceneHeight;
     requestContext.devicePixelRatioMilli = devicePixelRatioMilli;
@@ -13202,6 +13222,7 @@ int MainWindow::openMlv( QString fileName )
 void MainWindow::playbackHandling(int timeDiff)
 {
     const GuiOtherBusyScope otherBusySpan( this, gui_present_gap::OtherBusySpan::PlaybackHandling );
+    m_playbackTickAppliedFrames = 0.0;   // r7 (sol r6): set below only by a path that applied a grant
     if( ui->actionPlay->isChecked() )
     {
         if( m_fileLoaded && m_pMlvObject )
@@ -13223,7 +13244,9 @@ void MainWindow::playbackHandling(int timeDiff)
                                                             m_playRequiredSourceFrames ) ) return;
 
         //when on last frame (r32 fix iteration 2, adversary A1 + A2 on 03850f7b: under conform with Drop Frame and Loop the
-        //drop-frame engine owns the wrap from the last frame -- see playback_frame_range::outerLastFrameBranchHandlesTick)
+        //drop-frame engine owns the wrap from the last frame -- see playback_frame_range::outerLastFrameBranchHandlesTick;
+        //PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1, sol r10: so does EVERY Drop Frame Loop tick, so a
+        //stale playhead past Cut Out or on a one-frame cut goes through advanceDropFrameTick's correction contract, never a lap)
         if( playback_frame_range::outerLastFrameBranchHandlesTick(
                 ui->horizontalSliderPosition->value(), ui->spinBoxCutOut->value(),
                 ui->actionDropFrameMode->isChecked(), ui->actionLoop->isChecked(), playbackConformActive() ) )
@@ -13270,6 +13293,9 @@ void MainWindow::playbackHandling(int timeDiff)
                                                               1.0, m_playbackPaceGuard.creditFrames(),
                                                               getPlaybackFramerate(), !paceGuardArmedBeforeTick );
                 m_frameChanged = true;
+                // r7 (sol r6): the wrap is one granted frame transition (as the slip histogram books it), even when it lands
+                // on the frame it left (cut n..n) or leaves m_newPosDropMode where it was (no audio output).
+                m_playbackTickAppliedFrames = 1.0;
                 if( ui->actionAudioOutput->isChecked()
                  || ( repairDisabled && ui->actionDropFrameMode->isChecked() ) )
                 {
@@ -13325,6 +13351,8 @@ void MainWindow::playbackHandling(int timeDiff)
                     ui->horizontalSliderPosition->setValue( ui->horizontalSliderPosition->value() + 1 );
                     m_playbackInternalSliderAdvance = false;
                     m_sourceAdvance.noteEngineTick( sourcePositionBeforeTick, ui->horizontalSliderPosition->value(), false );
+                    // r7 (sol r6): the frame the slider really moved (0 at its maximum), whatever m_newPosDropMode held before
+                    m_playbackTickAppliedFrames = ui->horizontalSliderPosition->value() - sourcePositionBeforeTick;
                     if( m_playbackSmokeActive )
                         m_playbackSlipHistogram.noteTimelineMove( playback_slip::AdvancePath::WholeFrame,
                                                                   ui->horizontalSliderPosition->value(), paceNowMs,
@@ -13340,7 +13368,6 @@ void MainWindow::playbackHandling(int timeDiff)
                 //loop wraps back by the cut range width, or clamps to the last frame -- see
                 //PlaybackFrameRange.h for the BLOCKER note on why the wrapped case can never
                 //return the range's last frame)
-                const double sourcePositionBeforeDropTick = m_newPosDropMode;
                 // HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP): under conform the catch-up advances by whole
                 // frames, so a tick that owes less than one whole period beyond the next frame presents that frame (never
                 // N -> N + 2 from a fractional position) and carries the rest as m_conformDropDebtFrames, repaid one presented
@@ -13352,34 +13379,54 @@ void MainWindow::playbackHandling(int timeDiff)
                 // (adversary A1 on d98be193): with no present outstanding (an invalidation, an idle renderer) nothing holds. r28
                 // (CoS B1 on c4efe7e3): the gate keys off the frame on SCREEN; an accepted frame whose present drawFrameReady has
                 // not dispatched, or that the non-inline prep still holds (pending, in flight, unconsumed), is still to come.
+                // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 iteration 2 (adversary pass 2 A2 on 7de55386): the conform shaping
+                // and its target gate read the start the delta moves FROM, the corrected one (a stale start folded into the
+                // Loop cut or clamped onto its last frame); the tick itself reads the stale position, so it reports the correction.
+                const double dropFrameStart = playback_frame_range::dropFrameCorrectedStart(
+                    m_newPosDropMode, ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), ui->actionLoop->isChecked(),
+                    playbackConformActive() );
                 const playback_frame_range::DropFrameTickResult dropFrameTick =
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
                         playback_frame_range::conformDropFrameDelta(
-                            m_newPosDropMode,
-                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),
+                            dropFrameStart,
+                            m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),
                             playbackConformActive(), m_conformDropDebtFrames,
                             playback_frame_range::conformTargetShown(
-                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,
-                                conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),
+                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), dropFrameStart,
+                                conformAcceptedTargetPresentPending( dropFrameStart ), conformTargetPresentOutstanding( dropFrameStart ) ) ),
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked(),
                         playbackConformActive() );   // r32 (adversary A1 on 2e0a3985): conform presents the cut's last frame before a Loop wrap
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
                 // the clamp at the last frame without Loop reports what was actually advanced).
                 // r33 (adversary A1 on e0947e37): a tick can wrap more than one lap; each moved the position back by wrapWidth.
-                const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick
-                    + static_cast<double>( dropFrameTick.wrapWidth ) * dropFrameTick.wrapLaps;
+                // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S2): a stale start past the lap limit was folded back first.
+                // r8 (sol r7 on 75ed5094): without Loop, a stale start past the cut's last frame was clamped back onto it with no
+                // travel (clampedFrames), which 75ed5094 read as -51 frames advanced (start 100, cut 1..50). r8 iteration 1
+                // (adversary pass 14 A1 on a2983bf2): the tick reports the delta it applied (every lap included), so the grant is
+                // never recovered from the endpoints, whose subtraction rounds next to a far stale start.
+                const double grantedDropFrames = dropFrameTick.appliedFrames;
+                // r7 (sol r6 on 9f3f5ebd): the present trace's advance, including whole laps that land back on the start
+                m_playbackTickAppliedFrames = grantedDropFrames;
                 m_newPosDropMode = dropFrameTick.position;
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-3: the drop-frame engine's source-frame advance (dropped frames
-                // still advance the timeline; a wrap never counts).
-                m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );
+                // still advance the timeline; a wrap never counts). PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: from the
+                // corrected start (a fold or clamp of a stale start is not footage; the counter rebases there).
+                // r1 iteration 1 (adversary pass 1 A1 on fc9e3e93): a reader that skips a wrapped tick reads whether the tick
+                // LAPPED: the r9 fold marks a zero-lap correction wrapped, and skipping it lost the real step from correctedStart.
+                const bool dropFrameLapped = playback_frame_range::dropFrameTickLapped( dropFrameTick );
+                m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameLapped );
+                // r1 (sol r9 B1 + B2): a POSITION CORRECTION is recorded BEFORE the tick's laps, so the laps count as travel
+                // from it; the presentation that lands on it rebases the paint tracker (paintCreditHandOff) instead of
+                // crediting the move.
+                if( dropFrameTick.corrected ) m_playbackWrapRecorder.noteEngineCorrection( playback_frame_range::dropFrameCorrectionFrame( dropFrameTick.correctedStart ) );
                 // PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2: the drop-frame engine wrap, counted where it happens. r21 (key3
                 // M-HFR-DROP-WRAP-WIDTH): it is credited the width the tick subtracted (cutOut - cutIn), not the non-drop
                 // Loop wrap's cutOut - cutIn + 1, which counted one frame the timeline never travelled.
                 if( dropFrameTick.wrapped ) m_playbackWrapRecorder.noteEngineWrap( dropFrameTick.wrapWidth, dropFrameTick.wrapLaps );
-                //Sync audio
-                if( dropFrameTick.wrapped && ui->actionAudioOutput->isChecked() )
+                //Sync audio (r1: a correction moves the position too)
+                if( ( dropFrameTick.wrapped || dropFrameTick.corrected ) && ui->actionAudioOutput->isChecked() )
                 {
                     requestPlaybackAudioSync();
                 }
@@ -13389,17 +13436,20 @@ void MainWindow::playbackHandling(int timeDiff)
                 ui->horizontalSliderPosition->blockSignals( false );
                 if( m_playbackSmokeActive )
                 {
+                    // r1 (fable r9 H6 for corrections): the correction moves the histogram's timeline first, so the tick's move
+                    // below books only its own travel; the summary's residual shows the correction under Other, as a seek
+                    if( dropFrameTick.corrected ) m_playbackSlipHistogram.noteTimelineCorrection( playback_frame_range::dropFrameCorrectionFrame( dropFrameTick.correctedStart ) );
                     m_playbackSlipHistogram.noteTimelineMove(
-                        dropFrameTick.wrapped ? playback_slip::AdvancePath::LoopWrap
+                        dropFrameLapped ? playback_slip::AdvancePath::LoopWrap
                                               : playback_slip::AdvancePath::DropTick,
                         ui->horizontalSliderPosition->value(), paceNowMs,
                         grantedDropFrames, m_playbackPaceGuard.creditFrames(),
                         getPlaybackFramerate(), !paceGuardArmedBeforeTick );
                     // PLAYBACK-STARTUP-CATCHUP-BURST-1: startup_catchup_frames, the skips of the first 2 s after Play.
-                    if( !dropFrameTick.wrapped
+                    if( !dropFrameLapped
                      && paceNowMs - m_playbackSmokeStartTime * 1000.0 <= playback_native_pace::kStartupCatchupWindowMs )
                         m_playbackSmokeStartupSkippedFrames += playback_native_pace::skippedFrames(
-                            sourcePositionBeforeDropTick, dropFrameTick.position );
+                            dropFrameTick.correctedStart, dropFrameTick.position );
                 }
                 m_frameChanged = true;
             }
@@ -28171,6 +28221,7 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeConformPaintWaitEscapes = 0;
     // r16 (adversary A1): engine wraps before this measured Play are not this Play's wraps
     m_playbackSmokeTrackerEngineWraps = m_playbackWrapRecorder.engineWraps;
+    m_playbackSmokeTrackerEngineCorrections = m_playbackWrapRecorder.engineCorrections;   // r1: nor its corrections
     m_playbackSmokeStartRequestSerial = m_nextRenderRequestSerial;
     m_playbackSmokeStartDecodeRequestsIssued =
         m_pRenderThread ? m_pRenderThread->decodeRequestsIssuedCount() : 0;
@@ -28623,8 +28674,12 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         // PLAYBACK-PACE-GUARD-THROUGHPUT-1 r2: drawFrameReady runs the first present's early advance BEFORE it
         // gets here, so the slider already holds whatever the first-frame wait was repaid with (UM r5: a jump
         // of dozens of frames on one tick). The paced timeline rate must not count that.
+        // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): a position correction is not travel, so the
+        // engine's corrections (the slip histogram's signed sum, noted under m_playbackSmokeActive) are left out.
+        // The histogram's start is m_playbackSmokeStartPosition (reset at the measured Play's start); its travel is clamped into int
+        // (adversary pass 3 A3 on c4fa34c3).
         m_playbackSmokeFirstPresentTimelineDeltaAbs =
-            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition );
+            qAbs( m_playbackSlipHistogram.timelineTravel( ui->horizontalSliderPosition->value() ) );
     }
     gpuPresentEventSetContext( m_playbackSmokeSessionId, static_cast<qint64>( displayFrame ) );
 
@@ -28637,19 +28692,8 @@ void MainWindow::notePlaybackSmokePresentedFrame(
     // "went backward" test also fires for an external backward scrub, or a stress seek to an
     // arbitrary earlier frame, during a session where Loop never actually wrapped -- see
     // isContactSheetLoopWrapTransition for why Loop state and jump size now both gate this.
-    const bool playbackSmokeWrapNow =
-        m_playbackSmokePresentedFrames > 0
-     && playback_frame_range::isContactSheetLoopWrapTransition(
-            ui->actionLoop->isChecked(),
-            ui->spinBoxCutIn->value() - 1,
-            ui->spinBoxCutOut->value() - 1,
-            m_playbackSmokeLastPresentedFrame,
-            static_cast<int>( displayFrame ) );
-    if( playbackSmokeWrapNow )
-    {
-        m_playbackSmokeWrapped = true;
-        m_playbackWrapRecorder.noteInferredWrap();   // second signal only; see PlaybackWrapRecorder
-    }
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r2 (adversary pass 11 A2 on 6ff14cd4): decided below, once
+    // the engine corrections this presentation crossed are known (presentedTransitionInfersLoopWrap: a landed correction is no wrap).
     // PLAYBACK-HFR-CONFORM-DEFAULT-1: how fast the TIMELINE moves (source frames per wall second) and the
     // largest jump between PRESENTED source frames, loop wrap excluded (1 == every source frame shown).
     // r16 (adversary A1 on ff41b4fa, re-pass A1/A2): the wrap is the engine's own count, never the inference
@@ -28668,13 +28712,41 @@ void MainWindow::notePlaybackSmokePresentedFrame(
                                                           requestContext.engineWrapsAtRequest,
                                                           m_playbackSmokeTrackerEngineWraps,
                                                           m_playbackSmokePresentedFrames > 0 );
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B1 + B2): the engine's POSITION CORRECTIONS this frame lands, stamped and
+    // consumed exactly as its wraps (presentationLoopWraps is a generic counter). A landing that crossed one rebases the paint
+    // tracker to the last one's frame, and is credited only the wraps the engine made after it (paintCreditHandOff); the wrap
+    // COUNT is still every wrap crossed.
+    const int sourceAdvanceCorrectionsBefore = m_playbackSmokeTrackerEngineCorrections;
+    const int sourceAdvanceCorrections = presentationLoopWraps( m_playbackWrapRecorder.engineCorrections,
+                                                                requestContext.engineCorrectionsAtRequest,
+                                                                m_playbackSmokeTrackerEngineCorrections,
+                                                                m_playbackSmokePresentedFrames > 0 );
+    const playback_frame_range::PaintCreditHandOff sourceAdvanceHandOff =
+        playback_frame_range::paintCreditHandOff( m_playbackWrapRecorder, sourceAdvanceWrapsBefore, sourceAdvanceWraps,
+                                                  sourceAdvanceCorrectionsBefore, sourceAdvanceCorrections );
+    // The presented-frame wrap inference (the block comment above): Loop state and jump size gate it, and r2 a landed engine
+    // correction explains the backward jump (the engine counts its own wraps).
+    const bool playbackSmokeWrapNow =
+        m_playbackSmokePresentedFrames > 0
+     && playback_frame_range::presentedTransitionInfersLoopWrap(
+            ui->actionLoop->isChecked(),
+            ui->spinBoxCutIn->value() - 1,
+            ui->spinBoxCutOut->value() - 1,
+            m_playbackSmokeLastPresentedFrame,
+            static_cast<int>( displayFrame ),
+            sourceAdvanceCorrections );
+    if( playbackSmokeWrapNow )
+    {
+        m_playbackSmokeWrapped = true;
+        m_playbackWrapRecorder.noteInferredWrap();   // second signal only; see PlaybackWrapRecorder
+    }
     // r29 (adversary A1 on cf403dba, A2 on 4201a437): this is the HAND-OFF. The frame waits in the ledger for the surface's paint,
     // which credits m_playbackSmokeSourceAdvance (notePlaybackSmokePainted); replaced before that paint, it is never credited.
     m_playbackSmokePaintCredit.noteSubmitted( static_cast<uint64_t>( readyFrame.requestSerial ),
                                               static_cast<int>( displayFrame ),
                                               sourceAdvanceWraps,
-                                              m_playbackWrapRecorder.engineWrapsWidth( sourceAdvanceWrapsBefore,
-                                                                                       sourceAdvanceWraps ),
+                                              sourceAdvanceHandOff.wrapsWidth,
+                                              sourceAdvanceHandOff.rebase, sourceAdvanceHandOff.rebaseFrame,
                                               m_playbackSmokeSourceAdvance );
     // The engine's own wrap count (playbackHandling) is the authority; the inference above can only add.
     if( m_playbackWrapRecorder.replayCount() > 0 ) m_playbackSmokeWrapped = true;
@@ -29070,6 +29142,13 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         slipSample.uiLatencyMs = presentUiSignalLatencyMs;
         slipSample.timelinePosition = ui->horizontalSliderPosition->value();
         slipSample.lookaheadCovered = requestContext.playbackLookaheadDepth > 0;
+        // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): the corrections this frame's request crossed (the
+        // consumed-count step, which a first present takes too) and the hand-off's rebase, so the histogram rebases its display
+        // endpoint where the paint tracker rebases: a correction is never slips or startup catch-up.
+        slipSample.correctionsLanded = m_playbackSmokeTrackerEngineCorrections - sourceAdvanceCorrectionsBefore;
+        slipSample.rebase = sourceAdvanceHandOff.rebase;
+        slipSample.rebaseFrame = sourceAdvanceHandOff.rebaseFrame;
+        slipSample.rebaseLapped = sourceAdvanceHandOff.wrapsAfterRebase > 0;
         // HFR-NATIVE-M16-1457-GUI-TEXTURE-PRESENT-OFFLOAD-1 K1: this present's texture-present parts, from values
         // already captured (no clock read); only for a present the AMaZE texture presenter itself drew (A3).
         if( playback_texture_split::sampleEligible(
@@ -31257,6 +31336,9 @@ void MainWindow::notePlaybackSmokePresentedFrame(
         // The internal-advance guard avoids a second generation invalidation;
         // the play-stop transition performs the single authoritative fence.
         m_playbackInternalSliderAdvance = true;
+        // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 iteration 2 (adversary pass 4 A2 on b30cd3a1): the write-back takes the timeline to
+        // the PRESENTED frame, so the corrections its request never crossed leave with it (timeline_delta pairs it with its own)
+        m_playbackSlipHistogram.noteTimelinePinnedToDisplay( static_cast<int>( displayFrame ) );
         ui->horizontalSliderPosition->setValue(
             static_cast<int>( displayFrame ) );
         m_playbackInternalSliderAdvance = false;
@@ -31795,7 +31877,9 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
     const double elapsedMs = ( now - m_playbackSmokeStartTime ) * 1000.0;
     const double elapsedSeconds = elapsedMs > 0.0 ? elapsedMs / 1000.0 : 0.0;
     const int currentPosition = ui->horizontalSliderPosition->value();
-    const int timelineDelta = currentPosition - m_playbackSmokeStartPosition;
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): a position correction is not travel. timeline_delta and
+    // every rate and count derived from it leave out the engine's corrections (start_position and current_position stay raw).
+    const int timelineDelta = m_playbackSlipHistogram.timelineTravel( currentPosition );
     const int timelineDeltaAbs = timelineDelta >= 0
         ? timelineDelta
         : -timelineDelta;
@@ -36446,6 +36530,11 @@ void MainWindow::drawFrameReady()
             presentationAcceptedLookaheadStamp( requestContext.engineWrapsAtRequest,
                                                 m_playbackWrapRecorder.engineWraps );
         readyFrame.presentationContext.engineWrapsAtRequest = requestContext.engineWrapsAtRequest;
+        // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the position-correction count, raised exactly as the wrap count is
+        requestContext.engineCorrectionsAtRequest =
+            presentationAcceptedLookaheadStamp( requestContext.engineCorrectionsAtRequest,
+                                                m_playbackWrapRecorder.engineCorrections );
+        readyFrame.presentationContext.engineCorrectionsAtRequest = requestContext.engineCorrectionsAtRequest;
     }
 
     // Forward-only present guard: during forward playback never present a frame older

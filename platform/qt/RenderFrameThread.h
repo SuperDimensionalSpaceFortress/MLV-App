@@ -183,6 +183,11 @@ public:
              * request copies its base request's count, and r20: MainWindow::drawFrameReady raises it to the live count
              * when it accepts the frame as the engine's target (presentationAcceptedLookaheadStamp). */
             int engineWrapsAtRequest = 0;
+            /* PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the engine's POSITION-CORRECTION count
+             * (PlaybackWrapRecorder::engineCorrections) when this frame was requested, stamped and raised exactly as
+             * engineWrapsAtRequest above, so the presentation that lands on a correction rebases the paint tracker
+             * (playback_frame_range::paintCreditHandOff) and one requested before it does not. */
+            int engineCorrectionsAtRequest = 0;
             bool playbackActive = false;
             bool dropFramePlaybackActive = false;
             bool renderThreadUsing16BitPreview = false;

@@ -871,7 +871,7 @@ private:
     QLabel *m_pFpsStatus;
     QString m_lastPlaybackFpsStatusText;
     double m_playbackFpsEmaFrameMs = 0.0;
-    QTime m_lastPlaybackFpsStatusUpdateTime;
+    QElapsedTimer m_lastPlaybackFpsStatusUpdateTime;
     QLabel *m_pFrameNumber;
     QLabel *m_pChosenDebayer;
     QLabel *m_pLookLabelStatus = nullptr;   // LOOK-FULLSCREEN-PARITY-1: the current look, windowed
@@ -1323,6 +1323,8 @@ private:
     int m_playbackSmokeLastPresentedFrame = -1;
     // r16 (adversary A1): engine wraps the source-advance tracker has taken (presentationLoopWraps)
     int m_playbackSmokeTrackerEngineWraps = 0;
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: engine position corrections the tracker has taken (presentationLoopWraps)
+    int m_playbackSmokeTrackerEngineCorrections = 0;
     // CUDA-PLAYBACK-CONTACT-SHEET-2 (BLOCKER fix): set when a presented display_frame goes
     // backwards during the measured session -- the only way that happens is a Loop wrap
     // (cutOut back to cutIn), since playback otherwise only advances. Reset per session in
@@ -1402,6 +1404,9 @@ private:
     // (playback_frame_range::conformDropFrameDelta), repaid one presented frame per later tick. Cleared with the pace guard.
     double m_conformDropDebtFrames = 0.0;
     playback_present_trace::Recorder m_playbackPresentTrace;   // PLAYBACK-STARTUP-CATCHUP-BURST-1 r7, opt-in
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r7 (sol r6 on 9f3f5ebd): the source frames the last playbackHandling() call
+    // applied (its grant; 0 when it held). Cleared on entry, set on each grant path; the present trace reads it.
+    double m_playbackTickAppliedFrames = 0.0;
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: per-present slip accounting and timeline-path reconciliation for the
     // smoke session (playback_smoke.slip_summary); fed only while m_playbackSmokeActive.
     playback_slip::SlipHistogram m_playbackSlipHistogram;
@@ -1425,8 +1430,8 @@ private:
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
     bool playbackTargetPresentOutstanding( int target );
-    bool conformTargetPresentOutstanding();
-    bool conformAcceptedTargetPresentPending();
+    bool conformTargetPresentOutstanding( double position );       // r2: the tick's corrected start
+    bool conformAcceptedTargetPresentPending( double position );   // r2: the tick's corrected start
     bool conformDisplayedFramePaintPending();
     long long conformDisplayedPlaybackFrame();
     bool renderThreadIdleNoWait( int activePlaybackTarget, uint64_t *epochOut );

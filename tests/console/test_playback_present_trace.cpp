@@ -5,11 +5,14 @@
 #include "../common/repo_paths.h"
 
 #include "../../platform/qt/PlaybackPresentTrace.h"
+#include "../../platform/qt/PlaybackFpsMeterPolicy.h"
+#include "../../platform/qt/PlaybackFrameRange.h"
 
 #include <QFile>
 #include <QString>
 #include <QTextStream>
 
+#include <cmath>
 #include <string>
 
 using playback_present_trace::Recorder;
@@ -23,7 +26,7 @@ void driveOnePlay(Recorder &trace)
 {
     trace.begin(1000.0, 64);
     trace.noteTick(1001.0, false, false);
-    trace.noteAdvance(1001.5, 0.0, 1.0, 42);
+    trace.noteAdvance(1001.5, 1.0, 42);   // r7: the applied grant (0 -> 1)
     Row first;
     first.frame = 1;
     first.position = 1;
@@ -33,9 +36,9 @@ void driveOnePlay(Recorder &trace)
     trace.notePresentEnd(1012.0);
     trace.noteTick(1020.0, true, false);
     trace.noteTick(1028.0, false, true);
-    trace.noteAdvance(1028.5, 1.0, 1.4, 42);
+    trace.noteAdvance(1028.5, 0.4, 42);   // 1.0 -> 1.4
     trace.noteTick(1036.0, false, false);
-    trace.noteAdvance(1036.5, 1.4, 2.0, 8);
+    trace.noteAdvance(1036.5, 0.6, 8);    // 1.4 -> 2.0
     trace.noteGrab(3.5);
     trace.noteAudioSync();
     Row second;
@@ -118,7 +121,7 @@ TEST(PlaybackPresentTrace, AHoldIsNotAnAdvanceAndANewPlayStartsClean)
     driveOnePlay(trace);
     trace.begin(5000.0, 8);
     trace.noteTick(5008.0, false, false);
-    trace.noteAdvance(5008.5, 7.0, 7.0, 8);   // granted nothing: a hold
+    trace.noteAdvance(5008.5, 0.0, 8);   // granted nothing (7.0 -> 7.0): a hold
     Row r;
     r.presentMs = 5020.0;
     trace.notePresent(r);
@@ -126,6 +129,285 @@ TEST(PlaybackPresentTrace, AHoldIsNotAnAdvanceAndANewPlayStartsClean)
     ASSERT_EQ(0, trace.rows()[0].advances);
     ASSERT_NEAR(-1.0, trace.rows()[0].lastAdvanceMs, 1e-9);
     ASSERT_NEAR(0.0, trace.rows()[0].intervalMs, 1e-9);
+}
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r9 (fable r8 PRESENT-TRACE-NONFINITE-GRANT-ROW-1): a non-finite grant is no advance.
+// Dropping std::isfinite from noteAdvance's guard (leaving appliedFrames > 0.0) would record +inf as one advance.
+TEST(PlaybackPresentTrace, ANonFiniteGrantIsNotAnAdvance)
+{
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, HUGE_VAL, 8);
+    trace.noteAdvance(1009.5, std::nan(""), 8);
+    trace.noteAdvance(1010.5, -HUGE_VAL, 8);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
+    ASSERT_EQ(0, trace.rows()[0].advances);
+    ASSERT_NEAR(-1.0, trace.rows()[0].lastAdvanceMs, 1e-9);
+    ASSERT_NEAR(0.0, trace.rows()[0].advancedFrames, 0.0);
+}
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r7 (sol r6 blocker on 9f3f5ebd): the trace decided "advanced" from equal endpoints,
+// so a capped Drop Frame tick whose whole laps land back on its start lost its advance and its shaped interval. Sol's
+// literal repro: 24 fps, Drop Frame + Loop, cut 1..616, start 0, no pending advance, an unpaced (or fully credited) grant,
+// a 41666300 ms shaped tick. The cap asks for 41666250 ms = 999990 frames, which is 1626 laps of 615: position 0 -> 0.
+TEST(PlaybackPresentTrace, AWholeLapDropFrameTickIsAnAdvanceWithItsShapedInterval)
+{
+    const int shapedTickMs = 41666300;
+    const int cappedMs = playback_fps_meter::frameBoundedTickTimeDiffMs(shapedTickMs, 24.0);
+    ASSERT_EQ(41666250, cappedMs);
+    const double request = playback_fps_meter::dropFrameRequestFrames(24.0, cappedMs);
+    ASSERT_NEAR(999990.0, request, 0.0);
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(0.0, request, 1, 616, true, false);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_EQ(615, tick.wrapWidth);
+    ASSERT_EQ(1626, tick.wrapLaps);
+    ASSERT_NEAR(0.0, tick.position, 0.0);   // the endpoints are equal
+    // MainWindow's grantedDropFrames: the advance the tick applied
+    const double granted = tick.position - 0.0 + tick.foldedFrames + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+    ASSERT_NEAR(999990.0, granted, 0.0);
+
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, granted, shapedTickMs);   // 0 -> tick.position (0), 999990 granted
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
+    ASSERT_EQ(1, trace.rows()[0].advances);
+    ASSERT_NEAR(8.5, trace.rows()[0].lastAdvanceMs, 1e-9);
+    ASSERT_NEAR(41666300.0, trace.rows()[0].lastTickDiffMs, 0.0);   // the shaped interval, never the capped request
+    ASSERT_NEAR(999990.0, trace.rows()[0].advancedFrames, 0.0);     // "the source frames those advances granted"
+}
+
+// r7 (sol r6 INV-5 row 2): equal endpoints with no grant stay a hold, the same repro shape with a zero request.
+TEST(PlaybackPresentTrace, AZeroGrantOnEqualEndpointsIsStillAHold)
+{
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(0.0, 0.0, 1, 616, true, false);
+    ASSERT_FALSE(tick.wrapped);
+    ASSERT_NEAR(0.0, tick.position, 0.0);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, 0.0, 8);   // 0 -> tick.position (0), nothing granted
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
+    ASSERT_EQ(0, trace.rows()[0].advances);
+    ASSERT_NEAR(-1.0, trace.rows()[0].lastAdvanceMs, 1e-9);
+    ASSERT_EQ(1, trace.rows()[0].ticks);   // the tick ran; it only granted nothing
+    ASSERT_NEAR(0.0, trace.rows()[0].advancedFrames, 0.0);
+}
+
+// r7 iteration 2 (adversary pass 13 A1 on 80079007): a stale start past the lap limit is folded into the cut with zero
+// laps (r6), so a zero-grant tick moves the drop position 1100000 -> 0 without travelling a frame. The trace fell back to
+// the endpoint displacement and logged adv=1, adv_frames=-1100000. The fold's stale distance is never an advance.
+TEST(PlaybackPresentTrace, AFoldedStaleStartWithNoGrantIsNotAnAdvance)
+{
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(1100000.0, 0.0, 1, 2, true, false);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_EQ(0, tick.wrapLaps);
+    ASSERT_NEAR(0.0, tick.position, 0.0);
+    ASSERT_NEAR(1100000.0, tick.foldedFrames, 0.0);
+    const double granted = tick.position - 1100000.0 + tick.foldedFrames + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+    ASSERT_NEAR(0.0, granted, 0.0);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, granted, 1);   // 1100000 -> tick.position (0), nothing granted
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
+    ASSERT_EQ(0, trace.rows()[0].advances);
+    ASSERT_NEAR(-1.0, trace.rows()[0].lastAdvanceMs, 1e-9);
+    ASSERT_NEAR(0.0, trace.rows()[0].advancedFrames, 0.0);
+}
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r8 (sol r7 blocker on 75ed5094, DC-06 catalogue row "a non-Loop clamp correction is
+// not an advance"): during Play, Drop Frame off, seek 100 -> 10, cut 1..50, Drop Frame back on before the next tick, Loop
+// off. The slider handler leaves the Drop Frame position at 100 and the normalizer keeps it (it is inside the clip); the
+// slider at 10 bypasses the outer last-frame branch, and the non-Loop clamp returns 49 with no fold and no lap. 75ed5094's
+// grantedDropFrames (position - before + foldedFrames + wrapWidth * wrapLaps) read that correction as -51 frames of travel
+// and the trace logged adv=1, adv_frames=-51 and moved last_adv / last_tick_diff. A correction with zero grant is no
+// advance: the advance fields keep the previous real advance, for a zero request and for an ordinary 8 ms request.
+TEST(PlaybackPresentTrace, AClampedStaleNonLoopStartWithNoGrantIsNotAnAdvance)
+{
+    ASSERT_FALSE(playback_frame_range::outerLastFrameBranchHandlesTick(10, 50, true, false, false));
+    playback_frame_range::CutRange cut;
+    cut.cutIn = 1;
+    cut.cutOut = 50;
+    cut.valid = true;
+    ASSERT_NEAR(100.0, playback_frame_range::normalizeDropFramePosition(100.0, cut, 200, false), 0.0);
+    const double eightMsRequest = playback_fps_meter::dropFrameRequestFrames(24.0, 8);
+    ASSERT_NEAR(0.192, eightMsRequest, 1e-12);
+    const double requests[] = { 0.0, eightMsRequest };
+    for (const double request : requests)
+    {
+        const playback_frame_range::DropFrameTickResult tick =
+            playback_frame_range::advanceDropFrameTick(100.0, request, 1, 50, false, false);
+        ASSERT_FALSE(tick.wrapped);
+        ASSERT_EQ(0, tick.wrapLaps);
+        ASSERT_NEAR(0.0, tick.foldedFrames, 0.0);
+        ASSERT_NEAR(49.0, tick.position, 0.0);
+        // the value 75ed5094 handed the trace (its grantedDropFrames had no clamp term)
+        const double reconstructed = tick.position - 100.0 + tick.foldedFrames
+            + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+        ASSERT_NEAR(-51.0, reconstructed, 0.0);
+        Recorder trace;
+        trace.setEnabled(true);
+        trace.begin(1000.0, 4);
+        trace.noteTick(1008.0, false, false);
+        trace.noteAdvance(1008.5, 1.0, 42);            // a real advance first
+        trace.noteTick(1016.0, false, false);
+        trace.noteAdvance(1016.5, reconstructed, 8);   // 100 -> 49: the clamp's correction, nothing granted
+        Row r;
+        r.presentMs = 1020.0;
+        trace.notePresent(r);
+        ASSERT_EQ(static_cast<size_t>(1), trace.rows().size());
+        ASSERT_EQ(2, trace.rows()[0].ticks);
+        ASSERT_EQ(1, trace.rows()[0].advances);
+        ASSERT_NEAR(1.0, trace.rows()[0].advancedFrames, 0.0);
+        ASSERT_NEAR(8.5, trace.rows()[0].lastAdvanceMs, 1e-9);
+        ASSERT_NEAR(42.0, trace.rows()[0].lastTickDiffMs, 0.0);
+
+        // r8: MainWindow's grantedDropFrames adds the clamp's correction back, so the tick granted exactly nothing
+        ASSERT_NEAR(51.0, tick.clampedFrames, 0.0);
+        const double granted = tick.position - 100.0 + tick.foldedFrames + tick.clampedFrames
+            + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+        ASSERT_TRUE(granted == 0.0);
+        ASSERT_TRUE(tick.appliedFrames == 0.0);   // r8 iteration 1: what MainWindow reads
+        Recorder fixedTrace;
+        fixedTrace.setEnabled(true);
+        fixedTrace.begin(1000.0, 4);
+        fixedTrace.noteTick(1008.0, false, false);
+        fixedTrace.noteAdvance(1008.5, 1.0, 42);
+        fixedTrace.noteTick(1016.0, false, false);
+        fixedTrace.noteAdvance(1016.5, granted, 8);
+        fixedTrace.notePresent(r);
+        ASSERT_EQ(1, fixedTrace.rows()[0].advances);
+        ASSERT_NEAR(1.0, fixedTrace.rows()[0].advancedFrames, 0.0);
+        ASSERT_NEAR(8.5, fixedTrace.rows()[0].lastAdvanceMs, 1e-9);
+        ASSERT_NEAR(42.0, fixedTrace.rows()[0].lastTickDiffMs, 0.0);
+    }
+    // a fractional stale start is corrected to exactly 0 as well (the two roundings are exact negatives)
+    const playback_frame_range::DropFrameTickResult fractional =
+        playback_frame_range::advanceDropFrameTick(100.192, 0.192, 1, 50, false, false);
+    ASSERT_TRUE(fractional.position - 100.192 + fractional.foldedFrames + fractional.clampedFrames
+                + static_cast<double>(fractional.wrapWidth) * fractional.wrapLaps == 0.0);
+}
+
+// r8 (sol r7 INV-5 row 4, kept): a start BEFORE the last frame travels to it, and that travel is the advance. Start 48,
+// a grant of 2, cut 1..50, Loop off: the clamp lands on 49 with no correction, one applied frame, one advance.
+TEST(PlaybackPresentTrace, AClampedTickFromBeforeTheLastFrameIsStillItsTravel)
+{
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(48.0, 2.0, 1, 50, false, false);
+    ASSERT_NEAR(49.0, tick.position, 0.0);
+    ASSERT_NEAR(0.0, tick.clampedFrames, 0.0);
+    const double granted = tick.position - 48.0 + tick.foldedFrames + tick.clampedFrames
+        + static_cast<double>(tick.wrapWidth) * tick.wrapLaps;
+    ASSERT_NEAR(1.0, granted, 0.0);
+    ASSERT_TRUE(tick.appliedFrames == 1.0);
+    // on the last frame already: a grant that would pass it is held there, a hold and no correction
+    const playback_frame_range::DropFrameTickResult onLast =
+        playback_frame_range::advanceDropFrameTick(49.0, 0.192, 1, 50, false, false);
+    ASSERT_NEAR(49.0, onLast.position, 0.0);
+    ASSERT_NEAR(0.0, onLast.clampedFrames, 0.0);
+    ASSERT_TRUE(onLast.appliedFrames == 0.0);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, granted, 8);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(1, trace.rows()[0].advances);
+    ASSERT_NEAR(1.0, trace.rows()[0].advancedFrames, 0.0);
+}
+
+namespace
+{
+// MainWindow::playbackHandling's grantedDropFrames, as written on the head under test (the wiring row below pins it). On
+// a2983bf2 (RED cb613101) it was position - before + foldedFrames + clampedFrames + wrapWidth * wrapLaps.
+double mainWindowGrantedDropFrames(const playback_frame_range::DropFrameTickResult &tick, double before)
+{
+    (void)before;
+    return tick.appliedFrames;
+}
+} // namespace
+
+// r8 iteration 1 (adversary pass 14 A1 on a2983bf2, introduced major): the grant was RECONSTRUCTED from the endpoints, and
+// next to a far stale start that subtraction rounds. MLVI rate 3689/160, an 8 ms tick, stale Drop Frame position 1100000,
+// cut 1..2, Loop on: the fold applies 0.18445 with zero laps, the reconstruction read 0.1844500000588596; from 8400000 a
+// grant of 4.999999999999999e-10 reconstructed to 0 and was logged as a hold. The grant is the delta the tick applied.
+TEST(PlaybackPresentTrace, AFoldedStartsGrantIsTheAppliedDeltaNotAReconstruction)
+{
+    const double request = playback_fps_meter::dropFrameRequestFrames(3689.0 / 160.0, 8);
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(1100000.0, request, 1, 2, true, false);
+    ASSERT_TRUE(tick.wrapped);
+    ASSERT_EQ(0, tick.wrapLaps);
+    ASSERT_TRUE(tick.position == request);
+    ASSERT_TRUE(mainWindowGrantedDropFrames(tick, 1100000.0) == request);
+    const double tiny = 4.999999999999999e-10;
+    const playback_frame_range::DropFrameTickResult tinyTick =
+        playback_frame_range::advanceDropFrameTick(8400000.0, tiny, 1, 2, true, false);
+    ASSERT_EQ(0, tinyTick.wrapLaps);
+    const double tinyGranted = mainWindowGrantedDropFrames(tinyTick, 8400000.0);
+    ASSERT_TRUE(tinyGranted == tiny);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, tinyGranted, 8);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(1, trace.rows()[0].advances);
+    ASSERT_TRUE(trace.rows()[0].advancedFrames == tiny);
+}
+
+// r8 iteration 2 (adversary pass 15 A1 on 437108e0, introduced major): the delta is not the travel when the position cannot
+// hold it. 120 fps clip conformed at 100 fps, cut 1..2048, Drop Frame on, Loop off, position 1024, a held target: the
+// conform grants 2.1, 2.2, 1.9 and 1.8 total 8.000000000000002, so the fourth tick hands the engine a residue of
+// 1.7763568394002505e-15, and 1024 plus it is 1024. 437108e0 reported the residue as applied and the trace logged an
+// advance (moving last_adv and last_tick_diff); the base read 0. A tick that did not move the position applied nothing.
+TEST(PlaybackPresentTrace, AResidueThePositionCannotHoldIsNotAnAdvance)
+{
+    const double residue = 2.1 + 2.2 + 1.9 + 1.8 - 8.0;
+    ASSERT_TRUE(residue == 1.7763568394002505e-15);
+    const playback_frame_range::DropFrameTickResult tick =
+        playback_frame_range::advanceDropFrameTick(1024.0, residue, 1, 2048, false, true);
+    ASSERT_TRUE(tick.position == 1024.0);
+    ASSERT_FALSE(tick.wrapped);
+    ASSERT_TRUE(tick.appliedFrames == 0.0);
+    Recorder trace;
+    trace.setEnabled(true);
+    trace.begin(1000.0, 4);
+    trace.noteTick(1008.0, false, false);
+    trace.noteAdvance(1008.5, 1.0, 21);   // a real advance first
+    trace.noteTick(1016.0, false, false);
+    trace.noteAdvance(1016.5, mainWindowGrantedDropFrames(tick, 1024.0), 18);
+    Row r;
+    r.presentMs = 1020.0;
+    trace.notePresent(r);
+    ASSERT_EQ(1, trace.rows()[0].advances);
+    ASSERT_NEAR(8.5, trace.rows()[0].lastAdvanceMs, 1e-9);
+    ASSERT_NEAR(21.0, trace.rows()[0].lastTickDiffMs, 0.0);
 }
 
 TEST(PlaybackPresentTrace, ARowHasOneFieldPerHeaderColumn)
@@ -153,11 +435,78 @@ TEST(PlaybackPresentTraceWiring, ReadOnceFromTheEnvironmentAndEveryHookIsGuarded
         "        m_playbackPresentTrace.noteTick( mlv_stage_timing_now() * 1000.0, m_frameStillDrawing, predictivePlaybackAdvance );")));
     ASSERT_EQ(1, source.count(QStringLiteral(
         "    if( m_playbackPresentTrace.active() )\n"
-        "        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, tracePositionBefore, m_newPosDropMode, timeDiff );")));
+        "        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, m_playbackTickAppliedFrames, shapedTickMs );")));   // r7
     ASSERT_EQ(1, source.count(QStringLiteral("        if( m_playbackPresentTrace.active() )\n        {\n            playback_present_trace::Row traceRow;")));
     // rows are written after the Play stops, never inside the timed window
     const int stop = source.indexOf(QStringLiteral("    m_playbackSmokeActive = false;\n    m_playbackPresentTrace.end();"));
     const int dump = source.indexOf(QStringLiteral("\"playback_smoke.present_trace session=%1 row=%2\""));
     ASSERT_TRUE(stop >= 0);
     ASSERT_TRUE(dump > stop);
+}
+
+// r7 (sol r6 blocker on 9f3f5ebd): the trace is handed the tick's APPLIED grant, which playbackHandling clears on entry and
+// sets on each of its three grant paths (the outer Loop wrap, the Normal-mode whole frame, the Drop Frame tick), so an
+// advance is never inferred from equal endpoints alone.
+TEST(PlaybackPresentTraceWiring, TheAdvanceIsTheTicksAppliedGrantNotItsEndpoints)
+{
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "    if( m_playbackPresentTrace.active() )\n"
+        "        m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, m_playbackTickAppliedFrames, shapedTickMs );")));
+    // r7 iteration 2 (pass 13 A1 on 80079007): the endpoints are not passed at all, so no fallback can infer an advance
+    ASSERT_FALSE(source.contains(QStringLiteral("tracePositionBefore")));
+    const int handlingAt = source.indexOf(QStringLiteral("void MainWindow::playbackHandling(int timeDiff)\n{\n"));
+    ASSERT_TRUE(handlingAt >= 0);
+    const int handlingEnd = source.indexOf(QStringLiteral("void MainWindow::showPerformanceProfilingDialog"), handlingAt);
+    ASSERT_TRUE(handlingEnd > handlingAt);
+    const QString handling = source.mid(handlingAt, handlingEnd - handlingAt);
+    // cleared first, before any early return
+    ASSERT_TRUE(handling.contains(QStringLiteral(
+        "gui_present_gap::OtherBusySpan::PlaybackHandling );\n    m_playbackTickAppliedFrames = 0.0;   // r7 (sol r6)")));
+    ASSERT_EQ(4, handling.count(QStringLiteral("m_playbackTickAppliedFrames = ")));
+    const int wrapGrantAt = handling.indexOf(QStringLiteral(
+        "if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;"));
+    const int wrapSetAt = handling.indexOf(QStringLiteral("m_playbackTickAppliedFrames = 1.0;"));
+    const int wholeGrantAt = handling.indexOf(QStringLiteral(
+        "if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;"));
+    const int wholeSetAt = handling.indexOf(QStringLiteral(
+        "m_playbackTickAppliedFrames = ui->horizontalSliderPosition->value() - sourcePositionBeforeTick;"));
+    const int dropGrantedAt = handling.indexOf(QStringLiteral("const double grantedDropFrames = "));
+    const int dropSetAt = handling.indexOf(QStringLiteral("m_playbackTickAppliedFrames = grantedDropFrames;"));
+    ASSERT_TRUE(wrapGrantAt >= 0);
+    ASSERT_TRUE(wrapSetAt > wrapGrantAt);
+    ASSERT_TRUE(wholeGrantAt > wrapSetAt);
+    ASSERT_TRUE(wholeSetAt > wholeGrantAt);
+    ASSERT_TRUE(dropGrantedAt > wholeSetAt);
+    ASSERT_TRUE(dropSetAt > dropGrantedAt);
+    // r7 iteration 2 (pass 13 A3 on 80079007): each store is pinned with the line above it and its own indentation, so an
+    // `if( false )` in front of it (on its line or the line before) breaks the pin. An enclosing dead block is the open
+    // dead-block hardening row (sol r6).
+    ASSERT_EQ(1, handling.count(QStringLiteral(
+        "or leaves m_newPosDropMode where it was (no audio output).\n"
+        "                m_playbackTickAppliedFrames = 1.0;\n")));
+    ASSERT_EQ(1, handling.count(QStringLiteral(
+        "whatever m_newPosDropMode held before\n"
+        "                    m_playbackTickAppliedFrames = ui->horizontalSliderPosition->value() - sourcePositionBeforeTick;\n")));
+    ASSERT_EQ(1, handling.count(QStringLiteral(
+        "including whole laps that land back on the start\n"
+        "                m_playbackTickAppliedFrames = grantedDropFrames;\n")));
+}
+
+// r8 (sol r7 blocker on 75ed5094): the Drop Frame grant (the trace's advance and the slip histogram's granted share) is
+// never the clamp's correction of a stale start past the cut's last frame, so that correction is 0 frames, never a negative
+// advance. r8 iteration 1 (pass 14 A1 on a2983bf2): it is the tick's own applied delta (DropFrameTickResult::appliedFrames),
+// never reconstructed from the endpoints, which rounds next to a far stale start.
+TEST(PlaybackPresentTraceWiring, TheDropFrameGrantIsTheTicksAppliedDelta)
+{
+    const QString source = mainWindowSource();
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "                const double grantedDropFrames = dropFrameTick.appliedFrames;\n")));
+    ASSERT_FALSE(source.contains(QStringLiteral("dropFrameTick.position - sourcePositionBeforeDropTick")));
+    // r8 iteration 2 (pass 15 A3 on 437108e0): the store is pinned to the grant statement above it, so an `if( false )`
+    // line inserted before the comment (an unbraced dead guard) breaks the pin
+    ASSERT_EQ(1, source.count(QStringLiteral(
+        "                const double grantedDropFrames = dropFrameTick.appliedFrames;\n"
+        "                // r7 (sol r6 on 9f3f5ebd): the present trace's advance, including whole laps that land back on the start\n"
+        "                m_playbackTickAppliedFrames = grantedDropFrames;\n")));
 }

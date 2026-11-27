@@ -208,8 +208,11 @@ $legs = [System.Collections.Generic.List[object]]::new()
 foreach ($rel in $StandardLegs) {
     $path = Join-Path $here $rel
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { Stop-Baseline 'USAGE' "no standard leg spec at '$path'" }
-    $spec = try { [IO.File]::ReadAllText($path) | ConvertFrom-Json } catch { Stop-Baseline 'USAGE' "leg spec '$path' is not valid JSON" }
-    $legs.Add([pscustomobject]@{ legId = [string]$spec.legId; card = [string]$spec.card; spec = (Resolve-Path -LiteralPath $path).Path; backends = @($spec.backends); role = (Get-DvVenueRole -Table $table -Card ([string]$spec.card) -Venue $Venue) })
+    # r6 (adversary-fa329743.json A4): the spec is read ONCE; its plan fields and its planned leg type come from that one text
+    $specText = try { [IO.File]::ReadAllText($path) } catch { Stop-Baseline 'USAGE' "leg spec '$path' could not be read" }
+    $spec = try { $specText | ConvertFrom-Json } catch { Stop-Baseline 'USAGE' "leg spec '$path' is not valid JSON" }
+    # r6 (adversary-de8e3799.json A3): plannedLegType is read HERE, at planning, before any chain runs (a spec replaced later grants nothing)
+    $legs.Add([pscustomobject]@{ legId = [string]$spec.legId; card = [string]$spec.card; spec = (Resolve-Path -LiteralPath $path).Path; backends = @($spec.backends); role = (Get-DvVenueRole -Table $table -Card ([string]$spec.card) -Venue $Venue); plannedLegType = (Get-VenuePlannedLegType -SpecText $specText) })
 }
 
 $deadline = $startedUtc.AddSeconds($MaxTotalSec)
@@ -336,12 +339,25 @@ function Invoke-BoundedChain([string]$Backend) {
         kill = $kill; killAttempted = [bool]$kill; terminationConfirmed = $(if ($kill) { [bool]$kill.terminationConfirmed } else { $null }) }
 }
 
-function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
+function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend, [object]$PublishedSha = $null) {
     # The figures exactly as the receipt reports them (null when the receipt does not carry one; never a default). presentedFps / timelineFpsAfterFirstPresent come from
     # the receipt's own hashed run log through Get-DvMatrixRow, which refuses a log that no longer hashes to the receipt.
-    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null; identity = $null }
+    $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null; identity = $null; resultJsonSha256 = $null; receiptSha256 = $null }
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
-    try { $rc = [IO.File]::ReadAllText($ReceiptPath) | ConvertFrom-Json } catch { return $f }
+    # r6 (adversary-de8e3799.json A4): the receipt bytes are read ONCE; the figures come from them and the host-load read is bound to their sha256
+    # (merge with master's R3-RESIDUE-1 A1: the decoded TEXT is kept too, as $rcText, because the validator below takes the text as well as the parsed object)
+    $rcText = ''
+    try { $rcBytes = [IO.File]::ReadAllBytes($ReceiptPath); $rcText = [IO.StreamReader]::new([IO.MemoryStream]::new($rcBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF); $rc = $rcText | ConvertFrom-Json; $f.receiptSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes)) } catch { return $f }
+    # adversary-7efea617.json A2: -PublishedSha is the sha256 the leg published for its receipt, carried in the chain row ($null only for a chain row that has no
+    # such member: a legacy row). When the member is there, the bytes read above must BE those bytes: this read's own hash is never the expectation of itself, so a
+    # receipt (and the result.json it binds) replaced between the chain's read and this one is refused as not the leg's, and no figure is taken from it.
+    if ($null -ne $PublishedSha -and ([string]::IsNullOrEmpty([string]$PublishedSha) -or -not [string]::Equals([string]$PublishedSha, $f.receiptSha256, [StringComparison]::OrdinalIgnoreCase))) {
+        $f.identity = "receipt bytes sha256 $($f.receiptSha256) are not the sha256 the leg published ($(if ([string]::IsNullOrEmpty([string]$PublishedSha)) { 'none' } else { [string]$PublishedSha }))"
+        return $f
+    }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (adversary-01a12498.json A2): the smoke binding of the receipt these figures come from; the host-load read is bound to it
+    $boundSha = Get-DvProp (Get-DvProp $rc 'evidence') 'resultJsonSha256'
+    $f.resultJsonSha256 = $(if ($boundSha -is [string]) { $boundSha } elseif ($null -eq $boundSha) { '' } else { 'not-a-sha' })
     # The receipt must be the one THIS run's leg wrote, not a stale or foreign file the chain's path happens to name: its receiptId is its file name, its legId / venue /
     # buildManifestSha256 are the planned ones, and it started after this run did (the hub VM stamps it on the same clock). Anything else is `identity`: not validated, no figure.
     $idProblems = [System.Collections.Generic.List[string]]::new()
@@ -376,7 +392,7 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
             if (-not $vr.ok) { throw "validator exit $($vr.exit) timedOut=$($vr.timedOut)" }
             $vr.stdout | ConvertFrom-Json
         }
-        else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo }
+        else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo -ReceiptText $rcText }   # the TEXT too: ConvertFrom-Json keeps only the last of two same-name members (R3-RESIDUE-1 A1)
     } catch { $null }
     $f.verification = $(if ($v -and [string]$v.status) { [ordered]@{ status = [string]$v.status; valid = [bool]$v.valid; reasons = @($v.reasons | Select-Object -First 3) } } else { [ordered]@{ status = 'VALIDATOR_ERROR'; valid = $false; reasons = @() } })
     if ($f.verification.status -cnotin @('ADVISORY', 'NO_SIGNAL', 'VERIFIED', 'VERIFIED_OFFLINE_TEST')) { $f.rejected = $f.verification.status; return $f }
@@ -384,7 +400,7 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     if (-not $outcomeText) { return $f }      # no outcome, no figure: the caller types a RAN leg whose receipt names none
     $f.outcome = $outcomeText
     if ($f.verification.status -ceq 'NO_SIGNAL') { $f.noFigure = 'RECEIPT_NO_SIGNAL'; return $f }
-    if ($outcomeText -cnotin @('PASS', 'FAIL')) { $f.noFigure = "RECEIPT_OUTCOME_$outcomeText"; return $f }
+    if (-not (Test-DvOrdinalIn $outcomeText @('PASS', 'FAIL'))) { $f.noFigure = "RECEIPT_OUTCOME_$outcomeText"; return $f }
     $m =Get-DvProp $rc 'metrics'; $pb = Get-DvProp $rc 'playback'; $pm = Get-DvProp $m 'presentMonStats'
     $entry = [pscustomobject]@{ seq = 1; repeat = 1; cellId = $Leg.legId; backend = $Backend; displayMode = [string](Get-DvProp (Get-DvProp $rc 'display') 'requestedMode'); scaleFactor = Get-DvProp (Get-DvProp $rc 'scale') 'requestedScale' }
     $row = try { Get-DvMatrixRow -PlanEntry $entry -Receipt $rc } catch { $null }
@@ -430,7 +446,9 @@ foreach ($b in $StandardBackends) {
             if ($null -eq $planLeg) { $planLeg = @($legs | Where-Object { [string]$leg.name -like "*$($_.legId)*" })[0] }
             if ($null -eq $planLeg) { continue }
             # An unclean chain's receipts are never read: no figure of such a leg reaches the trend file.
-            $fig = Get-RowFigures $(if ($chainClean -and $leg.PSObject.Properties['receipt']) { [string]$leg.receipt } else { '' }) $planLeg $b
+            # adversary-7efea617.json A2: the sha256 the leg published for its receipt (the chain row's receiptSha256), the expectation of every read of that receipt below
+            $publishedSha = $(if ($leg.PSObject.Properties['receiptSha256']) { [string]$leg.receiptSha256 } else { $null })
+            $fig = Get-RowFigures $(if ($chainClean -and $leg.PSObject.Properties['receipt']) { [string]$leg.receipt } else { '' }) $planLeg $b $publishedSha
             $legStatus = [string]$leg.status
             $legOutcome = $(if ($fig.outcome) { $fig.outcome } else { [string]$leg.outcome })
             $failure = $null
@@ -453,11 +471,43 @@ foreach ($b in $StandardBackends) {
             if ($fig.noFigure) { $legOutcome = $fig.outcome }      # a noFigure row keeps the receipt's own outcome (the failure text names why it carries no figure)
             if ($failure) { $fig.fps = $null; $fig.drops = $null; $fig.stall = $null }      # a typed failure never carries figures, whatever the receipt held
             if ($fig.rejected -ceq 'INVALID' -and $legStatus -ceq 'EVIDENCE_INCOMPLETE') { $legStatus = 'EVIDENCE_INVALID' }
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing from its own hash-bound smoke result (VenueChain.psm1 Get-VenueLegHostLoad).
+            # A provisional or unknown RAN row keeps its figures for the trend file but is never a measured reference row (the $measuredRows predicate below).
+            # adversary-ac6205bd.json A7: an unclean chain's receipts are never read (the same rule as Get-RowFigures above): no path, so the standing is unknown unread
+            $hlReceipt = $(if ($chainClean -and $leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { '' })
+            # (adversary-01a12498.json A2: bound to the receipt Get-RowFigures took the figures from; no receipt read there means no figures and no expectation)
+            # r6 (sol r5 B2): the export exemption comes only from the PLANNED leg type (the plan leg's spec), never from the receipt's shape
+            $hlPlanned = $(if ($null -ne $planLeg -and $planLeg.PSObject.Properties['plannedLegType']) { [string]$planLeg.plannedLegType } else { 'unknown' })
+            # adversary-7efea617.json A2 (the legacy-row tail, r2): the expectation is ONLY the sha256 the leg published. A chain row with no receiptSha256 member (a legacy or stub row) has none,
+            # so its standing is 'unknown' (an empty expectation never matches), never this read's own hash judging itself; a receipt Get-RowFigures refused (no figures, no binding) is unknown too.
+            $hlExpectSha = $(if ($null -ne $publishedSha) { [string]$publishedSha } else { '' })
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R3-MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A5): a receipt Get-RowFigures REFUSED (its identity is not this run's, or the validator rejected it: a missing
+            # evidence manifest, an INVALID or incomplete verdict) is not this leg's receipt, so it binds no host load either: the standing is read from NO receipt (the reader's own unknown, provisional and
+            # uncollected answer), never from a result.json that merely hashes to what the refused receipt claims. Get-RowFigures sets resultJsonSha256 BEFORE it validates, so that field alone cannot say so.
+            $figRefused = (-not [string]::IsNullOrEmpty([string]$fig.identity)) -or (-not [string]::IsNullOrEmpty([string]$fig.rejected))
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A5, NARROWED): the chain's own host-load refusal survives this handoff. A chain row that says HOSTLOAD_PROVISIONAL (its class), or whose
+            # hostLoadProvisional member is anything but the boolean false, was judged by the chain (at its deadline it skips the read: the unknown, provisional standing). Re-reading the standing here on a fresh
+            # default 20 s budget promoted such a row to quiet and counted it in measuredRows, so a row the chain refused reads unknown, provisional and uncollected: no read is made. A legacy row with neither member is unchanged.
+            $chainRefusedHostLoad = ($leg.PSObject.Properties['class'] -and [string]::Equals([string]$leg.class, 'HOSTLOAD_PROVISIONAL', [StringComparison]::Ordinal)) -or
+                ($leg.PSObject.Properties['hostLoadProvisional'] -and -not ($leg.hostLoadProvisional -is [bool] -and -not $leg.hostLoadProvisional))
+            # R2-NARROW-1 r3 (adversary-baf2e69a.json A5): the two reading branches end at the run's ONE absolute deadline ($deadline, set once from MaxTotalSec): a row read cannot run on a fresh 20 s past the cap.
+            # Under 1 s to it nothing is read (unknown, provisional, uncounted: the safe side).
+            $hl = $(if ($figRefused -or $chainRefusedHostLoad) { Get-VenueLegHostLoad -ReceiptPath '' -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' }
+                    elseif ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned -ExpectReceiptSha256 $hlExpectSha -CallDeadlineUtc $deadline }
+                    else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' -CallDeadlineUtc $deadline })
+            # R2-NARROW-1 r7 (sol r7 A3, key3 fable r7 parity gap): the standing is judged against the run's absolute end where it is CONSUMED, by the same VenueChain.psm1 guard the chain and the lease batch
+            # use. A standing the reader returned at 899.9 s of a 900 s cap, consumed after a suspension at 901 s, reads unknown, provisional and uncollected: the row is kept for the trend file, never measured.
+            $hl = Limit-VenueHostLoadToDeadline -Standing $hl -DeadlineUtc $deadline
+            $hlLine = Get-VenueReferenceHostLoadRefusal -LegId $(if ($hlReceipt) { [IO.Path]::GetFileNameWithoutExtension($hlReceipt) } else { [string]$planLeg.legId }) -Standing $hl
+            if ($hlLine -and $legStatus -ceq 'RAN') { Out-Line $hlLine }
             $rows.Add([ordered]@{
                 schema = 'mlv-app/venue-baseline-trend/v1'; utc = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'); venue = $Venue; role = $planLeg.role
                 sourceCommit = $commit; leg = $planLeg.legId; card = $planLeg.card; backend = $b; status = $legStatus; failure = $failure
                 outcome = $legOutcome; fps = $fig.fps; drops = $fig.drops; stall = $fig.stall; receiptVerification = $fig.verification
                 receiptPath = $(if ($leg.PSObject.Properties['receipt'] -and $leg.receipt) { [string]$leg.receipt } else { $null }); buildManifestSha256 = $manifest; runDir = $RunDir; hubLoad = $null
+                hostLoadState = [string]$hl.state; hostLoadProvisional = [bool]$hl.provisional
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): the row keeps the standing's collected (Test-DvHostLoadRowClean requires a real $true)
+                hostLoadCollected = ($hl.collected -is [bool] -and $hl.collected)
             })
         }
     }
@@ -504,7 +554,10 @@ if ($rows.Count -gt 0) {
     finally { if ($held) { try { $trendMutex.ReleaseMutex() } catch { } }; $trendMutex.Dispose() }
 }
 # I3: a run in which no row carries a figure is never OK. It keeps exit 0 (the BASELINE-EXIT-NO-MEASUREMENT-1 behaviour) under its own token.
-$measuredRows = @($rows | Where-Object { $_.status -ceq 'RAN' -and $null -ne $_.fps }).Count
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a row is measured only when its hostLoadProvisional is the boolean false (a provisional or unknown leg is never counted).
+# r6 (sol r5 B3): the same strict row predicate as the matrix (DualVenueRunner.psm1 Test-DvHostLoadRowClean: state exactly 'quiet' AND provisional a real $false,
+# and since residue r1 (sol r6 B3) hostLoadCollected a real $true).
+$measuredRows = @($rows | Where-Object { $_.status -ceq 'RAN' -and $null -ne $_.fps -and (Test-DvHostLoadRowClean -Row $_) }).Count
 $reason = $(if ($typed) { $typed.reason } elseif ($measuredRows -eq 0) { 'NO_MEASUREMENT' } else { 'OK' })
 $code = [int]$ExitCodes[$reason]
 $noMeasurementDetail = "no row carries a figure ($($rows.Count) row(s) appended, 0 measured); this is NOT an OK run"

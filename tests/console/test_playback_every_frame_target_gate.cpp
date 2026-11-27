@@ -579,7 +579,9 @@ TEST( EveryFrameTargetGate, TheModeNeutralChecksAndTheConformDelegateAreLive )
 {
     const QString source = mainWindowSource();
     const QString neutralSignature = QStringLiteral( "bool MainWindow::playbackTargetPresentOutstanding( int target )" );
-    const QString conformSignature = QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding()" );
+    // r4 (merge of fork/master after #905): PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 gave the conform checks the tick's
+    // corrected start (\a position) in place of m_newPosDropMode; the delegate to the mode-neutral check is unchanged.
+    const QString conformSignature = QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding( double position )" );
     const QString neutral = stripComments( functionBody( source, neutralSignature, conformSignature ) ).simplified();
     ASSERT_EQ( std::string(
                    "bool MainWindow::playbackTargetPresentOutstanding( int target ) { "
@@ -590,12 +592,12 @@ TEST( EveryFrameTargetGate, TheModeNeutralChecksAndTheConformDelegateAreLive )
                    "return m_pRenderThread->hasPlaybackLookaheadRequest( static_cast<uint32_t>( target ), generation ); }" ),
                neutral.toStdString() );
     const QString conform = stripComments( functionBody( source, conformSignature,
-                                                         QStringLiteral( "bool MainWindow::conformAcceptedTargetPresentPending()" ) ) )
+                                                         QStringLiteral( "bool MainWindow::conformAcceptedTargetPresentPending( double position )" ) ) )
                                 .simplified();
     ASSERT_EQ( std::string(
-                   "bool MainWindow::conformTargetPresentOutstanding() { "
+                   "bool MainWindow::conformTargetPresentOutstanding( double position ) { "
                    "if( !m_pRenderThread || !playbackConformActive() ) return false; "
-                   "const int target = static_cast<int>( m_newPosDropMode ); "
+                   "const int target = static_cast<int>( position ); "
                    "if( target < 0 || m_lastPresentedPlaybackFrame == static_cast<long long>( target ) ) return false; "
                    "return playbackTargetPresentOutstanding( target ); }" ),
                conform.toStdString() );
@@ -642,8 +644,8 @@ TEST( EveryFrameTargetGate, ConformStillReturnsFalseWithoutConformAndDelegatesTo
 {
     const QString source = mainWindowSource();
     const QString conform = functionBody( source,
-                                          QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding()" ),
-                                          QStringLiteral( "bool MainWindow::conformAcceptedTargetPresentPending()" ) );
+                                          QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding( double position )" ),
+                                          QStringLiteral( "bool MainWindow::conformAcceptedTargetPresentPending( double position )" ) );
     ASSERT_FALSE( conform.isEmpty() );
     const int noConform = conform.indexOf( QStringLiteral( "if( !m_pRenderThread || !playbackConformActive() ) return false;" ) );
     const int earlyOut = conform.indexOf(
@@ -657,7 +659,7 @@ TEST( EveryFrameTargetGate, ConformStillReturnsFalseWithoutConformAndDelegatesTo
 
     const QString neutral = functionBody( source,
                                           QStringLiteral( "bool MainWindow::playbackTargetPresentOutstanding( int target )" ),
-                                          QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding()" ) );
+                                          QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding( double position )" ) );
     ASSERT_FALSE( neutral.isEmpty() );
     // fix 1 (adversary A4 sibling): each check with its polarity -- each one found means a present is coming
     ASSERT_TRUE( neutral.contains( QStringLiteral( "if( renderThreadBusyForPlaybackAdvance( target ) ) return true;" ) ) );

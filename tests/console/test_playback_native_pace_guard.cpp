@@ -840,8 +840,9 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
     ASSERT_TRUE(wrapMove > wrapGate);
     ASSERT_TRUE(handling.indexOf(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")) < wrapGate);
     // drop-frame mode advances by the GRANTED share, never the raw fps x timeDiff
+    // (PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6, sol r5 S1: that request is taken through the finite-request helper)
     ASSERT_TRUE(handling.contains(QStringLiteral(
-        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
+        "m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),")));
     ASSERT_FALSE(handling.contains(QStringLiteral("m_newPosDropMode, getPlaybackFramerate() * (double)timeDiff / 1000.0,")));
     ASSERT_FALSE(handling.contains(QStringLiteral("m_newPosDropMode, getFramerate() * (double)timeDiff / 1000.0,")));
     ASSERT_TRUE(handling.contains(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")));
@@ -942,7 +943,7 @@ TEST(PlaybackUnpacedWiring, ReadOnceAndHonouredOnlyInAutomation)
     ASSERT_EQ(1, source.count(QStringLiteral("if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;")));
     ASSERT_EQ(1, source.count(QStringLiteral("if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;")));
     ASSERT_EQ(1, source.count(QStringLiteral(
-        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
+        "m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),")));
     ASSERT_EQ(1, source.count(QStringLiteral("m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );")));
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: the due wake (arm and re-arm) reads the same pace, and only hands it to the guard's
     // msUntilCredit -- never unpaced (the arm refuses a pace that is not positive)
@@ -1029,7 +1030,7 @@ TEST(PlaybackNativePaceWiring, TheFirstPresentsCatchUpIsSampledAfterItsAdvanceAn
     ASSERT_TRUE(firstPresent >= 0);
     const int sample = source.indexOf(QStringLiteral(
         "        m_playbackSmokeFirstPresentTimelineDeltaAbs =\n"
-        "            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition );"), firstPresent);
+        "            qAbs( m_playbackSlipHistogram.timelineTravel( ui->horizontalSliderPosition->value() ) );"), firstPresent);
     ASSERT_TRUE(sample > firstPresent);
     ASSERT_TRUE(sample - firstPresent < 1200);
     ASSERT_TRUE(source.mid(firstPresent - 200, 200).contains(QStringLiteral("else")));
