@@ -1485,9 +1485,11 @@ function Get-DvVisualCaptureBeginRecord {
             }
             elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=playback_prep\.invalidate_generation(\s|$)'), $script:DvCi)) { }   # before the begin record: not tail evidence
             elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture(\s|$)'), $script:DvCi)) { }   # r12 (Grok CoS G4): the app's own summary record (MainWindow.cpp logInteractionEvent "gui_smoke.visual_capture"): not tail evidence, and its free-text error="..." may name any event, so the catch-all below must not read it
-            elseif ([string]$line -match '(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation') {
+            elseif ([string]$line -match '(?i)interaction_trace\b.*\bevent\s*=\s*["'']?\s*(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)') {
                 # r11 adversary A2 (sol on 6c0a9228): a record naming one of these events in any other form (a quoted event=, two spaces) was skipped
                 # silently, so a doubled or unreadable burst_end, begin, clip_changed or invalidation vanished; it now voids the whole tail binding
+                # r12 adversary A2 (sol on e8011af8): only in the EVENT position of an interaction_trace record: the r11 form matched the names anywhere in a line,
+                # so startup metadata carrying a legal path (run_metadata command_line ... gui_smoke.visual_capture.example) voided every real run's binding
                 $malformedTail = $true
             }
         }
@@ -8168,6 +8170,13 @@ function Get-DvTailInFlightCredit {
         # (equal-time, burst, behind-close, close-frame, order/repeat) whether or not it can credit: 364df36b filtered on saved, the recorded sha256, a
         # decodable PNG and source_id FIRST, so an unsaved second paint of 478 was never seen and 478 and 479 credited over a repeat. Those four decide only
         # which rows may CREDIT (add to the shown set); a paint-recording row that cannot credit still refuses, or leaves its target uncredited
+        # r12 adversary A3 (sol on e8011af8): such a row whose display frame or tail time the reader could not read (a string "478", a string "38": normalised to null)
+        # still records a paint, so it is refused here, never dropped from the checks below while the burst's index completeness still passes
+        if ((Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'labelBound') -eq $true -and $paintBasis -and
+            $unforcedKind -and $null -ne $forcedBefore -and [int64]$forcedBefore -eq 0 -and
+            $null -ne (Get-DvProp $f 'serial') -and ($null -eq $tailMs -or $null -eq $display)) {
+            return (& $no "TAIL_CREDIT_PAINT_ORDER: the bound $fKind capture $(Get-DvProp $f 'index') (serial $(Get-DvProp $f 'serial')) records a paint but its display frame or tail time is unreadable (display frame '$display', tail time '$tailMs'), so its place in the paint order cannot be told and the tail is not credited")
+        }
         if ((Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'labelBound') -eq $true -and $paintBasis -and
             $unforcedKind -and $null -ne $forcedBefore -and [int64]$forcedBefore -eq 0 -and
             $null -ne (Get-DvProp $f 'serial') -and $null -ne $tailMs -and $null -ne $display) {
@@ -8213,7 +8222,9 @@ function Get-DvTailInFlightCredit {
     foreach ($q in $ordered) {
         $qIndex = Get-DvProp $q 'index'; $qMs = [double](Get-DvProp $q 'tailElapsedMs')
         if ([string]::Equals([string](Get-DvProp $q 'kind'), 'play_first_unbound', [StringComparison]::Ordinal)) {
-            if ($null -eq $burstCaptures -or $burstCaptures -lt 0 -or $null -eq $qIndex -or [int64]$qIndex -ge $burstCaptures -or -not $nonBurstTimed -or ($null -ne $firstNonBurstMs -and $qMs -ge $firstNonBurstMs)) {
+            # r12 adversary A1 (sol on e8011af8): the boundary must EXIST. A visual.json with no non-burst row at all has firstNonBurstMs null and nonBurstUntimed false,
+            # which proved no order for burst captures taken at any time (900 ms, 950 ms), so a null boundary refuses like an untimed one
+            if ($null -eq $burstCaptures -or $burstCaptures -lt 0 -or $null -eq $qIndex -or [int64]$qIndex -ge $burstCaptures -or -not $nonBurstTimed -or $null -eq $firstNonBurstMs -or $qMs -ge $firstNonBurstMs) {
                 return (& $no "TAIL_CREDIT_BURST_NOT_LOGGED: the play_first_unbound capture $qIndex at $qMs ms is not one the burst logged before its end (burst_end burst_captures=$burstCaptures; first non-burst capture at $firstNonBurstMs ms; every non-burst capture timed: $nonBurstTimed), so an invalidation after burst_end may have replaced what it shows and the tail is not credited")
             }
         }

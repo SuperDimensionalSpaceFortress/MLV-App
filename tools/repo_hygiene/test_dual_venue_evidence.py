@@ -22163,9 +22163,14 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         return {**row, "index": index, "file": f"{row['kind'].replace('_', '-')}-{index}.png"}
 
     @classmethod
-    def app_json(cls, *frames: dict, **top) -> dict:
+    def app_json(cls, *frames: dict, boundary: bool = True, **top) -> dict:
+        rows = list(frames or (cls.play(0), cls.play(1), cls.play(2)))
+        # r12 adversary A1 (sol on e8011af8): a burst capture is credited only below a readable non-burst row (the first forced play capture, which every real run
+        # writes). A fixture of burst rows alone gets that boundary here, late (2000 ms) and not itself a qualifying capture; `boundary=False` leaves it out
+        if boundary and rows and all(isinstance(r, dict) and r.get("kind") == "play_first_unbound" for r in rows):
+            rows.append(cls.play(0, kind="play", tail_elapsed_ms=2000, display_frame=479, serial=900, painted_serial=900))
         doc = {"schema": "mlv-app/visual-capture/v1", "error": "", "measured_session": 1, "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
-               "tail_begin_utc": cls.BEGIN_UTC, "run_nonce": cls.RUN_A, "frames": list(frames or (cls.play(0), cls.play(1), cls.play(2)))}
+               "tail_begin_utc": cls.BEGIN_UTC, "run_nonce": cls.RUN_A, "frames": rows}
         doc.update(top)
         return doc
 
@@ -22307,10 +22312,11 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
             "a kind with a zero-width suffix": ({}, self.app_json(play(0, kind="play​")), "no play capture"),
             # r2 (sol r1 finding 5): a capture showing 478 exactly now credits 478 (test_r2_...); 477 is the last painted frame, before every in-flight target
             "display frame before every in-flight target": ({}, self.app_json(play(0, display_frame=477)), "no play capture"),
-            "display frame a string": ({}, self.app_json(play(0, display_frame="479")), "no play capture"),
-            "tail time a string": ({}, self.app_json(play(0, tail_elapsed_ms="Infinity")), "no play capture"),
-            "no tail time": ({}, self.app_json(play(0, tail_elapsed_ms=None)), "no play capture"),
-            "a negative tail time": ({}, self.app_json(play(0, tail_elapsed_ms=-1)), "no play capture"),
+            # r12 (adversary A3 on e8011af8): a bound paint-recording row whose frame or time the reader could not read is refused by name, no longer dropped
+            "display frame a string": ({}, self.app_json(play(0, display_frame="479")), "display frame or tail time is unreadable"),
+            "tail time a string": ({}, self.app_json(play(0, tail_elapsed_ms="Infinity")), "display frame or tail time is unreadable"),
+            "no tail time": ({}, self.app_json(play(0, tail_elapsed_ms=None)), "display frame or tail time is unreadable"),
+            "a negative tail time": ({}, self.app_json(play(0, tail_elapsed_ms=-1)), "display frame or tail time is unreadable"),
             "a prepared result replaced before": ({"prepReplacedBefore": 1}, "default", "was replaced"),
             "a prepared result replaced after": ({"prepReplacedAfter": 1}, "default", "was replaced"),
             "a drop that is not a generation change": ({"prepStaleDrops": 2}, "default", "differs from prep_generation_drops"),
@@ -23282,7 +23288,8 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         "gui_smoke.visual_capture": {"measured_session": "3", "requested": "5", "written": "5", "stop_frame": "480", "paused_settled": "1",
                                      "tail_begin_utc": BEGIN_UTC, "tail_end_utc": "2026-11-25T18:00:03.100Z", "error": "", "source_difference": "omitted"},
     }
-    TAIL_CATCH_ALL = r"'(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation'"
+    TAIL_CATCH_ALL = r"""'(?i)interaction_trace\b.*\bevent\s*=\s*["'']?\s*(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)'"""
+    R11_CATCH_ALL = r"'(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation'"
     TAIL_SUMMARY_EXEMPTION = (r"elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture(\s|$)'), "
                               r"$script:DvCi)) { }")
 
@@ -23326,7 +23333,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         except ValueError:
             self.fail(proc.stdout + proc.stderr)
 
-    TAIL_SUMMARY_ERROR = "gui_smoke.visual_capture.burst_end could not be written; playback_prep.invalidate_generation followed"
+    TAIL_SUMMARY_ERROR = "gui_smoke.visual_capture.burst_end could not be written (event=gui_smoke.visual_capture.burst_end); playback_prep.invalidate_generation followed"
 
     def every_emitter_log(self, with_clip_changed: bool = False, error: str | None = None) -> list:
         """A run log carrying one record from every emitter, in the app's order: an invalidation BEFORE the begin record (its free-text `reason` names an
@@ -23350,7 +23357,9 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         derived = self.derive_tail_binding(lines, module)
         burst = (self.play(0, kind="play_first_unbound", tail_elapsed_ms=8, display_frame=478, serial=484, painted_serial=484),
                  self.play(1, kind="play_first_unbound", tail_elapsed_ms=45, display_frame=479, serial=485, painted_serial=485))
-        return derived, self.metrics({**derived, "summarySession": "3", "conformSession": "3"}, app=self.app_json(*burst, measured_session=3), criteria=self.BOTH)
+        # (the first forced play capture after the burst, as every real run writes it: a burst capture is credited only below a readable non-burst boundary, r12 A1)
+        forced = self.play(0, kind="play", tail_elapsed_ms=125, display_frame=479, serial=487, painted_serial=487)
+        return derived, self.metrics({**derived, "summarySession": "3", "conformSession": "3"}, app=self.app_json(*burst, forced, measured_session=3), criteria=self.BOTH)
 
     def test_r12_g4_a_log_built_from_every_app_emitter_still_binds_the_tail_and_credits_two(self) -> None:
         """Grok CoS G4 (control). The emitters, as of 92e096dd: MainWindow.cpp:4662 playback_prep.invalidate_generation (free-text `reason=%1`), :11924
@@ -23374,20 +23383,23 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         self.assertIn("clip_changed count=1", out["m"]["conformTailInFlightCreditNote"], out)
 
     def test_r12_g4_mutation_the_catch_all_without_its_trailing_dot_turns_the_control_red(self) -> None:
-        """Mutation rows for the A2 catch-all (DualVenueRunner.psm1:1487). On 92e096dd the catch-all read the whole line, so (a) the summary record's own event
-        name (`gui_smoke.visual_capture `) matched it as soon as its trailing `\\.` was dropped, and (b) an `error=\"...\"` naming an event matched it with the
-        `\\.` in place; either voided every real run's binding (the control RED: no session, no UTC, no drops, no credit). r12 exempts the summary record
-        (TAIL_SUMMARY_EXEMPTION) ahead of the catch-all, so rows 1 and 2 drive the module with that exemption removed, and row 3 is the equivalent mutant."""
+        """Mutation rows for the A2 catch-all (DualVenueRunner.psm1:1487). On 92e096dd the catch-all read the whole line (R11_CATCH_ALL), so an `error=\"...\"` that
+        names an event voided every real run's binding; r12 narrows it to the EVENT position of an interaction_trace record (and the app's quoted free text
+        masks its `=`), and keeps the summary record's own exemption (TAIL_SUMMARY_EXEMPTION) ahead of it as defence in depth. The control goes RED when (1) the
+        whole-line catch-all comes back (the exemption removed with it), or (2) the narrowed one loses its trailing `\\.` (the summary record's own event name,
+        `event=gui_smoke.visual_capture `, then matches), the exemption removed. The exemption alone survives a lost dot (3, an equivalent mutant), and the narrowed
+        catch-all alone survives the exemption's removal (4): either guard keeps the binding."""
         self.assertEqual(self.tail_catch_all_count(), 1)
         dotless = (self.TAIL_CATCH_ALL, self.TAIL_CATCH_ALL.replace(r"visual_capture\.|", r"visual_capture|"))
+        whole_line = (self.TAIL_CATCH_ALL, self.R11_CATCH_ALL)
         no_exemption = (self.TAIL_SUMMARY_EXEMPTION, "elseif ($false) { }")
         empty_error = self.every_emitter_log(error="")
         voided = {"visualCaptureBeginSession": None, "visualCaptureBeginUtc": None, "visualTailPrepDrops": None}
         for name, edits, log, red in (
-                ("row 1: exemption removed, the error names events (the 92e096dd behaviour)", [no_exemption], self.every_emitter_log(), True),
-                ("row 2: exemption removed and the trailing dot dropped, an empty error", [no_exemption, dotless], empty_error, True),
-                ("row 2 control: exemption removed, the trailing dot in place, an empty error (the unmutated 92e096dd binds)", [no_exemption], empty_error, False),
-                ("row 3 (equivalent mutant): the trailing dot dropped alone, the exemption in place", [dotless], self.every_emitter_log(), False)):
+                ("row 1: the r11 whole-line catch-all, exemption removed, the error names events (the 92e096dd behaviour)", [whole_line, no_exemption], self.every_emitter_log(), True),
+                ("row 2: the trailing dot dropped, exemption removed, an empty error", [dotless, no_exemption], empty_error, True),
+                ("row 3 (equivalent mutant): the trailing dot dropped alone, the exemption in place", [dotless], self.every_emitter_log(), False),
+                ("row 4 (equivalent mutant): the exemption removed alone, the error names events", [no_exemption], self.every_emitter_log(), False)):
             with self.subTest(case=name):
                 derived, out = self.credit_from_log(log, module=self.mutated_module(edits))
                 if red:
@@ -23413,8 +23425,56 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         sparse = self.app_json(row(0, 8, 478, 484), row(2, 45, 479, 486))
         out = self.metrics({"visualBurstCaptures": 2}, app=sparse, criteria=self.BOTH)
         self.assertIn("TAIL_CREDIT_BURST_NOT_LOGGED", out["m"]["conformTailInFlightCreditNote"], out)
-        dense = self.metrics(None, app=self.app_json(row(0, 8, 478, 484), row(1, 45, 479, 485)), criteria=self.BOTH)
+        forced = self.play(0, kind="play", tail_elapsed_ms=125, display_frame=479, serial=487, painted_serial=487)   # (the non-burst boundary, r12 A1)
+        dense = self.metrics(None, app=self.app_json(row(0, 8, 478, 484), row(1, 45, 479, 485), forced), criteria=self.BOTH)
         self.assertEqual(dense["m"].get("conformTailInFlightCreditedFrames"), 2, dense)
+
+    def test_r12_a2_startup_metadata_naming_an_event_in_a_path_never_voids_the_tail_binding(self) -> None:
+        """r12 adversary A2 (sol on e8011af8), its input: a run_metadata record whose command_line carries a legal path, C:/Temp/gui_smoke.visual_capture.example,
+        before an ordinary begin + burst_end log. The r11 catch-all matched the name anywhere in a line, set malformedTail and returned $null for the session,
+        the drops and the burst count. Sibling: the invalidate_generation name in a path. Only the event position of an interaction_trace record counts."""
+        base = self.every_emitter_log(error="")
+        for name, path in (("gui_smoke.visual_capture.", "C:/Temp/gui_smoke.visual_capture.example"),
+                           ("playback_prep.invalidate_generation", "C:/Temp/playback_prep.invalidate_generation/run1")):
+            with self.subTest(case=name):
+                metadata = 'run_metadata={"command_line":["MLVApp.exe","--visual-capture-dir","' + path + '"],"process_id":1234}'
+                derived, out = self.credit_from_log([metadata] + base)
+                self.assertEqual((derived["visualCaptureBeginSession"], derived["visualTailPrepDrops"], derived["visualBurstCaptures"]), ("3", 0, 2), derived)
+                self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+
+    def test_r12_a1_burst_captures_with_no_non_burst_boundary_in_visual_json_are_not_credited(self) -> None:
+        """r12 adversary A1 (sol on e8011af8), its input: burst_captures=2 and one post-burst invalidation, visual.json with ONLY the two burst rows (900 ms, 950 ms,
+        frames 478 and 479) and no non-burst row. firstNonBurstMs was null and nonBurstUntimed false, so the boundary check passed and both targets credited
+        (jump 1, unpainted 0, PASS). An absent boundary proves no order. (control) the same rows with a forced play row after them still credit."""
+        burst = (self.play(0, kind="play_first_unbound", tail_elapsed_ms=900, display_frame=478, serial=484, painted_serial=484),
+                 self.play(1, kind="play_first_unbound", tail_elapsed_ms=950, display_frame=479, serial=485, painted_serial=485))
+        pb = {"visualBurstCaptures": 2, "visualPostBurstPrepDrops": 1}
+        out = self.metrics(pb, app=self.app_json(*burst, boundary=False), criteria=self.BOTH)
+        self.assert_no_credit(out, 2)
+        self.assertIn("TAIL_CREDIT_BURST_NOT_LOGGED", out["m"]["conformTailInFlightCreditNote"], out)
+        later = self.play(0, kind="play", tail_elapsed_ms=1000, display_frame=479, serial=487, painted_serial=487)
+        control = self.metrics(pb, app=self.app_json(*burst, later), criteria=self.BOTH)
+        self.assertEqual(control["m"].get("conformTailInFlightCreditedFrames"), 2, control)
+
+    def test_r12_a3_a_bound_paint_row_with_an_unreadable_frame_or_time_is_refused_not_dropped(self) -> None:
+        """r12 adversary A3 (sol on e8011af8), its input: burst_captures=3 with burst rows (index, ms, frame, serial, saved) (0, 8, 478, 484, true),
+        (1, 38, "478", 485, false), (2, 68, 479, 486, true) and a forced play row at 125 ms. The string display_frame (or tail_elapsed_ms) normalised to null, the row
+        left the ordered checks at the `$null -ne $display` test, and index completeness still passed, so 478 and 479 credited over a repeat of 478. (control)
+        the readable row refuses TAIL_CREDIT_PAINT_ORDER."""
+        forced = self.play(0, kind="play", tail_elapsed_ms=125, display_frame=479, serial=487, painted_serial=487)
+
+        def burst(i: int, ms, frame, serial: int, **over) -> dict:
+            return self.play(i, kind="play_first_unbound", tail_elapsed_ms=ms, display_frame=frame, serial=serial, painted_serial=serial, **over)
+
+        for name, middle, why in (("readable control", burst(1, 38, 478, 485, saved=False), "TAIL_CREDIT_PAINT_ORDER"),
+                                  ("display_frame as a string", burst(1, 38, "478", 485, saved=False), "unreadable"),
+                                  ("tail_elapsed_ms as a string", burst(1, "38", 478, 485, saved=False), "unreadable"),
+                                  ("display_frame absent", {k: v for k, v in burst(1, 38, 478, 485, saved=False).items() if k != "display_frame"}, "unreadable")):
+            with self.subTest(case=name):
+                out = self.metrics({"visualBurstCaptures": 3}, app=self.app_json(burst(0, 8, 478, 484), middle, burst(2, 68, 479, 486), forced), criteria=self.BOTH)
+                self.assertNotIn("conformTailInFlightCreditedFrames", out["m"], out)
+                self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
+                self.assertIn(why, out["m"]["conformTailInFlightCreditNote"], out)
 
     def tail_catch_all_count(self) -> int:
         return (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8").count(self.TAIL_CATCH_ALL)
