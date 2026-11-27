@@ -615,6 +615,16 @@ def leg_receipt_root_guard_ps(leg: Path, root: str, offline: bool = False) -> st
     )
 
 
+def canonical_receipt_state_for(spec: Path) -> dict[str, tuple[int, int]]:
+    """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r2: every file under the CANONICAL receipt root's directory for `spec`'s card/legId, as name -> (size, mtime_ns).
+    The canonical root is the one Invoke-VenueLeg resolves for itself when it is given no -ReceiptRoot (the main checkout's .claude-state\\dual-venue\\receipts, found from the git common dir)."""
+    doc = json.loads(spec.read_text(encoding="utf-8"))
+    common = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=60)
+    main_root = Path(common.stdout.strip()).parent if common.returncode == 0 and common.stdout.strip() else ROOT
+    base = main_root / ".claude-state" / "dual-venue" / "receipts" / str(doc["card"]) / str(doc["legId"])
+    return {str(p.relative_to(base)): (p.stat().st_size, p.stat().st_mtime_ns) for p in base.rglob("*") if p.is_file()} if base.exists() else {}
+
+
 def utc_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -853,7 +863,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         defaults = {"-LegBudgetSec": "60", "-LeaseMarginSec": "0", "-ClaimPollSec": "1", "-RecheckSec": "1",
                     "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
         for k in omit:
-            defaults.pop(k)
+            defaults.pop(k, None)   # (r2: an OMIT_DEFAULTS name that is not a valued default, as -SkipCommittedSpecPreflight, is read below)
         args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.runner), "-LegSpec", ",".join(str(s) for s in (specs or self.specs[:2])),
                 "-RunDir", str(self.run_dir), "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST, "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
@@ -3565,6 +3575,19 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         super().setUpClass()
         (cls.tmp / "fake-leg-args.ps1").write_text(FAKE_LEG_ARGS, encoding="utf-8")
         cls.commit_a, cls.commit_b = "1" * 40, "2" * 40
+        # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r2: this class lets the REAL Invoke-VenueLeg.ps1 run in a few cases (and would on a regression); its default receipt root is the CANONICAL one
+        cls.canonical_receipts_before = canonical_receipt_state_for(DV / "legs" / "m16-1243-chainattr-l-fullscreen-s1.json")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            after = canonical_receipt_state_for(DV / "legs" / "m16-1243-chainattr-l-fullscreen-s1.json")
+            if after != cls.canonical_receipts_before:
+                added = sorted(set(after) - set(cls.canonical_receipts_before))
+                changed = sorted(k for k in after if k in cls.canonical_receipts_before and after[k] != cls.canonical_receipts_before[k])
+                raise AssertionError(f"the CANONICAL receipt root was written by this class (the real leg ran with its default -ReceiptRoot): added={added} changed={changed}")
+        finally:
+            super().tearDownClass()
 
     def setUp(self) -> None:
         super().setUp()
@@ -5817,6 +5840,10 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         p.write_text(json.dumps(doc), encoding="utf-8")
         return p
 
+    def _hermetic_receipt_root(self) -> tuple[str, str]:
+        """r2: this case's own receipt root (under a .claude-state directory of its temp dir, as the batch's guard requires), never the canonical one a real leg defaults to."""
+        return ("-ReceiptRoot", str(self.case / ".claude-state" / "dual-venue" / "receipts"))
+
     def _reset_committed_case(self) -> None:
         for p in (self.events, self.leg_args, self.claim_path):
             p.unlink(missing_ok=True)
@@ -5832,7 +5859,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def test_legspec_committed_an_uncommitted_spec_is_refused_before_any_claim_in_every_mode(self) -> None:
         untracked = self._untracked_copy_of_a_committed_spec()
-        seam = ("-CommittedSpecRepoRoot", str(ROOT))
+        seam = ("-CommittedSpecRepoRoot", str(ROOT), *self._hermetic_receipt_root())
         self._reset_committed_case()
         r = self.run_batch([untracked], *seam)
         self._assert_nothing_claimed_or_leased("-LegSpec", r)
@@ -5865,19 +5892,15 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_legspec_committed_the_real_leg_script_turns_the_preflight_on_without_the_seam(self) -> None:
         # production: the batch runs the real Invoke-VenueLeg.ps1, whose own check refuses an uncommitted spec, so the preflight is on with no seam at all
         self._reset_committed_case()
-        # (-ReceiptRoot: a regression here lets the real leg run, and it would write its refusal receipt into the shared receipt root; a scratch root under the repo's .claude-state keeps that out)
-        scratch = ROOT / ".claude-state" / f"zz-legspec-committed-{uuid.uuid4().hex[:8]}"
-        try:
-            args, e = self.batch_cmd([self._untracked_copy_of_a_committed_spec()], "-ReceiptRoot", str(scratch / "receipts"))
-            args[args.index("-LegScript") + 1] = str(LEG)
-            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
+        # (r2 hermetic: a regression here lets the real leg run, and it writes its refusal receipt under -ReceiptRoot; this case's own temp dir keeps that out of the canonical root)
+        args, e = self.batch_cmd([self._untracked_copy_of_a_committed_spec()], *self._hermetic_receipt_root())
+        args[args.index("-LegScript") + 1] = str(LEG)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
         self._assert_nothing_claimed_or_leased("real leg script", r)
         self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
 
     def test_legspec_committed_a_committed_spec_still_passes_the_preflight(self) -> None:
-        seam = ("-CommittedSpecRepoRoot", str(ROOT))
+        seam = ("-CommittedSpecRepoRoot", str(ROOT), *self._hermetic_receipt_root())
         self._reset_committed_case()
         r = self.run_batch([self._COMMITTED_SPEC], *seam)
         self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr, r.stdout + r.stderr)
@@ -5893,7 +5916,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         for flag, value in (("-CommittedSpecRepoRoot", str(ROOT)), ("-CommittedSpecScript", str(stand_in))):
             with self.subTest(seam=flag):
                 self._reset_committed_case()
-                args, e = self.batch_cmd([self._COMMITTED_SPEC], flag, value)
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], flag, value, *self._hermetic_receipt_root())
                 args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
                 r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
@@ -5915,7 +5938,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # the spec IS committed in this repo, but the copy's own repo (its ..\..\.. : a plain directory, no HEAD) holds nothing: the leg that runs would refuse it, so the batch does first.
         # (the real um-run.ps1 is never reached: the refusal is before any claim; the short deadline bounds the run if a regression let it through)
         # (OMIT_DEFAULTS: the real um-run.ps1 refuses the stub's -LeaseCooldownSec 0 as LEASE_CAP_RELAXED, which would end the run before the preflight is reached)
-        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=60)), OMIT_DEFAULTS="-LeaseCooldownSec")
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=60)), *self._hermetic_receipt_root(), OMIT_DEFAULTS="-LeaseCooldownSec")
         args[args.index("-LegScript") + 1] = str(leg_copy_dir / "Invoke-VenueLeg.ps1")
         args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
         r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=e)
@@ -5927,7 +5950,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     def test_legspec_committed_an_inherited_git_environment_changes_neither_the_commit_nor_writes_a_file(self) -> None:
         trace = self.case / "git-trace.log"
         self._reset_committed_case()
-        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT), GIT_DIR=str(self.case / "no-such-override.git"), GIT_TRACE=str(trace), GIT_TRACE2_EVENT=str(trace))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT), *self._hermetic_receipt_root(), GIT_DIR=str(self.case / "no-such-override.git"), GIT_TRACE=str(trace), GIT_TRACE2_EVENT=str(trace))
         self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr, r.stdout + r.stderr)
         self.assertNotIn("COMMITTED_SPEC_PREFLIGHT", r.stdout + r.stderr, r.stdout + r.stderr)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -5944,11 +5967,107 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self._reset_committed_case()
                 deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=30))
                 t0 = time.monotonic()
-                r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT), "-CommittedSpecScript", str(script), "-DeadlineUtc", deadline)
+                r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT), "-CommittedSpecScript", str(script), "-DeadlineUtc", deadline, *self._hermetic_receipt_root())
                 elapsed = time.monotonic() - t0
                 self._assert_nothing_claimed_or_leased(name, r)
                 self.assertIn(f"BATCH_USAGE {code}", r.stderr)
                 self.assertLess(elapsed, limit_s, f"{name}: the run outlived the child's bound ({elapsed:.1f} s): " + r.stderr[-1500:])
+
+    # ---- r2 (adversary r1 pass 3: A1, A2) ----
+    # A1: "production" was decided by inference (the real um-run.ps1 by path or bytes, or the real leg script's path), and an inference a line-ending change defeats leaves the gate OFF in a complete
+    # second checkout. The preflight is now ON in every mode, and off only by the explicit offline switch -SkipCommittedSpecPreflight (refused with the real um-run.ps1).
+    # A2: the repo root is resolved by the bounded child from the LEG SCRIPT PATH it is handed (and so is the offline seam's value), never by the parent before -DeadlineUtc exists.
+    _SKIP = "-SkipCommittedSpecPreflight"
+
+    def test_legspec_committed_r2_the_preflight_is_on_by_default_for_a_stand_in_leg_and_um_run_in_every_mode(self) -> None:
+        untracked = self._untracked_copy_of_a_committed_spec()
+        hermetic = self._hermetic_receipt_root()
+        self._reset_committed_case()
+        r = self.run_batch([untracked], *hermetic, OMIT_DEFAULTS=self._SKIP)
+        self._assert_nothing_claimed_or_leased("-LegSpec, no switch, no seam", r)
+        self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+        self._reset_committed_case()
+        r = self.run_plan(self.write_plan([self.item(untracked, "A", self.commit_a)]), *hermetic, OMIT_DEFAULTS=self._SKIP)
+        self._assert_nothing_claimed_or_leased("-LegPlan, no switch, no seam", r)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_NOT_COMMITTED item=1 ", r.stderr)
+
+    def test_legspec_committed_r2_a_second_checkout_whose_leg_and_um_run_differ_by_line_endings_is_still_preflighted_in_its_own_repo(self) -> None:
+        # the second checkout: its real leg script differs from this checkout's only by line endings, and so would its um-run.ps1. Both then classify as "not the real one" by path AND by bytes,
+        # exactly like the harness's stand-in um-run below, so no classification may decide whether the gate is on.
+        leg_copy_dir = self.case / "checkout2" / "tools" / "profiling" / "dual-venue"
+        leg_copy_dir.mkdir(parents=True)
+        original = LEG.read_bytes()
+        lf = original.replace(b"\r\n", b"\n")
+        converted = lf.replace(b"\n", b"\r\n") if lf == original else lf
+        self.assertNotEqual(converted, original)
+        (leg_copy_dir / "Invoke-VenueLeg.ps1").write_bytes(converted)
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        args[args.index("-LegScript") + 1] = str(leg_copy_dir / "Invoke-VenueLeg.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=e)
+        self._assert_nothing_claimed_or_leased("second checkout, line-ending copy of the leg, stand-in um-run", r)
+        self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+        self.assertIn("checkout2", r.stderr)   # the repo it asked is the second checkout's own tree
+
+    def test_legspec_committed_r2_the_explicit_offline_switch_turns_the_preflight_off(self) -> None:
+        untracked = self._untracked_copy_of_a_committed_spec()
+        self._reset_committed_case()
+        r = self.run_batch([untracked], self._SKIP, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr)
+        self.assertTrue(self.leg_calls() or self.kinds(), "the legs ran")
+        self._reset_committed_case()
+        r = self.run_plan(self.write_plan([self.item(untracked, "A", self.commit_a)]), self._SKIP, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr)
+
+    def test_legspec_committed_r2_the_offline_switch_is_refused_with_the_real_um_run_and_with_the_seam_that_turns_the_preflight_on(self) -> None:
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], self._SKIP, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"{self._SKIP} is an offline test seam", r.stderr)
+        self.assertEqual(self.kinds(), [])
+        self._reset_committed_case()
+        r = self.run_batch([self._COMMITTED_SPEC], self._SKIP, "-CommittedSpecRepoRoot", str(ROOT), *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"{self._SKIP} contradicts -CommittedSpecRepoRoot", r.stderr)
+        self.assertEqual(self.kinds(), [])
+
+    def test_legspec_committed_r2_the_child_is_handed_the_leg_script_path_and_the_seam_unresolved(self) -> None:
+        # A2: the parent does NO file-system work on the root before the bounded child: it hands over the leg script's path (the child resolves ..\..\..) and the seam value as spelled
+        child = self.case / "recording-committed.ps1"
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         "Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'child-args.log') -Value ('LegScript={0}|RepoRoot={1}|Sha={2}' -f $LegScript, $RepoRoot, $LegSpecSha256)\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        log = self.case / "child-args.log"
+        hermetic = self._hermetic_receipt_root()
+        self._reset_committed_case()
+        log.unlink(missing_ok=True)
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), *hermetic, OMIT_DEFAULTS=self._SKIP)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rows = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        self.assertTrue(rows, "the preflight child ran (the gate is on with no seam and no switch): " + r.stdout[-1500:] + r.stderr[-1500:])
+        first = dict(kv.split("=", 1) for kv in rows[0].split("|"))
+        self.assertEqual(first["LegScript"].lower(), str(self.tmp / "fake-leg.ps1").lower(), rows[0])
+        self.assertEqual(first["RepoRoot"], "", "no seam: the child resolves the root itself: " + rows[0])
+        self.assertRegex(first["Sha"], r"^[0-9a-f]{64}$")
+        spelled = str(ROOT) + "\\tools\\.."   # a spelling Resolve-Path would normalise: the child must get it as written
+        self._reset_committed_case()
+        log.unlink(missing_ok=True)
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", spelled, "-CommittedSpecScript", str(child), *hermetic)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        first = dict(kv.split("=", 1) for kv in log.read_text(encoding="utf-8").splitlines()[0].split("|"))
+        self.assertEqual(first["RepoRoot"], spelled, "the seam value reaches the child as spelled, unresolved by the parent")
+        self.assertEqual(first["LegScript"].lower(), str(self.tmp / "fake-leg.ps1").lower())
+
+    def test_legspec_committed_r2_a_seam_root_that_does_not_resolve_is_the_childs_typed_refusal_not_a_synchronous_usage_stop(self) -> None:
+        self._reset_committed_case()
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(self.case / "no-such-repo"), *self._hermetic_receipt_root())
+        self._assert_nothing_claimed_or_leased("seam root that does not exist", r)
+        self.assertIn("BATCH_USAGE COMMITTED_SPEC_PREFLIGHT_FAILED", r.stderr)
+        self.assertNotIn("is not a directory", r.stderr)
 
     def test_r8_export_a_window_the_agent_job_cap_refuses_is_refused_before_the_claim_in_every_mode(self) -> None:
         # EXPORT-VENUE-LEG-1 r8 (adversary r7 A3): maxFrames=20000 on the shipped 3.4 GB ProRes leg is a job the agent refuses (submitted timeout past 86400 s), but only the
