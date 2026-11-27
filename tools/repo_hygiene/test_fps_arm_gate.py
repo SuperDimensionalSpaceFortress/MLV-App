@@ -3346,7 +3346,7 @@ class EnvelopePreemptR1ResidueTests(_Probe):
                 "$heldBytes['Proof.json'] = [byte[]](1)\n"
                 "Write-Host ('EXACT=' + $heldBytes.Contains('Proof.json'))\nWrite-Host ('OTHER-CASE=' + $heldBytes.Contains('proof.json'))\n")
         self.assertEqual(dict(item.split("=", 1) for item in self.ok(body).split()), {"EXACT": "True", "OTHER-CASE": "False"})
-        self.assertIn("(@($heldFullPaths | Where-Object { Test-FpsPathAlias $_ $diskPath }).Count -gt 0)", source)
+        self.assertIn("$aliasOf = @($heldPairs | Where-Object { Test-FpsPathAlias $_.Path $diskPath })", source)
 
     # ---- r7 (adversary 55acb091 A1-A4), each fed its own `input` ----
 

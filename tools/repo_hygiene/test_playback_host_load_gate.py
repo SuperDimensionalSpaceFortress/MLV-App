@@ -4129,7 +4129,8 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
                 self.assertIsNotNone(report, proc.stdout + proc.stderr)
                 self.assertEqual(report["fps"]["smokePresentedFps"]["before"], published, report["fps"]["smokePresentedFps"])
                 if published is None:
-                    self.assertTrue(any("not one object" in str(f) for f in report["failures"]), report["failures"])
+                    # the arm gate's raw check (r7, adversary 55acb091 A1) now refuses the array root first and names it ("is a JSON Array, not an object"); the reader's own "not one object" stays behind it
+                    self.assertTrue(any("not one object" in str(f) or "JSON Array, not an object" in str(f) for f in report["failures"]), report["failures"])
                     self.assertEqual(report["verdict"], "INCONCLUSIVE")
         source = _extract_functions(COMPARE_SCRIPT, ["Read-SmokeSourceOnce"])
         self.assertIn("ConvertFrom-Json -InputObject $parseText -Depth 100 -NoEnumerate", source)
