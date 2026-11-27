@@ -351,7 +351,9 @@ $jsonReportPath = [System.IO.Path]::ChangeExtension($ReportPath, ".json")
 # 1. THE ONE READ of summary.json (sol 5add23cf A8): its hash, its parse, the copy the children read and the archived file are these bytes.
 $summaryLastWrite = (Get-Item -LiteralPath $summaryFullPath).LastWriteTime
 $summaryBytes = [IO.File]::ReadAllBytes($summaryFullPath)
-$summary = [Text.UTF8Encoding]::new($false).GetString($summaryBytes).TrimStart([char]0xFEFF) | ConvertFrom-Json -Depth 100
+# r7 (adversary 55acb091 A3): decoded by its BOM (UTF-8, UTF-16 LE/BE, UTF-32), as the Get-Content this one read replaced did; no BOM reads UTF-8. A fixed UTF-8 decode made a UTF-16 summary invalid JSON.
+$summaryText = [IO.StreamReader]::new([IO.MemoryStream]::new($summaryBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF)
+$summary = $summaryText | ConvertFrom-Json -Depth 100
 
 $hostSafe = if ([string]::IsNullOrWhiteSpace([string]$summary.host.name)) {
     [Environment]::MachineName
@@ -410,14 +412,29 @@ try {
     }
     # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A2): a disk file is this run's own output, the manifest or the packet when the volume that holds it says it is the same name (Test-FpsPathAlias), not by the
     # comparison taken from the input's directory
-    $heldFullPaths = @(@($summaryFullPath, $ReportPath, $jsonReportPath) | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
-    $diskFiles = @(Get-ChildItem -LiteralPath $runRootResolved -Recurse -File | Sort-Object FullName | Where-Object {
-            $diskPath = $_.FullName
-            $relative = Get-RelativeArtifactPath -Root $runRootResolved -Path $diskPath
-            $isOwn = $heldBytes.Contains($relative) -or (@($heldFullPaths | Where-Object { Test-FpsPathAlias $_ $diskPath }).Count -gt 0)
-            $isPrivate = @($relative.Split('/') | Where-Object { $_.StartsWith('.pkg-', [StringComparison]::Ordinal) }).Count -gt 0
-            -not $isOwn -and -not $isPrivate -and -not (Test-FpsPathAlias $diskPath $manifestPath) -and -not (Test-FpsPathAlias $diskPath $packetFullPath)
+    # r7 (adversary 55acb091 A2): a disk file that is a held output by IDENTITY (a hard link or alias of the external input summary or of a report) is replaced by this run's own bytes under ITS OWN name in
+    # the run root, so the packet keeps a name for it (an excluded in-root link to the external summary left the packet without summary.json). A disk file that is a held output already named by its own
+    # in-root path is represented by that name.
+    # r7 (adversary 55acb091 A4): the private-directory exception is for DIRECTORIES a packager made (".pkg-" + 32 hex), never a regular file whose leaf name begins with ".pkg-".
+    $heldPairs = @(foreach ($held in @(@($summaryFullPath, $summaryBytes), @($ReportPath, $summarizerResult.markdownBytes), @($jsonReportPath, $summarizerResult.jsonBytes))) {
+            [pscustomobject]@{ Path = [IO.Path]::GetFullPath([string]$held[0]); Bytes = $held[1]; InRoot = ($null -ne (Get-FpsRelativeUnderRoot -Root $runRootResolved -Path ([string]$held[0]))) }
         })
+    $diskFiles = [System.Collections.Generic.List[object]]::new()
+    foreach ($diskFile in @(Get-ChildItem -LiteralPath $runRootResolved -Recurse -File | Sort-Object FullName)) {
+        $diskPath = $diskFile.FullName
+        $relative = Get-RelativeArtifactPath -Root $runRootResolved -Path $diskPath
+        $segments = @($relative.Split('/'))
+        $isPrivate = @($segments | Select-Object -SkipLast 1 | Where-Object { $_ -cmatch '^\.pkg-[0-9a-f]{32}$' }).Count -gt 0
+        if ($isPrivate) { continue }
+        if ($heldBytes.Contains($relative)) { continue }
+        $aliasOf = @($heldPairs | Where-Object { Test-FpsPathAlias $_.Path $diskPath })
+        if ($aliasOf.Count -gt 0) {
+            if (-not @($aliasOf | Where-Object { $_.InRoot }).Count) { $heldBytes[$relative] = $aliasOf[0].Bytes }
+            continue
+        }
+        if ((Test-FpsPathAlias $diskPath $manifestPath) -or (Test-FpsPathAlias $diskPath $packetFullPath)) { continue }
+        [void]$diskFiles.Add($diskFile)
+    }
 
     $zip = $null
     $privatePacket = Join-Path $privateDir "packet.zip"

@@ -132,6 +132,9 @@ function Read-SmokeSourceOnce {
         try {
             # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A7): -NoEnumerate, so a root that is a ONE-element array stays an array (refused below as "not one object"),
             # never unwrapped into its member and read as the figure object
+            # r14 (sol r13 B4, adversary r14 A2) and r7 (adversary 55acb091 A1): this is the ACTIVE reader, and ConvertFrom-Json keeps the LAST of a repeated member (a launch environment's per-frame-log opt-out
+            # written 0 then 1 read LIGHT). The repeat is refused before the parse and reads as a typed parse error (empty figures), the same route as a text the parser refuses.
+            Assert-FpsJsonNoRepeatedKey $parseText $resolved
             $smoke = ConvertFrom-Json -InputObject $parseText -Depth 100 -NoEnumerate
         }
         catch {

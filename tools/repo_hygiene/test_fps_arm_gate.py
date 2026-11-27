@@ -3348,6 +3348,82 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         self.assertEqual(dict(item.split("=", 1) for item in self.ok(body).split()), {"EXACT": "True", "OTHER-CASE": "False"})
         self.assertIn("(@($heldFullPaths | Where-Object { Test-FpsPathAlias $_ $diskPath }).Count -gt 0)", source)
 
+    # ---- r7 (adversary 55acb091 A1-A4), each fed its own `input` ----
+
+    def test_r7_adversary_55acb091_a1_the_active_smoke_reader_refuses_a_repeated_launch_member(self) -> None:
+        # A1, its input: launch.environment carries MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG '0' then '1'. The active reader (Read-SmokeSourceOnce) parsed with ConvertFrom-Json, which keeps the last,
+        # so the figures read LIGHT; the guard sat in an unused reader. The repeat is a typed parse error with empty figures, and the one-member control still reads.
+        funcs = _extract_functions(COMPARE_SMOKE_AB_SCRIPT, ["Get-SmokeFileIdentity", "Read-SmokeSourceOnce"])
+        repeated_env = LIGHT_ENV_JSON.replace('"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"1"',
+                                              '"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"0","MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"1"')
+        self.assertNotEqual(repeated_env, LIGHT_ENV_JSON)
+        control = self.tmp / "control.json"
+        repeated = self.tmp / "repeated.json"
+        control.write_text('{"launch":{"environment":' + LIGHT_ENV_JSON + ',"arguments":' + PRODUCER_ARGS_JSON + '}}', encoding="utf-8")
+        repeated.write_text('{"launch":{"environment":' + repeated_env + ',"arguments":' + PRODUCER_ARGS_JSON + '}}', encoding="utf-8")
+        out = self.ok(funcs + "\n"
+                      f"$c = Read-SmokeSourceOnce -Path '{control}'\n$r = Read-SmokeSourceOnce -Path '{repeated}'\n"
+                      "Write-Host ('CONTROL=' + [string]($null -eq $c.parseError) + ' ARM=' + (Get-FpsArmFromLaunch $c.smoke.launch).arm)\n"
+                      "Write-Host ('REPEATED=' + [string]($r.parseError -like '*FPS_JSON_REPEATED_KEY*') + ' FIGURES=' + @($r.smoke.PSObject.Properties).Count)\n")
+        self.assertEqual(out.split(), ["CONTROL=True", "ARM=LIGHT", "REPEATED=True", "FIGURES=0"])
+
+    def test_r7_adversary_55acb091_a2_a_hard_link_of_the_external_summary_keeps_its_name_in_the_packet(self) -> None:
+        # A2, its input: -RunRoot run -SummaryPath outside\summary.json; run\summary.json is a hard link to that external summary. The in-root link was excluded by identity and the external spelling had no
+        # held name inside the root, so the packet lacked summary.json (the importer then rejects it as missing).
+        import zipfile
+        repo, run, original = self._pkg_fixture()
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "summary.json").write_bytes(original)
+        (run / "summary.json").unlink()
+        try:
+            os.link(outside / "summary.json", run / "summary.json")
+        except OSError as exc:
+            self.skipTest(f"hard links are not available here: {exc}")
+        packet = self.tmp / "out" / "packet.zip"
+        proc = self._package(repo, "-RunRoot", str(run), "-SummaryPath", str(outside / "summary.json"), "-PacketPath", str(packet))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        with zipfile.ZipFile(packet) as archive:
+            self.assertIn("summary.json", archive.namelist())
+            self.assertEqual(archive.read("summary.json"), original)
+        self._import(repo, packet, "-ExpectedHostName", "Dell")
+
+    def test_r7_adversary_55acb091_a3_a_bom_encoded_summary_packages_and_is_decoded_by_its_bom(self) -> None:
+        # A3, its input: a valid summary saved as UTF-16LE with a BOM (and UTF-16BE). The fixed UTF-8 decode made it invalid JSON and the packager threw before summarizing; the Get-Content this read
+        # replaced decoded the BOM. The importer's proof-report decode (sibling) is the same expression.
+        import zipfile
+        for label, encoding in (("utf-16-le", "utf-16"), ("utf-16-be-bom", None)):
+            with self.subTest(label):
+                repo, run, original = self._pkg_fixture()
+                body = original.decode("utf-8")
+                data = body.encode("utf-16") if encoding else b"\xfe\xff" + body.encode("utf-16-be")
+                (run / "summary.json").write_bytes(data)
+                packet = self.tmp / f"out-{label}" / "packet.zip"
+                proc = self._package(repo, "-RunRoot", str(run), "-PacketPath", str(packet))
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                with zipfile.ZipFile(packet) as archive:
+                    self.assertEqual(archive.read("summary.json"), data)
+        importer = self.IMPORTER.read_text(encoding="utf-8")
+        self.assertIn("[System.IO.StreamReader]::new([System.IO.MemoryStream]::new($proofReportBytes), [System.Text.UTF8Encoding]::new($false), $true).ReadToEnd()", importer)
+        self.assertNotIn("GetString($proofReportBytes)", importer)
+
+    def test_r7_adversary_55acb091_a4_a_regular_file_named_like_a_private_directory_is_packaged(self) -> None:
+        # A4, its input: a normal regular file .pkg-evidence.txt in the run root. The private-directory exception matched any path segment, the leaf too, so it left the packet. Only a DIRECTORY a packager made
+        # (".pkg-" + 32 hex) is private; a file inside one stays out.
+        import zipfile
+        repo, run, original = self._pkg_fixture()
+        (run / ".pkg-evidence.txt").write_text("capture diagnostic retained for review", encoding="utf-8")
+        private = run / (".pkg-" + "a" * 32)
+        private.mkdir()
+        (private / "inside.txt").write_text("a packager's own scratch", encoding="utf-8")
+        packet = self.tmp / "out" / "packet.zip"
+        proc = self._package(repo, "-RunRoot", str(run), "-PacketPath", str(packet))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        with zipfile.ZipFile(packet) as archive:
+            names = archive.namelist()
+        self.assertIn(".pkg-evidence.txt", names)
+        self.assertNotIn(".pkg-" + "a" * 32 + "/inside.txt", names)
+
     # ---- r6 (hub ruling 2026-11-27T13:17Z): ONE identity rule for the packager's paths (volume serial + file id), and the batch deadline read without Get-Variable ----
 
     # a stand-in for the module's raw identity reader, with a case-SENSITIVE volume R: (R:\r\Run and R:\r\run are two directories) and a drive S: that is a SUBST of R:\r\Run

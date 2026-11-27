@@ -140,7 +140,8 @@ if ($failures.Count -eq 0) {
         # whatever is at the path when the file is hashed later)
         $proofReportBytes = [System.IO.File]::ReadAllBytes($proofReportJsonPath)
         $proofReportJudgedSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($proofReportBytes))
-        $proofReportRaw = [System.Text.UTF8Encoding]::new($false).GetString($proofReportBytes).TrimStart([char]0xFEFF)
+        # r7 (adversary 55acb091 A3, sibling): decoded by its BOM (UTF-8, UTF-16 LE/BE, UTF-32), as the Get-Content this one read replaced did; no BOM reads UTF-8
+        $proofReportRaw = [System.IO.StreamReader]::new([System.IO.MemoryStream]::new($proofReportBytes), [System.Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF)
         $proofReport = $proofReportRaw | ConvertFrom-Json -Depth 100
     }
     catch {
