@@ -997,8 +997,8 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
         mutations = {
             "overrun compare inverted": ("$overrun -gt $tolerance", "$overrun -le $tolerance"),
             "tolerance replaced by 0": (
-                "$tolerance = [int64][Math]::Ceiling($script:GuiSmokePlayOverrunToleranceSeconds * $overrunFps)",
-                "$tolerance = [int64]0"),
+                "$tolerance = [Math]::Ceiling($script:GuiSmokePlayOverrunToleranceSeconds * $overrunFps)",
+                "$tolerance = 0.0"),
             "oracle guard always false": ("if ($RequireWindowStop -and ", "if ($false -and "),
             "RequireWindowStop default ignored": ("if ($RequireWindowStop -and ", "if ($true -and "),
             "presented-over-clip suppression dropped": (" -and -not $overranWithoutWrap", ""),
