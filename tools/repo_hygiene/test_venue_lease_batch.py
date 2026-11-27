@@ -624,7 +624,14 @@ def receipt_state_written_by_this_harness(base: Path) -> dict[str, tuple[int, in
     """Every file under `base` that carries THIS_PROCESS_MANIFEST, as name -> (size, mtime_ns). A file another process wrote there (whatever manifest it carries) is not counted."""
     if not base.exists():
         return {}
-    return {str(p.relative_to(base)): (p.stat().st_size, p.stat().st_mtime_ns) for p in base.rglob("*") if p.is_file() and THIS_PROCESS_MANIFEST.encode("ascii") in p.read_bytes()}
+    state: dict[str, tuple[int, int]] = {}
+    for p in base.rglob("*"):
+        try:
+            if p.is_file() and THIS_PROCESS_MANIFEST.encode("ascii") in p.read_bytes():
+                state[str(p.relative_to(base))] = (p.stat().st_size, p.stat().st_mtime_ns)
+        except OSError:
+            continue   # (a receipt another process holds open for write, or removes between the listing and the read, is not this harness's)
+    return state
 
 
 def canonical_receipt_state_for(spec: Path) -> dict[str, tuple[int, int]]:
@@ -6139,6 +6146,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         (base / "bachelor" / "ours.json").write_text(json.dumps({"subject": {"buildManifestSha256": THIS_PROCESS_MANIFEST}}), encoding="utf-8")
         self.assertEqual(list(receipt_state_written_by_this_harness(base)), [str(Path("bachelor") / "ours.json")])
         self.assertEqual(receipt_state_written_by_this_harness(self.case / "no-such-dir"), {})
+        # pass 6 A2: a receipt another process holds open for write (Write-DvReceipt's FileShare.None) or removes between the listing and the read is not ours and must not fail the check
+        (base / "bachelor" / "locked.json").write_text("{}\n", encoding="utf-8")
+        original = Path.read_bytes
+
+        def read_bytes_with_a_held_file(path: Path) -> bytes:
+            if path.name == "locked.json":
+                raise PermissionError("held by its writer")
+            return original(path)
+
+        with mock.patch.object(Path, "read_bytes", read_bytes_with_a_held_file):
+            self.assertEqual(list(receipt_state_written_by_this_harness(base)), [str(Path("bachelor") / "ours.json")])
 
     def test_legspec_committed_r2_a_seam_root_that_does_not_resolve_is_the_childs_typed_refusal_not_a_synchronous_usage_stop(self) -> None:
         self._reset_committed_case()
