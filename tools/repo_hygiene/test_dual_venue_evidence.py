@@ -22007,7 +22007,8 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             self.assertIsNotNone(res, proc.stdout + proc.stderr)
             self.assertEqual(res, {"isNull": False, "refused": ""}, res)
         mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
-        validator = mod[mod.index("$tailVisual = Get-DvTailVisualEvidence"):mod.index("$validatorCriteriaMetrics = Get-DvCriteriaMetrics")]
+        # (r6, sol A1 on 9df7d35f: the throw now follows the criteria metrics, so the slice runs to the verdict)
+        validator = mod[mod.index("$tailVisual = Get-DvTailVisualEvidence"):mod.index("$verdict = Test-DvCriteria -Criteria $criteria -Metrics $validatorCriteriaMetrics")]
         self.assertIn("throw \"DVE_TAIL_VISUAL_UNREADABLE the post-close tail evidence '$tailUnreadable' could not be re-read", validator)
         collector = mod[mod.index("Copy-Item -LiteralPath $appJsonShare -Destination"):mod.index("$block.method = [string](Get-DvProp $app 'method')")]
         self.assertIn("try { $appBytes = [IO.File]::ReadAllBytes((Join-Path $dir 'app-visual.json')) }", collector)
@@ -22130,6 +22131,82 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         self.assertIsNone(out["refused"], out)
         self.assertEqual(out["frames"], 3, out)
         self.assertIsNone(out["nonce"], out)
+
+    def test_r6_r6_sol_a1_a_fully_painted_run_is_never_invalidated_by_an_unreadable_tail_png(self) -> None:
+        """A1 (sol on 9df7d35f), its input: a sound fully painted run (last = target = 479, presented 479, maxJump 1) with an eligible burst row whose recorded
+        PNG is held with FileShare.None. The reader's typed TAIL_VISUAL_UNREADABLE is correct, but the validator threw it (DVE_EVIDENCE_VALIDATION_IO) although the
+        criteria never ask a fully painted run's tail for a credit. The throw now fires only when the criteria asked (conformTailUnpaintedAtCloseFrames set)."""
+        first = self.play(0, kind="play_first_unbound", tail_elapsed_ms=4)
+        raw = json.dumps(self.app_json(first)).encode("utf-8")
+        painted = {**self.PB, "conformLastFrame": 479, "conformSourceAdvanced": 478, "conformPresented": 479}
+        results = {}
+        for name, pb in (("fully painted", painted), ("(control) one target held", {**self.PB, **self.HELD})):
+            with tempfile.TemporaryDirectory() as d:
+                vis = Path(d) / "visual"
+                vis.mkdir()
+                (vis / "app-visual.json").write_bytes(raw)
+                body = self.png_bytes(0)
+                (vis / f"{self.LEG}-play-first-unbound-0.png").write_bytes(body)
+                rec = [{"kind": "play_first_unbound", "index": 0, "sha256": hashlib.sha256(body).hexdigest()}]
+                proc, out = run_pwsh_json(
+                    "$rec = @($env:DVE_REC | ConvertFrom-Json); $pb = $env:DVE_PB | ConvertFrom-Json\n"
+                    "$lock = [IO.File]::Open((Join-Path $env:DVE_DIR ('visual\\' + $env:DVE_LEG + '-play-first-unbound-0.png')), 'Open', 'Read', 'None')\n"
+                    "try { $vis = Get-DvTailVisualEvidence -EvidenceDir $env:DVE_DIR -LegId $env:DVE_LEG -ExpectedSha256 $env:DVE_SHA -RecordedFrames $rec } finally { $lock.Dispose() }\n"
+                    "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback $pb -Visual $vis\n"
+                    "[ordered]@{ unreadable = [string]$vis.unreadablePath; asked = ($null -ne $m.PSObject.Properties['conformTailUnpaintedAtCloseFrames']) } | ConvertTo-Json -Compress",
+                    DVE_DIR=d, DVE_LEG=self.LEG, DVE_SHA=hashlib.sha256(raw).hexdigest(), DVE_REC=json.dumps(rec), DVE_PB=json.dumps(pb))
+            self.assertIsNotNone(out, proc.stdout + proc.stderr)
+            self.assertTrue(out["unreadable"].endswith("play-first-unbound-0.png"), out)
+            results[name] = out["asked"]
+        self.assertEqual(results, {"fully painted": False, "(control) one target held": True}, results)
+        # the validator throws only on that condition, after the criteria metrics are derived
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        start = mod.index("$tailVisual = Get-DvTailVisualEvidence -EvidenceDir $ev.dir")
+        block = mod[start:mod.index("$verdict = Test-DvCriteria -Criteria $criteria -Metrics $validatorCriteriaMetrics", start)]
+        self.assertLess(block.index("$validatorCriteriaMetrics = Get-DvCriteriaMetrics"), block.index("throw \"DVE_TAIL_VISUAL_UNREADABLE"), block)
+        self.assertIn("if ($tailUnreadable -ne '' -and $null -ne $validatorCriteriaMetrics.PSObject.Properties['conformTailUnpaintedAtCloseFrames']) { throw", block)
+
+    def test_r6_r6_sol_a2_a_locked_burst_png_never_throws_out_of_the_visual_collector(self) -> None:
+        """A2 (sol on 9df7d35f), its input: a forced-first fixture whose published play-first-unbound-0.png is held with FileShare.None while the collector runs
+        under ErrorActionPreference=Stop. 9df7d35f's Copy-Item sat before the guarded decode and threw (RUNNER_ERROR, the late frozen evidence never judged).
+        The row is now collected with a typed VISUAL_EVIDENCE_UNREADABLE reason and no sha256, and the other rows are still read."""
+        rows = [self.play(0, kind="play_first_unbound", tail_elapsed_ms=4)] + [self.play(i, forced_paints_before=6, tail_elapsed_ms=1625 + 250 * i) for i in range(6)]
+        with tempfile.TemporaryDirectory() as d:
+            share = Path(d) / "art" / "visual"
+            share.mkdir(parents=True)
+            (share / "visual.json").write_bytes(json.dumps(self.app_json(*rows)).encode("utf-8"))
+            for row in rows:
+                (share / row["file"]).write_bytes(self.png_bytes(row["index"]))
+            proc, out = run_pwsh_json(
+                "$ErrorActionPreference = 'Stop'\n"
+                "$lock = [IO.File]::Open((Join-Path $env:DVE_SHARE 'visual\\play-first-unbound-0.png'), 'Open', 'Read', 'None')\n"
+                "$threw = ''\n"
+                "try { $b = Read-DvVisualCaptures -Requested $true -ArtifactsDir $env:DVE_SHARE -EvidenceDir $env:DVE_EV -LegId $env:DVE_LEG -Header 'h' -ClipId 'M16-1243' }\n"
+                "catch { $threw = $_.Exception.Message } finally { $lock.Dispose() }\n"
+                "$burst = @($b.frames | Where-Object { $_.kind -ceq 'play_first_unbound' }) | Select-Object -First 1\n"
+                "[ordered]@{ threw = $threw; frames = @($b.frames).Count; burstSha = $burst.sha256; burstReason = [string]$burst.appReason\n"
+                "            lateHashed = @($b.frames | Where-Object { $_.kind -ceq 'play_unbound' -and $_.sha256 }).Count } | ConvertTo-Json -Compress",
+                DVE_SHARE=str(Path(d) / "art"), DVE_EV=str(Path(d) / "ev"), DVE_LEG=self.LEG)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["threw"], "", out)
+        self.assertEqual((out["frames"], out["burstSha"], out["lateHashed"]), (7, None, 6), out)
+        self.assertTrue(out["burstReason"].startswith("VISUAL_EVIDENCE_UNREADABLE"), out)
+
+    def test_r6_r6_sol_a3_one_frame_on_two_serials_is_a_repeat_never_a_credit(self) -> None:
+        """A3 (sol on 9df7d35f), its input: the default fixture (last 477, target 479) with three eligible bound burst rows (index, ms, frame, serial) =
+        (0, 8, 478, 484), (1, 38, 478, 485), (2, 68, 479, 486). The shown-set collapsed the repeated 478, so credit 2 passed every-frame over a repeat.
+        (control) 478 then 479 on rising serials still credits both."""
+        rows = (self.play(0, kind="play_first_unbound", tail_elapsed_ms=8, display_frame=478, serial=484, painted_serial=484),
+                self.play(1, kind="play_first_unbound", tail_elapsed_ms=38, display_frame=478, serial=485, painted_serial=485),
+                self.play(2, kind="play_first_unbound", tail_elapsed_ms=68, display_frame=479, serial=486, painted_serial=486))
+        out = self.metrics(None, app=self.app_json(*rows), criteria=self.BOTH)
+        self.assertEqual((out["m"].get("conformTailInFlightCreditedFrames"), out["m"]["conformTailUnpaintedFrames"]), (None, 2), out)
+        self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
+        self.assertFalse(out["v"]["pass"], out)
+        with self.subTest(case="(control) 478 then 479, the end frame 479 held on a new serial"):
+            held = self.play(3, kind="play_first_unbound", tail_elapsed_ms=98, display_frame=479, serial=487, painted_serial=487)
+            out = self.metrics(None, app=self.app_json(rows[0], rows[2], held), criteria=self.BOTH)
+            self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
 
     def test_r4r_r4_the_play_first_unbound_burst_before_the_first_forced_paint_is_credited(self) -> None:
         """R4: the app's play_first_unbound burst (index 0, play-first-unbound-0.png, forced_paints_before=0, saved, Play active, label-bound, a 16-hex source_id,

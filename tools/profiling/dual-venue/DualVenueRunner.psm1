@@ -4754,19 +4754,23 @@ function Read-DvVisualCaptures {
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $requestPath = Join-Path $share 'visual-capture-request.json'
     if (Test-Path -LiteralPath $requestPath -PathType Leaf) {
-        Copy-Item -LiteralPath $requestPath -Destination (Join-Path $dir 'request.json') -Force
+        # R6-BURST-CUTOFF-RESIDUE-1 r6 (sol A2 sibling): the copy is inside the guard, so a locked request record is a typed reason, never a throw
         try {
+            try { Copy-Item -LiteralPath $requestPath -Destination (Join-Path $dir 'request.json') -Force -ErrorAction Stop }
+            catch { throw [IO.IOException]::new('VISUAL_EVIDENCE_UNREADABLE') }
             $request = [IO.File]::ReadAllText((Join-Path $dir 'request.json')) | ConvertFrom-Json -ErrorAction Stop
             $block.forwarded = [bool](Get-DvProp $request 'forwarded'); $block.probe = [string](Get-DvProp $request 'probe'); $block.probeReason = Get-DvProp $request 'reason'
             $block.presentMonWindowEndUtc = ConvertTo-DvVisualUtcText (Get-DvProp $request 'presentMonWindowEndUtc')
-        } catch { $block.reason = 'the job''s visual-capture request record is not valid JSON' }
+        } catch { $block.reason = $(if ($_.Exception.Message -ceq 'VISUAL_EVIDENCE_UNREADABLE') { 'VISUAL_EVIDENCE_UNREADABLE: the job''s visual-capture request record could not be copied' } else { 'the job''s visual-capture request record is not valid JSON' }) }
     }
     $appJsonShare = Join-Path $share 'visual.json'
     if (-not (Test-Path -LiteralPath $appJsonShare -PathType Leaf)) {
         if (-not $block.reason) { $block.reason = $(if ($block.forwarded -eq $false) { "the capture was not forwarded to the app (probe $($block.probe): $($block.probeReason))" } else { 'the app wrote no visual.json' }) }
         return (& $finish)
     }
-    Copy-Item -LiteralPath $appJsonShare -Destination (Join-Path $dir 'app-visual.json') -Force
+    # R6-BURST-CUTOFF-RESIDUE-1 r6 (sol A2 sibling): the copy is guarded like the read below (typed reason, no digest, never RUNNER_ERROR)
+    try { Copy-Item -LiteralPath $appJsonShare -Destination (Join-Path $dir 'app-visual.json') -Force -ErrorAction Stop }
+    catch { $block.reason = "VISUAL_EVIDENCE_UNREADABLE: the job's visual.json could not be copied ($($_.Exception.GetType().Name))"; return (& $finish) }
     # r2 (sol r1 finding 6, sibling): ONE read; the stored digest and this parse are of the same bytes (a file swapped between a hash read and a parse read
     # bound one file's digest to another's content). The parse here stays ConvertFrom-Json (the capture verdict's contract); the tail credit re-reads strictly.
     # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r4 (adversary A7 on eabccd6c): the read is guarded. A copy held with FileShare.None (or one that vanished) is a
@@ -4820,9 +4824,12 @@ function Read-DvVisualCaptures {
         if (-not $fileIsKinds) { $entry.appReason = "the $kind capture $index names file=$file, not its own $kindFile, so its picture is not read" }
         elseif ($entry.saved -and (Test-Path -LiteralPath $src -PathType Leaf)) {
             $local = Join-Path $dir $legName
-            Copy-Item -LiteralPath $src -Destination $local -Force
-            $entry.sha256 = Get-DvSha256OfFile $local
-            try {
+            # R6-BURST-CUTOFF-RESIDUE-1 r6 (sol A2 on 9df7d35f): the copy and its hash are guarded like the decode below. A published PNG held with FileShare.None
+            # (or gone) is this capture's typed reason with no sha256, never a throw that loses the whole visual block (RUNNER_ERROR) before the frozen check
+            $copied = $false
+            try { Copy-Item -LiteralPath $src -Destination $local -Force -ErrorAction Stop; $entry.sha256 = Get-DvSha256OfFile $local; $copied = $true }
+            catch { $entry.sha256 = $null; $entry.appReason = "VISUAL_EVIDENCE_UNREADABLE: the runner could not copy or hash the $kind capture $index ($($_.Exception.GetType().Name))" }
+            if ($copied) { try {
                 $hashPx = Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualHashSize[0] -Height $script:VisualHashSize[1] -RequireViewport
                 if ($null -eq $hashPx) { $entry.viewportAvailable = $false }   # no usable viewport rectangle: the whole window is never hashed in its place
                 else {
@@ -4835,7 +4842,7 @@ function Read-DvVisualCaptures {
                     }
                     if (-not $isPlayKind) { $pixels[$kind] = (Get-DvVisualViewportPixels -Path $local -Viewport $entry.viewport -Width $script:VisualDiffSize[0] -Height $script:VisualDiffSize[1] -RequireViewport).rgb }
                 }
-            } catch { $entry.appReason = "the runner could not read the image: $($_.Exception.GetType().Name)" }
+            } catch { $entry.appReason = "the runner could not read the image: $($_.Exception.GetType().Name)" } }
         }
         if ($kind -ceq 'paused') {
             $block.pausedSettled = Get-DvProp $f 'settled'; $block.pausedFrame = Get-DvProp $f 'settled_frame'
@@ -7095,8 +7102,10 @@ function Test-DvReceiptValid {
                 # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r4 (adversary A7 on eabccd6c): a tail file that exists but cannot be re-read is an evidence-validation I/O
                 # failure (Write-DvReceipt tags the throw DVE_EVIDENCE_VALIDATION_IO|<path>), never a silent no-credit that reads as an outcome mismatch
                 $tailUnreadable = [string](Get-DvProp $tailVisual 'unreadablePath')
-                if ($tailUnreadable -ne '') { throw "DVE_TAIL_VISUAL_UNREADABLE the post-close tail evidence '$tailUnreadable' could not be re-read: $([string](Get-DvProp $tailVisual 'refused'))" }
                 $validatorCriteriaMetrics = Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived -Visual $tailVisual
+                # R6-BURST-CUTOFF-RESIDUE-1 r6 (sol A1 on 9df7d35f): the throw fires only when the criteria asked the tail for a credit (a target unpainted at the
+                # measured close); a fully painted run never reads its tail, so an unreadable tail PNG cannot invalidate it
+                if ($tailUnreadable -ne '' -and $null -ne $validatorCriteriaMetrics.PSObject.Properties['conformTailUnpaintedAtCloseFrames']) { throw "DVE_TAIL_VISUAL_UNREADABLE the post-close tail evidence '$tailUnreadable' could not be re-read: $([string](Get-DvProp $tailVisual 'refused'))" }
                 $verdict = Test-DvCriteria -Criteria $criteria -Metrics $validatorCriteriaMetrics
                 # r4 (adversary A8 on eabccd6c): a tail credit the criteria were judged with is on record in the stored outcomeDetail (Invoke-VenueLeg.ps1 appends
                 # Get-DvTailCreditDetail; the writer may only PREFIX it, ADVISORY), so a receipt that drops the suffix is refused, whatever its outcome
@@ -7986,12 +7995,18 @@ function Get-DvTailInFlightCredit {
     # r4 (adversary A5 on eabccd6c): the qualifying captures, in the order they were taken (tail_elapsed_ms), must show a non-decreasing display frame and paint
     # serial: 479 at 126 ms then 478 at 376 ms is a backward paint after the close, never two credits. Two captures at the same instant cannot be ordered.
     $byTime = @($ordered | Sort-Object -Property @{ Expression = { [double](Get-DvProp $_ 'tailElapsedMs') } })
+    $lastShownFrame = [int64](@($byTime | ForEach-Object { [int64](Get-DvProp $_ 'displayFrame') }) | Measure-Object -Maximum).Maximum   # (r6, A3: the held end frame)
     for ($i = 1; $i -lt $byTime.Count; $i++) {
         $prev = $byTime[$i - 1]; $cur = $byTime[$i]
         if ([double](Get-DvProp $cur 'tailElapsedMs') -le [double](Get-DvProp $prev 'tailElapsedMs') -or
             [int64](Get-DvProp $cur 'displayFrame') -lt [int64](Get-DvProp $prev 'displayFrame') -or [int64](Get-DvProp $cur 'serial') -lt [int64](Get-DvProp $prev 'serial') -or
             # r4 (sol A7 on 560c9642): the app allocates one serial per request and stamps that request's frame, so two frames on one serial are not two paints
             ([int64](Get-DvProp $cur 'serial') -eq [int64](Get-DvProp $prev 'serial') -and [int64](Get-DvProp $cur 'displayFrame') -ne [int64](Get-DvProp $prev 'displayFrame')) -or
+            # R6-BURST-CUTOFF-RESIDUE-1 r6 (sol A3 on 9df7d35f): one frame on two serials is two render requests painted for it (MainWindow.cpp
+            # m_nextRenderRequestSerial), a re-present. Before a LATER frame it is a repeat the measured conformRepeats never saw (the shown-set collapsed it to one
+            # credit, so every-frame passed over 478, 478, 479); the last frame the tail shows may be held on new serials (the end of playback), never credited twice
+            ([int64](Get-DvProp $cur 'displayFrame') -eq [int64](Get-DvProp $prev 'displayFrame') -and [int64](Get-DvProp $cur 'serial') -ne [int64](Get-DvProp $prev 'serial') -and
+             [int64](Get-DvProp $cur 'displayFrame') -lt $lastShownFrame) -or
             ([int64](Get-DvProp $cur 'displayFrame') -gt [int64](Get-DvProp $prev 'displayFrame') -and [int64](Get-DvProp $cur 'serial') -le [int64](Get-DvProp $prev 'serial'))) {
             return (& $no "TAIL_CREDIT_PAINT_ORDER: the qualifying captures are not in paint order (display frame $(Get-DvProp $prev 'displayFrame') serial $(Get-DvProp $prev 'serial') at $(Get-DvProp $prev 'tailElapsedMs') ms, then display frame $(Get-DvProp $cur 'displayFrame') serial $(Get-DvProp $cur 'serial') at $(Get-DvProp $cur 'tailElapsedMs') ms), so the tail may hide a backward paint and is not credited")
         }
