@@ -371,6 +371,9 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
         if ($SheetCopyDir) { $sArgs += @('-SheetCopyDir', $SheetCopyDir) }
         L "LEG $($Leg.name) SUPPLEMENTARY_RUN venue=$suppVenue role=supplementary trigger=$Trigger quietVerdict=$($sq.verdict) quietMean=$(Format-Mean $sq.mean) capSec=$capSec umManifestSha256=$($built.sha256) spec=$($Leg.spec) backend=$(if ($Leg.backend) { $Leg.backend } else { 'spec' })"
         $sr = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec
+        # R2-RESIDUE-2 r1 (adversary A2 on 36c22ed2): started=$false means the process listing before the launch used the whole allowance and NOTHING was launched: no client was killed and no job exists, so
+        # no unresolved-job guard is armed; the offer is skipped like a deadline too near
+        if ($sr.started -eq $false) { Write-SuppSkip $Leg $Trigger 'DEADLINE_NEAR' "the process listing before the launch used the whole $capSec s allowance: nothing was launched" $false; return }
         if ($sr.timedOut) {
             # Arm the unresolved-job guard at once, BEFORE any fallible step (the output write below, the receipt read, the share reads): the client was killed, the job it submitted was not,
             # and an exception from here on must leave the venue read as busy-or-unknown, never idle. Armed with no ids first, so even a failure reading the ids fails closed.

@@ -5206,8 +5206,35 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         lease = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
         for var in ("$bp", "$fp"):
             line = next(ln for ln in lease.splitlines() if ln.lstrip().startswith(f"if ({var}.timedOut) {{ return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT'"))
-            self.assertIn(f"if (-not {var}.started)", line, f"{var}: the not-launched case is worded before any kill claim")
-            self.assertLess(line.index(f"-not {var}.started"), line.index("kill confirmed"), line)
+            self.assertIn(f"if ({var}.started -eq $false)", line, f"{var}: the not-launched case is worded before any kill claim")
+            self.assertLess(line.index(f"{var}.started -eq $false"), line.index("kill confirmed"), line)
+        # adversary A2 on 36c22ed2: the two LEG callers read started too. A leg whose listing used the whole allowance launched nothing: it is not consumed (no LEASE_EXPIRED row, nothing removed from
+        # pending) and goes to the next batch; a supplementary offer arms no unresolved-job guard and is skipped.
+        leg_at = lease.index("$lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec")
+        not_launched = lease.index("if ($lp.started -eq $false) {", leg_at)
+        self.assertLess(not_launched, lease.index("if ($lp.timedOut) {", leg_at), "the not-launched case is judged before the lease-expired row")
+        block = lease[not_launched:lease.index("break", not_launched) + 5]
+        self.assertIn("$b.legsAttempted--", block)
+        self.assertIn("$inFlightLeg = $null", block)
+        self.assertNotIn("RemoveAt", block, "an unlaunched leg stays pending")
+        chain = (DV / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        sr_at = chain.index("$sr = Invoke-VenueBoundedProcess")
+        self.assertLess(chain.index("if ($sr.started -eq $false) { Write-SuppSkip", sr_at), chain.index("$script:suppRemote = @{", sr_at), "no unresolved-job guard is armed for a call that launched nothing")
+
+    def test_r2_residue_2_a3_adversary_no_scan_is_dispatched_when_the_budget_cannot_hold_its_timeout(self) -> None:
+        """R2-RESIDUE-2 r1, adversary A3 on 36c22ed2. The caller read 3899 ms, was suspended past the bound, and passed BudgetMs=Max(1.0, 5000-5001)=1 with OperationTimeoutSec 1: the snapshot
+        dispatched its 1 s CIM query before it looked at the budget. A budget under the query's own timeout (here 1 ms against 1000 ms) now starts no scan: the typed unknown, no CIM call. Control:
+        a budget that holds the timeout dispatches (the fixture rows are given, so no CIM runs) and decodes."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$bl = & $realSnapshot -BaselineOnly -Processes $sys\n"
+            "$short = & $realSnapshot -RootProcessId 100 -Baseline $bl -OperationTimeoutSec 1 -BudgetMs 1\n"
+            "$rows = @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1))))\n"
+            "$holds = & $realSnapshot -RootProcessId 100 -Processes $rows -Baseline $bl -OperationTimeoutSec 1 -BudgetMs 1100 -Clock { 5.0 }\n"
+            "[ordered]@{ shortOk = $short.ok; shortWhy = $short.error; holdsOk = $holds.ok } | ConvertTo-Json -Compress")
+        self.assertFalse(got["shortOk"], got)
+        self.assertEqual(got["shortWhy"], "deadline-exceeded", f"no CIM query is dispatched under a budget smaller than its timeout: {got}")
+        self.assertTrue(got["holdsOk"], got)
 
     def test_r2_sol_a3_a4_the_tree_is_recorded_before_the_bound_so_the_kill_is_at_the_bound(self) -> None:
         """sol r2 A3 on b428e461: a call granted 5 s or more records the tree one lead (2 s) BEFORE the bound, so the kill is not held behind a slow scan; a call granted less records it

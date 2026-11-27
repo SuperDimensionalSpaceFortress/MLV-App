@@ -5099,8 +5099,10 @@ function Get-AttrCudaProcessTreeSnapshot {
         if ($baseTable.Count -eq 0) { return (& $unknown 'baseline-unknown') }
         # an entry is (stamp) or (stamp, parent pid): a row is that baseline process only when its pid, stamp AND (when the entry has one) parent pid all match
         $inBase = { param($BasePid, $BaseTicks, $BaseParent) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid][0] -eq [int64]$BaseTicks) -and (($baseTable[[int64]$BasePid].Count -lt 2) -or (($null -ne $BaseParent) -and ([int64]$baseTable[[int64]$BasePid][1] -eq [int64]$BaseParent))) }
+        # (adversary A3 on 36c22ed2) the CIM query is dispatched only when the budget still holds its own timeout: a budget under it (a grant read just before the bound) starts no scan
+        if ($BudgetMs -ne 0 -and -not $PSBoundParameters.ContainsKey('Processes') -and ($BudgetMs -lt ($OperationTimeoutSec * 1000.0) -or (& $overBudget))) { return (& $unknown 'deadline-exceeded') }
         $rows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
-        if ($BudgetMs -gt 0 -and $(if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds }) -gt $BudgetMs) { return (& $unknown 'deadline-exceeded') }
+        if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
         # r5b fix (adversary A1 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started, so the
         # creation-time ordering the orphan classification below relies on is untrustworthy: the tree is unknown (fail closed), never classified by a rolled-back clock.
         # -NowTicks is the test seam; the check is inline because VenueChain and DualVenueRunner embed this function alone, by name.
@@ -5109,13 +5111,13 @@ function Get-AttrCudaProcessTreeSnapshot {
         # proved by the listing taken before the root started (see .DESCRIPTION), so an unbounded rollback cannot make a live orphan look like an outsider.
         $skewTicks = 20000000L
         foreach ($row in $rows) {
-            if ($BudgetMs -gt 0 -and $(if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds }) -gt $BudgetMs) { return (& $unknown 'deadline-exceeded') }
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
             if ($null -ne $row -and $null -ne $row.CreationDate -and ([datetime]$row.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + $skewTicks)) { return (& $unknown "clock-stepped-back pid=$($row.ProcessId)") }
         }
         $byParent = @{}
         $rootTicks = $null
         foreach ($row in $rows) {
-            if ($BudgetMs -gt 0 -and $(if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds }) -gt $BudgetMs) { return (& $unknown 'deadline-exceeded') }
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
             if ($null -eq $row) { continue }
             if ($null -ne $row.ProcessId -and [int64]$row.ProcessId -eq [int64]$RootProcessId) {
                 if ($null -eq $row.CreationDate) { return (& $unknown 'root-creation-unreadable') }
@@ -5135,7 +5137,7 @@ function Get-AttrCudaProcessTreeSnapshot {
         $queue = [System.Collections.Generic.Queue[object]]::new()
         $queue.Enqueue([pscustomobject]@{ processId = [int64]$RootProcessId; creationTicks = $rootTicks })
         while ($queue.Count -gt 0) {
-            if ($BudgetMs -gt 0 -and $(if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds }) -gt $BudgetMs) { return (& $unknown 'deadline-exceeded') }
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
             $parent = $queue.Dequeue()
             if (-not $byParent.ContainsKey($parent.processId)) { continue }
             foreach ($child in $byParent[$parent.processId]) {
@@ -5160,7 +5162,7 @@ function Get-AttrCudaProcessTreeSnapshot {
         $rowTicks = @{}
         $rowParent = @{}
         foreach ($row in $rows) {
-            if ($BudgetMs -gt 0 -and $(if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds }) -gt $BudgetMs) { return (& $unknown 'deadline-exceeded') }
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
             if ($null -eq $row -or $null -eq $row.ProcessId) { continue }
             $rp = [int64]$row.ProcessId
             $rowTicks[$rp] = $(if ($null -eq $row.CreationDate) { $null } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
@@ -5182,12 +5184,12 @@ function Get-AttrCudaProcessTreeSnapshot {
         }
         $others = @{}
         foreach ($q in @($late.Keys)) {
-            if ($BudgetMs -gt 0 -and $(if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds }) -gt $BudgetMs) { return (& $unknown 'deadline-exceeded') }
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
             # r2 (sol r2 A2): an outsider is recorded by pid, stamp AND parent pid (immutable): a replacement that reuses the number and, after a rollback, the stamp is another process unless it names the same parent
             if ($late[$q]) { $members.Add([pscustomobject]@{ processId = [int64]$q; creationTicks = $rowTicks[$q] }) }
             else { $others[[int64]$q] = $(if ($null -eq $rowTicks[$q]) { $null } elseif ($null -eq $rowParent[$q]) { [int64[]]@($rowTicks[$q]) } else { [int64[]]@($rowTicks[$q], $rowParent[$q]) }) }
         }
-        if ($BudgetMs -gt 0 -and $(if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds }) -gt $BudgetMs) { return (& $unknown 'deadline-exceeded') }
+        if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
         [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $rootTicks; members = @($members); others = $others; baseline = $baseTable; error = $null }
     } catch { & $unknown "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
 }
