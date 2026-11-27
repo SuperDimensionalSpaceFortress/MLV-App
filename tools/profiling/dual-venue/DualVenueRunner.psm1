@@ -1456,6 +1456,8 @@ function Get-DvVisualCaptureBeginRecord {
     $burstEnd = [System.Collections.Generic.List[string]]::new()
     $clipChanged = 0L
     $tailDrops = 0L
+    $postBurstDrops = 0L
+    $burstCaptures = $null
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $bodies = Get-DvLogRecordBodies -LogText $LogText   # (assigned, never @()-wrapped: it returns `, $array`, as Get-DvSmokeSummaryFields reads it)
         # r4 adversary fix 2 (A1 on b6c53917): the app writes these through its interaction formatter (MainWindow.cpp logInteractionEvent), so the record body is
@@ -1474,6 +1476,11 @@ function Get-DvVisualCaptureBeginRecord {
                 # R5-RESIDUE-1 adversary A1 (on 4de735e6): EVERY invalidation after the begin record counts, whatever its dropped_* fields say: a task the
                 # worker was already computing is not in dropped_pending/dropped_results, and its stale result is dropped later (and the target reissued)
                 $tailDrops++
+            }
+            elseif ($begin.Count -gt 0 -and $burstEnd.Count -gt 0 -and [regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=playback_prep\.invalidate_generation(\s|$)'), $script:DvCi)) {
+                # R6-BURST-CUTOFF-RESIDUE-1 r10 (sol A2 on a95fca2f): an invalidation AFTER burst_end is harmless only to a capture the burst itself took
+                # before it; it is counted apart, and Get-DvTailInFlightCredit refuses it for any other qualifying capture
+                $postBurstDrops++
             }
         }
     }
@@ -1499,9 +1506,14 @@ function Get-DvVisualCaptureBeginRecord {
                 if ($v -cnotmatch '^[0-9]{1,18}\z') { $tailDrops = $null; break }
                 $tailDrops += [int64]$v
             }
+            # r10 (sol A2 on a95fca2f): how many captures the burst logged (a decimal; unreadable is unknown: no burst capture is credited, and the drops
+            # are unknown too)
+            $bc = [string]$endRead.fields['burst_captures']
+            if ($null -ne $tailDrops -and $bc -cmatch '^[0-9]{1,18}\z') { $burstCaptures = [int64]$bc } else { $tailDrops = $null }
         }
     }
-    [pscustomobject]@{ session = $session; tailBeginUtc = $utc; clipChanged = $clipChanged; tailPrepDrops = $tailDrops }
+    if ($null -eq $tailDrops) { $burstCaptures = $null; $postBurstDrops = $null }
+    [pscustomobject]@{ session = $session; tailBeginUtc = $utc; clipChanged = $clipChanged; tailPrepDrops = $tailDrops; burstCaptures = $burstCaptures; postBurstPrepDrops = $postBurstDrops }
 }
 
 function Get-DvPlaybackEvidence {
@@ -1588,6 +1600,9 @@ function Get-DvPlaybackEvidence {
         visualCaptureBeginUtc = $visualBegin.tailBeginUtc
         visualCaptureClipChanged = $visualBegin.clipChanged
         visualTailPrepDrops = $visualBegin.tailPrepDrops
+        # R6-BURST-CUTOFF-RESIDUE-1 r10 (sol A2 on a95fca2f): burst_end's burst_captures and the invalidations logged after burst_end
+        visualBurstCaptures = $visualBegin.burstCaptures
+        visualPostBurstPrepDrops = $visualBegin.postBurstPrepDrops
         # r2 (sol r1 B2): the keys the measured conform line / summary line carry more than once with different values (left out above, so absent);
         # Get-DvCriteriaMetrics names them in its CouldNotCheck reasons and Get-DvPlaybackProblems refuses a summary that carries one.
         conformConflictingFields = @($conformConflicts)
@@ -3388,9 +3403,10 @@ $script:PlaybackComparedFields = @('sourceAdvanced', 'requiredSourceFrames', 'na
 # written before a field existed does not carry it and is not re-judged for it. The older conform fields are not compared (OPEN in PR #910).
 $script:PlaybackComparedFieldsWhenStored = @('conformRepeats', 'conformPresented', 'conformConflictingFields', 'summaryConflictingFields',
     'prepReplacedBefore', 'prepReplacedAfter', 'prepStaleDrops', 'prepGenerationDrops',   # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1: the tail-credit inputs
-    'conformPaintWaitEscapes', 'visualCaptureBeginSession', 'visualCaptureBeginUtc', 'visualCaptureClipChanged', 'visualTailPrepDrops')   # r4 (adversary A2 on 2e941c3a): the r4 tail-credit inputs
+    'conformPaintWaitEscapes', 'visualCaptureBeginSession', 'visualCaptureBeginUtc', 'visualCaptureClipChanged', 'visualTailPrepDrops',   # r4 (adversary A2 on 2e941c3a): the r4 tail-credit inputs
+    'visualBurstCaptures', 'visualPostBurstPrepDrops')   # R6-BURST-CUTOFF-RESIDUE-1 r10 (sol A2 on a95fca2f)
 # r4 adversary fix 2 (A5 on b6c53917): the r4 fields compare EXACTLY (an integer as Int64, never through a double; a string ordinally, so "3" plus a NUL is not "3")
-$script:PlaybackComparedFieldsExact = @('conformPaintWaitEscapes', 'visualCaptureBeginSession', 'visualCaptureClipChanged', 'visualTailPrepDrops')
+$script:PlaybackComparedFieldsExact = @('conformPaintWaitEscapes', 'visualCaptureBeginSession', 'visualCaptureClipChanged', 'visualTailPrepDrops', 'visualBurstCaptures', 'visualPostBurstPrepDrops')
 
 function Get-DvStoredPlaybackFieldProblems {
     <#
@@ -8119,6 +8135,38 @@ function Get-DvTailInFlightCredit {
             $ordered.Add($f)
             $d = [int64]$display
             if ($d -gt ($Target - $Unpainted) -and $d -le $Target) { [void]$shown.Add($d) }
+        }
+    }
+    # R6-BURST-CUTOFF-RESIDUE-1 r10 (G3, Grok CoS on a95fca2f): two qualifying captures at the same tail_elapsed_ms cannot be ordered, so they are refused
+    # here, explicitly, before any sort: the order checks below never rest on Sort-Object's order between equal keys
+    $atMs = [System.Collections.Generic.Dictionary[double, object]]::new()
+    foreach ($q in $ordered) {
+        $qMs = [double](Get-DvProp $q 'tailElapsedMs')
+        if ($atMs.ContainsKey($qMs)) {
+            return (& $no "TAIL_CREDIT_EQUAL_TIME: two qualifying captures were taken at the same tail time $qMs ms (display frame $(Get-DvProp $atMs[$qMs] 'displayFrame') serial $(Get-DvProp $atMs[$qMs] 'serial') and display frame $(Get-DvProp $q 'displayFrame') serial $(Get-DvProp $q 'serial')), so their paint order cannot be told (a TAIL_CREDIT_PAINT_ORDER refusal) and the tail is not credited")
+        }
+        $atMs[$qMs] = $q
+    }
+    # r10 (sol A2 on a95fca2f): invalidations after burst_end are ignored only for a capture the burst itself took before it: a play_first_unbound row is
+    # credited only when the burst_end record logged it (index below burst_captures) and it was taken before every non-burst capture; any other qualifying
+    # capture needs no invalidation after burst_end at all (fail closed when either count is unreadable)
+    $burstCaptures = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'visualBurstCaptures') } else { $null })
+    $postBurstDrops = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'visualPostBurstPrepDrops') } else { $null })
+    $firstNonBurstMs = $null
+    foreach ($f in @($tailFrames)) {
+        if ($null -eq $f -or [string]::Equals([string](Get-DvProp $f 'kind'), 'play_first_unbound', [StringComparison]::Ordinal)) { continue }
+        $fMs = Get-DvProp $f 'tailElapsedMs'
+        if ($null -ne $fMs -and ($null -eq $firstNonBurstMs -or [double]$fMs -lt $firstNonBurstMs)) { $firstNonBurstMs = [double]$fMs }
+    }
+    foreach ($q in $ordered) {
+        $qIndex = Get-DvProp $q 'index'; $qMs = [double](Get-DvProp $q 'tailElapsedMs')
+        if ([string]::Equals([string](Get-DvProp $q 'kind'), 'play_first_unbound', [StringComparison]::Ordinal)) {
+            if ($null -eq $burstCaptures -or $burstCaptures -lt 0 -or $null -eq $qIndex -or [int64]$qIndex -ge $burstCaptures -or ($null -ne $firstNonBurstMs -and $qMs -ge $firstNonBurstMs)) {
+                return (& $no "TAIL_CREDIT_BURST_NOT_LOGGED: the play_first_unbound capture $qIndex at $qMs ms is not one the burst logged before its end (burst_end burst_captures=$burstCaptures; first non-burst capture at $firstNonBurstMs ms), so an invalidation after burst_end may have replaced what it shows and the tail is not credited")
+            }
+        }
+        elseif ($null -eq $postBurstDrops -or $postBurstDrops -ne 0) {
+            return (& $no "TAIL_CREDIT_PREP_DROPPED: the run log records $postBurstDrops playback_prep.invalidate_generation record(s) after the burst_end record (or no readable count), and the qualifying $(Get-DvProp $q 'kind') capture $qIndex at $qMs ms is not a burst capture, so what it shows may be a reissue of a dropped target")
         }
     }
     if ($shown.Count -eq 0) { return (& $no "no play capture (unforced play_unbound or play_first_unbound taken before any forced repaint, saved, label-bound with a paint-path label_bound_basis ($($script:TailCreditPaintBases -join ', '); a forced repaint's by-construction basis never qualifies), bound to its clip by a source_id, its PNG on disk and decodable, Play active) in the post-close tail shows exactly an in-flight target ($(($Target - $Unpainted + 1))..$Target)") }
