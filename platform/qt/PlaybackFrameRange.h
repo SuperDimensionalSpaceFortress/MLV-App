@@ -1465,20 +1465,19 @@ inline bool pacedMeasuredHoldReached( bool automationIsolated, bool unpacedReque
 // frame short of what it counted). This clamps the ADVANCED POSITION instead, in frames, so it holds at any fps and any span.
 //
 // The frame that completes the requirement is the counter's high-water mark (after this tick's rebase) plus the frames still owed.
-// MainWindow may read only consumed() and startFrame of the counter (tools/repo_hygiene/app_play_scan.py pins every other use), so
-// the mark is taken as max( startFrame + consumed - 1, the tick's start frame on the counter's rounding ): the mark is
-// startFrame + forwardSteps plus every external jump it was rebased by, and a playhead above it is rebased to the playhead. That is
-// the mark exactly on forward play, after a rebase, and after a backward seek with no earlier rebase (r2 fix iteration 1, adversary
-// A1 on dad594f3: from the tick's start frame alone, a seek back to 0 owed one frame per tick, 3 -> 1.5, and timed out). Only a
-// backward seek after an external forward jump reads below the mark; that lands short, the next tick asks again, and it advances
-// at least the owed frames per tick while below the mark -- nothing is ever credited past the requirement.
+// r3 (hub ruling HUB-TICK 20261127T1152Z, closes adversary A1 on 8b386cb9): the caller passes the counter's REAL high-water mark
+// (MainWindow's one reviewed .highWater read in playbackHandling, pinned by tools/repo_hygiene/app_play_scan.py), and the mark after
+// the tick's rebase is max( highWater, floor( tickStart + 1e-9 ) ) -- the counter's own rebase rule, so the completing frame is exact
+// on forward play, after a rebase, after a backward seek, and after a backward seek that follows an external forward jump. r2's
+// estimate from startFrame + consumed - 1 read below the mark there (a jump to 3001, a seek back to 2000, one frame owed: the
+// completing frame read 2001, not 3002), cut every tick to about one frame, and timed out (PLAY_SAFETY_TIMEOUT at 65000 ms).
 // When the tick lands on or past the completing frame on the counter's rounding, the landing is clamped into [frame, frame + 0.5],
 // where both roundings agree on the frame: consumed reaches the requirement exactly and the hold freezes ON the rendered frame. A
 // landing already inside that span is returned unchanged (bit for bit).
 // Anything else -- a wrap (never counted as footage), a backward or non-finite tick, an unarmed counter (consumed 0), no
 // requirement, the requirement already met, a landing short of the completing frame -- returns tick.position unchanged.
 // MainWindow calls it only while pacedMeasuredHoldApplies.
-inline double pacedMeasuredHoldLanding( double tickStartPosition, const DropFrameTickResult & tick, int64_t counterStartFrame,
+inline double pacedMeasuredHoldLanding( double tickStartPosition, const DropFrameTickResult & tick, int64_t counterHighWater,
                                         int64_t consumedSourceFrames, int64_t requiredSourceFrames )
 {
     if( tick.wrapped || requiredSourceFrames <= 0 || consumedSourceFrames < 1 || consumedSourceFrames >= requiredSourceFrames
@@ -1487,8 +1486,7 @@ inline double pacedMeasuredHoldLanding( double tickStartPosition, const DropFram
     // 1 <= consumed < required here: the shortfall is formed in uint64_t, exact for every int64 pair (the signed form overflows)
     const double owed = static_cast<double>( static_cast<uint64_t>( requiredSourceFrames )
                                              - static_cast<uint64_t>( consumedSourceFrames ) );
-    const double markFloor = static_cast<double>( counterStartFrame ) + static_cast<double>( consumedSourceFrames - 1 );
-    const double completingFrame = std::max( markFloor, std::floor( tickStartPosition + 1e-9 ) ) + owed;
+    const double completingFrame = std::max( static_cast<double>( counterHighWater ), std::floor( tickStartPosition + 1e-9 ) ) + owed;
     if( !( std::floor( tick.position + 1e-9 ) >= completingFrame ) ) return tick.position;
     const double insideFrame = completingFrame + 0.5;
     // r2 (adversary advisory A2 on 8b386cb9): past 2^52 a half frame (and past 2^53 a whole one) is not representable, so the span

@@ -1029,8 +1029,14 @@ TEST(PlaybackUnpacedWiring, APacedPlayHoldsAtItsRequiredFramesOnlyWhileTheMeasur
     const QString clamp = QStringLiteral(
         "                if( pacedHoldClampArmed )\n"
         "                    dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,\n"
-        "                        m_sourceAdvance.startFrame, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );\n");
+        "                        m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );\n");
     ASSERT_EQ(1, source.count(clamp));
+    // r3 (hub ruling HUB-TICK 20261127T1152Z, adversary A1 on 8b386cb9): the landing reads the counter's real high-water mark, the
+    // ONE reviewed .highWater read in playbackHandling (app_play_scan.py pins it as that call's third argument); the only other
+    // .highWater read in MainWindow is the conform line's engine_target in finishPlaybackSmokeTelemetry
+    ASSERT_EQ(1, handling.count(QRegularExpression(QStringLiteral("\\bm_sourceAdvance\\s*\\.\\s*highWater\\b"))));
+    ASSERT_EQ(2, source.count(QRegularExpression(QStringLiteral("\\bm_sourceAdvance\\s*\\.\\s*highWater\\b"))));
+    ASSERT_EQ(0, handling.count(QStringLiteral("m_sourceAdvance.startFrame")));
     ASSERT_EQ(1, source.count(QStringLiteral("playback_frame_range::pacedMeasuredHoldLanding(")));
     ASSERT_EQ(2, handling.count(QStringLiteral("pacedHoldClampArmed")));
     ASSERT_EQ(1, handling.count(QStringLiteral("dropFrameTick.position =")));

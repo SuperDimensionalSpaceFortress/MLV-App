@@ -1079,8 +1079,18 @@ PINNED_COUNTER_WRITES = {
 _WRITE_OP = r"(?:\s*\))*\s*(?:(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--)"
 _ADV_USE = re.compile(r"\bm_sourceAdvance\b")
 _ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|startFrame\b(?!" + _WRITE_OP + r"))")
-PINNED_COUNTER_READS = {"MainWindow::finishPlaybackSmokeTelemetry": 1}   # the conform line's engine_target
+PINNED_COUNTER_READS = {"MainWindow::finishPlaybackSmokeTelemetry": 1,   # the conform line's engine_target
+                        "MainWindow::playbackHandling": 1}               # r3: the paced hold landing clamp's high-water mark
 _ADV_PINNED_READ = re.compile(r"\bm_sourceAdvance\s*\.\s*armed\s*\?\s*m_sourceAdvance\s*\.\s*highWater\s*:\s*-\s*1\s*\)")
+# GUI-SMOKE-PACED-STOP-STARVATION-1 r3 (hub ruling HUB-TICK 20261127T1152Z, adversary A1 on 8b386cb9): the paced hold's landing clamp needs the
+# counter's real high-water mark. Its one reviewed read is the THIRD argument of the guarded landing call, an int64_t taken by value, matched only
+# by this expression and only inside playbackHandling; any other .highWater / .armed use there (a plain read, a second call, another argument
+# position, the conform line's expression) stays unreviewed.
+_ADV_PINNED_HOLD_READ = re.compile(r"\bplayback_frame_range::pacedMeasuredHoldLanding\s*\(\s*sourcePositionBeforeDropTick\s*,\s*dropFrameTick\s*,"
+                                   r"\s*m_sourceAdvance\s*\.\s*highWater\s*,")
+# each reviewed read is matched only by its own pinned expression, in its own function
+PINNED_COUNTER_READ_EXPRESSIONS = {"MainWindow::finishPlaybackSmokeTelemetry": _ADV_PINNED_READ,
+                                   "MainWindow::playbackHandling": _ADV_PINNED_HOLD_READ}
 _ADV_BEGIN = re.compile(r"\s*\.\s*begin\s*\(")
 _ADV_TICK = re.compile(r"\s*\.\s*noteEngineTick\s*\(")
 _ADV_RESET = re.compile(r"\s*=(?!=)\s*playback_frame_range::SourceFrameAdvanceCounter\s*\(\s*\)\s*;")
@@ -1102,13 +1112,16 @@ def _scan_counter_writes(blank: str, keep: str) -> list[str]:
         found[function][kind] += 1
 
     # r30 fix iteration 2: the uses inside the pinned read expression, at most PINNED_COUNTER_READS per function
+    # (r3: each reviewed function by its own expression; an expression in any other function reviews nothing)
     reviewed_reads: set[int] = set()
-    reads_seen: dict[str, int] = {}
-    for read in _ADV_PINNED_READ.finditer(blank):
-        function = _enclosing(spans, read.start())
-        reads_seen[function] = reads_seen.get(function, 0) + 1
-        if reads_seen[function] <= PINNED_COUNTER_READS.get(function, 0):
-            reviewed_reads.update(use.start() for use in _ADV_USE.finditer(blank, read.start(), read.end()))
+    for pinned_function, expression in PINNED_COUNTER_READ_EXPRESSIONS.items():
+        reads_seen = 0
+        for read in expression.finditer(blank):
+            if _enclosing(spans, read.start()) != pinned_function:
+                continue
+            reads_seen += 1
+            if reads_seen <= PINNED_COUNTER_READS.get(pinned_function, 0):
+                reviewed_reads.update(use.start() for use in _ADV_USE.finditer(blank, read.start(), read.end()))
 
     for match in _ADV_USE.finditer(blank):
         function = _enclosing(spans, match.start())

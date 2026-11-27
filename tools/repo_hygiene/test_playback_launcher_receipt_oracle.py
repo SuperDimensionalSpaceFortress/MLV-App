@@ -827,10 +827,53 @@ class CounterWritePinTests(unittest.TestCase):
                                 ("adversary: shift-right write", "m_sourceAdvance.highWater >>= 1;"),
                                 ("adversary: parenthesised armed write", "(m_sourceAdvance.armed) = false;"),
                                 ("a plain read outside the pinned site", "const bool advArmed = m_sourceAdvance.armed;"),
-                                ("the pinned expression outside its function", "const long long advHigh = ( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 );")):
+                                ("the pinned expression outside its function", "const long long advHigh = ( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 );"),
+                                ("r3: the landing's pinned argument outside playbackHandling",
+                                 "const double advLand = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,"
+                                 " m_sourceAdvance.highWater, 0, 0 );")):
             with self.subTest(name):
                 self.assert_caught(self.inject_in_smoke(statement), "unreviewed use of m_sourceAdvance")
-        self.assertEqual(PINNED_COUNTER_READS, {"MainWindow::finishPlaybackSmokeTelemetry": 1})
+        self.assertEqual(PINNED_COUNTER_READS, {"MainWindow::finishPlaybackSmokeTelemetry": 1, "MainWindow::playbackHandling": 1})
+
+    LANDING_CALL = ("dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,\n"
+                    "                        m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );")
+
+    def test_r3_the_paced_hold_landing_mark_is_the_one_reviewed_high_water_read_in_playback_handling(self) -> None:
+        """GUI-SMOKE-PACED-STOP-STARVATION-1 r3 (hub ruling HUB-TICK 20261127T1152Z, adversary A1 on 8b386cb9): the paced hold's landing clamp
+        needs the counter's real high-water mark, so playbackHandling has ONE reviewed `.highWater` read, matched only by its own pinned expression:
+        the third argument of the guarded `pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick, m_sourceAdvance.highWater, ...`
+        (an int64_t by value, nothing writes through it). Every other `.highWater` use in playbackHandling, a second landing call, the argument in
+        another position, and the other site's pinned expression there all stay unreviewed (the real sources are clean)."""
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        self.assertEqual(PINNED_COUNTER_READS.get("MainWindow::playbackHandling"), 1)
+        adv = "unreviewed use of m_sourceAdvance"
+        call = self.LANDING_CALL
+        cases = (
+            ("a plain read beside the landing", call + "\n                const long long advHigh = m_sourceAdvance.highWater;"),
+            ("a second landing call", call + "\n                " + call),
+            ("the mark in another argument position",
+             call + "\n                dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick,"
+                    " dropFrameTick, m_sourceAdvance.consumed(), m_sourceAdvance.highWater, m_playRequiredSourceFrames );"),
+            ("the landing with another tick start",
+             call + "\n                dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( m_newPosDropMode, dropFrameTick,"
+                    " m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );"),
+            ("the telemetry site's expression in playbackHandling",
+             call + "\n                const long long advHigh = ( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 );"),
+            ("a write beside the landing", call + "\n                m_sourceAdvance.highWater = 0;"),
+            ("a parenthesised write beside the landing", call + "\n                (m_sourceAdvance.highWater) += 1500;"),
+            ("armed read beside the landing", call + "\n                const bool advArmed = m_sourceAdvance.armed;"),
+        )
+        for name, replacement in cases:
+            with self.subTest(name):
+                self.assert_caught(self.mutated(call, replacement), adv)
+        # the one read itself, rewritten as anything but the pinned argument, is unreviewed too
+        for name, replacement in (
+                ("the mark read into a local first",
+                 "const int64_t advHigh = m_sourceAdvance.highWater;\n                " + call.replace("m_sourceAdvance.highWater,", "advHigh,")),
+                ("the mark taken by reference", call.replace("m_sourceAdvance.highWater,", "&m_sourceAdvance.highWater,"))):
+            with self.subTest(name):
+                problems = scan_app_play_sources(self.mutated(call, replacement))
+                self.assertTrue(any("m_sourceAdvance" in p for p in problems), problems)
 
     def test_r31_every_compound_and_parenthesised_write_is_a_write(self) -> None:
         """HFR-NATIVE-60FPS-FULLRES-1 r31 (Dot M2 on aa598479, the class): the read rule for .startFrame and the write rule for

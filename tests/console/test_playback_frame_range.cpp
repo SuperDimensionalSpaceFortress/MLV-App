@@ -4888,7 +4888,7 @@ inline bool engineTick( playback_frame_range::SourceFrameAdvanceCounter &counter
     playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
         position, fps * static_cast<double>( timeDiffMs ) / 1000.0, 1, cutOutValue, false );
     if( playback_frame_range::pacedMeasuredHoldApplies( true, unpaced, armed, target, required ) )
-        tick.position = playback_frame_range::pacedMeasuredHoldLanding( before, tick, counter.startFrame, counter.consumed(), required );
+        tick.position = playback_frame_range::pacedMeasuredHoldLanding( before, tick, counter.highWater, counter.consumed(), required );
     position = tick.position;
     counter.noteEngineTick( before, position, tick.wrapped );
     return true;
@@ -4943,7 +4943,8 @@ TEST( PlaybackPacedMeasuredHold, AStarvedStopCheckSeesTheRequiredFrameAndTheTail
         ASSERT_TRUE( playback_frame_range::measuredPlayLoopShouldStop( playback_frame_range::PlayStopState::Reached, false, 0, 0,
                                                                        kRequired, true, r.consumedAtStop ) );
         // disarmed, the timeline advances again at the paced request: the visual-capture tail plays
-        const int64_t tailFrames = static_cast<int64_t>( 180.0 * kFps * timeDiffMs / 1000.0 );
+        // r3: qualified -- the file's anonymous namespace has its own kFps (24), and the unqualified name was ambiguous (r2's build)
+        const int64_t tailFrames = static_cast<int64_t>( 180.0 * paced_starvation_model::kFps * timeDiffMs / 1000.0 );
         ASSERT_TRUE( r.consumedAfterTail >= r.consumedAtStop + tailFrames - 1 );
         ASSERT_TRUE( r.consumedAfterTail <= r.consumedAtStop + tailFrames + 1 );
     }
@@ -5108,26 +5109,29 @@ TEST( PlaybackPacedMeasuredHold, R2TheCrossingTickLandsInsideTheCompletingFrameA
         t.wrapped = wrapped;
         return t;
     };
-    // (the counter's start frame is 0 below unless named: consumed 1499 then means high water 1498)
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 0, 1499, 1500 ) == 1499.5 );        // past: clamped inside
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1499.25 ), 0, 1499, 1500 ) == 1499.25 );      // inside: unchanged
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1499.5 ), 0, 1499, 1500 ) == 1499.5 );
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1499.0 - 5.0e-10 ), 0, 1499, 1500 ) == 1499.0 );   // epsilon band: raised
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1498.9 ), 0, 1499, 1500 ) == 1498.9 );        // short: unchanged
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0, true ), 0, 1499, 1500 ) == 1558.0 );  // a wrap is never counted
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1400.0 ), 0, 1499, 1500 ) == 1400.0 );        // backward
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 0, 1500, 1500 ) == 1558.0 );        // already met
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 0, 1499, 0 ) == 1558.0 );           // no requirement
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 0, 0, 1500 ) == 1558.0 );           // an unarmed counter
-    ASSERT_TRUE( std::isnan( pacedMeasuredHoldLanding( 1498.0, tickTo( std::numeric_limits<double>::quiet_NaN() ), 0, 1499, 1500 ) ) );
-    ASSERT_TRUE( pacedMeasuredHoldLanding( std::numeric_limits<double>::quiet_NaN(), tickTo( 1558.0 ), 0, 1499, 1500 ) == 1558.0 );
+    // (r3: the third argument is the counter's high-water mark; started at 0, consumed 1499 is high water 1498)
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 1498, 1499, 1500 ) == 1499.5 );        // past: clamped inside
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1499.25 ), 1498, 1499, 1500 ) == 1499.25 );      // inside: unchanged
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1499.5 ), 1498, 1499, 1500 ) == 1499.5 );
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1499.0 - 5.0e-10 ), 1498, 1499, 1500 ) == 1499.0 );   // epsilon band: raised
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1498.9 ), 1498, 1499, 1500 ) == 1498.9 );        // short: unchanged
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0, true ), 1498, 1499, 1500 ) == 1558.0 );  // a wrap is never counted
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1400.0 ), 1498, 1499, 1500 ) == 1400.0 );        // backward
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 1499, 1500, 1500 ) == 1558.0 );        // already met
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 1498, 1499, 0 ) == 1558.0 );           // no requirement
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 0, 0, 1500 ) == 1558.0 );              // an unarmed counter
+    ASSERT_TRUE( std::isnan( pacedMeasuredHoldLanding( 1498.0, tickTo( std::numeric_limits<double>::quiet_NaN() ), 1498, 1499, 1500 ) ) );
+    ASSERT_TRUE( pacedMeasuredHoldLanding( std::numeric_limits<double>::quiet_NaN(), tickTo( 1558.0 ), 1498, 1499, 1500 ) == 1558.0 );
     // a counter started at 120 (the venue's identity start): consumed 1380 is high water 1499
-    ASSERT_TRUE( pacedMeasuredHoldLanding( 1499.0, tickTo( 1530.0 ), 120, 1380, 1381 ) == 1500.5 );
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1499.0, tickTo( 1530.0 ), 1499, 1380, 1381 ) == 1500.5 );
+    // r3: a mark above the tick's start frame (a backward seek) is the completing frame's base, not the start frame
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 2000.0, tickTo( 2003.0 ), 3001, 1499, 1500 ) == 2003.0 );        // short of 3002: unchanged
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 3001.0, tickTo( 3004.0 ), 3001, 1499, 1500 ) == 3002.5 );
     // a playhead above the counter's high-water mark (an external jump) is rebased to it by the counter: the start frame is the mark
     {
         SourceFrameAdvanceCounter counter = counterAt( 100.0 );   // consumed 101, high water 100
         const DropFrameTickResult jumped = tickTo( 5000.0 );
-        const double landed = pacedMeasuredHoldLanding( 3000.0, jumped, counter.startFrame, counter.consumed(), 105 );
+        const double landed = pacedMeasuredHoldLanding( 3000.0, jumped, counter.highWater, counter.consumed(), 105 );
         ASSERT_TRUE( landed == 3004.5 );
         counter.noteEngineTick( 3000.0, landed, false );
         ASSERT_EQ( 105, counter.consumed() );
@@ -5169,8 +5173,102 @@ TEST( PlaybackPacedMeasuredHold, R2TheCrossingTickLandsInsideTheCompletingFrameA
         ASSERT_EQ( 1501, bareCounter.consumed() );          // the unclamped engine overshoots on that tick
         ASSERT_TRUE( 25000 + ticks * 50 < kSafetyMs );
     }
-    // the remaining under-read: a backward seek after an external forward jump (the mark is above startFrame + consumed - 1). It
-    // lands short and never past; with fewer frames owed than a tick asks it advances at least the owed frames per tick
+}
+
+// r3 (hub ruling HUB-TICK 20261127T1152Z): the landing's mark is the counter's real high-water mark (playbackHandling's one reviewed
+// .highWater read), so a backward seek after an external forward jump is never throttled and never overshoots.
+TEST( PlaybackPacedMeasuredHold, R3AJumpThenASeekBackLandsOnTheRealCompletingFrame )
+{
+    using paced_starvation_model::engineTick;
+    using paced_starvation_model::renderedFrame;
+    using paced_starvation_model::countedFrame;
+    using playback_frame_range::SourceFrameAdvanceCounter;
+    using playback_frame_range::pacedMeasuredHoldLanding;
+    using playback_frame_range::DropFrameTickResult;
+    const auto counterAt = []( double position )   // consumed counted from start frame 0 up to the playhead's position
+    {
+        SourceFrameAdvanceCounter counter;
+        counter.begin( 0 );
+        counter.noteEngineTick( 0.0, position, false );
+        return counter;
+    };
+    const auto tickTo = []( double position, bool wrapped = false )
+    {
+        DropFrameTickResult t;
+        t.position = position;
+        t.wrapped = wrapped;
+        return t;
+    };
+    // r3 (hub ruling HUB-TICK 20261127T1152Z; adversary A1 on 8b386cb9): a backward seek after an external forward jump. r2 read the
+    // mark as startFrame + consumed - 1, below the real one; the landing now reads the counter's high-water mark, so it is exact.
+    // The adversary's input: 60 fps, required 1500, cut 1..5000; begin( 0 ), a tick 0 -> 1497, an external jump 3000 -> 3001
+    // (rebased: high water 3001, consumed 1499); at 25000 ms of Play a seek to 2000, then 3 frames per 50 ms. The completing frame
+    // is 3002: the ticks pass through untouched and the crossing lands on 3002 on the same tick the unclamped engine crosses.
+    // RED on 67dba94d: the completing frame read 2001, every tick was cut to about one frame, and 1499 still at 1000 ticks.
+    {
+        static constexpr int kSafetyMs = 25000 * 2 + 15000;
+        SourceFrameAdvanceCounter counter;
+        counter.begin( 0 );
+        counter.noteEngineTick( 0.0, 1497.0, false );
+        counter.noteEngineTick( 3000.0, 3001.0, false );
+        ASSERT_EQ( 1499, counter.consumed() );
+        ASSERT_EQ( 3001, counter.highWater );
+        ASSERT_EQ( 0, counter.startFrame );
+        SourceFrameAdvanceCounter bareCounter = counter;
+        double position = 2000.0;
+        double barePosition = 2000.0;
+        int ticks = 0;
+        int bareTicks = 0;
+        int cutTicks = 0;
+        while( ticks < 1000 && counter.consumed() < 1500 )
+        {
+            const double before = position;
+            ASSERT_TRUE( engineTick( counter, position, 50, 60.0, false, true, 0, 1500, 5000 ) );
+            ++ticks;
+            if( counter.consumed() < 1500 && position - before != 3.0 ) ++cutTicks;
+        }
+        while( bareTicks < 1000 && bareCounter.consumed() < 1500 )
+        {
+            const double before = barePosition;
+            barePosition = playback_frame_range::advanceDropFrameTick( barePosition, 3.0, 1, 5000, false ).position;
+            bareCounter.noteEngineTick( before, barePosition, false );
+            ++bareTicks;
+        }
+        ASSERT_EQ( 0, cutTicks );                           // RED on 67dba94d: every tick short of the crossing was cut
+        ASSERT_EQ( 1500, counter.consumed() );              // RED on 67dba94d: 1499
+        ASSERT_EQ( 334, bareTicks );                        // ceil( ( 3002 - 2000 ) / 3 )
+        ASSERT_EQ( bareTicks, ticks );                      // RED on 67dba94d: 1000 (the loop's bound)
+        ASSERT_EQ( 1500, bareCounter.consumed() );
+        ASSERT_EQ( 3002, renderedFrame( position ) );
+        ASSERT_EQ( 3002, countedFrame( position ) );
+        ASSERT_TRUE( 25000 + ticks * 50 < kSafetyMs );      // 41700 ms: Reached, not PLAY_SAFETY_TIMEOUT
+        ASSERT_TRUE( !engineTick( counter, position, 50, 60.0, false, true, 0, 1500, 5000 ) );   // held there
+        ASSERT_EQ( 1500, counter.consumed() );
+    }
+    // the same jump-then-seek shape with one frame owed and with eight owed: exact either way (r2 under-read the one-owed case)
+    for( const int64_t required : { int64_t( 103 ), int64_t( 110 ) } )
+    {
+        SourceFrameAdvanceCounter counter = counterAt( 100.0 );     // consumed 101, high water 100
+        counter.noteEngineTick( 1000.0, 1001.0, false );            // an external jump to 1000 (rebased), then one frame: 102
+        ASSERT_EQ( 102, counter.consumed() );
+        ASSERT_EQ( 1001, counter.highWater );
+        double position = 500.0;                                     // a seek back below the mark (1001)
+        int ticks = 0;
+        while( ticks < 2000 && counter.consumed() < required )
+        {
+            const double before = position;
+            ASSERT_TRUE( engineTick( counter, position, 50, 60.0, false, true, 0, required, 3000 ) );
+            ++ticks;
+            ASSERT_TRUE( counter.consumed() <= required );
+            if( counter.consumed() < required ) ASSERT_TRUE( position - before == 3.0 );   // never cut short of the crossing
+        }
+        ASSERT_EQ( required, counter.consumed() );
+        const int64_t completing = 1001 + ( required - 102 );
+        ASSERT_EQ( completing, renderedFrame( position ) );
+        ASSERT_EQ( completing, countedFrame( position ) );
+        ASSERT_EQ( static_cast<int>( ( completing - 500 + 2 ) / 3 ), ticks );   // the unclamped engine's ticks: ceil( travel / 3 )
+    }
+    // the eight-owed row as r2 had it
     {
         SourceFrameAdvanceCounter counter = counterAt( 100.0 );     // consumed 101, high water 100
         counter.noteEngineTick( 1000.0, 1001.0, false );            // an external jump to 1000 (rebased), then one frame: 102
