@@ -1036,6 +1036,13 @@ OVERRUN_CASES = [
     ("O25 a counter one frame short of the requirement is short, not rounded up", dict(
         _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254740989e0", required_source_frames=9007199254740990),
      25, False, True, 1200, True, False, False),
+    # r8b (adversary 820377cc A1): the exponent counts -- a fraction written with a negative exponent is not an integer.
+    ("O26 a fractional counter in negative-exponent form is refused", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="59999999999999999999999999999999e-29"),
+     25, False, True, 1200, True, False, False),
+    ("O26 a whole counter in negative-exponent form is still clean", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="64800e-2", required_source_frames="6e2"),
+     25, False, True, 1200, False, False, False),
     # r8 (adversary accac79e A1): a counter whose text is not an integer is refused even when rounding would make it one.
     ("O23 a 29-digit fractional counter below the requirement is refused", dict(
         _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="599.99999999999999999999999999999"),
@@ -1151,7 +1158,8 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
         # Truncate check then passes it. The text must be an integer literal (a fraction of zeros, an exponent) to be read as one.
         for text, ok in (("599.99999999999999999999999999999", False), ("600.0000000000000000000000000000001", False),
                          ("0.9999999999999999999999999999999", False), ("1.5", False), ("600.0", True), ("6e2", True),
-                         ("+600", True), ("600", True)):
+                         ("+600", True), ("600", True), ("59999999999999999999999999999999e-29", False), ("6.48e2", True),
+                         ("64800e-2", True), ("64801e-2", False), ("0e-9999", True), ("1e-1", False)):
             with self.subTest(text):
                 proc = _pwsh(f". {_q(GATE)}; Get-GuiSmokeExactCounter -Value {_q(text)} | ConvertTo-Json -Compress")
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

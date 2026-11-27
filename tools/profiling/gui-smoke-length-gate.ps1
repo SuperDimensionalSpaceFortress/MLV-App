@@ -619,10 +619,24 @@ function Test-GuiSmokeIntegerLiteral {
     .SYNOPSIS
     GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r8 (adversary accac79e A1): $true when the TEXT spells an integer -- digits, an optional
     fraction of zeros only, an optional exponent. A parser rounds a long fraction ("599.99999999999999999999999999999" -> 600), after which
-    "is it integral" is true of a value the receipt never held; only the text can say. Conservative: "1.5e1" (15) reads as not an integer.
+    "is it integral" is true of a value the receipt never held; only the text can say. r8b (adversary 820377cc A1): the exponent counts --
+    "59999999999999999999999999999999e-29" is a fraction, "6.48e2" and "648e0" are 648. The digits and the exponent are evaluated
+    EXACTLY (BigInteger), so no parser rounding can hide a fraction. A text of more than 400 digits of exponent is not an integer here.
     #>
     param([AllowNull()][string]$Text)
-    return ($null -ne $Text) -and [regex]::IsMatch($Text, '^\s*[+-]?[0-9]+(\.0*)?([eE][+-]?[0-9]+)?\s*$')
+    if ($null -eq $Text) { return $false }
+    $t = [regex]::Match($Text, '^\s*[+-]?([0-9]*)(?:\.([0-9]*))?(?:[eE]([+-]?[0-9]{1,4}))?\s*$')
+    if (-not $t.Success -or ($t.Groups[1].Value.Length + $t.Groups[2].Value.Length) -eq 0) { return $false }
+    $digits = $t.Groups[1].Value + $t.Groups[2].Value
+    $shift = $(if ($t.Groups[3].Success) { [int]$t.Groups[3].Value } else { 0 }) - $t.Groups[2].Value.Length
+    if ($shift -ge 0) { return $true }                  # digits x 10^shift is a whole number
+    $trimmed = $digits.TrimStart('0')
+    if ($trimmed.Length -eq 0) { return $true }         # zero
+    if (-$shift -gt $trimmed.Length) { return $false }  # fewer digits than the places to drop, and not zero: a fraction
+    $mantissa = [Numerics.BigInteger]::Parse($trimmed, [Globalization.CultureInfo]::InvariantCulture)
+    $remainder = [Numerics.BigInteger]::Zero
+    [void][Numerics.BigInteger]::DivRem($mantissa, [Numerics.BigInteger]::Pow([Numerics.BigInteger]10, -$shift), [ref]$remainder)
+    return $remainder.IsZero
 }
 
 function Get-GuiSmokeExactCounter {
