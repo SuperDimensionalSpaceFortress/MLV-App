@@ -7974,10 +7974,12 @@ function Get-DvTailVisualEvidence {
                          (($serialRaw -is [int]) -or ($serialRaw -is [long])) -and (($paintedRaw -is [int]) -or ($paintedRaw -is [long])) -and ([int64]$serialRaw -eq [int64]$paintedRaw) -and
                          ($basisRaw -is [string]) -and (@($script:TailCreditPaintBases | Where-Object { [string]::Equals($basisRaw, $_, [StringComparison]::Ordinal) }).Count -eq 1) -and
                          ($sourceRaw -is [string]) -and ($sourceRaw -cmatch '^[0-9a-f]{16}\z') -and ($active -is [bool]) -and $active -and $null -ne $display -and $tailOk
-            if ($isUnforcedPlay -and $mayCredit -and (($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
+            # r9 (sol A1 on 2cec2ecf): and only when the receipt recorded a hash for it: a row with no (or an ambiguous) recorded sha256 can never be credited,
+            # so a lock on its PNG is no tail evidence I/O and cannot refuse a tail whose other rows prove the credit
+            $recordedSha = $null
+            [void]$recorded.TryGetValue("$kind|$([int64]$index)", [ref]$recordedSha)
+            if ($isUnforcedPlay -and $mayCredit -and $null -ne $recordedSha -and (($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
                 try { $pngBytes = [IO.File]::ReadAllBytes($png) } catch { return (& $unreadable $png $_) }   # r4 (A7): typed, never $null
-                $recordedSha = $null
-                [void]$recorded.TryGetValue("$kind|$([int64]$index)", [ref]$recordedSha)
                 $actualSha = Get-DvSha256OfBytes $pngBytes
                 # adversary A1 on 9f327333: the bytes the receipt recorded at collection, and a decodable PNG
                 if ($null -ne $recordedSha -and $actualSha -ceq $recordedSha -and $null -eq (Get-DvPngImageProblem -Bytes $pngBytes)) { $pngSha = $actualSha }
@@ -8123,6 +8125,14 @@ function Get-DvTailInFlightCredit {
     # r4 (adversary A5 on eabccd6c): the qualifying captures, in the order they were taken (tail_elapsed_ms), must show a non-decreasing display frame and paint
     # serial: 479 at 126 ms then 478 at 376 ms is a backward paint after the close, never two credits. Two captures at the same instant cannot be ordered.
     $byTime = @($ordered | Sort-Object -Property @{ Expression = { [double](Get-DvProp $_ 'tailElapsedMs') } })
+    # r9 (sol A3 on 2cec2ecf): the order check starts at the measured close, not at the first capture. The last frame painted at the close is
+    # Target - Unpainted (477 for target 479 with 2 in flight), so a qualifying capture showing an EARLIER frame (476) is a backward paint across the
+    # boundary that the measured line never saw: 476, 478, 479 would otherwise credit 478 and 479 as an in-order tail
+    $closeFrame = $Target - $Unpainted
+    $behind = @($byTime | Where-Object { [int64](Get-DvProp $_ 'displayFrame') -lt $closeFrame } | Select-Object -First 1)
+    if ($behind.Count -gt 0) {
+        return (& $no "TAIL_CREDIT_PAINT_ORDER: a qualifying capture shows display frame $(Get-DvProp $behind[0] 'displayFrame') (serial $(Get-DvProp $behind[0] 'serial') at $(Get-DvProp $behind[0] 'tailElapsedMs') ms), earlier than frame $closeFrame, the last painted at the measured close, so the tail shows a backward paint across the close and is not credited")
+    }
     $lastShownFrame = [int64](@($byTime | ForEach-Object { [int64](Get-DvProp $_ 'displayFrame') }) | Measure-Object -Maximum).Maximum   # (r6, A3: the held end frame)
     for ($i = 1; $i -lt $byTime.Count; $i++) {
         $prev = $byTime[$i - 1]; $cur = $byTime[$i]

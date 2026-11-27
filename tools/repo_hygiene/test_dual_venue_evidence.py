@@ -11732,6 +11732,39 @@ class VisualCaptureVenueHelperTests(unittest.TestCase):
                                    f"try {{ [void](Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}') }} finally {{ $lock.Dispose() }}")
             self.assertNotEqual(proc.returncode, 0, "(guard) a locked non-burst image keeps the base's throw")
 
+    def test_r6_r9_sol_a2_a_burst_image_that_is_not_copied_never_leaves_an_older_one_in_its_slot(self) -> None:
+        # R6-BURST-CUTOFF-RESIDUE-1 r9 (sol A2 on 2cec2ecf), its input: forwarded=true, a fresh source visual.json and play-first-unbound-0.png, and the
+        # destination visual\play-first-unbound-0.png already holding an OLDER image, held open with FileShare.Read (reads allowed, replacement refused).
+        # 2cec2ecf swallowed the failed copy, so the older image was published beside the fresh visual.json and bound to its labels. A slot that cannot be
+        # emptied now throws (as a locked non-burst image does); a source the job cannot read empties an older slot and the rest is published.
+        with tempfile.TemporaryDirectory(prefix="vis-pub-r9a2-") as d:
+            src = Path(d, "src")
+            src.mkdir()
+            Path(d, "pub", "visual").mkdir(parents=True)
+            for name in ("play-first-unbound-0.png", "play-unbound-0.png", "visual.json"):
+                Path(src, name).write_bytes(b"new")
+            stale = Path(d, "pub", "visual", "play-first-unbound-0.png")
+            stale.write_bytes(b"old")
+            proc = self.run_module(f"$lock = [IO.File]::Open('{stale}', 'Open', 'Read', 'Read'); "
+                                   f"try {{ [void](Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}') }} finally {{ $lock.Dispose() }}")
+            published_old = stale.exists() and stale.read_bytes() == b"old" and Path(d, "pub", "visual", "visual.json").exists() and \
+                Path(d, "pub", "visual", "visual.json").read_bytes() == b"new"
+            self.assertFalse(proc.returncode == 0 and published_old, "an older burst image was published beside the fresh visual.json: " + proc.stdout + proc.stderr)
+            self.assertNotEqual(proc.returncode, 0, "a burst slot that cannot be emptied throws, as a locked non-burst image does")
+        with tempfile.TemporaryDirectory(prefix="vis-pub-r9a2b-") as d:
+            src = Path(d, "src")
+            src.mkdir()
+            Path(d, "pub", "visual").mkdir(parents=True)
+            for name in ("play-first-unbound-0.png", "play-unbound-0.png", "visual.json"):
+                Path(src, name).write_bytes(b"new")
+            Path(d, "pub", "visual", "play-first-unbound-0.png").write_bytes(b"old")
+            proc = self.run_module(f"$lock = [IO.File]::Open('{Path(src, 'play-first-unbound-0.png')}', 'Open', 'Read', 'None'); "
+                                   f"try {{ $pub = Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}' }} finally {{ $lock.Dispose() }}; "
+                                   "(Get-ChildItem -LiteralPath $pub -File | ForEach-Object Name | Sort-Object) -join ','")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines()[-1], "play-unbound-0.png,visual-capture-request.json,visual.json",
+                             "the uncopied burst image's slot is empty, never the older image")
+
     def test_the_visual_tail_is_cut_off_the_presentmon_window_and_never_extends_it(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-pm-") as d:
             Path(d, "visual.json").write_text(json.dumps({"tail_begin_utc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
@@ -22918,6 +22951,50 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             held = self.play(3, kind="play_first_unbound", tail_elapsed_ms=98, display_frame=479, serial=487, painted_serial=487)
             out = self.metrics(None, app=self.app_json(rows[0], rows[2], held), criteria=self.BOTH)
             self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+
+    def test_r6_r9_sol_a1_a_locked_png_whose_row_has_no_recorded_hash_never_refuses_the_tail(self) -> None:
+        """A1 (sol on 2cec2ecf), its input: PB + HELD (last 478, target 479) with two eligible burst rows play_first_unbound 0 (4 ms) and 1 (34 ms), the matching
+        visual.json digest, local PNG 0 held with FileShare.None and its RecordedFrames row sha256=null, row 1 with its PNG and recorded sha256. 2cec2ecf read
+        PNG 0 before looking up its (absent) recorded hash and refused the whole tail TAIL_VISUAL_UNREADABLE; row 0 can never be credited, so it is not
+        read, and row 1 credits frame 479."""
+        rows = (self.play(0, kind="play_first_unbound", tail_elapsed_ms=4), self.play(1, kind="play_first_unbound", tail_elapsed_ms=34))
+        raw = json.dumps(self.app_json(*rows)).encode("utf-8")
+        with tempfile.TemporaryDirectory() as d:
+            vis = Path(d) / "visual"
+            vis.mkdir()
+            (vis / "app-visual.json").write_bytes(raw)
+            rec = []
+            for row in rows:
+                body = self.png_bytes(row["index"])
+                (vis / f"{self.LEG}-play-first-unbound-{row['index']}.png").write_bytes(body)
+                rec.append({"kind": row["kind"], "index": row["index"], "sha256": None if row["index"] == 0 else hashlib.sha256(body).hexdigest()})
+            proc, out = run_pwsh_json(
+                "$rec = @($env:DVE_REC | ConvertFrom-Json); $pb = $env:DVE_PB | ConvertFrom-Json\n"
+                "$lock = [IO.File]::Open((Join-Path $env:DVE_DIR ('visual\\' + $env:DVE_LEG + '-play-first-unbound-0.png')), 'Open', 'Read', 'None')\n"
+                "try { $vis = Get-DvTailVisualEvidence -EvidenceDir $env:DVE_DIR -LegId $env:DVE_LEG -ExpectedSha256 $env:DVE_SHA -RecordedFrames $rec } finally { $lock.Dispose() }\n"
+                "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback $pb -Visual $vis\n"
+                "[ordered]@{ refused = [string]$vis.refused; unreadable = [string]$vis.unreadablePath; credited = $m.conformTailInFlightCreditedFrames\n"
+                "            tail = $m.conformTailUnpaintedFrames } | ConvertTo-Json -Compress",
+                DVE_DIR=d, DVE_LEG=self.LEG, DVE_SHA=hashlib.sha256(raw).hexdigest(), DVE_REC=json.dumps(rec), DVE_PB=json.dumps({**self.PB, **self.HELD}))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual((out["refused"], out["unreadable"]), ("", ""), out)
+        self.assertEqual((out["credited"], out["tail"]), (1, 0), out)
+
+    def test_r6_r9_sol_a3_a_capture_behind_the_measured_close_is_a_backward_paint(self) -> None:
+        """A3 (sol on 2cec2ecf), its input: the default PB (last measured 477, target 479, backward 0, repeats 0) with bound burst rows (index, ms, frame, serial)
+        = (0, 4, 476, 484), (1, 34, 478, 485), (2, 64, 479, 486). 2cec2ecf checked the order 476 -> 478 -> 479 only, never measured 477 -> 476, and credited
+        478 and 479 (jump 1, repeats 0, unpainted 0: PASS over a backward paint). (control) 478 then 479 still credits both."""
+        crit = self.BOTH + [{"metric": "conformRepeats", "op": "eq", "value": 0}]
+        rows = (self.play(0, kind="play_first_unbound", tail_elapsed_ms=4, display_frame=476, serial=484, painted_serial=484),
+                self.play(1, kind="play_first_unbound", tail_elapsed_ms=34, display_frame=478, serial=485, painted_serial=485),
+                self.play(2, kind="play_first_unbound", tail_elapsed_ms=64, display_frame=479, serial=486, painted_serial=486))
+        out = self.metrics(None, app=self.app_json(*rows), criteria=crit)
+        self.assert_no_credit(out, 2)
+        self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="(control) 478 then 479"):
+            out = self.metrics(None, app=self.app_json(rows[1], rows[2]), criteria=crit)
+            self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+            self.assertTrue(out["v"]["pass"], out)
 
     def test_r4r_r4_the_play_first_unbound_burst_before_the_first_forced_paint_is_credited(self) -> None:
         """R4: the app's play_first_unbound burst (index 0, play-first-unbound-0.png, forced_paints_before=0, saved, Play active, label-bound, a 16-hex source_id,
