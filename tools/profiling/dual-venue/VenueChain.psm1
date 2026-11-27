@@ -1226,6 +1226,12 @@ $script:VenueTestPostClockStartDelayMs = 0
 # NTP/VM-resume step between a caller's own wall-clock sample and this call's is. Production leaves it 0. The lease batch no longer hands a monotonic budget over as an instant at
 # all (-CallBudgetClock/-CallBudgetEndSec), so a step cannot reach its call; -CallDeadlineUtc stays for the nightly, whose own cap is a UTC deadline end to end.
 $script:VenueTestUtcStepSec = 0
+# Test-only (VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1): Get-VenueUtcLeftSec reads the wall clock from this scriptblock instead of [DateTime]::UtcNow (a reader that throws or answers anything
+# but one DateTime is the case under test: it reads as expired). Production leaves it $null.
+$script:VenueTestUtcNowScript = $null
+# VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1 (sol r7 A1 on #906): a bounded read handed an absolute UTC end waits in slices of at most this many seconds and re-reads both clocks between
+# them, so a wall-clock step inside the wait is seen within one slice (a single WaitOne sized at the start cannot see a step that comes later).
+$script:VenueUtcWaitSliceSec = 0.25
 # Test-only (VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r2, adversary-7efea617.json A4): Read-VenueFileBytesBounded's worker sleeps this many ms before it reads, as a share that
 # answers late does. Production leaves it 0.
 $script:VenueTestFileReadDelayMs = 0
@@ -1276,8 +1282,12 @@ function Invoke-VenueBoundedRead {
     # before it (after the worker started), so time spent creating the worker is never added past the caller's end. No -Clock: -TimeoutSec from the wait, as before.
     # r16 (Grok G22 on #814): -EndIsBoundEnd says -EndSec is the end of -TimeoutSec ITSELF (measured from an earlier start on the caller's clock), not a cap the
     # caller set under it; a wait it shortens is then a plain timeout and the "cut ... short" clause is not printed. Absent: any shortening by -EndSec is named.
+    # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1 (sol r7 A1 on #906): -EndUtc is the caller's ABSOLUTE end. The wait blocks for min(the stopwatch's left, the UTC end's left), clamped at 0,
+    # in slices of $script:VenueUtcWaitSliceSec, and re-reads BOTH on every wake: either one past its end ends the wait with no answer (the caller's typed unknown), and an answer seen
+    # after either end is never acted on. A UTC left that is not one finite number reads as passed (Get-VenueUtcLeftSec, the clock the consumption guard reads too). Absent: unchanged.
     param([Parameter(Mandatory)][string]$ScriptText, [Parameter(Mandatory)]$Argument, [Parameter(Mandatory)][ValidateRange(1.0, 600.0)][double]$TimeoutSec,
-        [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [switch]$EndIsBoundEnd)
+        [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [switch]$EndIsBoundEnd, [DateTime]$EndUtc)
+    $hasUtc = $PSBoundParameters.ContainsKey('EndUtc')
     # r28 (sol r27 blocker VENUE-STAGE-NONFINITE-ENDPOINT-ERASES-CAP-1, catalogue B-03, sibling of Get-VenueStagedBuildManifest -CallBudgetEndSec): an -EndSec that is not a
     # finite number is REFUSED, typed, before the worker starts. NaN skipped both the clamp (NaN -lt x is false: the full -TimeoutSec wait) and the late-answer rejection
     # (Elapsed - NaN -gt 0 is false), so an answer past the caller's end was acted on.
@@ -1288,6 +1298,9 @@ function Invoke-VenueBoundedRead {
     # batch's host-load reads, and the staged-manifest reads) gets this one check, so no per-site copy can miss it.
     if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -le 0) {
         return [pscustomobject]@{ answered = $false; value = @(); error = "no time is left of the caller's budget to start the read (its end passed $([Math]::Round($Clock.Elapsed.TotalSeconds - $EndSec, 2)) s ago); nothing was started" }
+    }
+    if ($hasUtc -and (Get-VenueUtcLeftSec -DeadlineUtc $EndUtc) -le 0) {
+        return [pscustomobject]@{ answered = $false; value = @(); error = "the caller's absolute end had already passed; nothing was started" }
     }
     $ps = [powershell]::Create()
     $abandoned = $false
@@ -1300,15 +1313,32 @@ function Invoke-VenueBoundedRead {
         if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -le 0) {
             return [pscustomobject]@{ answered = $false; value = @(); error = "no time is left of the caller's budget to start the read (its end passed $([Math]::Round($Clock.Elapsed.TotalSeconds - $EndSec, 2)) s ago, during the worker's setup); nothing was started" }
         }
+        if ($hasUtc -and (Get-VenueUtcLeftSec -DeadlineUtc $EndUtc) -le 0) {
+            return [pscustomobject]@{ answered = $false; value = @(); error = "the caller's absolute end passed during the worker's setup; nothing was started" }
+        }
         $async = $ps.BeginInvoke()
         if ($script:VenueTestPreWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreWaitDelayMs) }
         # r13 (Grok G20 on #814): $endCut = the caller's end, not -TimeoutSec, set the wait (as the nightly's capCut), so the message reports the wait actually given
         $waitSec = $TimeoutSec; $endCut = $false
         if ($null -ne $Clock) { $toEnd = $EndSec - $Clock.Elapsed.TotalSeconds; if ($toEnd -lt $waitSec) { $waitSec = [Math]::Max(0.0, $toEnd); $endCut = $true } }
-        if (-not $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec))) {
+        $done = $false; $utcCut = $false
+        if (-not $hasUtc) { $done = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec)) }
+        else {
+            # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1: the same stopwatch bound ($waitSec from $waitClock's start), cut to the UTC end's left, read again after every slice
+            $waitClock = [Diagnostics.Stopwatch]::StartNew()
+            while ($true) {
+                $utcLeft = Get-VenueUtcLeftSec -DeadlineUtc $EndUtc
+                if ($utcLeft -le 0) { $utcCut = $true; break }
+                $swLeft = $waitSec - $waitClock.Elapsed.TotalSeconds
+                if ($swLeft -le 0) { break }
+                if ($async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Max(0.0, [Math]::Min([Math]::Min($swLeft, $utcLeft), $script:VenueUtcWaitSliceSec))))) { $done = $true; break }
+            }
+        }
+        if (-not $done) {
             $abandoned = $true
             $script:VenueAbandonedReads++
             try { [void]$ps.BeginStop($null, $null) } catch { }
+            if ($utcCut) { return [pscustomobject]@{ answered = $false; value = @(); error = "no answer before the caller's absolute end ($([Math]::Round($waitClock.Elapsed.TotalSeconds, 2)) s into the wait)" } }
             return [pscustomobject]@{ answered = $false; value = @()
                 error ="no answer in $([Math]::Round($waitSec, 2)) s$(if ($endCut -and -not $EndIsBoundEnd) { " (the call's end cut the $([Math]::Round($TimeoutSec, 2)) s bound short)" })" }
         }
@@ -1316,6 +1346,10 @@ function Invoke-VenueBoundedRead {
         # sees only after -EndSec is never acted on (the worker finished, so it is disposed as usual)
         if ($null -ne $Clock -and ($late = $Clock.Elapsed.TotalSeconds - $EndSec) -gt 0) {
             return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen $([Math]::Round($late, 2)) s after the call's end is never acted on" }
+        }
+        # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1: and on the UTC end too, re-read on the wake that saw the answer
+        if ($hasUtc -and (Get-VenueUtcLeftSec -DeadlineUtc $EndUtc) -le 0) {
+            return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen after the caller's absolute end is never acted on" }
         }
         [pscustomobject]@{ answered = $true; value = @($ps.EndInvoke($async)); error = $null }
     } catch {
@@ -1350,21 +1384,25 @@ function Read-VenueFileBytesBounded {
     $waitSec = $(if ($null -ne $Clock) { [Math]::Min([double]$boundSec, $EndSec - $entrySec) } else { $boundSec })
     $workEndSec = $entrySec + [Math]::Max(0.0, $waitSec)
     $endTicks = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $waitSec)).Ticks
+    # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1 (sol r7 A1 on #906): the absolute end is handed to the bounded read's WAIT too (-EndUtc), so a wall clock stepped past it while the worker is
+    # blocked ends the wait at the UTC end, not at the stopwatch's; every read of that end goes through Get-VenueUtcLeftSec (fail closed)
+    $utcArgs = @{}
     if ($PSBoundParameters.ContainsKey('EndUtc')) {
         $absoluteEnd = $EndUtc.ToUniversalTime()
-        if ($absoluteEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: the caller's absolute end had already passed; nothing was started" }
+        if ((Get-VenueUtcLeftSec -DeadlineUtc $absoluteEnd) -le 0) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: the caller's absolute end had already passed; nothing was started" }
         if ($absoluteEnd.Ticks -lt $endTicks) { $endTicks = $absoluteEnd.Ticks }
+        $utcArgs['EndUtc'] = $absoluteEnd
     }
     $workerArg = @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs; endUtcTicks = $endTicks; clock = $workClock; clockEndSec = $workEndSec }
     if ($script:VenueTestCaptureWorkerArg) { $script:VenueTestLastFileWorkerArg = $workerArg }
-    $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd }
-           else { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec })
+    $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd @utcArgs }
+           else { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec @utcArgs })
     if (-not $r.answered) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: $($r.error)" }
     # adversary-d10f5241.json A2: an answer is judged against the ABSOLUTE end when it is OBSERVED too, not only before the read starts: the late-answer check inside Invoke-VenueBoundedRead reads the
     # stopwatch alone, so a wall clock stepped (or a caller suspended) inside the read let bytes seen after the caller's UTC deadline be acted on and a leg be counted
     if ($PSBoundParameters.ContainsKey('EndUtc')) {
         if ($script:VenueTestPostReadDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPostReadDelayMs) }
-        if ($EndUtc.ToUniversalTime().AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: an answer seen after the caller's absolute end is never acted on" }
+        if ((Get-VenueUtcLeftSec -DeadlineUtc $EndUtc.ToUniversalTime()) -le 0) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: an answer seen after the caller's absolute end is never acted on" }
     }
     $got = @($r.value)
     if ($got.Count -eq 0) {
@@ -2036,7 +2074,7 @@ function Get-VenueLegHostLoad {
             # take the seconds left as the endpoint itself, which charged the time already on the stopwatch twice: a caller descheduled 7 s after the stopwatch started, with 12 s to its deadline,
             # got endpoint 5 on a stopwatch at 7 and refused a readable quiet standing with 5 s still left. Sampling the stopwatch first can only land the endpoint at or before the real end (the safe side).
             $sampleSec = $readClock.Elapsed.TotalSeconds
-            $toDeadline = ($CallDeadlineUtc.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds
+            $toDeadline = Get-VenueUtcLeftSec -DeadlineUtc $CallDeadlineUtc.ToUniversalTime()
             if (-not ($toDeadline -ge 1.0)) { $unknown.reason = 'no time was left before the caller''s deadline to read the leg''s receipt and smoke result'; return $unknown }
             if (($sampleSec + $toDeadline) -lt $budgetSec) { $budgetSec = $sampleSec + $toDeadline }
         }
@@ -2047,7 +2085,7 @@ function Get-VenueLegHostLoad {
         $absEnd = $(if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) { $CallDeadlineUtc.ToUniversalTime() } else { $null })
         # R2-RESIDUE-1 r2 (adversary-f1221390.json A2): the end is the absolute deadline when one was given AND the shared read budget ($budgetSec on $readClock) always: a call with no -CallDeadlineUtc (the
         # baseline, the leg's own read) that was suspended after its last read past -ReadTimeoutSec classified and returned quiet or exempt just the same
-        $pastEnd = { ($null -ne $absEnd -and $absEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) -or $readClock.Elapsed.TotalSeconds -gt $budgetSec }
+        $pastEnd = { ($null -ne $absEnd -and (Get-VenueUtcLeftSec -DeadlineUtc $absEnd) -le 0) -or $readClock.Elapsed.TotalSeconds -gt $budgetSec }
         $lateReason = 'an answer classified after the caller''s absolute end or its read budget is never acted on'
         $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $budgetSec -Clock $readClock -EndSec $budgetSec @endArgs
         if ($script:VenueTestPostReceiptBytesDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPostReceiptBytesDelayMs) }
@@ -2104,13 +2142,30 @@ function Get-VenueLegHostLoad {
     }
 }
 
+function Get-VenueUtcLeftSec {
+    # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1 (sol r7 A1 on #906): the seconds left before an absolute UTC end, the ONE wall-clock read of a host-load deadline. Limit-VenueHostLoadToDeadline
+    # (the shared consumption guard), Get-VenueLegHostLoad's entry and late checks, Read-VenueFileBytesBounded and Invoke-VenueBoundedRead's wait all read the end through it, so the wait
+    # and the guard can never disagree about whether the end has passed. A wall clock that cannot be read (it throws, or answers anything but one DateTime) or a left that is not one
+    # finite number reads as 0: the end has passed (fail closed, never a wait or a standing past an end nobody could see). Honours the test seams VenueTestUtcNowScript / VenueTestUtcStepSec.
+    param([Parameter(Mandatory)][DateTime]$DeadlineUtc)
+    $left = try {
+        $now = $(if ($null -ne $script:VenueTestUtcNowScript) { & $script:VenueTestUtcNowScript } else { [DateTime]::UtcNow })
+        # the end is compared as handed over (each caller converts it as it always did: the reads pass .ToUniversalTime(), the guard its -DeadlineUtc as is)
+        if ($now -is [DateTime]) { ($DeadlineUtc - $now).TotalSeconds - [double]$script:VenueTestUtcStepSec } else { [double]::NaN }
+    } catch { [double]::NaN }
+    if (-not ($left -is [double]) -or -not [double]::IsFinite($left)) { return 0.0 }
+    $left
+}
+
 function Limit-VenueHostLoadToDeadline {
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r7 (sol r7 A3): the ONE guard every caller of Get-VenueLegHostLoad applies where it CONSUMES the standing (the chain, the lease batch and
     # the baseline; it was an inline copy in the first two). A standing a caller sees after its own absolute end is never acted on, whatever the reader returned: the caller can be
     # suspended after the reader's last check (a standing that passed at 899.9 s of a 900 s cap and is consumed at 901 s must not become a counted row). Past the end it reads
     # unknown, provisional and uncollected; before it, the standing comes back unchanged.
+    # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1: the end is read through Get-VenueUtcLeftSec, the SAME UTC clock the host-load read's wait reads (one clock, fail closed: an unreadable
+    # wall clock is past the end)
     param([AllowNull()][object]$Standing, [Parameter(Mandatory)][DateTime]$DeadlineUtc)
-    if ($DeadlineUtc -le [DateTime]::UtcNow) { return [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'the standing was seen after the absolute end (-DeadlineUtc) and is never acted on'; applies = $true } }
+    if ((Get-VenueUtcLeftSec -DeadlineUtc $DeadlineUtc) -le 0) { return [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'the standing was seen after the absolute end (-DeadlineUtc) and is never acted on'; applies = $true } }
     $Standing
 }
 

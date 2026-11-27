@@ -1327,7 +1327,8 @@ class HostLoadWaitHonoursUtcDeadlineTests(unittest.TestCase):
         import re
         text = MODULE.read_text(encoding="utf-8")
         body = text[text.index("function Read-VenueFileBytesBounded"):text.index("function Get-VenueRemoteJobIds")]
-        self.assertRegex(body, r"Invoke-VenueBoundedRead [^\r\n]*-EndUtc", "the absolute end reaches the bounded read's wait")
+        self.assertRegex(body, r"\$utcArgs\['EndUtc'\] = \$absoluteEnd", "the absolute end is put in the bounded read's arguments")
+        self.assertEqual(len(re.findall(r"Invoke-VenueBoundedRead [^\r\n]*@utcArgs", body)), 2, "both bounded-read calls (with and without a caller clock) hand the absolute end to the wait")
         self.assertEqual(len(re.findall(r"^function Get-VenueUtcLeftSec ", text, re.M)), 1, "one UTC clock read for the wait and the guard")
 
 
