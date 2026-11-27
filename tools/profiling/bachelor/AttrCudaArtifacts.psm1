@@ -5071,6 +5071,10 @@ function Get-AttrCudaProcessTreeSnapshot {
     [CmdletBinding(DefaultParameterSetName = 'Tree')]
     param([Parameter(ParameterSetName = 'Tree', Mandatory = $true)][int]$RootProcessId, [Parameter(ParameterSetName = 'Baseline', Mandatory = $true)][switch]$BaselineOnly,
           [Parameter(ParameterSetName = 'Tree')][AllowNull()][hashtable]$Baseline, [object[]]$Processes, [ValidateRange(1, 120)][int]$OperationTimeoutSec = 20, [int64]$NowTicks, [double]$BudgetMs = 0, [scriptblock]$Clock)
+    # R2-RESIDUE-3 r2 (sol r8 A3): a relative budget handed across this call boundary goes stale while the caller is suspended before the helper's first statement, and a stopwatch started HERE
+    # then reads the suspension as free time. A caller that owns a bound passes -Clock (a scriptblock reading the elapsed ms of ITS OWN clock, the one its bound is measured on) and
+    # -BudgetMs as the ABSOLUTE bound on that clock; every decision below (the dispatch guard and each deadline check) reads that clock at the moment of the decision, never a stopwatch started here.
+    # Without -Clock, -BudgetMs is the legacy relative budget on this body's own stopwatch; no call site in the tree uses it that way.
     # R2-RESIDUE-2 r1 (sol B2): -BudgetMs (0 = none) bounds the whole tree decode, its own clock started at the first statement (-Clock is the test seam: a scriptblock returning elapsed ms). The CIM
     # query has its own -OperationTimeoutSec; the rows it returns were then decoded with no deadline. Past the budget the answer is the typed unknown 'deadline-exceeded' (no caller may confirm
     # a tree from it). The check is inline (no helper) because VenueChain embeds this function alone, by name.
@@ -5214,10 +5218,15 @@ function Wait-AttrCudaProcessTreeGone {
     [pscustomobject]@{ confirmed; survivors; error }: confirmed is $true only when the snapshot's ok is the boolean $true and a scan that ended inside -WaitMs showed
     no survivor. Anything else is $false (fail closed). Never throws. -Scan is the test seam: a scriptblock returning the rows of one scan.
     #>
-    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [ValidateRange(0, 600000)][int]$WaitMs = 15000, [scriptblock]$Scan, [int64]$NowTicks)
+    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [ValidateRange(0, 600000)][int]$WaitMs = 15000, [scriptblock]$Scan, [int64]$NowTicks, [scriptblock]$Clock)
     # sol A3 on 91e548f8: the bound's clock starts at the FIRST statement, so the time spent decoding the snapshot (members, outsiders, the listing before the root) is spent from -WaitMs, never
     # added to it: a scan is granted only what the caller's shared cleanup budget still holds.
-    $clock = [Diagnostics.Stopwatch]::StartNew()
+    # R2-RESIDUE-3 r2 (sol r8 A3): a caller that owns a bound passes -Clock (a scriptblock reading the elapsed ms of ITS OWN clock) and -WaitMs as the ABSOLUTE bound on that clock; every read below
+    # (the loop test, each scan's grant, the post-scan check, the sleep) is then taken from that clock at the moment of the decision, so time the caller spent before this call (a suspension
+    # between its read and this first statement) is never forgotten. Without -Clock, -WaitMs is relative to the stopwatch started here (the job's own 15 s wait, which has no outer bound).
+    # (PowerShell names are case-insensitive: the stopwatch is $ownStopwatch because $clock would overwrite the -Clock parameter)
+    $ownStopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $elapsedMs = { if ($null -ne $Clock) { [double](& $Clock) } else { $ownStopwatch.Elapsed.TotalMilliseconds } }
     # r3 fix 2 (adversary A2 advisory on 6b788356): every snapshot field is read through PSObject.Properties, so a snapshot missing one (under strict mode) is an
     # unknown tree, never a throw. r5b fix (adversary A4 on 2420b65f): a property getter that throws is read inside the same guard.
     $snapProps = $null
@@ -5260,15 +5269,15 @@ function Wait-AttrCudaProcessTreeGone {
     $survivors = @()
     $lastError = 'no-time-to-confirm'
     # r7b (adversary A3 on 1413e30f): the clock is read to the fraction of a millisecond; ElapsedMilliseconds truncates, so 1200.6 ms read as inside a 1200 ms bound.
-    while (($WaitMs - $clock.Elapsed.TotalMilliseconds) -ge ($scanFloorMs + $scanMarginMs)) {
+    while (($WaitMs - (& $elapsedMs)) -ge ($scanFloorMs + $scanMarginMs)) {
         try {
             # r5b fix 2 (adversary A2 on e75704ae): the floor is re-checked at the moment the scan's timeout is granted (the 250 ms sleep and the work since the loop
             # test have used budget), so a scan never starts, or is granted its 1 s minimum, with less than $scanFloorMs left.
-            $remainMs = $WaitMs - $clock.Elapsed.TotalMilliseconds
+            $remainMs = $WaitMs - (& $elapsedMs)
             if ($remainMs -lt ($scanFloorMs + $scanMarginMs)) { break }
             # r2c (sol r3 A2): the grant is read AGAIN here, and a grant under one whole second starts no scan (an OperationTimeoutSec of 0 selects the provider's server-default timeout, which
             # is unbounded for this purpose); only the guard statement sits between this read and the dispatch.
-            $leftSec = [int][Math]::Floor(($WaitMs - $clock.Elapsed.TotalMilliseconds - $scanMarginMs) / 1000.0)
+            $leftSec = [int][Math]::Floor(($WaitMs - (& $elapsedMs) - $scanMarginMs) / 1000.0)
             if ($leftSec -lt 1) { break }
             $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
             # r5b fix (adversary A2 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started; the
@@ -5349,11 +5358,11 @@ function Wait-AttrCudaProcessTreeGone {
             foreach ($np in $noPidParents) { if ($expanded.Contains($np) -or $adopted.Contains($np)) { $noPidUnder = $np; break } }
             if ($blindRow -and $null -eq $noPidUnder) { $noPidUnder = 'none'; $lastError = 'descendant-unreadable row-without-pid' }
             elseif ($null -ne $noPidUnder) { $lastError = "descendant-unreadable parent=$noPidUnder" }
-            if ($clock.Elapsed.TotalMilliseconds -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
+            if ((& $elapsedMs) -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
             if ($survivors.Count -eq 0 -and $null -eq $noPidUnder) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
         } catch { $lastError = "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
         # r2 (sol r1 A2): the sleep is read from the exact remaining milliseconds (a double), floored, so it never runs into the scan floor and margin.
-        $sleepMs = [Math]::Floor([Math]::Min(250.0, $WaitMs - $clock.Elapsed.TotalMilliseconds - $scanFloorMs - $scanMarginMs))
+        $sleepMs = [Math]::Floor([Math]::Min(250.0, $WaitMs - (& $elapsedMs) - $scanFloorMs - $scanMarginMs))
         if ($sleepMs -lt 0) { break }
         if ($sleepMs -gt 0) { Start-Sleep -Milliseconds ([int]$sleepMs) }
     }

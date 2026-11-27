@@ -4709,11 +4709,11 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         wait_src = ARTIFACTS_MODULE.read_text(encoding="utf-8")
         start = wait_src.index("function Wait-AttrCudaProcessTreeGone")
         body = wait_src[start:wait_src.index("function Get-AttrCudaProcessCpuSnapshot")]
-        self.assertIn("$remainMs = $WaitMs - $clock.Elapsed.TotalMilliseconds\n", body)
+        self.assertIn("$remainMs = $WaitMs - (& $elapsedMs)\n", body)   # R2-RESIDUE-3 r2: every read is the caller's clock when it passed one (was $clock.Elapsed.TotalMilliseconds)
         # r2 (sol r1 A2): the floor now includes the dispatch margin, and the grant is the whole seconds of the exact remaining milliseconds less that margin
         self.assertIn("if ($remainMs -lt ($scanFloorMs + $scanMarginMs)) { break }", body, "the floor and margin are re-checked where the scan's timeout is granted")
         # r2c (sol r3 A2): the grant is re-read, and under one whole second no scan starts (a 0 s CIM timeout would select the server default)
-        self.assertIn("$leftSec = [int][Math]::Floor(($WaitMs - $clock.Elapsed.TotalMilliseconds - $scanMarginMs) / 1000.0)\n            if ($leftSec -lt 1) { break }\n", body)
+        self.assertIn("$leftSec = [int][Math]::Floor(($WaitMs - (& $elapsedMs) - $scanMarginMs) / 1000.0)\n            if ($leftSec -lt 1) { break }\n", body)
         self.assertIn("-OperationTimeoutSec $leftSec -ErrorAction Stop", body)
         self.assertNotIn("[Math]::Max(1,", body, "no 1 s minimum is forced on a scan the budget cannot cover")
         venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
@@ -4742,9 +4742,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         after the helper source loaded. Here the source takes 1600 ms to load under a 1500 ms budget: no scan may start, and the kill is unconfirmed. With 5000 ms
         and a 1200 ms load, the scan gets at most the remaining whole seconds (3), never the original 5."""
         module = DV / "VenueChain.psm1"
-        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, $BudgetMs, [switch]$BaselineOnly) if ($BaselineOnly) { return @{ ([int64]4) = [int64]1 } }; $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
+        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, $BudgetMs, $Clock, [switch]$BaselineOnly) if ($BaselineOnly) { return @{ ([int64]4) = [int64]1 } }; $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
                 "[pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } }\n"
-                "function Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }")
+                "function Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs, $Clock) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }")
         got = json.loads(run_pwsh(["-Command",
             "$ErrorActionPreference = 'Stop'\n"
             f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
@@ -4824,14 +4824,14 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         child starts. Behavior: a 1600 ms load under 1500 ms still gets its snapshot scan and the kill. A load that throws leaves the tree unknown (unconfirmed)
         and the child is still killed inside the bound. Source: the load precedes Process.Start, and nothing reads the source after the timeout."""
         module = DV / "VenueChain.psm1"
-        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, $BudgetMs, [switch]$BaselineOnly) if ($BaselineOnly) { return @{ ([int64]4) = [int64]1 } }; $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
+        fake = ("function Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, $BudgetMs, $Clock, [switch]$BaselineOnly) if ($BaselineOnly) { return @{ ([int64]4) = [int64]1 } }; $global:snapCalls++; $global:snapTimeout = $OperationTimeoutSec; "
                 "[pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } }\n"
-                "function Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }")
+                "function Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs, $Clock) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }")
         # r7b (adversary A2 on 1413e30f): r7 loaded the source before Process.Start, which delayed a start its caller had timed against an absolute deadline. The
         # helpers are now defined once when the module loads: the fakes replace them in the module's own scope, and the old source seam is slowed (and throws) to
         # prove no call reads it. 'quick': a child that exits at once returns in well under the slow read. A3 on 1413e30f: 'late' is a wait that returns its
         # confirmation past the one cleanup allowance; that is late evidence and confirms nothing.
-        late_wait = "function script:Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) if ($global:lateWait) { Start-Sleep -Milliseconds ($WaitMs + 400) }; [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }"
+        late_wait = "function script:Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs, $Clock) if ($global:lateWait) { Start-Sleep -Milliseconds ($WaitMs + 400) }; [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }"
         got = json.loads(run_pwsh(["-Command",
             "$ErrorActionPreference = 'Stop'\n"
             f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
@@ -5082,7 +5082,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         proc = run_pwsh(["-Command",
             "$ErrorActionPreference = 'Stop'\n"
             f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
-            "& $m { function script:Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, $BudgetMs, [switch]$BaselineOnly) if ($BaselineOnly) { Start-Sleep -Milliseconds 4850; return @{ ([int64]4) = [int64]1 } }; "
+            "& $m { function script:Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, $BudgetMs, $Clock, [switch]$BaselineOnly) if ($BaselineOnly) { Start-Sleep -Milliseconds 4850; return @{ ([int64]4) = [int64]1 } }; "
             "$global:rootScans++; [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } } }\n"
             "$global:rootScans = 0; $exe = (Get-Process -Id $PID).Path\n"
             "$r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 5 -CleanupWaitMs 1500\n"
@@ -5170,7 +5170,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n" + self.FAKE_BOUNDED_SEAMS +
             "& $m { function script:Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, [double]$BudgetMs, $Clock, [switch]$BaselineOnly) if ($BaselineOnly) { return @{ ([int64]4) = [int64]1 } }; "
             "$global:budgetSeen = $BudgetMs; $global:fakeMs = 6044.0; [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } } }\n"
-            "& $m { function script:Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } } }\n"
+            "& $m { function script:Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs, $Clock) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } } }\n"
             "$global:waitGrants = [System.Collections.Generic.List[int]]::new(); $global:fakeMs = 0.0; $global:stepMs = 0.0; $global:exitAtMs = 1e9; $global:slackMs = 0.0; $global:budgetSeen = $null\n"
             "$exe = (Get-Process -Id $PID).Path\n"
             "$r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 6 -CleanupWaitMs 1500\n"
@@ -5178,9 +5178,8 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         late = json.loads(proc.stdout.strip().splitlines()[-1])
         self.assertTrue(late["timedOut"], late)
-        self.assertIsNotNone(late["budget"], f"the caller passes the allowance the record still has: {late}")
-        self.assertLessEqual(late["budget"], 2000.0, late)
-        self.assertGreater(late["budget"], 0.0, late)
+        self.assertIsNotNone(late["budget"], f"the caller passes the bound the record is held to: {late}")
+        self.assertEqual(late["budget"], 6000.0, f"R2-RESIDUE-3 r2: the ABSOLUTE bound on the caller's clock (-TimeoutSec 6), not what was left of it: {late}")
         self.assertFalse(late["killConfirmed"], f"a snapshot that came back past the bound is never used: the tree is unknown, the kill unconfirmed: {late}")
 
     def test_r2_residue_2_b3_a_call_that_never_launched_reports_no_kill_and_both_preflight_callers_say_so(self) -> None:
@@ -5248,6 +5247,169 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertFalse(got["spentOk"], got)
         self.assertEqual(got["spentWhy"], "deadline-exceeded", f"900 ms of a 1100 ms budget are spent: a 1000 ms query is not dispatched: {got}")
 
+    # R2-RESIDUE-3 r2 (sol r8 A3). The two snapshot calls and the confirmation call used to get a RELATIVE allowance (what was left when the caller read its clock). A caller suspended between that
+    # read and the helper's first statement handed over a stale figure, and the helper's own new stopwatch read the suspension as free time. These tests stand in for the suspension: a stub of
+    # the helper sleeps (or advances the injected clock) and THEN runs the real embedded helper with exactly the arguments the caller passed. A counted Get-CimInstance shows whether the
+    # helper still dispatched its query. The helpers are the real ones: the copies VenueChain embeds, taken before the stubs replace them.
+    ABSOLUTE_DEADLINE_PRELUDE = (
+        "$ErrorActionPreference = 'Stop'\n"
+        "$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
+        "& $m { $script:realSnap = (Get-Item function:Get-AttrCudaProcessTreeSnapshot).ScriptBlock; $script:realWait = (Get-Item function:Wait-AttrCudaProcessTreeGone).ScriptBlock\n"
+        "  function script:Get-CimInstance { [CmdletBinding()] param($ClassName, $Property, $OperationTimeoutSec) $global:cim++; @() } }\n"
+        "$global:cim = 0; $global:seen = $null; $global:waitGrants = [System.Collections.Generic.List[int]]::new(); $exe = (Get-Process -Id $PID).Path\n")
+
+    def test_r2_residue_3_a3_the_early_snapshot_dispatches_no_query_when_the_caller_is_suspended_past_the_bound(self) -> None:
+        """R2-RESIDUE-3 r2, sol r8 A3, early record. TimeoutSec=5, the caller reads outer 3899 ms (grant 1 s, 1101 ms left), is suspended until outer 5001 ms and only then does the helper start: at
+        HEAD it started its own stopwatch, read 1101-5 >= 1000 and dispatched its CIM query at 5006 ms (the kill held to about 6006 ms against a 5000 ms bound). The caller now passes the
+        ABSOLUTE bound (5000) and its own clock; the helper reads that clock at the dispatch, finds 5001, and dispatches nothing. Control: with no suspension (clock 3899) the query is dispatched."""
+        module = DV / "VenueChain.psm1"
+        stubs = (
+            "& $m { function script:New-VenueBoundedClock { $c = [pscustomobject]@{}; Add-Member -InputObject $c -MemberType ScriptProperty -Name Elapsed -Value { [pscustomobject]@{ TotalMilliseconds = [double]$global:fakeMs } }; $c }\n"
+            "  function script:Wait-VenueBoundedExit { param($Process, [int]$Ms) $global:waitGrants.Add($Ms); if ($global:waitGrants.Count -eq 1) { $global:fakeMs = 3899.0 } else { $global:fakeMs = [double]$global:fakeMs + $Ms }; $false }\n"
+            "  function script:Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, [double]$BudgetMs, $Clock, [switch]$BaselineOnly)\n"
+            "    if ($BaselineOnly) { return @{ ([int64]4) = [int64[]]@(1) } }\n"
+            "    $global:seen = [ordered]@{ grant = $OperationTimeoutSec; budget = $BudgetMs; clock = ($null -ne $Clock) }\n"
+            "    if ($global:suspend) { $global:fakeMs = 5001.0 }\n"
+            "    & $script:realSnap @PSBoundParameters }\n"
+            "  function script:Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs, $Clock) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } } }\n")
+        run = (
+            "$out = [ordered]@{}\n"
+            "foreach ($case in @(@('suspended', $true), @('control', $false))) {\n"
+            "  $global:cim = 0; $global:seen = $null; $global:waitGrants.Clear(); $global:fakeMs = 0.0; $global:suspend = [bool]$case[1]\n"
+            "  $r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 5 -CleanupWaitMs 1500\n"
+            "  $out[$case[0]] = [ordered]@{ cim = $global:cim; seen = $global:seen; timedOut = $r.timedOut; killConfirmed = $r.killConfirmed }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 5")
+        proc = run_pwsh(["-Command", self.ABSOLUTE_DEADLINE_PRELUDE.replace("{module}", str(module)) + stubs + run], timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["suspended"]["seen"]["grant"], 1, got)
+        self.assertEqual(got["suspended"]["cim"], 0, f"a helper that starts after the bound dispatches no query: {got}")
+        self.assertTrue(got["suspended"]["timedOut"], got)
+        self.assertFalse(got["suspended"]["killConfirmed"], f"the tree is unknown, the kill unconfirmed: {got}")
+        self.assertEqual(got["suspended"]["seen"]["budget"], 5000.0, f"the caller hands over the ABSOLUTE bound, not what was left: {got}")
+        self.assertTrue(got["suspended"]["seen"]["clock"], f"the caller hands over its own clock: {got}")
+        self.assertEqual(got["control"]["cim"], 1, f"control: an in-time helper still dispatches its query: {got}")
+
+    def test_r2_residue_3_a3_the_cleanup_snapshot_dispatches_no_query_when_the_caller_is_suspended_past_the_cleanup_bound(self) -> None:
+        """R2-RESIDUE-3 r2, sol r8 A3, cleanup snapshot (a call granted under 5 s records the tree at its timeout, under -CleanupWaitMs). The caller grants a 2 s scan from a 2500 ms
+        allowance, is suspended 2600 ms before the helper starts, and the helper used to start a new stopwatch and dispatch. It now reads the caller's cleanup clock (and the absolute
+        bound -CleanupWaitMs) at the dispatch and dispatches nothing. Control: with no suspension the query is dispatched."""
+        module = DV / "VenueChain.psm1"
+        stubs = (
+            "& $m { $script:VenueBaseline = @{ ([int64]4) = [int64[]]@(1) }; $script:VenueBaselineClock = [Diagnostics.Stopwatch]::StartNew()\n"
+            "  function script:Wait-VenueBoundedExit { param($Process, [int]$Ms) $global:waitGrants.Add($Ms); $false }\n"
+            "  function script:Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, [double]$BudgetMs, $Clock, [switch]$BaselineOnly)\n"
+            "    if ($BaselineOnly) { return @{ ([int64]4) = [int64[]]@(1) } }\n"
+            "    $global:seen = [ordered]@{ grant = $OperationTimeoutSec; budget = $BudgetMs; clock = ($null -ne $Clock) }\n"
+            "    if ($global:suspend) { Start-Sleep -Milliseconds 2600 }\n"
+            "    & $script:realSnap @PSBoundParameters }\n"
+            "  function script:Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs, $Clock) [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } } }\n")
+        run = (
+            "$out = [ordered]@{}\n"
+            "foreach ($case in @(@('suspended', $true), @('control', $false))) {\n"
+            "  $global:cim = 0; $global:seen = $null; $global:waitGrants.Clear(); $global:suspend = [bool]$case[1]\n"
+            "  $r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs 2500\n"
+            "  $out[$case[0]] = [ordered]@{ cim = $global:cim; seen = $global:seen; timedOut = $r.timedOut; killConfirmed = $r.killConfirmed }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 5")
+        proc = run_pwsh(["-Command", self.ABSOLUTE_DEADLINE_PRELUDE.replace("{module}", str(module)) + stubs + run], timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["suspended"]["seen"]["grant"], 2, got)
+        self.assertEqual(got["suspended"]["cim"], 0, f"a cleanup helper that starts after the cleanup bound dispatches no query: {got}")
+        self.assertTrue(got["suspended"]["timedOut"], got)
+        self.assertFalse(got["suspended"]["killConfirmed"], got)
+        self.assertEqual(got["suspended"]["seen"]["budget"], 2500.0, f"the caller hands over the ABSOLUTE cleanup bound: {got}")
+        self.assertTrue(got["suspended"]["seen"]["clock"], got)
+        self.assertEqual(got["control"]["cim"], 1, f"control: an in-time helper still dispatches its query: {got}")
+
+    def test_r2_residue_3_a3_the_confirmation_call_scans_nothing_when_the_caller_is_suspended_past_the_cleanup_bound(self) -> None:
+        """R2-RESIDUE-3 r2, sol r8 A3, the sibling confirmation call (Wait-AttrCudaProcessTreeGone). It was handed -WaitMs = what was left of -CleanupWaitMs when the caller read it, and its own
+        stopwatch started at its first statement. The caller is suspended 2600 ms past a 2500 ms cleanup bound before the helper starts: the helper now reads the caller's clock, finds the bound
+        spent, and scans nothing (confirmed False). Control: with no suspension it scans (and, on an empty tree, confirms)."""
+        module = DV / "VenueChain.psm1"
+        stubs = (
+            "& $m { $script:VenueBaseline = @{ ([int64]4) = [int64[]]@(1) }; $script:VenueBaselineClock = [Diagnostics.Stopwatch]::StartNew()\n"
+            "  function script:Wait-VenueBoundedExit { param($Process, [int]$Ms) $global:waitGrants.Add($Ms); $false }\n"
+            "  function script:Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, [double]$BudgetMs, $Clock, [switch]$BaselineOnly)\n"
+            "    if ($BaselineOnly) { return @{ ([int64]4) = [int64[]]@(1) } }\n"
+            "    [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); others = @{}; baseline = @{ ([int64]4) = [int64[]]@(1) }; error = $null } }\n"
+            "  function script:Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs, $Clock)\n"
+            "    $global:seen = [ordered]@{ waitMs = $WaitMs; clock = ($null -ne $Clock) }\n"
+            "    if ($global:suspend) { Start-Sleep -Milliseconds 2600 }\n"
+            "    $w = & $script:realWait @PSBoundParameters; $global:waitErr = $w.error; $w } }\n")
+        run = (
+            "$out = [ordered]@{}\n"
+            "foreach ($case in @(@('suspended', $true), @('control', $false))) {\n"
+            "  $global:cim = 0; $global:seen = $null; $global:waitErr = $null; $global:waitGrants.Clear(); $global:suspend = [bool]$case[1]\n"
+            "  $r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs 2500\n"
+            "  $out[$case[0]] = [ordered]@{ cim = $global:cim; seen = $global:seen; waitErr = $global:waitErr; killConfirmed = $r.killConfirmed }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 5")
+        proc = run_pwsh(["-Command", self.ABSOLUTE_DEADLINE_PRELUDE.replace("{module}", str(module)) + stubs + run], timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertEqual(got["suspended"]["cim"], 0, f"a confirmation that starts after the cleanup bound scans nothing: {got}")
+        self.assertEqual(got["suspended"]["waitErr"], "no-time-to-confirm", got)
+        self.assertFalse(got["suspended"]["killConfirmed"], got)
+        self.assertEqual(got["suspended"]["seen"]["waitMs"], 2500, f"the caller hands over the ABSOLUTE cleanup bound: {got}")
+        self.assertTrue(got["suspended"]["seen"]["clock"], got)
+        self.assertGreaterEqual(got["control"]["cim"], 1, f"control: an in-time confirmation still scans: {got}")
+
+    def test_r2_residue_3_a3_the_helpers_read_the_callers_clock_at_every_decision(self) -> None:
+        """R2-RESIDUE-3 r2, helper contract. With the caller's -Clock the snapshot's -BudgetMs is the absolute bound: a clock already past it dispatches no query (typed unknown), and the wait's
+        -WaitMs is the absolute bound on the caller's clock for the loop test, the grant, the post-scan check and the sleep: a clock past it scans nothing; a scan that moves the clock past it
+        confirms nothing; a clock that holds lets one scan run. Without -Clock the wait keeps its own stopwatch (the job's 15 s wait has no outer bound)."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$bl = & $realSnapshot -BaselineOnly -Processes $sys\n"
+            "$late = & $realSnapshot -RootProcessId 100 -Baseline $bl -OperationTimeoutSec 1 -BudgetMs 5000 -Clock { 5001.0 }\n"
+            "$rows = @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1))))\n"
+            "$s = & $realSnapshot -RootProcessId 100 -Processes $rows -Baseline $bl\n"
+            "$global:n = 0; $global:ck = 1201.0\n"
+            "$spent = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Clock { $global:ck } -Scan { $global:n++; @() }\n"
+            "$nSpent = $global:n; $global:n = 0; $global:ck = 0.0\n"
+            "$moves = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Clock { $global:ck } -Scan { $global:n++; $global:ck = 1300.0; @() }\n"
+            "$nMoves = $global:n; $global:n = 0; $global:ck = 0.0\n"
+            "$holds = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Clock { $global:ck } -Scan { $global:n++; @() }\n"
+            "$nHolds = $global:n; $global:n = 0\n"
+            "$own = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { $global:n++; @() }\n"
+            "[ordered]@{ lateOk = $late.ok; lateWhy = $late.error; spent = $spent.confirmed; spentWhy = $spent.error; nSpent = $nSpent; moves = $moves.confirmed; movesWhy = $moves.error; nMoves = $nMoves;\n"
+            "            holds = $holds.confirmed; nHolds = $nHolds; own = $own.confirmed; nOwn = $global:n } | ConvertTo-Json -Compress")
+        self.assertFalse(got["lateOk"], got)
+        self.assertEqual(got["lateWhy"], "deadline-exceeded", got)
+        self.assertFalse(got["spent"], got)
+        self.assertEqual(got["spentWhy"], "no-time-to-confirm", got)
+        self.assertEqual(got["nSpent"], 0, f"no scan is granted once the caller's clock is past the bound: {got}")
+        self.assertFalse(got["moves"], got)
+        self.assertEqual(got["movesWhy"], "scan-ended-past-the-bound", got)
+        self.assertEqual(got["nMoves"], 1, got)
+        self.assertTrue(got["holds"], got)
+        self.assertEqual(got["nHolds"], 1, got)
+        self.assertTrue(got["own"], f"without -Clock the wait keeps its own stopwatch: {got}")
+        self.assertEqual(got["nOwn"], 1, got)
+
+    def test_r2_residue_3_a3_every_call_site_in_the_pr_hands_the_helpers_the_absolute_bound_and_its_clock(self) -> None:
+        """R2-RESIDUE-3 r2 (source pin, sol r8 A3 sibling sweep). No call of the snapshot or the wait in the tree hands a RELATIVE allowance across the call boundary: the early snapshot and the cleanup
+        snapshot pass -BudgetMs as the absolute bound with the caller's clock, the confirmation call passes -WaitMs=-CleanupWaitMs with that clock; the old relative forms are gone."""
+        venue = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = venue[venue.index("function Invoke-VenueBoundedProcess"):venue.index("function Get-VenueDriverScriptMissing")]
+        self.assertIn("-BudgetMs ($TimeoutSec * 1000.0) -Clock $callMs", body)
+        self.assertIn("-BudgetMs $CleanupWaitMs -Clock $cleanupMs", body)
+        self.assertIn("Wait-AttrCudaProcessTreeGone -Snapshot $tree -WaitMs $CleanupWaitMs -Clock $cleanupMs", body)
+        self.assertIn("$callMs = { $censusClock.Elapsed.TotalMilliseconds }.GetNewClosure()", body)
+        self.assertIn("$cleanupMs = { $cleanup.Elapsed.TotalMilliseconds }.GetNewClosure()", body)
+        self.assertNotIn("-BudgetMs ([Math]::Max(", body, "no relative allowance is handed to the snapshot")
+        self.assertNotIn("-WaitMs ([int][Math]::Floor(", body, "no relative allowance is handed to the wait")
+        # the late-result rejections stay as defence in depth
+        self.assertIn("if ($censusClock.Elapsed.TotalMilliseconds -gt $TimeoutSec * 1000.0) { $tree = $null }", body)
+        self.assertIn("if ($cleanup.Elapsed.TotalMilliseconds -gt $CleanupWaitMs) { $treeGone = $false }", body)
+        # the other callers in the tree carry no outer bound (the job's own waits): they pass no budget, so no stale allowance can cross
+        job = (ROOT / "tools" / "profiling" / "bachelor" / "export-stage-job.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("-BudgetMs", job)
+        self.assertIn("Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000 }", job)
+
     def test_r2_sol_a3_a4_the_tree_is_recorded_before_the_bound_so_the_kill_is_at_the_bound(self) -> None:
         """sol r2 A3 on b428e461: a call granted 5 s or more records the tree one lead (2 s) BEFORE the bound, so the kill is not held behind a slow scan; a call granted less records it
         at the timeout (the earlier rule). Behavior: the fake snapshot reports when it ran."""
@@ -5255,7 +5417,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         proc = run_pwsh(["-Command",
             "$ErrorActionPreference = 'Stop'\n"
             f"$m = Import-Module '{module}' -Force -DisableNameChecking -PassThru\n"
-            "& $m { function script:Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, $BudgetMs, [switch]$BaselineOnly) if ($BaselineOnly) { return @{ ([int64]4) = [int64]1 } }; "
+            "& $m { function script:Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, $BudgetMs, $Clock, [switch]$BaselineOnly) if ($BaselineOnly) { return @{ ([int64]4) = [int64]1 } }; "
             "$global:snapAt = $global:sw.Elapsed.TotalMilliseconds; [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = [int64]1; members = @(); error = $null } } }\n"
             "$exe = (Get-Process -Id $PID).Path; $out = [ordered]@{}\n"
             "foreach ($sec in @(6, 2)) {\n"
@@ -5287,8 +5449,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertNotIn("$censusMs", body, "the wait is not reduced by the census alone")
         src = ARTIFACTS_MODULE.read_text(encoding="utf-8")
         wait = src[src.index("function Wait-AttrCudaProcessTreeGone"):src.index("function Get-AttrCudaProcessCpuSnapshot")]
-        self.assertLess(wait.index("$clock = [Diagnostics.Stopwatch]::StartNew()"), wait.index("$snapProps = $null"), "the bound's clock starts before the snapshot is decoded")
-        self.assertEqual(wait.count("$clock = [Diagnostics.Stopwatch]::StartNew()"), 1, wait)
+        # R2-RESIDUE-3 r2: the own stopwatch is $ownStopwatch (PowerShell names are case-insensitive: `$clock` would overwrite the new -Clock parameter); it is still the first statement
+        self.assertLess(wait.index("$ownStopwatch = [Diagnostics.Stopwatch]::StartNew()"), wait.index("$snapProps = $null"), "the bound's clock starts before the snapshot is decoded")
+        self.assertEqual(wait.count("$ownStopwatch = [Diagnostics.Stopwatch]::StartNew()"), 1, wait)
         job = EXPORT_JOB.read_text(encoding="utf-8")
         self.assertIn("try { $exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 10 } catch {", job)
         self.assertIn("$exportTree = try { Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline -OperationTimeoutSec 5 } catch { $null }", job)

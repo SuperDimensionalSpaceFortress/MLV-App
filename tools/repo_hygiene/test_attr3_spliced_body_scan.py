@@ -366,6 +366,12 @@ _allow("Wait-AttrCudaProcessTreeGone",
        "test-only seam: runs the caller's -Scan block (a stand-in for the Win32_Process scan) only when a test passed one; production passes none and reads Get-CimInstance, a read-only query",
        ("R3", "& $Scan", 1))
 _allow("Wait-AttrCudaProcessTreeGone", _LOCAL_BLOCK, ("R3", "& $inBase", 2))
+# R2-RESIDUE-3 r2 (sol r8 A3): -Clock is the caller's own clock (a block reading the elapsed ms of the bound -WaitMs is measured on). $elapsedMs is the body's pure block, defined on its second
+# statement: `{ if ($null -ne $Clock) { [double](& $Clock) } else { $ownStopwatch.Elapsed.TotalMilliseconds } }`. 5 calls: the loop test, the scan grant (twice: the floor re-check and the whole seconds
+# left), the post-scan check and the sleep. It reads a clock and runs nothing else.
+_allow("Wait-AttrCudaProcessTreeGone",
+       "runs the caller's -Clock block (the elapsed milliseconds of the caller's own clock, the one the bound -WaitMs is measured on) and the body's pure $elapsedMs reader of it; a clock read only",
+       ("R3", "& $Clock", 1), ("R3", "& $elapsedMs", 5))
 _allow("Get-AttrCudaPresentMonDisplayReport", _LOCAL_BLOCK, ("R3", "& $buildWindow", 2), ("R3", "& $unavailable", 7))
 _allow("Get-AttrCudaSelfHealMetrics", _LOCAL_BLOCK,
        ("R3", "& $count", 4), ("R3", "& $field", 2), ("R3", "& $fps", 2), ("R3", "& $iniFlag", 2), ("R3", "& $readJson", 3),
