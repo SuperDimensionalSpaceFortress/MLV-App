@@ -615,14 +615,21 @@ def leg_receipt_root_guard_ps(leg: Path, root: str, offline: bool = False) -> st
     )
 
 
+def receipt_state_written_by_this_harness(base: Path) -> dict[str, tuple[int, int]]:
+    """Every file under `base` that carries this harness's build manifest digest (MANIFEST, the -BuildManifestSha256 every batch_cmd run hands the leg, which a leg's receipt records as
+    subject.buildManifestSha256), as name -> (size, mtime_ns). A file another process wrote there is not this harness's and is not counted (adversary r2 pass 4 A2)."""
+    if not base.exists():
+        return {}
+    return {str(p.relative_to(base)): (p.stat().st_size, p.stat().st_mtime_ns) for p in base.rglob("*") if p.is_file() and MANIFEST.encode("ascii") in p.read_bytes()}
+
+
 def canonical_receipt_state_for(spec: Path) -> dict[str, tuple[int, int]]:
-    """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r2: every file under the CANONICAL receipt root's directory for `spec`'s card/legId, as name -> (size, mtime_ns).
+    """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r2: the files this harness wrote under the CANONICAL receipt root's directory for `spec`'s card/legId.
     The canonical root is the one Invoke-VenueLeg resolves for itself when it is given no -ReceiptRoot (the main checkout's .claude-state\\dual-venue\\receipts, found from the git common dir)."""
     doc = json.loads(spec.read_text(encoding="utf-8"))
     common = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=60)
     main_root = Path(common.stdout.strip()).parent if common.returncode == 0 and common.stdout.strip() else ROOT
-    base = main_root / ".claude-state" / "dual-venue" / "receipts" / str(doc["card"]) / str(doc["legId"])
-    return {str(p.relative_to(base)): (p.stat().st_size, p.stat().st_mtime_ns) for p in base.rglob("*") if p.is_file()} if base.exists() else {}
+    return receipt_state_written_by_this_harness(main_root / ".claude-state" / "dual-venue" / "receipts" / str(doc["card"]) / str(doc["legId"]))
 
 
 def utc_iso(dt: datetime) -> str:
@@ -6071,6 +6078,38 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         first = dict(kv.split("=", 1) for kv in log.read_text(encoding="utf-8").splitlines()[0].split("|"))
         self.assertEqual(first["RepoRoot"], spelled, "the seam value reaches the child as spelled, unresolved by the parent")
         self.assertEqual(first["LegScript"].lower(), str(self.tmp / "fake-leg.ps1").lower())
+
+    # adversary r2 pass 4 A1: the "real um-run.ps1" classification must not be defeated by line endings either, or the offline seams (the new skip switch among them) are accepted from a second
+    # checkout's production um-run. (Hermetic: the spec does not exist, so the run ends at its usage checks and never reaches a um-run.)
+    def test_legspec_committed_r2_a_um_run_that_differs_from_the_real_one_only_by_line_endings_is_still_the_real_one(self) -> None:
+        real_bytes = (RUNNER.parent.parent / "um-run.ps1").read_bytes()
+        lf = real_bytes.replace(b"\r\n", b"\n")
+        converted = lf.replace(b"\n", b"\r\n") if lf == real_bytes else lf
+        self.assertNotEqual(converted, real_bytes)
+        copy_dir = self.case / "checkout2" / "tools" / "profiling"
+        copy_dir.mkdir(parents=True)
+        (copy_dir / "um-run.ps1").write_bytes(converted)
+        for flag, needle in ((["-SkipCommittedSpecPreflight"], "-SkipCommittedSpecPreflight is an offline test seam"),
+                             (["-LeaseBudgetWindowSec", "3600"], "LEASE_CAP_RELAXED"),
+                             (["-CommittedSpecRepoRoot", str(ROOT)], "-CommittedSpecRepoRoot is an offline test seam")):
+            with self.subTest(flag=flag[0]):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self.case / "no-such-spec.json"], *flag, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+                args[args.index("-UmRunScript") + 1] = str(copy_dir / "um-run.ps1")
+                r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(needle, r.stderr)
+                self.assertEqual(self.kinds(), [])
+
+    # adversary r2 pass 4 A2: the canonical-receipt teardown check counts only what this harness wrote, so another process's receipt in the same directory is not a false failure
+    def test_legspec_committed_r2_the_receipt_state_check_ignores_files_another_process_wrote(self) -> None:
+        base = self.case / "receipts-under-watch"
+        (base / "bachelor").mkdir(parents=True)
+        (base / "bachelor" / "parallel.json").write_text("{}\n", encoding="utf-8")
+        self.assertEqual(receipt_state_written_by_this_harness(base), {})
+        (base / "bachelor" / "ours.json").write_text(json.dumps({"subject": {"buildManifestSha256": MANIFEST}}), encoding="utf-8")
+        self.assertEqual(list(receipt_state_written_by_this_harness(base)), [str(Path("bachelor") / "ours.json")])
+        self.assertEqual(receipt_state_written_by_this_harness(self.case / "no-such-dir"), {})
 
     def test_legspec_committed_r2_a_seam_root_that_does_not_resolve_is_the_childs_typed_refusal_not_a_synchronous_usage_stop(self) -> None:
         self._reset_committed_case()

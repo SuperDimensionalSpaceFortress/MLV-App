@@ -303,7 +303,10 @@ if (-not $UmRunScript) { $UmRunScript = Join-Path $here '..\um-run.ps1' }
 foreach ($s in $QuietScript, $LegScript, $UmRunScript) { if (-not (Test-Path -LiteralPath $s -PathType Leaf)) { Stop-Usage "no script at '$s'" } }
 # The caps hold against the real um-run.ps1 (by path or by content): only an offline stub may shorten the cooldown or the budget window.
 $realUmRun = [IO.Path]::GetFullPath((Join-Path $here '..\um-run.ps1'))
-$umRunIsReal = ([IO.Path]::GetFullPath($UmRunScript) -ieq $realUmRun) -or ((Test-Path -LiteralPath $realUmRun -PathType Leaf) -and (Get-FileHash -LiteralPath $UmRunScript).Hash -ceq (Get-FileHash -LiteralPath $realUmRun).Hash)
+# r2 (adversary pass 4 A1): the content test is on the LINE-ENDING-NORMALISED hash (Get-DvLegSpecSha256, CRLF -> LF), not the raw bytes: a second checkout's production um-run.ps1 that differs from this one only
+# by line endings (an autocrlf checkout) is still the real one, so it is refused every offline seam, -SkipCommittedSpecPreflight among them.
+function Get-NormalisedFileSha256([string]$Path) { Get-DvLegSpecSha256 ([IO.File]::ReadAllBytes($Path)) }
+$umRunIsReal = ([IO.Path]::GetFullPath($UmRunScript) -ieq $realUmRun) -or ((Test-Path -LiteralPath $realUmRun -PathType Leaf) -and (Get-NormalisedFileSha256 $UmRunScript) -ceq (Get-NormalisedFileSha256 $realUmRun))
 if ($umRunIsReal -and $LeaseBudgetWindowSec -lt 10800) {
     Stop-Usage "LEASE_CAP_RELAXED -LeaseBudgetWindowSec $LeaseBudgetWindowSec is looser than Bachelor's 10800 s window"
 }
