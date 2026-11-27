@@ -161,15 +161,16 @@ class ClipLengthGateTests(_TmpCase):
         incomplete = _gate(first, 24)
         self.assertEqual(incomplete["verdict"], "CLIP_LENGTH_UNKNOWN", incomplete)
         self.assertEqual(incomplete["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)")
-        # Both parts: 400 + 400 = 800 frames = 33.37 s.
-        write_synthetic_mlv(self.tmp / "span.M00", 400, file_num=1, file_count=2, guid=guid)
+        # Both parts: 400 + 400 = 800 frames = 33.37 s. (The part is named exactly as the app probes it, the first part's own
+        # case, so this holds on the case-sensitive ubuntu shard too: GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1, adversary A1.)
+        write_synthetic_mlv(self.tmp / ("span" + self._probed(0)), 400, file_num=1, file_count=2, guid=guid)
         complete = _gate(first, 24)
         self.assertEqual(complete["verdict"], "OK", complete)
         self.assertAlmostEqual(complete["clipSeconds"], 33.37, places=2)
 
     def test_a_spanned_set_from_two_recordings_is_unknown(self) -> None:
         first = write_synthetic_mlv(self.tmp / ("mix" + MLV_EXTENSION), 400, file_num=0, file_count=2, guid=1)
-        write_synthetic_mlv(self.tmp / "mix.M00", 400, file_num=1, file_count=2, guid=2)
+        write_synthetic_mlv(self.tmp / ("mix" + self._probed(0)), 400, file_num=1, file_count=2, guid=2)
         verdict = _gate(first, 24)
         self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_mismatch)")
 
@@ -200,8 +201,8 @@ class ClipLengthGateTests(_TmpCase):
         guid = 0x1122334455667788
         first = write_synthetic_mlv_with_blocks(self.tmp / ("vspan" + MLV_EXTENSION), 200, 400,
                                                 file_num=0, file_count=3, guid=guid)
-        write_synthetic_mlv_with_blocks(self.tmp / "vspan.M00", 200, 300, file_num=1, file_count=3, guid=guid)
-        write_synthetic_mlv_with_blocks(self.tmp / "vspan.M01", 212, 237, file_num=2, file_count=3, guid=guid)
+        write_synthetic_mlv_with_blocks(self.tmp / ("vspan" + self._probed(0)), 200, 300, file_num=1, file_count=3, guid=guid)
+        write_synthetic_mlv_with_blocks(self.tmp / ("vspan" + self._probed(1)), 212, 237, file_num=2, file_count=3, guid=guid)
         verdict = _gate(first, 24)
         self.assertEqual(verdict["frames"], 937, verdict)
         self.assertAlmostEqual(verdict["clipSeconds"], 39.08, places=2)
@@ -266,9 +267,27 @@ class ClipLengthGateTests(_TmpCase):
         self.assertEqual(verdict["frames"], 800 if self._case_insensitive_tmp() else 400, verdict)
 
     def test_g6_a_declared_three_part_set_with_a_gap_is_incomplete(self) -> None:
-        verdict = _gate(self._span("g6", 3, {".M00": (1, 3, 0x5A5A0001), ".M02": (2, 3, 0x5A5A0001)}), 24)
+        verdict = _gate(self._span("g6", 3, {self._probed(0): (1, 3, 0x5A5A0001), self._probed(2): (2, 3, 0x5A5A0001)}), 24)
         self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
         self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)")
+
+    # adversary f408901c A1: a header that DECLARES the set is followed by the same probed names (the app reads no fileCount),
+    # so its parts are found exactly as the app finds them: by the probed name, as the file system resolves it.
+    def test_g8_a_declared_part_whose_base_differs_in_case_counts_only_where_the_app_can_open_it(self) -> None:
+        first = write_synthetic_mlv(self.tmp / ("g8" + MLV_EXTENSION), 400, file_num=0, file_count=2, guid=0x5A5A0001)
+        write_synthetic_mlv(self.tmp / ("G8" + self._probed(0)), 400, file_num=1, file_count=2, guid=0x5A5A0001)
+        verdict = _gate(first, 24)
+        if self._case_insensitive_tmp():
+            self.assertEqual(verdict["frames"], 800, verdict)
+        else:
+            self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)")
+
+    def test_g9_a_declared_part_in_the_other_case_counts_only_where_the_app_can_open_it(self) -> None:
+        verdict = _gate(self._span("g9", 2, {self._probed(0).swapcase(): (1, 2, 0x5A5A0001)}), 24)
+        if self._case_insensitive_tmp():
+            self.assertEqual(verdict["frames"], 800, verdict)
+        else:
+            self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)")
 
     def test_other_blocks_are_skipped_and_only_vidf_is_counted(self) -> None:
         path = self.tmp / ("mixed" + MLV_EXTENSION)
@@ -874,6 +893,11 @@ OVERRUN_CASES = [
     # adversary e8eeaee1 A2: a counter far outside any real Play (9e15) is still an overrun, never a silent pass.
     ("O10 a counter of 9e15", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9000000000000000),
      25, False, True, 1200, True, True, False),
+    # adversary f408901c A2: past 2^53 a double cannot hold the difference (49 frames read as 48); the overrun is exact.
+    ("O11 an exact overrun past 2^53", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9007199254741041,
+                                             required_source_frames=9007199254740992), 25, False, True, 1200, True, True, False),
+    ("O11 the same at the tolerance", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9007199254741040,
+                                            required_source_frames=9007199254740992), 25, False, True, 1200, False, False, False),
 ]
 
 
