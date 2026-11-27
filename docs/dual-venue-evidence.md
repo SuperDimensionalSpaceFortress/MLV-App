@@ -808,8 +808,8 @@ times out or returns nothing is a typed unknown, never a guess and never a missi
 |---|---|---|
 | `displayAdapterName` | text | `Win32_VideoController.Name` of the first controller that reports a current mode (width, height and refresh each a whole number from 1 to 2147483647; a null, a 0 or the uint32 sentinel 4294967295 is not usable, so a controller with a resolution and no usable refresh is skipped, like a headless render adapter): the adapter driving a display |
 | `displayAdapterDriverVersion` | text | the same controller's `DriverVersion` |
-| `displayAdapterDriverDate` | `yyyy-MM-dd` | the same controller's `DriverDate` (the calendar date as reported) |
-| `displays` | 1 to 64 of `{ adapter; width; height; refreshHz }` | every controller with a current mode (the same rule as the adapter's): `CurrentHorizontalResolution`, `CurrentVerticalResolution`, `CurrentRefreshRate` |
+| `displayAdapterDriverDate` | `yyyy-MM-dd` | the same controller's `DriverDate`, the calendar date as reported: CIM hands over a local-kind `DateTime` (the instant shown in the host's zone), so it is converted back to UTC before it is cut to a date, and a driver dated `20240514000000.000000-000` reads `2024-05-14` on a UTC-6 host too. Limit: CIM keeps the instant and not the DMTF offset, so a date reported with a positive offset (`+120`) reads as the UTC day, the day before; Windows reports driver dates as `-000` midnight |
+| `displays` | 1 to 64 of `{ adapter; width; height; refreshHz }` | every controller with a current mode (the same rule as the adapter's): `CurrentHorizontalResolution`, `CurrentVerticalResolution`, `CurrentRefreshRate`. One entry per video controller (adapter), not per monitor: a second monitor on the same adapter is not listed (follow-up VENUE-LEG-DISPLAY-STATE-PER-MONITOR-MODES-1) |
 | `windowsBuild` | digits | `Win32_OperatingSystem.BuildNumber` |
 | `windowsUbr` | int | the registry value `HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\UBR` (CIM carries no UBR; an in-process read-only registry read) |
 | `lastBootUtc` | `yyyy-MM-ddTHH:mm:ssZ` | `Win32_OperatingSystem.LastBootUpTime`, in UTC |

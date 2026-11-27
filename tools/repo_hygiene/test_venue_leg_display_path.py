@@ -1074,7 +1074,9 @@ def run_fragment(scenarios: list[dict]) -> list[dict]:
     """Run the health probe's display-state fragment (New-DvDisplayStateProbeText) once per scenario, with Get-CimInstance and Get-ItemProperty shadowed
     by test doubles, and return per scenario { line: the `DVE_PROBE=` line a probe would print, seen: the -OperationTimeoutSec the hotfix read was given }.
     A scenario: gpus [{name, ver, date yyyyMMdd|None, w, h, hz}], gpuErr None|'timeout'|'error', os {build, boot yyyyMMddHHmmss}|None,
-    quick 'ok'|'throw'|'timeout'|'empty', reg 'ok'|'throw'|'text', budget None|<seconds>."""
+    quick 'ok'|'throw'|'timeout'|'empty', reg 'ok'|'throw'|'text', budget None|<seconds>; optional: budgetText <a budget override handed over as text>,
+    zone <Windows time-zone id of the HOST to simulate: the driver date (and, with bootKind 'local', the boot time) reach the fragment as LOCAL-kind values in that zone>,
+    offsetMin <the DMTF UTC offset in minutes the driver date was reported with, default 0>."""
     with tempfile.TemporaryDirectory(prefix=TMP_PREFIX) as d:
         cases = Path(d) / "scenarios.json"
         cases.write_text(json.dumps(scenarios, ensure_ascii=True), encoding="utf-8")
@@ -1098,12 +1100,24 @@ def run_fragment(scenarios: list[dict]) -> list[dict]:
             "function Invoke-Scenario($s) {\n"
             "  $script:seen = $null; $script:regCalled = $false; $script:quick = [string]$s.quick; $script:reg = [string]$s.reg\n"
             "  if ($null -ne $s.budget) { $dsBudgetSec = [double]$s.budget }\n"
+            # r3 (opus key r1 hardening a): a budget override handed over as TEXT, the way a harness may, is not cast here
+            "  if ($null -ne $s.budgetText) { $dsBudgetSec = [string]$s.budgetText }\n"
             "  $inv = [Globalization.CultureInfo]::InvariantCulture\n"
+            # r3 (opus key r1 blocker): `zone` is a Windows time-zone id naming the HOST the double pretends to run on. CIM hands the fragment a LOCAL-kind DateTime, the
+            # driver's instant shown in the host's zone; .NET cannot build a Local-kind value for another zone, so the double builds the wall-clock value of that zone and
+            # stamps it Local, and hands the fragment the zone through $dsLocalZone (a test seam: production never sets it). `offsetMin` is the DMTF UTC offset the
+            # driver date was reported with (default 0 = `20240514000000.000000-000`). Neither depends on the zone the test runs in.
+            "  $dsLocalZone = $null\n"
+            "  $zone = $null\n"
+            "  if ($s.zone) { $zone = [TimeZoneInfo]::FindSystemTimeZoneById([string]$s.zone); $dsLocalZone = $zone }\n"
+            "  $offsetMin = $(if ($null -ne $s.offsetMin) { [int]$s.offsetMin } else { 0 })\n"
             "  $probe = [ordered]@{}\n"
             "  $os = $null\n"
-            "  if ($null -ne $s.os) { $os = [pscustomobject]@{ BuildNumber = $s.os.build; LastBootUpTime = [datetime]::SpecifyKind([datetime]::ParseExact([string]$s.os.boot, 'yyyyMMddHHmmss', $inv), 'Utc') } }\n"
+            "  $bootUtc = $(if ($null -ne $s.os) { [datetime]::SpecifyKind([datetime]::ParseExact([string]$s.os.boot, 'yyyyMMddHHmmss', $inv), 'Utc') } else { $null })\n"
+            "  if ($null -ne $bootUtc -and $zone -and $s.bootKind -eq 'local') { $bootUtc = [datetime]::SpecifyKind([TimeZoneInfo]::ConvertTimeFromUtc($bootUtc, $zone), 'Local') }\n"
+            "  if ($null -ne $s.os) { $os = [pscustomobject]@{ BuildNumber = $s.os.build; LastBootUpTime = $bootUtc } }\n"
             "  $gpus = @($s.gpus | ForEach-Object { [pscustomobject]@{ Name = $_.name; DriverVersion = $_.ver;\n"
-            "      DriverDate = $(if ($_.date) { [datetime]::ParseExact([string]$_.date, 'yyyyMMdd', $inv) } else { $null });\n"
+            "      DriverDate = $(if (-not $_.date) { $null } elseif ($zone) { [datetime]::SpecifyKind([TimeZoneInfo]::ConvertTimeFromUtc([datetime]::SpecifyKind([datetime]::ParseExact([string]$_.date, 'yyyyMMdd', $inv).AddMinutes(-$offsetMin), 'Utc'), $zone), 'Local') } else { [datetime]::ParseExact([string]$_.date, 'yyyyMMdd', $inv) });\n"
             "      CurrentHorizontalResolution = $_.w; CurrentVerticalResolution = $_.h; CurrentRefreshRate = $_.hz } })\n"
             "  $gpuErr = @()\n"
             "  if ($s.gpuErr -eq 'timeout') { $gpuErr = @([System.Management.Automation.ErrorRecord]::new([System.TimeoutException]::new('t'), 'e', [System.Management.Automation.ErrorCategory]::OperationTimeout, $null)) }\n"
@@ -1111,7 +1125,7 @@ def run_fragment(scenarios: list[dict]) -> list[dict]:
             "  if ($s.gpuErr -eq 'error') { $gpuErr = @([System.Management.Automation.ErrorRecord]::new([System.InvalidOperationException]::new('x'), 'e', [System.Management.Automation.ErrorCategory]::InvalidOperation, $null)) }\n"
             "  . ([scriptblock]::Create($fragment))\n"
             "  $wrap = [ordered]@{ gpuNames = @('Probe Adapter'); driverVersion = '1.0'; displayDevice = 'D'; displayState = $probe.displayState }\n"
-            "  [ordered]@{ line = ('DVE_PROBE=' + ($wrap | ConvertTo-Json -Compress -Depth 6)); seen = $script:seen; regCalled = $script:regCalled }\n"
+            "  [ordered]@{ line = ('DVE_PROBE=' + ($wrap | ConvertTo-Json -Compress -Depth 6)); seen = $script:seen; regCalled = $script:regCalled; budget = $dsBudgetSec; budgetType = $(if ($null -ne $dsBudgetSec) { $dsBudgetSec.GetType().Name } else { $null }) }\n"
             "}\n"
             f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{psq(cases)}'))\n"
             "$out = @(foreach ($e in $doc.RootElement.EnumerateArray()) { Invoke-Scenario ($e.GetRawText() | ConvertFrom-Json) })\n"
@@ -1145,7 +1159,12 @@ class DisplayStateFragmentTests(unittest.TestCase):
                      "quick-empty", "registry-throws", "registry-text", "no-budget", "no-os", "no-driver-date", "two-active",
                      "partial-then-timeout", "headless-only-then-error", "partial-then-error-active",
                      "wbem-quick-timeout", "wbem-controller-timeout", "refresh-sentinel", "width-sentinel", "budget-override-60",
-                     "no-refresh-first-then-good", "sentinel-first-then-good", "no-refresh-only", "no-refresh-then-no-resolution"]
+                     "no-refresh-first-then-good", "sentinel-first-then-good", "no-refresh-only", "no-refresh-then-no-resolution",
+                     # r3 (opus key r1 blocker, catalogue row DT-01 cim-datetime-local-shift)
+                     "date-utc-6-host", "date-utc-8-host-winter", "date-utc-plus-9-host", "date-utc-host", "date-dmtf-offset-minus-360-utc-6-host", "date-unspecified-kind",
+                     "boot-local-kind-utc-6-host", "boot-local-kind-utc-plus-9-host",
+                     # r3 (opus key r1 hardening a): a budget override handed over as text
+                     "budget-text-100", "budget-text-5", "budget-text-junk", "budget-text-nan", "budget-text-negative", "budget-number-5"]
         cls.rows = run_fragment([
             sc(),
             sc(gpus=[], gpuErr="error"),
@@ -1176,6 +1195,16 @@ class DisplayStateFragmentTests(unittest.TestCase):
             sc(gpus=[dict(INTEL, name="A", ver="1", date="20240101", w=1920, h=1080, hz=4294967295), dict(INTEL, name="B", ver="2", date="20240201", w=3840, h=2400, hz=60)]),
             sc(gpus=[dict(INTEL, hz=0)]),
             sc(gpus=[dict(INTEL, hz=0), NVIDIA_HEADLESS]),
+            # r3 DT-01: CIM gives a LOCAL-kind DateTime. The driver DMTF `20240514000000.000000-000` read on a UTC-6 host shows as 2024-05-13 evening
+            sc(zone="Central Standard Time"),
+            sc(gpus=[dict(INTEL, date="20240114")], zone="Pacific Standard Time"),
+            sc(zone="Tokyo Standard Time"),
+            sc(zone="UTC"),
+            sc(zone="Central Standard Time", gpus=[dict(INTEL, date="20240514")], offsetMin=-360),
+            sc(),
+            sc(zone="Central Standard Time", os={"build": "26200", "boot": "20261121071209"}, bootKind="local"),
+            sc(zone="Tokyo Standard Time", os={"build": "26200", "boot": "20261121071209"}, bootKind="local"),
+            sc(budgetText="100"), sc(budgetText="5"), sc(budgetText="not a number"), sc(budgetText="NaN"), sc(budgetText="-3"), sc(budget=5),
         ])
         cls.states = {n: state_of(r["line"]) for n, r in zip(cls.names, cls.rows)}
 
@@ -1265,8 +1294,53 @@ class DisplayStateFragmentTests(unittest.TestCase):
         """adversary pass sol r2 A4 (minor): a pre-set budget above 30 s is clamped to 30."""
         text = MODULE.read_text(encoding="utf-8")
         frag = re.search(r"function New-DvDisplayStateProbeText \{.*?^\}", text, re.S | re.M).group(0)
-        self.assertRegex(frag, r"\$dsBudgetSec -gt 30\) \{ \$dsBudgetSec = 30 \}")
+        self.assertIn("[math]::Min(30.0, $dsBudgetN)", frag)
         self.assertEqual(self.states["budget-override-60"], GOOD_STATE)
+
+    def budget_of(self, name: str) -> tuple:
+        row = self.rows[self.names.index(name)]
+        return row["budget"], row["budgetType"]
+
+    def test_a_budget_override_handed_over_as_text_is_a_number_and_is_clamped_like_one(self) -> None:
+        """opus key r1 hardening a (advisory A1 of the r2 adversary pass): '100' compared as text (`'100' -gt 30` is false) escaped the 30 s clamp."""
+        self.assertEqual(self.budget_of("budget-text-100"), (30, "Double"))
+        self.assertEqual(self.budget_of("budget-text-5"), (5, "Double"))
+        self.assertEqual(self.budget_of("budget-number-5"), (5, "Double"))
+        self.assertEqual(self.budget_of("budget-override-60"), (30, "Double"))
+        # an override that is no number, or NaN (every comparison with NaN is false, so it would never run out), is the 30 s default; a negative one is no budget at all
+        self.assertEqual(self.budget_of("budget-text-junk"), (30, "Double"))
+        self.assertEqual(self.budget_of("budget-text-nan"), (30, "Double"))
+        self.assertEqual(self.budget_of("budget-text-negative"), (0, "Double"))
+        self.unknown("budget-text-negative", "hotfixCount", "windowsUbr", why="DEADLINE")
+        self.assertEqual(self.states["budget-text-100"], GOOD_STATE)
+        self.assertEqual(self.states["budget-text-5"], GOOD_STATE)
+
+    def test_the_driver_date_is_the_calendar_date_the_driver_reports_on_any_host_zone(self) -> None:
+        """opus key r1 BLOCKER, catalogue row DT-01 (cim-datetime-local-shift). CIM hands the fragment a LOCAL-kind DateTime. The driver's DMTF value
+        `20240514000000.000000-000` read on a UTC-6 host shows as the evening of 2024-05-13, and formatting that value gave `2024-05-13`. The double builds
+        the Local-kind value of the simulated host zone and hands the fragment that zone ($dsLocalZone), so the row is red on a UTC runner too."""
+        for name in ("date-utc-6-host", "date-utc-plus-9-host", "date-utc-host", "date-dmtf-offset-minus-360-utc-6-host", "date-unspecified-kind"):
+            with self.subTest(name):
+                self.assertEqual(self.states[name]["displayAdapterDriverDate"], {"value": "2024-05-14", "unknown": None})
+                self.assertEqual(self.states[name], GOOD_STATE)
+        self.assertEqual(self.states["date-utc-8-host-winter"]["displayAdapterDriverDate"], {"value": "2024-01-14", "unknown": None})
+
+    def test_the_last_boot_time_is_the_utc_instant_on_any_host_zone(self) -> None:
+        """DT-01 sibling: `lastBootUtc` is the other CIM DateTime the fragment formats; it was already converted, now through the same one seam."""
+        for name in ("boot-local-kind-utc-6-host", "boot-local-kind-utc-plus-9-host"):
+            with self.subTest(name):
+                self.assertEqual(self.states[name]["lastBootUtc"], {"value": "2026-11-21T07:12:09Z", "unknown": None})
+                self.assertEqual(self.states[name], GOOD_STATE)
+
+    def test_every_cim_datetime_the_fragment_formats_goes_through_the_one_utc_conversion(self) -> None:
+        """DT-01 sweep: no `.ToString('yyyy` on a CIM DateTime outside the one helper's result."""
+        text = MODULE.read_text(encoding="utf-8")
+        frag = re.search(r"function New-DvDisplayStateProbeText \{.*?^\}", text, re.S | re.M).group(0)
+        self.assertIn("function ConvertTo-DsUtc", frag)
+        self.assertNotIn("$first.DriverDate.ToString", frag)
+        self.assertIn("ConvertTo-DsUtc $first.DriverDate", frag)
+        self.assertIn("ConvertTo-DsUtc $os.LastBootUpTime", frag)
+        self.assertEqual(len(re.findall(r"\.ToString\('yyyy", frag)), 2, "the driver date and the boot time are the only two DateTime formats")
 
     def test_an_error_beside_returned_controllers_is_never_published_as_display_state(self) -> None:
         """adversary pass sol r1 A4: a controller enumeration that returned objects but also recorded an error (a timeout, say) is incomplete: the four

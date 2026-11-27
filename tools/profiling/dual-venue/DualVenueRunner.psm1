@@ -7315,7 +7315,18 @@ function New-DvDisplayStateProbeText {
 $probe.displayState = $null
 try {
     $dsClock = [Diagnostics.Stopwatch]::StartNew()
-    if ($null -eq $dsBudgetSec -or $dsBudgetSec -gt 30) { $dsBudgetSec = 30 }   # a test may pre-set a SMALLER budget; the job never does
+    # A test may pre-set a SMALLER budget; the job never does. The override is coerced to a number BEFORE the clamp (a text '100' compared with `-gt 30` as text is
+    # false and escaped it; opus key r1 hardening a): no number, or NaN, is the 30 s default, and a negative one is no budget at all.
+    $dsBudgetN = 0.0
+    if ($null -eq $dsBudgetSec -or -not [double]::TryParse(([string]$dsBudgetSec), [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$dsBudgetN) -or [double]::IsNaN($dsBudgetN)) { $dsBudgetN = 30.0 }
+    $dsBudgetSec = [math]::Max(0.0, [math]::Min(30.0, $dsBudgetN))
+    # CIM hands over a date as a LOCAL-kind DateTime: the instant of its DMTF value shown in the host's zone, so a driver dated `20240514000000.000000-000` read on a
+    # UTC-6 host is the evening of 2024-05-13 (opus key r1 blocker, catalogue row DT-01). ConvertTo-DsUtc gives the instant back. $dsLocalZone is a TEST seam (the
+    # zone of the host a double pretends to run on); the job never sets it, so the host's own zone converts.
+    function ConvertTo-DsUtc($d) {
+        if ($dsLocalZone -is [TimeZoneInfo]) { return [TimeZoneInfo]::ConvertTimeToUtc([datetime]::SpecifyKind($d, [DateTimeKind]::Unspecified), $dsLocalZone) }
+        $d.ToUniversalTime()
+    }
     function Get-DsFailReason($ex) {
         # A CimException can carry a timeout in three places: a TimeoutException, NativeErrorCode TimedOut, or ErrorData.error_Code 0x80041069 (WBEM_E_TIMED_OUT) with
         # NativeErrorCode reading Failed (adversary pass sol r2 A2). Any of them, anywhere in the exception chain, is a timeout.
@@ -7369,7 +7380,9 @@ try {
         $ds.displayAdapterName = $(if ($name.Length -gt 0) { New-DsReading $name $null } else { New-DsReading $null 'CIM_EMPTY' })
         $ver = [string]$first.DriverVersion
         $ds.displayAdapterDriverVersion = $(if ($ver.Length -gt 0) { New-DsReading $ver $null } else { New-DsReading $null 'CIM_EMPTY' })
-        $ds.displayAdapterDriverDate = $(if ($first.DriverDate -is [datetime]) { New-DsReading ($first.DriverDate.ToString('yyyy-MM-dd', $dsInvariant)) $null } else { New-DsReading $null 'CIM_EMPTY' })
+        # The calendar date as REPORTED: a Local-kind value is converted back to the UTC instant before it is cut to a date (UTC is the DMTF `-000` Windows reports a
+        # driver date in); a value of any other kind carries no host zone to undo and is cut as it stands.
+        $ds.displayAdapterDriverDate = $(if ($first.DriverDate -is [datetime]) { New-DsReading ($(if ($first.DriverDate.Kind -eq [DateTimeKind]::Local) { ConvertTo-DsUtc $first.DriverDate } else { $first.DriverDate }).ToString('yyyy-MM-dd', $dsInvariant)) $null } else { New-DsReading $null 'CIM_EMPTY' })
         $ds.displays = New-DsReading ([object[]]@($dsActive | Select-Object -First 64 | ForEach-Object {
             [ordered]@{ adapter = [string]$_.Name; width = (Get-DsModeNumber $_.CurrentHorizontalResolution); height = (Get-DsModeNumber $_.CurrentVerticalResolution); refreshHz = (Get-DsModeNumber $_.CurrentRefreshRate) } })) $null
       } catch { foreach ($f in @('displayAdapterName', 'displayAdapterDriverVersion', 'displayAdapterDriverDate', 'displays')) { $ds[$f] = New-DsReading $null 'CIM_ERROR' } }
@@ -7385,7 +7398,7 @@ try {
             $ds.windowsUbr = $(if ($ubr -is [int] -and $ubr -ge 0) { New-DsReading $ubr $null } else { New-DsReading $null 'REGISTRY_ERROR' })
         } catch { $ds.windowsUbr = New-DsReading $null 'REGISTRY_ERROR' }
     }
-    $ds.lastBootUtc = $(if ($null -ne $os -and $os.LastBootUpTime -is [datetime]) { New-DsReading ($os.LastBootUpTime.ToUniversalTime().ToString('yyyy-MM-dd\THH:mm:ss\Z', $dsInvariant)) $null } else { New-DsReading $null 'CIM_EMPTY' })
+    $ds.lastBootUtc = $(if ($null -ne $os -and $os.LastBootUpTime -is [datetime]) { New-DsReading ($(if ($os.LastBootUpTime.Kind -eq [DateTimeKind]::Local) { ConvertTo-DsUtc $os.LastBootUpTime } else { $os.LastBootUpTime.ToUniversalTime() }).ToString('yyyy-MM-dd\THH:mm:ss\Z', $dsInvariant)) $null } else { New-DsReading $null 'CIM_EMPTY' })
     $dsLeft = $dsBudgetSec - $dsClock.Elapsed.TotalSeconds
     if ($dsLeft -lt 1) { $ds.hotfixCount = New-DsReading $null 'DEADLINE' }
     else {
@@ -8272,7 +8285,8 @@ function Read-DvReceiptDisplayPath {
     VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2: the ONE reader of a leg receipt's `venue.displayPath` block. It reads the receipt TEXT with System.Text.Json
     and its default, strict options (no comments, no trailing commas, double-quoted names and strings only, depth 64); every string is the text as
     written. There is no second reader, no fallback to the PowerShell JSON cmdlet and no recovery rewrite. Returns [pscustomobject]@{ state; block; reason }:
-      present   -- block is the typed block: [ordered]@{ schema; source; adapters ([string[]]); firstAdapterDriverVersion; primaryDisplayDevice }
+      present   -- block is the typed block: [ordered]@{ schema; source; adapters ([string[]]); firstAdapterDriverVersion; primaryDisplayDevice } for a v2
+                   block, and the same five plus `displayState` ([ordered] of eight { value; unknown } readings) for a v3 block (VENUE-LEG-DISPLAY-STATE-FIELDS-1)
       malformed -- block $null, reason names why: the text is empty or not strict JSON, the root is not an object, a `venue` or `displayPath` member
                    appears twice in any letter case, venue is not an object, the block member is not spelled `displayPath`, the block is not an
                    object, a field is missing, unknown, doubled (any letter case) or of the wrong type, schema/source is not the exact string, the
