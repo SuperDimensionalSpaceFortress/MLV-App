@@ -397,7 +397,10 @@ try {
 
     # The files of the packet: every file under the run root (read once, hashed as it is written), except this run's own outputs, which come from memory at their relative names. A private directory
     # of any packager (".pkg-*") is never packaged, the manifest and the final packet name are written fresh, and the input summary / the two reports are replaced by this run's own bytes.
-    $heldBytes = [System.Collections.Specialized.OrderedDictionary]::new($(if ($comparison -eq [StringComparison]::OrdinalIgnoreCase) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }))
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 55683e1f A2): the held names are keyed EXACTLY (Ordinal). The comparer used to follow the INPUT's directory, so a case-insensitive input directory under a case-sensitive
+    # run root made Contains('proof.json') match the held 'Proof.json' and a distinct existing proof.json vanished from the packet. Whether a disk file IS a held output is asked of the volume that holds it
+    # (Test-FpsPathAlias, below); the outputs were already checked against each other and the input by Assert-OutputPathsAreSafe, so no two held names are one file.
+    $heldBytes = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
     foreach ($held in @(@($summaryFullPath, $summaryBytes), @($ReportPath, $summarizerResult.markdownBytes), @($jsonReportPath, $summarizerResult.jsonBytes))) {
         $relative = [System.IO.Path]::GetRelativePath($runRootResolved, [IO.Path]::GetFullPath([string]$held[0]))
         if ($relative -eq ".." -or $relative.StartsWith(".." + [IO.Path]::DirectorySeparatorChar, [StringComparison]::Ordinal) -or [IO.Path]::IsPathRooted($relative)) { continue }

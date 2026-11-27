@@ -3277,6 +3277,32 @@ class EnvelopePreemptR1ResidueTests(_Probe):
             f"try {{ Assert-OutputPathsAreSafe -Summary $s -SummaryBytes $b -Outputs ([ordered]@{{ 'Markdown report' = '{self.tmp / 'SUMMARY.md'}'; 'JSON report' = '{self.tmp / 'SUMMARY.json'}'; 'packet' = '{self.tmp / 'out' / 'return.zip'}' }}) -Comparison $cmp; Write-Host 'OUTCOME=OK' }} catch {{ Write-Host ('OUTCOME=REFUSED ' + $_.Exception.Message) }}\n")
         self.assertEqual(self.ok(body).strip(), "OUTCOME=OK")
 
+    def test_r5_adversary_55683e1f_a1_the_published_figures_follow_from_the_judged_legs_not_a_near_endpoint(self) -> None:
+        # adversary 55683e1f A1 (input verbatim): legs presentedFps baseline 100 and candidate 98.99949999; compare {baseline 100, candidate 98.99950004, delta -1.0005, deltaPercent -1}. The endpoint is 5e-10
+        # relative from the leg (inside float noise), and the recompute started from THAT endpoint, so the percent came out -1 where the legs give the producer's -1.001. The same substitution in a generic metric.
+        body = (
+            "$leg = { param($f) [pscustomobject]@{ presentedFps = $f; avgRenderTotalMs = $f } }\n"
+            "function T($cmp) { $p = Get-FpsCompareBindingProblem -Compare $cmp -Baseline (& $leg 100) -Candidate (& $leg 98.99949999); if ($null -eq $p) { 'OK' } else { 'REFUSED' } }\n"
+            "Write-Host ('presented-near-endpoint=' + (T ([pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 100; candidate = 98.99950004; delta = -1.0005; deltaPercent = -1 } })))\n"
+            "Write-Host ('presented-the-legs-own-figures=' + (T ([pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 100; candidate = 98.99949999; delta = -1.0005; deltaPercent = -1.001 } })))\n"
+            "Write-Host ('generic-near-endpoint=' + (T ([pscustomobject]@{ avgRenderTotalMs = [pscustomobject]@{ baseline = 100; candidate = 98.99950004; delta = -1.0005; deltaPercent = -1 } })))\n"
+            "Write-Host ('generic-the-legs-own-figures=' + (T ([pscustomobject]@{ avgRenderTotalMs = [pscustomobject]@{ baseline = 100; candidate = 98.99949999; delta = -1.0005; deltaPercent = -1.001 } })))\n")
+        self.assertEqual(dict(line.split("=", 1) for line in self.ok(body).split()), {
+            "presented-near-endpoint": "REFUSED", "presented-the-legs-own-figures": "OK", "generic-near-endpoint": "REFUSED", "generic-the-legs-own-figures": "OK"})
+
+    def test_r5_adversary_55683e1f_a2_a_held_output_name_never_hides_a_distinct_existing_file_of_another_case(self) -> None:
+        # adversary 55683e1f A2 (input): C:\R is case sensitive, input\summary.json sits in a case-insensitive subdirectory (so the comparison was OrdinalIgnoreCase), C:\R\proof.json is an existing distinct
+        # diagnostic and the report is Proof.md (JSON twin Proof.json). Contains('proof.json') matched the held 'Proof.json', so the diagnostic left the ZIP and the manifest. The held names are keyed
+        # exactly; whether a disk file is a held output is the volume's answer (Test-FpsPathAlias).
+        source = self.PACKAGER.read_text(encoding="utf-8")
+        start = source.index("    $heldBytes = [System.Collections.Specialized.OrderedDictionary]::new(")
+        line = source[start:source.index("\n", start)]
+        body = ("$comparison = [StringComparison]::OrdinalIgnoreCase\n" + line.strip() + "\n"
+                "$heldBytes['Proof.json'] = [byte[]](1)\n"
+                "Write-Host ('EXACT=' + $heldBytes.Contains('Proof.json'))\nWrite-Host ('OTHER-CASE=' + $heldBytes.Contains('proof.json'))\n")
+        self.assertEqual(dict(item.split("=", 1) for item in self.ok(body).split()), {"EXACT": "True", "OTHER-CASE": "False"})
+        self.assertIn("(@($heldFullPaths | Where-Object { Test-FpsPathAlias $_ $diskPath }).Count -gt 0)", source)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -426,7 +426,8 @@ function Get-FpsMetricBindingProblem {
         if (-not $ownIsNumber) { return "the judged $($side[0]) leg records no finite $Name, so the compare's $Name $($side[0]) cannot be bound to it" }
         if (-not (& $isNumber $compared)) { return "the compare's $Name $($side[0]) is not a finite number (the judged $($side[0]) leg measured $own)" }
         if ([Math]::Abs([double]$compared - [double]$own) -gt (0.000000001 * [Math]::Abs([double]$own))) { return "the compare's $Name $($side[0]) is $compared but the judged $($side[0]) leg measured $own" }
-        $endpoints[$side[0]] = [double]$compared
+        # R4-DEADLINE-RESIDUE-1 r5 (adversary 55683e1f A1): the figures below follow from the JUDGED LEG's own number, never from the compare's endpoint that float noise let stand for it
+        $endpoints[$side[0]] = [double]$own
     }
     $publishedDelta = & $leaf $Metric 'delta'
     $publishedPercent = & $leaf $Metric 'deltaPercent'
@@ -473,9 +474,12 @@ function Get-FpsPresentedFpsBindingProblem {
     # deltaPercent = Round((candidate - baseline) / baseline * 100, 3), no percent at all for |baseline| <= 1e-6) and compared with float noise only (sol c29f8dc1 A2, sol 5add23cf A1: a tolerance of
     # half a rounding step accepted -1 for the producer's -1.001, and a percent beside a 1e-7 baseline, which the producer never publishes).
     # A present delta or deltaPercent that is not a finite number is refused; an absent one is left to the reader's own null check.
-    $base = [double](& $leaf $metric "baseline")
-    $cand = [double](& $leaf $metric "candidate")
-    if ($base -le 0.000001) { return "the compare's presentedFps baseline is $base, not above 0.000001 (the producer publishes no deltaPercent there), so no gain or cost can follow from it" }
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 55683e1f A1): the figures are recomputed from the JUDGED LEGS' own numbers, not from the compare's endpoints. The endpoint check above owes float noise (1e-9 relative),
+    # and a compare endpoint 5e-10 away from the leg (98.99950004 for 98.99949999) made the recomputed percent -1 where the legs give the producer's -1.001. The producer copies the leg's number, so the
+    # two are the same double and the recompute from the leg is exactly the producer's.
+    $base = [double](& $leaf $Baseline "presentedFps")
+    $cand = [double](& $leaf $Candidate "presentedFps")
+    if ($base -le 0.000001) { return "the judged baseline leg's presentedFps is $base, not above 0.000001 (the producer publishes no deltaPercent there), so no gain or cost can follow from it" }
     $publishedDelta = & $leaf $metric "delta"
     if ($null -ne $publishedDelta) {
         if (-not (& $isNumber $publishedDelta)) { return "the compare's presentedFps delta is not a finite number" }
