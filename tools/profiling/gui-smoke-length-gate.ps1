@@ -241,7 +241,38 @@ function Get-GuiSmokeClipLength {
     # parts: the full paths of the parts counted above, first part then the probed names in probe order. A launcher that BINDS
     # the clip's parts (run-release-gui-smoke.ps1) compares its own list to this one (GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r4).
     return [pscustomobject]@{ known = $true; reason = ''; frames = $frames; fps = $fps; seconds = ([double]$frames / $fps)
-                              parts = @(, $Path) + @($probed) }
+                              parts = @(@(, $Path) + @($probed) | ForEach-Object { [IO.Path]::GetFullPath([string]$_) }) }
+}
+
+function Test-GuiSmokeBindingMatchesGateParts {
+    <#
+    .SYNOPSIS
+    GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r4 (adversary ff851a0b A1): $true only when a launcher's bound part list IS the set
+    the length gate counted -- the same count, in the same order, each bound path the very FILE the gate's name opens.
+    -DirectoryEntries is the names in the clips' directory (hidden ones included, as File.Exists sees them). The gate's name opens
+    the entry spelled exactly so; where the directory holds no such entry (a case-insensitive volume resolving another case) it
+    opens the one entry that differs only in case; two or more case variants and no exact one is ambiguous, and so is a bound
+    path that is a DIFFERENT case variant of the same name (a case-sensitive directory holding both clip.M00 and clip.m00).
+    A case-folded path compare alone cannot tell those apart, which is why this compares the resolved on-disk names.
+    #>
+    param([AllowEmptyCollection()][string[]]$GateParts = @(), [AllowEmptyCollection()][string[]]$BoundParts = @(),
+          [AllowEmptyCollection()][string[]]$DirectoryEntries = @())
+    $gate = @($GateParts)
+    $bound = @($BoundParts)
+    if ($gate.Count -ne $bound.Count) { return $false }
+    for ($i = 0; $i -lt $gate.Count; $i++) {
+        $leaf = [IO.Path]::GetFileName($gate[$i])
+        $exact = @($DirectoryEntries | Where-Object { $_ -ceq $leaf })
+        $folded = @($DirectoryEntries | Where-Object { $_ -ieq $leaf })
+        $named = $null
+        if ($exact.Count -eq 1) { $named = $exact[0] } elseif ($exact.Count -eq 0 -and $folded.Count -eq 1) { $named = $folded[0] }
+        if ($null -eq $named) { return $false }
+        if (-not ([IO.Path]::GetFileName($bound[$i]) -ceq $named)) { return $false }
+        if (-not ([IO.Path]::GetDirectoryName($gate[$i]).Equals([IO.Path]::GetDirectoryName($bound[$i]), [StringComparison]::OrdinalIgnoreCase))) {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Get-GuiSmokeClipPlayFloorSeconds {

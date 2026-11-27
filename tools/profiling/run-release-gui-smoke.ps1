@@ -1435,10 +1435,10 @@ $launchInputBindings = [pscustomobject]@{
 if ($clipLengthGate.PSObject.Properties['parts'] -and -not ($DryRun -and $clipParts.Count -eq 0)) {
     $gateCountedParts = @($clipLengthGate.parts | ForEach-Object { [string]$_ })
     $boundParts = @($clipParts | ForEach-Object { [string]$_.path })
-    $partsAgree = ($gateCountedParts.Count -eq $boundParts.Count)
-    for ($partAt = 0; $partsAgree -and $partAt -lt $gateCountedParts.Count; $partAt++) {
-        if (-not $gateCountedParts[$partAt].Equals($boundParts[$partAt], [StringComparison]::OrdinalIgnoreCase)) { $partsAgree = $false }
-    }
+    # Compared as the files the names open, not as case-folded paths: a case-sensitive directory can hold two case variants of one
+    # part name, and the gate counts one (hidden files included) while the binding lists the other (adversary ff851a0b A1).
+    $clipDirectoryEntries = @(Get-ChildItem -LiteralPath (Split-Path -Parent $inputPath) -Force | ForEach-Object { $_.Name })
+    $partsAgree = Test-GuiSmokeBindingMatchesGateParts -GateParts $gateCountedParts -BoundParts $boundParts -DirectoryEntries $clipDirectoryEntries
     if (-not $partsAgree) {
         [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: CLIP_LENGTH_UNKNOWN (reason=binding_parts_mismatch gate_parts=$($gateCountedParts.Count) bound_parts=$($boundParts.Count))")
         exit (Get-GuiSmokeGateExitCode -Verdict 'CLIP_LENGTH_UNKNOWN')

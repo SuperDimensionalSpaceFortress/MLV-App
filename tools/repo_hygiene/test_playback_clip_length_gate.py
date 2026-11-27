@@ -289,6 +289,47 @@ class ClipLengthGateTests(_TmpCase):
         else:
             self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)")
 
+    # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r4 (adversary ff851a0b A1/A2). A case-sensitive directory cannot be made without
+    # elevation, so the parity decision is a pure function over the directory's entry names and is driven with the listings
+    # such a directory would give.
+    def _binding_matches(self, gate_parts: list, bound_parts: list, entries: list) -> bool:
+        def arr(items: list) -> str:
+            return "@(" + ",".join(_q(item) for item in items) + ")" if items else "@()"
+        proc = _pwsh(f". {_q(GATE)}; Test-GuiSmokeBindingMatchesGateParts -GateParts {arr(gate_parts)} "
+                     f"-BoundParts {arr(bound_parts)} -DirectoryEntries {arr(entries)}")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout.strip() == "True"
+
+    def test_r4_a1_the_binding_must_be_the_files_the_gate_counted_not_a_case_variant_of_them(self) -> None:
+        d = str(self.tmp) + os.sep
+        mlv, hidden_m00, other_m00 = d + "clip.MLV", d + "clip.M00", d + "clip.m00"
+        # A case-sensitive directory holding the counted (hidden) clip.M00 AND a visible, different clip.m00: the binding
+        # lists the visible one. Equal counts and equal case-folded paths, yet not the file the gate counted.
+        self.assertFalse(self._binding_matches([mlv, hidden_m00], [mlv, other_m00], ["clip.MLV", "clip.M00", "clip.m00"]))
+        # The binding that lists the counted file passes, even though a case variant sits beside it.
+        self.assertTrue(self._binding_matches([mlv, hidden_m00], [mlv, hidden_m00], ["clip.MLV", "clip.M00", "clip.m00"]))
+        # A case-insensitive volume: one entry, resolved from another spelling of its name, is that file.
+        self.assertTrue(self._binding_matches([mlv, d + "clip.m00"], [mlv, hidden_m00], ["clip.MLV", "clip.M00"]))
+        # Two case variants and neither is the spelling the gate used: ambiguous, so refused.
+        self.assertFalse(self._binding_matches([d + "clip.mlv"], [d + "clip.MLV"], ["clip.MLV", "clip.Mlv"]))
+        # Counts differ (the G8 case: the gate counts a part the binding never lists), and an empty binding.
+        self.assertFalse(self._binding_matches([mlv, hidden_m00], [mlv], ["clip.MLV", "clip.M00"]))
+        self.assertFalse(self._binding_matches([mlv], [], ["clip.MLV"]))
+        # A name the directory does not hold is not a counted file.
+        self.assertFalse(self._binding_matches([mlv], [mlv], []))
+
+    def test_r4_a2_the_gates_parts_are_full_paths_even_for_a_relative_input(self) -> None:
+        clip = write_synthetic_mlv(self.tmp / ("rel" + MLV_EXTENSION), 400, file_num=0, file_count=1, guid=0x5A5A0001)
+        proc = subprocess.run(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+             f". {_q(GATE)}; (Get-GuiSmokeClipLength -Path ('.' + [IO.Path]::DirectorySeparatorChar + {_q(clip.name)})).parts "
+             "| ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=120, cwd=str(self.tmp))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        parts = json.loads(proc.stdout)
+        parts = parts if isinstance(parts, list) else [parts]
+        self.assertEqual([p.lower() for p in parts], [str(clip).lower()])
+
     def test_other_blocks_are_skipped_and_only_vidf_is_counted(self) -> None:
         path = self.tmp / ("mixed" + MLV_EXTENSION)
         body = b"".join(block(b"VIDF") + block(b"AUDF") + block(b"NULL", 40) for _ in range(30))
