@@ -11907,17 +11907,19 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         // (1) the measured interval ends HERE, before the first capture.
         m_contactSheetCaptureActive = false;   // no in-pass contact-sheet grab can land in the tail
         const qulonglong visualMeasuredSession = static_cast<qulonglong>( m_playbackSmokeSessionId );
-        finishPlaybackSmokeTelemetry( "visual-capture" );
-        const QString visualTailBeginUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
         // R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A1 + A2 on 560c9642): the prep counters at the tail's start. The burst_end record below carries how
         // far each moved by the burst's end, written whether or not MLVAPP_INTERACTIVE_TRACE is on (the per-invalidation record is trace-only, so
         // with tracing off a resize that dropped and reissued the target was invisible to the runner, A2), and it ends the window the runner
         // counts invalidations in (the normal play-stop invalidation after the burst no longer refuses a target the burst already proved, A1).
+        // r4 pass 3 (sol A1 on a02d8246): read BEFORE finishPlaybackSmokeTelemetry loads the summary's counters, so a drop between that load and
+        // these reads is in the deltas (one in both is a refusal twice, never a miss)
         const quint64 visualBurstGeneration0 = static_cast<quint64>( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
         const quint64 visualBurstStaleDrops0 = static_cast<quint64>( m_playbackPrepStaleDropCount.load( std::memory_order_acquire ) );
         const quint64 visualBurstGenerationDrops0 = static_cast<quint64>( m_playbackPrepGenerationDropCount.load( std::memory_order_acquire ) );
         const quint64 visualBurstReplacedBefore0 = static_cast<quint64>( m_playbackPrepReplacedBeforeComputeCount.load( std::memory_order_acquire ) );
         const quint64 visualBurstReplacedAfter0 = static_cast<quint64>( m_playbackPrepReplacedAfterComputeCount.load( std::memory_order_acquire ) );
+        finishPlaybackSmokeTelemetry( "visual-capture" );
+        const QString visualTailBeginUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
         logInteractionEvent(
             QStringLiteral("gui_smoke.visual_capture.begin"),
             QStringLiteral("measured_session=%1 tail_ms=%2 play_frames=%3 tail_begin_utc=%4")

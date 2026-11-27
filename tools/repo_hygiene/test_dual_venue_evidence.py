@@ -10565,20 +10565,22 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
     def test_r6_r4_pass2_sol_a2_lf_suffixed_unforced_files_never_switch_the_freeze_gate_to_forced_rows(self) -> None:
         """r4 pass 2, sol A2 on b3713c24, its input: the forced-first stuck fixture with one LF appended to every play_unbound row's file. b3713c24's `\\z`
         filter dropped all six unforced rows, so the gate judged the six moving forced pictures (OK). The rows stay collected with no pixels."""
-        with tempfile.TemporaryDirectory(prefix="vis-r6-p2a2-") as d:
-            art = Path(d) / "artifacts"
-            dest = art / "visual"
-            write_stateful_visual_captures(dest, "forced-first", "stuck")
-            visual = json.loads((dest / "visual.json").read_text(encoding="utf-8"))
-            for row in visual["frames"]:
-                if row.get("kind") == "play_unbound":
-                    row["file"] = row["file"] + "\n"
-            (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
-            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
-                                      "| ConvertTo-Json -Depth 8 -Compress")
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertEqual(out["frozenJudgedOn"], "play_unbound", out)
-            self.assertNotEqual(out["verdict"], "OK", out["reason"])
+        # r4 pass 3 (sol A2 on a02d8246): the same for a kind spelled play_un<soft hyphen>bound, which the ordinal kind filter dropped
+        for case, field, change in (("LF-suffixed file", "file", lambda v: v + "\n"), ("soft-hyphen kind", "kind", lambda v: "play_un­bound")):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(prefix="vis-r6-p2a2-") as d:
+                art = Path(d) / "artifacts"
+                dest = art / "visual"
+                write_stateful_visual_captures(dest, "forced-first", "stuck")
+                visual = json.loads((dest / "visual.json").read_text(encoding="utf-8"))
+                for row in visual["frames"]:
+                    if row.get("kind") == "play_unbound":
+                        row[field] = change(row[field])
+                (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                          "| ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual(out["frozenJudgedOn"], "play_unbound", out)
+                self.assertNotEqual(out["verdict"], "OK", out["reason"])
 
     @requires_windows_imaging
     def test_the_visual_reader_says_ok_over_a_healthy_display_on_the_r3_order(self) -> None:

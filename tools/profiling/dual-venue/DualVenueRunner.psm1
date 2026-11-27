@@ -4795,12 +4795,13 @@ function Read-DvVisualCaptures {
         $kind = [string](Get-DvProp $f 'kind'); $index = [int](Get-DvProp $f 'index'); $file = [string](Get-DvProp $f 'file')
         # R4-RESIDUE-1: play_first_unbound (the unforced burst before the first forced paint) is collected and hashed like the play kinds; the frozen check
         # below judges play_unbound (or play) only, so these rows never enter it
-        # (sol A6 on 560c9642: the kind is matched ordinally; a culture compare ignores a NUL)
-        if (@(@('play', 'play_unbound', 'play_first_unbound', 'stop_unbound', 'stop', 'paused_unbound', 'paused') | Where-Object { [string]::Equals($kind, $_, [StringComparison]::Ordinal) }).Count -ne 1 -or
+        # r4 pass 3 (sol A2 on a02d8246): the base's culture compare on the kind is kept on purpose. An ordinal one dropped every row spelled
+        # `play_un<soft hyphen>bound`, and the freeze gate fell back to the forced rows. Such a row stays collected, and the ordinal own-name check below refuses its pixels.
+        if ($kind -cnotin @('play', 'play_unbound', 'play_first_unbound', 'stop_unbound', 'stop', 'paused_unbound', 'paused') -or
             $file -cnotmatch '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$') { continue }
         # (r4 pass 2, sol A2 on b3713c24: the base's `$` is kept on purpose. It admits a final LF, so such a row stays collected, and the own-name
         # check below refuses its pixels. `\z` dropped every such unforced row, and the freeze gate fell back to the forced ones.)
-        $isPlayKind = @(@('play', 'play_unbound', 'play_first_unbound') | Where-Object { [string]::Equals($kind, $_, [StringComparison]::Ordinal) }).Count -eq 1
+        $isPlayKind = $kind -cin @('play', 'play_unbound', 'play_first_unbound')
         # R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A5 on 560c9642): kind and file were checked independently, so a play_unbound row naming play-first-unbound-0.png
         # copied burst pixels under a late-play name into the frozen check. The row is still collected (skipping it would let the freeze gate fall back to
         # the forced rows: r4 fix 2, A2 on b6c53917), but its PNG is read only when the file is the kind's own name (MainWindow.cpp `<kind-stem>-<index>.png`
