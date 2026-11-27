@@ -914,6 +914,10 @@ function Read-SmokeSummary {
     $smokeParseError = $null
     $json = $null
     try {
+        # r14 (sol r13 B4, adversary r14 A2), kept beside master's reader at the merge: VenueChain's Find-VenueJsonDuplicateMember reads only the root and hostLoad, but the arm is judged from the recorded
+        # launch (nested), where ConvertFrom-Json keeps the LAST of a repeated member (a HEAVY environment entry written twice, the second clean, read LIGHT). A repeated member anywhere is refused here and
+        # reads as a provisional, arm-unknown leg (the same typed route as a parse error), never a throw and never collapsed to its last value.
+        Assert-FpsJsonNoRepeatedKey $smokeText $Path
         $json = ConvertFrom-Json -InputObject $smokeText -Depth 100 -NoEnumerate
     }
     catch {

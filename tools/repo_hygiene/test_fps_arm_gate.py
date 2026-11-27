@@ -35,6 +35,10 @@ SUMMARIZER_SCRIPT = PROFILING / "summarize-local-cuda-proof.ps1"
 DNG_SMOKE_SCRIPT = PROFILING / "run-local-cuda-playback-dng-smoke.ps1"
 LEASE_BATCH_SCRIPT = PROFILING / "dual-venue" / "Invoke-VenueLeaseBatch.ps1"
 LEGS_DIR = PROFILING / "dual-venue" / "legs"
+# the comparators import VenueChain.psm1's strict host-load rule and its repeated-member refusal at script top (master, VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1); the probe imports the same functions
+VENUE_CHAIN_MODULE = PROFILING / "dual-venue" / "VenueChain.psm1"
+VENUE_CHAIN_IMPORT = (f"Import-Module '{VENUE_CHAIN_MODULE}' -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal,"
+                      " ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember -DisableNameChecking\n")
 
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
@@ -76,7 +80,7 @@ class _Probe(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         self.probe = self.tmp / "probe.ps1"
-        body = f"Import-Module '{MODULE}' -Force\n"
+        body = f"Import-Module '{MODULE}' -Force\n" + VENUE_CHAIN_IMPORT
         if self.script is not None:
             body += _extract_functions(self.script, self.functions)
         self.probe.write_text(body, encoding="utf-8")
@@ -957,14 +961,14 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
     """G1: -RequireCandidateImprovesPresentedFps is an fps verdict; it refuses, typed, when the pair is not LIGHT/LIGHT, and never reports a fake regression."""
 
     script = CUDA_AB_SCRIPT
-    functions = ["Convert-ToNullableDouble", "Get-PlaybackAbFpsVerdict", "Get-SmokeSummaryTelemetryArm"]
+    functions = ["Convert-ToNullableDouble", "Get-PlaybackAbFpsVerdict", "Get-SmokeSummaryTelemetryArm", "Get-HostLoadProofFailures"]
 
     def run_block(self, baseline: str, candidate: str, fps_b: float, fps_c: float) -> list[str]:
         source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
         block = _extract_block(source, "if ($RequireCandidateImprovesPresentedFps) {", "candidate-presented-fps-not-improved baseline=$baselineFps candidate=$candidateFps", trailing_lines=3)
         out = self.ok(
-            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = {baseline}; {LIGHT_EVIDENCE}presentedFps = {fps_b}; hostLoadProvisional = $false }}\n"
-            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = {candidate}; {LIGHT_EVIDENCE}presentedFps = {fps_c}; hostLoadProvisional = $false }}\n"
+            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = {baseline}; {LIGHT_EVIDENCE}presentedFps = {fps_b}; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}\n"
+            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = {candidate}; {LIGHT_EVIDENCE}presentedFps = {fps_c}; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}\n"
             "$candidateSpeedSummary = $null\n$SeparateCandidateSpeedRun = $false\n$RequireCandidateImprovesPresentedFps = $true\n$proofFailures = @()\n"
             "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary\n"
             + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
@@ -974,9 +978,9 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
         source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
         block = _extract_block(source, "if ($RequireCandidateImprovesPresentedFps) {", "candidate-presented-fps-not-improved baseline=$baselineFps candidate=$candidateFps", trailing_lines=3)
         return self.ok(
-            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}presentedFps = 10.0; hostLoadProvisional = $false }}\n"
-            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = '{parity}'; {LIGHT_EVIDENCE}presentedFps = 7.0; hostLoadProvisional = $false }}\n"
-            f"$candidateSpeedSummary = [pscustomobject]@{{ telemetryArm = '{speed}'; {LIGHT_EVIDENCE}presentedFps = {fps_speed}; hostLoadProvisional = $false }}\n"
+            f"$baselineSummary = [pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}presentedFps = 10.0; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}\n"
+            f"$candidateSummary = [pscustomobject]@{{ telemetryArm = '{parity}'; {LIGHT_EVIDENCE}presentedFps = 7.0; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}\n"
+            f"$candidateSpeedSummary = [pscustomobject]@{{ telemetryArm = '{speed}'; {LIGHT_EVIDENCE}presentedFps = {fps_speed}; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}\n"
             "$SeparateCandidateSpeedRun = $true\n$RequireCandidateImprovesPresentedFps = $true\n$proofFailures = @()\n"
             "$fpsVerdict = Get-PlaybackAbFpsVerdict -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary -CandidateSpeedSummary $candidateSpeedSummary -SeparateCandidateSpeedRun\n"
             + block + "\nforeach ($f in $proofFailures) { Write-Host ('FAIL=' + $f) }\nWrite-Host ('COUNT=' + @($proofFailures).Count)\n")
@@ -1026,7 +1030,7 @@ class CudaPlaybackAbRequireImprovementBlockTests(_Probe):
             "    foreach ($kv in $EnvList) { $k, $v = $kv -split '=', 2; $environment[$k] = $v }\n"
             "    $environment['MLVAPP_PLAYBACK_SMOKE_TELEMETRY'] = '1'   # FrameTelemetry = $true in the generated smoke (run-release-gui-smoke.ps1: launchEnv)\n"
             "    $json = [pscustomobject]@{ launch = [pscustomobject]@{ environment = [pscustomobject]$environment; arguments = @() } }\n"
-            "    [pscustomobject]@{ telemetryArm = (Get-SmokeSummaryTelemetryArm -Json $json); launch = $json.launch; presentedFps = $Fps; hostLoadProvisional = $false }\n"
+            "    [pscustomobject]@{ telemetryArm = (Get-SmokeSummaryTelemetryArm -Json $json); launch = $json.launch; presentedFps = $Fps; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }\n"
             "}\n"
             "$baselineSummary = New-WrapperLeg $baselineEnv 10.0\n$candidateSummary = New-WrapperLeg $candidateSpeedEnv 20.0\n$candidateSpeedSummary = $null\n"
             "Write-Host ('ARM=' + $baselineSummary.telemetryArm.arm + ',' + $candidateSummary.telemetryArm.arm)\n"
@@ -1068,7 +1072,7 @@ class CompareMachinePerfFpsGateTests(_Probe):
     def record(baseline_arm: str | None, candidate_arm: str | None, with_verdict: bool = False) -> str:
         def leg(arm: str | None, fps: float) -> str:
             arm_part = _light_word(arm)
-            return f"[pscustomobject]@{{ {arm_part}presentedFps = {fps}; hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
+            return f"[pscustomobject]@{{ {arm_part}presentedFps = {fps}; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}"
         verdict = "fpsVerdict = [pscustomobject]@{ allowed = $true; reason = '' }; " if with_verdict else ""
         return ("[pscustomobject]@{ schema = 'mlvapp-cuda-playback-ab.v1'; status = 'success'; " + verdict +
                 "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
@@ -1103,8 +1107,8 @@ class CompareMachinePerfFpsGateTests(_Probe):
 
     def test_a_record_with_a_speed_compare_is_judged_on_its_speed_leg(self) -> None:
         # adversary A6: the row publishes speedCompare, so the leg judged is candidateSpeed; an absent one is UNKNOWN, never the ordinary candidate
-        leg = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
-        heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
+        leg = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}"
+        heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }"
         fingerprint = "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
         compare = "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 10.0; candidate = 20.0; deltaPercent = 100.0 } }"
         # R2-RESIDUE-1 r1 (adversary 698fffb1 A7): the compare (10 -> 20 fps) is measured on the legs it names, so each leg records the presentedFps it carried into the compare
@@ -1123,8 +1127,8 @@ class CompareMachinePerfFpsGateTests(_Probe):
     def test_a_saved_speed_leg_held_in_a_one_element_array_is_unknown_through_the_pair_selection(self) -> None:
         # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A3): `$candidateLeg = if (...) { $Record.candidateSpeed }` unrolled a one-element array into the leg inside it, so a malformed
         # container the direct reader rejects was judged as that LIGHT leg and the machine row published the speed delta. Both leg choices keep the container whole.
-        light = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
-        heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
+        light = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}"
+        heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }"
         fingerprint = "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
         compare = "[pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 20.0; candidate = 30.0; delta = 10.0; deltaPercent = 50.0 } }"
         # R2-RESIDUE-1 r1 (adversary 698fffb1 A7): the compare (20 -> 30 fps) is measured on the legs it names
@@ -1142,8 +1146,8 @@ class CompareMachinePerfFpsGateTests(_Probe):
     def test_a_json_record_whose_arm_is_a_one_element_array_is_refused(self) -> None:
         # adversary A5: parsed JSON, the way compare-machine-perf reads a record
         record = ('{"schema":"mlvapp-cuda-playback-ab.v1","status":"success","machineFingerprint":{"schema":"machine-fingerprint.v1","hostname":"H","cpu":"x","gpu":"y","os":"z","build_sha":"abc1234"},'
-                  '"baseline":{"telemetryArm":["LIGHT"],"hostLoadProvisional":false,"hostLoadState":"quiet"},'
-                  '"candidate":{"telemetryArm":["LIGHT"],"hostLoadProvisional":false,"hostLoadState":"quiet"},'
+                  '"baseline":{"telemetryArm":["LIGHT"],"hostLoadProvisional":false,"hostLoadState":"quiet","hostLoadCollected":true},'
+                  '"candidate":{"telemetryArm":["LIGHT"],"hostLoadProvisional":false,"hostLoadState":"quiet","hostLoadCollected":true},'
                   '"compare":{"presentedFps":{"baseline":10.0,"candidate":20.0,"deltaPercent":100.0}}}')
         r = self.row(f"(ConvertFrom-Json '{record}')")
         self.assertIsNone(r["playback_fps_delta_pct"])
@@ -1165,7 +1169,7 @@ class CompareMachinePerfFpsGateTests(_Probe):
     def test_a_record_whose_legs_carry_only_the_light_word_is_unknown_and_refused(self) -> None:
         # r5 (Dot on f51e0821): the saved A/B record's legs name LIGHT and record no observer controls, so the delta and the cached optimization are withheld through THIS verdict reader too
         def bare(fps: float) -> str:
-            return f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; presentedFps = {fps}; hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
+            return f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; presentedFps = {fps}; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}"
         record = self.record("LIGHT", "LIGHT").replace(f"baseline = {self.record_leg('LIGHT', 10.0)}; candidate = {self.record_leg('LIGHT', 20.0)};", f"baseline = {bare(10.0)}; candidate = {bare(20.0)};")
         self.assertIn(f"baseline = {bare(10.0)}", record, "the fixture replacement must land")
         r = self.row(record)
@@ -1177,7 +1181,7 @@ class CompareMachinePerfFpsGateTests(_Probe):
 
     @staticmethod
     def record_leg(arm: str | None, fps: float) -> str:
-        return f"[pscustomobject]@{{ {_light_word(arm)}presentedFps = {fps}; hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
+        return f"[pscustomobject]@{{ {_light_word(arm)}presentedFps = {fps}; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}"
 
     def test_a_record_that_names_no_arm_is_unknown_and_refused_even_if_it_carries_a_cached_allowed_verdict(self) -> None:
         for with_verdict in (False, True):
@@ -1189,8 +1193,8 @@ class CompareMachinePerfFpsGateTests(_Probe):
     @staticmethod
     def a7_record(analysis_basis: str, analysis_delta: str, legacy: bool = False) -> str:
         # adversary r14 pass 18 A7: quiet baseline LIGHT at 50, candidate HEAVY at 40, candidateSpeed LIGHT at 55; compare deltaPercent -20 (the HEAVY pair), speedCompare deltaPercent 10
-        light = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
-        heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet' }"
+        light = f"[pscustomobject]@{{ telemetryArm = 'LIGHT'; {LIGHT_EVIDENCE}hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}"
+        heavy = "[pscustomobject]@{ telemetryArm = 'HEAVY'; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }"
         fingerprint = "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
         # R3-MERGE-RESIDUE-1 (sol 07d50621 A11): the speed pair's OWN analysis (basis candidateSpeed, +10 %, no stage field) carries the producer's label for it (none / validate_same_clip_on_second_machine);
         # every other analysis here belongs to another pair or to none, and carries a label that is not the speed pair's ('render-work' is nobody's)
@@ -1231,7 +1235,7 @@ class CompareMachinePerfSuggestionFpsGateTests(_Probe):
     def suggestion(self, arm: str | None) -> str:
         arm_part = _light_word(arm)
         # R2-RESIDUE-1 r1 (adversary 698fffb1 A7): the compare (10 -> 7 fps) is measured on the legs it names
-        leg = f"[pscustomobject]@{{ {arm_part}presentedFps = {{fps}}; hostLoadProvisional = $false; hostLoadState = 'quiet' }}"
+        leg = f"[pscustomobject]@{{ {arm_part}presentedFps = {{fps}}; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}"
         return self.ok(
             "$rec = [pscustomobject]@{ proof = [pscustomobject]@{ playback = [pscustomobject]@{ totalFallbackFrames = 0; totalGpuTextureNoReadbackFrames = 5 }; "
             f"playbackAb = [pscustomobject]@{{ baseline = {leg.replace('{fps}', '10.0')}; candidate = {leg.replace('{fps}', '7.0')}; candidateSpeed = $null; "
@@ -1373,8 +1377,8 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
             "$ErrorActionPreference = 'Stop'\n" f"Import-Module '{MODULE}' -Force\n" + funcs +
             "\n$playbackAbComparisonBasis = 'candidate'\n"
             # R2-RESIDUE-1 r1 (adversary 698fffb1 A7): each leg records the presented fps the compare below was measured from (50 and 49), so the compare is bound to the pair the gate judged
-            f"$playbackAb = [pscustomobject]@{{ analysis = {analysis}; baseline = [pscustomobject]@{{ {_light_word(baseline_arm)}presentedFps = {baseline_fps}; {base_metrics}hostLoadProvisional = $false; hostLoadState = 'quiet' }}; "
-            f"candidate = [pscustomobject]@{{ {candidate_word}{candidate_extra}presentedFps = {candidate_fps}; {cand_metrics}hostLoadProvisional = $false; hostLoadState = 'quiet' }} }}\n"
+            f"$playbackAb = [pscustomobject]@{{ analysis = {analysis}; baseline = [pscustomobject]@{{ {_light_word(baseline_arm)}presentedFps = {baseline_fps}; {base_metrics}hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }}; "
+            f"candidate = [pscustomobject]@{{ {candidate_word}{candidate_extra}presentedFps = {candidate_fps}; {cand_metrics}hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }} }}\n"
             f"$playbackAbSpeedCompare = [pscustomobject]@{{ presentedFps = [pscustomobject]@{{ {presented_compare} }}; {compare_metrics} }}\n"
             "$playbackAbCandidateLeg = $playbackAb.candidate\n$playbackAbHostLoadProvisional = $false\n"
             "$playbackAbBlockers = [System.Collections.Generic.List[string]]::new()\n$diagnostics = [System.Collections.Generic.List[object]]::new()\n"
@@ -2182,6 +2186,37 @@ class ObserverControlTests(_Probe):
 
 
 @requires_pwsh
+class CudaAbReadSmokeSummaryRepeatedMemberTests(_Probe):
+    """R4-DEADLINE-RESIDUE-1 r7 (the master merge, run-release-cuda-playback-ab.ps1): a repeated member in a smoke result is a PROVISIONAL, arm-UNKNOWN leg, never a throw and never the last value."""
+
+    script = CUDA_AB_SCRIPT
+    functions = ["Convert-PlaybackLogLineToObject", "Get-ScopedPlaybackLogLines", "Add-NullableDouble", "Get-AverageOrNull", "Convert-ToNullableDouble",
+                 "Convert-ToNullableInt64", "Get-NestedValue", "Get-SmokeSummaryHostLoadFields", "Get-SmokeSummaryTelemetryArm", "Read-SmokeSummary"]
+
+    QUIET = '"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}'
+
+    def _read(self, text: str) -> str:
+        smoke = self.tmp / "smoke.json"
+        smoke.write_text(text, encoding="utf-8", newline="")
+        return self.ok(
+            f"$s = Read-SmokeSummary -Path '{smoke}' -ExitCode 0\n"
+            "Write-Host \"LEG=$($s.hostLoadProvisional)|$($s.hostLoadState)|$($s.hostLoadCollected)|$($s.telemetryArm.arm)\"\n").strip()
+
+    def test_a_repeated_member_reads_as_a_provisional_arm_unknown_leg_not_a_throw(self) -> None:
+        launch = '"launch":{"environment":' + LIGHT_ENV_JSON + ',"arguments":' + PRODUCER_ARGS_JSON + '}'
+        # control: the one-member form is a clean LIGHT leg, so the refusals below are the repeat's doing
+        self.assertEqual(self._read('{' + self.QUIET + ',' + launch + '}'), "LEG=False|quiet|True|LIGHT")
+        # a repeated member in the recorded launch environment (a HEAVY opt-out written 0 then 1: the last value reads LIGHT); master's reader scans only the root and hostLoad
+        nested_env = LIGHT_ENV_JSON.replace('"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"1"',
+                                            '"MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"0","MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG":"1"')
+        self.assertNotEqual(nested_env, LIGHT_ENV_JSON)
+        nested = '{' + self.QUIET + ',"launch":{"environment":' + nested_env + ',"arguments":' + PRODUCER_ARGS_JSON + '}}'
+        self.assertEqual(self._read(nested), "LEG=True|unknown|False|UNKNOWN")
+        # a repeated root member (master's own refusal) reads the same way
+        self.assertEqual(self._read('{' + self.QUIET + ',' + launch + ',"launch":{}}'), "LEG=True|unknown|False|UNKNOWN")
+
+
+@requires_pwsh
 class LightShapeAllowlistTests(_Probe):
     """BENCH-LIGHT-ARM-GAIN-GATES-1 r8, THE NARROW PROMISE: LIGHT only on the producers' exact closed shape (two data tables in FpsArmGate.psm1), UNKNOWN on anything else."""
 
@@ -2250,9 +2285,9 @@ class LightShapeAllowlistTests(_Probe):
         # before ConvertFrom-Json, so a new reader of one of those files that parses directly is a decision someone makes here.
         sites = {
             "compare-release-gui-smoke-ab.ps1": ["Assert-FpsJsonNoRepeatedKey $raw $resolved"],
-            "run-release-cuda-playback-ab.ps1": ["Assert-FpsJsonNoRepeatedKey $raw $Path"],
+            "run-release-cuda-playback-ab.ps1": ["Assert-FpsJsonNoRepeatedKey $smokeText $Path"],
             "compare-machine-perf.ps1": ["Assert-FpsJsonNoRepeatedKey $raw $resolved", 'Assert-FpsJsonNoRepeatedKey $line "${resolved}:$lineNumber"'],
-            "summarize-local-cuda-proof.ps1": ["Assert-FpsJsonNoRepeatedKey $summaryRaw $summaryFullPath"],
+            "summarize-local-cuda-proof.ps1": ["Assert-FpsJsonNoRepeatedKey $summaryText $summaryFullPath"],
             "run-local-cuda-playback-dng-smoke.ps1": ["Assert-FpsJsonNoRepeatedKey $playbackAbRaw $playbackAbSummaryPath"],
             "dual-venue/Invoke-VenueLeaseBatch.ps1": ["Assert-FpsJsonNoRepeatedKey $specText $Path", "Assert-FpsJsonNoRepeatedKey $planText $planPath"],
         }
@@ -2718,7 +2753,7 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         # adversary 698fffb1 A7, sibling reader (compare-machine-perf.ps1 Get-PlaybackAbFpsArmRefusal): it publishes the same compare, so it refuses the same way
         funcs = _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Get-PlaybackAbFpsArmRefusal"])
         body = funcs + (
-            "$leg = { param($fps) [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = $fps; hostLoadProvisional = $false; hostLoadState = 'quiet' } }\n"
+            "$leg = { param($fps) [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = $fps; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true } }\n"
             "$cmp = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 50; candidate = 60; delta = 10; deltaPercent = 20 } }\n"
             "foreach ($fps in 60, 40) { $r = [pscustomobject]@{ baseline = (& $leg 50); candidate = (& $leg $fps); candidateSpeed = (& $leg $fps); speedCompare = $cmp }; "
             "$v = Get-PlaybackAbFpsArmRefusal -Record $r; Write-Host ('SPEED' + $fps + '=' + $v.refused + '|' + $v.reason) }\n")
@@ -2728,7 +2763,7 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         # luna r1b A1, sibling reader: both legs 40 fps, published delta 40 / deltaPercent 100 (a gain no leg measured)
         funcs = _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Get-PlaybackAbFpsArmRefusal"])
         body = funcs + (
-            "$leg = { param($fps) [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = $fps; hostLoadProvisional = $false; hostLoadState = 'quiet' } }\n"
+            "$leg = { param($fps) [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = $fps; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true } }\n"
             "$cases = [ordered]@{ adversary = @(40, 40, 40, 100); percent = @(40, 40, 0, 100); delta = @(40, 40, 40, 0); zero = @(0, 0, 0, 0); honest = @(40, 40, 0, 0); gain = @(40, 50, 10, 25) }\n"
             "foreach ($k in $cases.Keys) { $c = $cases[$k]; $cmp = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = $c[0]; candidate = $c[1]; delta = $c[2]; deltaPercent = $c[3] } }\n"
             "$r = [pscustomobject]@{ baseline = (& $leg $c[0]); candidate = (& $leg $c[1]); candidateSpeed = (& $leg $c[1]); speedCompare = $cmp }\n"
@@ -3173,7 +3208,7 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         start = source.index("    $fpsArmRefusal = Get-PlaybackAbFpsArmRefusal -Record $Record")
         block = source[start:source.index("    $fpsDeltaRefused = ", start)]
         body = funcs + (
-            "$leg = { [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = 40; hostLoadProvisional = $false; hostLoadState = 'quiet' } }\n"
+            "$leg = { [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = 40; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true } }\n"
             "$Record = [pscustomobject]@{ baseline = (& $leg); candidate = (& $leg); candidateSpeed = $null; speedCompare = $null; compare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 20; candidate = 60; delta = 40; deltaPercent = 200 } } }\n"
             "$baselinePresented = 20.0; $candidatePresented = 60.0\n" + block +
             "Write-Host ('PER_LEG=' + $baselinePresented + '|' + $candidatePresented + '|' + $fpsArmRefusal.refused)\n")
@@ -3184,7 +3219,7 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         # unbound avgPresentIntervalMs was never asked. A10 input: legs at presentedFps 40 / avgPresentIntervalMs 25, the compare publishes the interval 50 -> 25.
         funcs = _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Get-PlaybackAbFpsArmRefusal"])
         body = funcs + (
-            "$leg = { [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = 40; avgPresentIntervalMs = 25; hostLoadProvisional = $false; hostLoadState = 'quiet' } }\n"
+            "$leg = { [pscustomobject]@{ telemetryArm = 'LIGHT'; " + RECORDED_LIGHT_LAUNCH + "; generatorArgs = [pscustomobject]@{ telemetryArm = 'LIGHT' }; legType = 'speed'; presentedFps = 40; avgPresentIntervalMs = 25; hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true } }\n"
             "$presented = [pscustomobject]@{ baseline = 40; candidate = 40; delta = 0; deltaPercent = 0 }\n"
             "$bound = [pscustomobject]@{ baseline = 25; candidate = 25; delta = 0; deltaPercent = 0 }\n"
             "$unbound = [pscustomobject]@{ baseline = 50; candidate = 25; delta = -25; deltaPercent = -50 }\n"
@@ -3275,7 +3310,17 @@ class EnvelopePreemptR1ResidueTests(_Probe):
             f"$s = '{summary}'; $b = [byte[]](1, 2, 3)\n"
             f"$cmp = Get-VolumeNameComparison -ExistingFile $s\n"
             f"try {{ Assert-OutputPathsAreSafe -Summary $s -SummaryBytes $b -Outputs ([ordered]@{{ 'Markdown report' = '{self.tmp / 'SUMMARY.md'}'; 'JSON report' = '{self.tmp / 'SUMMARY.json'}'; 'packet' = '{self.tmp / 'out' / 'return.zip'}' }}) -Comparison $cmp; Write-Host 'OUTCOME=OK' }} catch {{ Write-Host ('OUTCOME=REFUSED ' + $_.Exception.Message) }}\n")
-        self.assertEqual(self.ok(body).strip(), "OUTCOME=OK")
+        # r6 (adversary d68bc1e8 A1): the packager answers by FILE IDENTITY now. Where this directory ignores case, summary.JSON and SUMMARY.json ARE one file, so the report twin is refused as the
+        # input summary (correct); only where the directory is case sensitive are they two files and the twin is accepted. Both outcomes are asserted, never skipped.
+        probe_dir = self.tmp / "case-probe"
+        probe_dir.mkdir()
+        (probe_dir / "a").write_text("x", encoding="utf-8")
+        case_insensitive = (probe_dir / "A").exists()
+        out = self.ok(body).strip()
+        if case_insensitive:
+            self.assertTrue(out.startswith("OUTCOME=REFUSED"), out)
+        else:
+            self.assertEqual(out, "OUTCOME=OK")
 
     def test_r5_adversary_55683e1f_a1_the_published_figures_follow_from_the_judged_legs_not_a_near_endpoint(self) -> None:
         # adversary 55683e1f A1 (input verbatim): legs presentedFps baseline 100 and candidate 98.99949999; compare {baseline 100, candidate 98.99950004, delta -1.0005, deltaPercent -1}. The endpoint is 5e-10

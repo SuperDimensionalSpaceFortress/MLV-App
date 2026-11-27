@@ -3840,7 +3840,7 @@ class ResidueR2CudaAbReadSmokeSummaryTests(_ProbeCase):
 
     script = CUDA_AB_SCRIPT
     functions = ["Convert-PlaybackLogLineToObject", "Get-ScopedPlaybackLogLines", "Add-NullableDouble", "Get-AverageOrNull", "Convert-ToNullableDouble",
-                 "Convert-ToNullableInt64", "Get-NestedValue", "Get-SmokeSummaryHostLoadFields", "Read-SmokeSummary"]
+                 "Convert-ToNullableInt64", "Get-NestedValue", "Get-SmokeSummaryHostLoadFields", "Get-SmokeSummaryTelemetryArm", "Read-SmokeSummary"]
     preamble = f"Import-Module '{VENUE_CHAIN_MODULE}' -Function ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember -DisableNameChecking\n"
 
     def _summary(self, text: str) -> subprocess.CompletedProcess:
@@ -3885,7 +3885,10 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             record.write_text('{"schema":"release-cuda-playback-ab.v1","baseline":' + baseline + ',"candidate":' + clean + '}', encoding="utf-8", newline="")
             proc = _run_ps_file(COMPARE_MACHINE_PERF_SCRIPT, str(record))
             self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn("is not strict JSON", _flat_pwsh_text(proc.stdout + proc.stderr), proc.stdout + proc.stderr)
+            # the strict scanner cannot read the comment ("is not strict JSON"), or, on this branch, the arm gate's own repeated-key check (which reads past a comment) refuses the same record first
+            # (BENCH-LIGHT-ARM-GAIN-GATES-1, the master merge); either way the row is refused, never compared
+            flat = _flat_pwsh_text(proc.stdout + proc.stderr)
+            self.assertTrue("is not strict JSON" in flat or "FPS_JSON_REPEATED_KEY" in flat, proc.stdout + proc.stderr)
             summary = Path(tmp) / "summary.json"
             summary.write_text('{"status":"PASS","proof":{"playbackAb":{"baseline":' + baseline + ',"candidate":' + clean + '}}}', encoding="utf-8", newline="")
             proc = _run_ps_file(CUDA_PROOF_SUMMARIZER_SCRIPT, "-SummaryPath", str(summary))
