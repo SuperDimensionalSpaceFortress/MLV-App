@@ -10526,6 +10526,42 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
             self.assertEqual(len({f["contentHash"] for f in copied}), 3, "the burst itself moved")
 
     @requires_windows_imaging
+    def test_r6_r4_sol_a5_a_play_unbound_row_naming_a_burst_file_never_lends_burst_pixels_to_the_frozen_check(self) -> None:
+        """R6-BURST-CUTOFF-RESIDUE-1 r4, sol A5 on 560c9642, its input: the forced-first stuck fixture, two MOVING burst PNGs, and two extra play_unbound rows
+        (indices 6 and 7, forced_paints_before=6, display_frame 606 / 607) whose file= names those burst PNGs. 560c9642 checked kind and file independently,
+        copied the burst pixels under late-play names and judged them as late play: more than one distinct picture, so FROZEN_DISPLAY was bypassed. The rows
+        are still collected (no fallback to the forced rows) but supply no pixels: FROZEN_DISPLAY stands."""
+        with tempfile.TemporaryDirectory(prefix="vis-r6-a5-") as d:
+            art = Path(d) / "artifacts"
+            dest = art / "visual"
+            write_stateful_visual_captures(dest, "forced-first", "stuck")
+            visual = json.loads((dest / "visual.json").read_text(encoding="utf-8"))
+            burst = [{"kind": "play_first_unbound", "index": n, "file": f"play-first-unbound-{n}.png", "display_frame": 597 + n, "serial": 897 + n,
+                      "painted_serial": 897 + n, "painted_serial_valid": True, "label_bound": True, "label_bound_basis": "gl_window_paint",
+                      "play_active": True, "tail_elapsed_ms": 3 + 30 * n, "capture_ms": 40.0, "viewport": VIEWPORT, "saved": True, "reason": "",
+                      "forced_paints_before": 0, "source_id": f"{597 + n:016x}"} for n in range(2)]
+            late = [r for r in visual["frames"] if r.get("kind") == "play_unbound"]
+            forced = late[0].get("forced_paints_before", 6) if late else 6
+            alias = [{**burst[n], "kind": "play_unbound", "index": 6 + n, "file": f"play-first-unbound-{n}.png", "display_frame": 606 + n,
+                      "serial": 906 + n, "painted_serial": 906 + n, "forced_paints_before": forced, "tail_elapsed_ms": 2900 + n,
+                      "source_id": f"{0x25e + n:016x}"} for n in range(2)]
+            visual["frames"] = burst + visual["frames"] + alias
+            (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
+            calls = [f"New-VisPng '{dest / row['file']}' {n + 4} {200 + 7 * n} {40 * n} $false" for n, row in enumerate(burst)]
+            proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(calls)])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      "| ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(out["verdict"], "FROZEN_DISPLAY", out["reason"])
+            self.assertEqual(out["frozenJudgedOn"], "play_unbound")
+            aliased = [f for f in out["frames"] if f["kind"] == "play_unbound" and f["index"] in (6, 7)]
+            self.assertEqual(len(aliased), 2, out["frames"])
+            for f in aliased:
+                self.assertIsNone(f["contentHash"], f)
+                self.assertIsNone(f["sha256"], f)
+
+    @requires_windows_imaging
     def test_the_visual_reader_says_ok_over_a_healthy_display_on_the_r3_order(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-r3-healthy-") as d:
             _, out = self.read(d, "forced-first", "healthy")
@@ -12966,7 +13002,8 @@ class VisualCaptureSpecAndAppSourceTests(unittest.TestCase):
         # capture show frame N-1 labelled N). The helper lives outside the block, beside the PrintWindow capture.
         helper = "paintPresentedFrameForCapture("
         self.assertTrue("static bool paintPresentedFrameForCapture(" in src, "the binding helper is defined in MainWindow.cpp")
-        self.assertLess(abs(src.index("static bool paintPresentedFrameForCapture(") - src.index("static QImage captureTopLevelWindowByPrintWindow(")), 6000,
+        # (7000: R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A3) put the start gate inside the capture function, which grew it by ~600 characters)
+        self.assertLess(abs(src.index("static bool paintPresentedFrameForCapture(") - src.index("static QImage captureTopLevelWindowByPrintWindow(")), 7000,
                         "the binding helper sits next to the PrintWindow capture")
         lam = block[block.index("auto grabVisual = [&]"):block.index("// (1) the measured interval ends HERE")]
         self.assertLess(lam.index(helper), lam.index("m_lastPresentedRequestContext.frameNumber"), "paint first, then read the label")
@@ -21154,7 +21191,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
     # old wiring test. grabVisual now re-reads the tail clock immediately before the capture starts and the burst passes it its cutoff and reserve.
     # r4 (sol A3 on 560c9642): the gate read the clock before captureTopLevelWindowByPrintWindow's HWND / DC / DIB setup, so the native PrintWindow
     # start was unbounded. The read is now a predicate grabVisual passes in, asked inside the capture function immediately before PrintWindow.
-    BURST_START_GATE = ("[&]() { return visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ); },")
+    BURST_START_GATE = ("visual_capture_source_difference::captureStartGate( visualTailClock, startReserveMs, startCutoffMs ),")
     BURST_ASK = "if( mayStartNow && !mayStartNow() )"
     BURST_ASK_TO_PRINT = ('if( mayStartNow && !mayStartNow() ) { if( startRefusedOut ) *startRefusedOut = true; '
                           'if( reasonOut ) *reasonOut = QStringLiteral( "start_refused_at_cutoff" ); } else { const BOOL printed =')
@@ -21219,6 +21256,10 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         # keeps a read of 124 against a 125 ms cutoff (reserve 0, the first burst capture) from starting a capture at 125 ms
         if "constexpr qint64 kCaptureStartMarginMs = 1;" not in header:
             problems.append("the capture start margin is not one whole millisecond")
+        # r4 (sol A3): the predicate reads the tail clock on each call, at the ask site, never once when it is built
+        if ("    return [&tailClock, reserveMs, cutoffMs]() { return captureMayStartBeforeCutoff( tailClock.elapsed(), reserveMs, cutoffMs ); };\n"
+                not in header):
+            problems.append("captureStartGate does not read the tail clock when the capture function asks it")
         return problems
 
     def test_r6_r2_burst_start_margin_refuses_a_read_one_ms_before_the_cutoff(self) -> None:

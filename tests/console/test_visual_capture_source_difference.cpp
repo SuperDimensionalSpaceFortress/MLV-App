@@ -276,6 +276,19 @@ TEST(VisualCaptureSourceDifference, TheCutoffPredicateNeverOverflowsOnAnExtremeR
     ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(maxMs, maxMs, -1));
 }
 
+// R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A3 on 560c9642): the gate the capture function asks immediately before PrintWindow reads the tail clock at
+// that call: no cutoff always starts; a cutoff of 0 or 1 ms never does (the margin); a far cutoff on a just-started clock does.
+TEST(VisualCaptureSourceDifference, TheCaptureStartGateDecidesOnTheClockReadWhenAsked)
+{
+    QElapsedTimer clock;
+    clock.start();
+    ASSERT_TRUE(vcsd::captureStartGate(clock, 0, -1)());
+    ASSERT_FALSE(vcsd::captureStartGate(clock, 0, 0)());
+    ASSERT_FALSE(vcsd::captureStartGate(clock, 0, 1)());
+    ASSERT_TRUE(vcsd::captureStartGate(clock, 0, 3600000)());
+    ASSERT_FALSE(vcsd::captureStartGate(clock, 3600000, 3600000)());
+}
+
 // r7 (adversary r6 pass 3 A2 on 3663c8a3): the capture path pumps events after the play captures (the post-stop drain at the
 // old MainWindow.cpp:10698, the paused settle) and a QFileOpenEvent handled there replaces m_pMlvObject before the deferred
 // source hashing. 3663c8a3 then hashed "the open clip at display_frame", so clip B's ids were attached to clip A's captures:

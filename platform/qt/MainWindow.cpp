@@ -1752,9 +1752,7 @@ static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
 #ifndef PW_RENDERFULLCONTENT
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
-        // R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A3 on 560c9642): the HWND, window rectangle, DC and DIB setup above can take over a millisecond, so a
-        // start decision taken before this function (the r1-r3 gate in grabVisual) did not bound the native capture's start. The caller's
-        // predicate now reads the clock HERE, after all setup: the only statement after a true answer is the PrintWindow call itself.
+        // R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A3): the start is decided HERE, after all setup, right before PrintWindow
         if( mayStartNow && !mayStartNow() )
         {
             if( startRefusedOut ) *startRefusedOut = true;
@@ -11896,7 +11894,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             captureClock.start();
             bool captureStartRefused = false;
             grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason,
-                [&]() { return visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ); },
+                visual_capture_source_difference::captureStartGate( visualTailClock, startReserveMs, startCutoffMs ),
                 &captureStartRefused );
             if( !captureStartRefused )
             {

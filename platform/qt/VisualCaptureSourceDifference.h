@@ -13,6 +13,7 @@
  * >= 2 distinct display frames. A repeated display index is a stuck playback clock, not
  * evidence of a static clip. Without that evidence the field is removed, never null or empty. */
 
+#include <QElapsedTimer>
 #include <QHash>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -20,6 +21,8 @@
 #include <QString>
 #include <QVector>
 #include <QtGlobal>
+
+#include <functional>
 
 namespace visual_capture_source_difference
 {
@@ -104,6 +107,14 @@ inline bool captureMayStartBeforeCutoff( qint64 nowMs, qint64 reserveMs, qint64 
     if( nowMs < 0 || reserveMs < 0 ) return false;
     const qint64 room = cutoffMs - kCaptureStartMarginMs;   // the start must be strictly before cutoff - margin
     return nowMs < room && reserveMs < room - nowMs;
+}
+
+/* R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A3 on 560c9642): the start decision as the predicate captureTopLevelWindowByPrintWindow asks AFTER its HWND, DC and
+ * DIB setup, immediately before the native PrintWindow call: each call reads tailClock then and decides with captureMayStartBeforeCutoff. Lives here
+ * because the capture block is pinned to contain no `return` (a lambda body there would). tailClock must outlive the returned predicate. */
+inline std::function<bool()> captureStartGate( const QElapsedTimer &tailClock, qint64 reserveMs, qint64 cutoffMs )
+{
+    return [&tailClock, reserveMs, cutoffMs]() { return captureMayStartBeforeCutoff( tailClock.elapsed(), reserveMs, cutoffMs ); };
 }
 
 /* A frame's source_id in visual.json: 16 lowercase hex digits, zero-padded. */

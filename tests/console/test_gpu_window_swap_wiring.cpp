@@ -931,7 +931,7 @@ TEST(VisualCaptureBinding, TheBurstRereadsTheClockImmediatelyBeforeEachCaptureSt
     // r4 (sol A3 on 560c9642): the deciding read is a predicate the capture function calls AFTER its HWND / DC / DIB setup, immediately before
     // the native PrintWindow call; a refused start appends nothing.
     const QString gate = QStringLiteral(
-        "[&]() { return visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ); },");
+        "visual_capture_source_difference::captureStartGate( visualTailClock, startReserveMs, startCutoffMs ),");
     ASSERT_EQ(1, countOccurrences(block, gate));
     const int captureAt = lambda.indexOf(QStringLiteral("grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason,"));
     ASSERT_TRUE(captureAt > lambda.indexOf(QStringLiteral("grab.clip = ")));
