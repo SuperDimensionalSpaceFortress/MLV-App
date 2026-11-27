@@ -608,6 +608,50 @@ class RunnerChokePointTests(_TmpCase):
         self.assertEqual(proc.returncode, EXIT_TOO_SHORT, proc.stdout + proc.stderr)
         self.assertIn("CLIP_TOO_SHORT (clip=0.667 window=40)", proc.stderr)
 
+    # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r4 (Grok G1, adversary pass 4 A1): the gate's counted parts and the runner's
+    # immutable binding must be the same set. The binding lists parts by an exact-case base name; the gate (like the app's
+    # fopen) resolves the probed name through the file system, so on NTFS a continuation whose base differs in case is counted
+    # by the gate and absent from the binding. That run is refused, typed, before anything is staged or launched.
+    @staticmethod
+    def _continuation_extension() -> str:
+        return MLV_EXTENSION[:-2] + "00"
+
+    def _case_insensitive_volume(self) -> bool:
+        probe = self.tmp / "case-probe-lower"
+        probe.write_bytes(b"")
+        try:
+            return (self.tmp / "CASE-PROBE-LOWER").exists()
+        finally:
+            probe.unlink()
+
+    def test_r4_g1_a_continuation_whose_base_differs_in_case_is_refused_by_the_runner_not_bound_partially(self) -> None:
+        first = write_synthetic_mlv(self.tmp / ("g8" + MLV_EXTENSION), 400, file_num=0, file_count=2, guid=0x5A5A0001)
+        write_synthetic_mlv(self.tmp / ("G8" + self._continuation_extension()), 400, file_num=1, file_count=2, guid=0x5A5A0001)
+        proc = self.run_runner(first)
+        self.assertEqual(proc.returncode, EXIT_UNKNOWN, proc.stdout + proc.stderr)
+        if self._case_insensitive_volume():
+            # The gate counts both parts (800 frames, 33 s) and the binding holds one: the typed parity refusal.
+            self.assertIn("CLIP_LENGTH_UNKNOWN (reason=binding_parts_mismatch", proc.stderr)
+        else:
+            # A case-sensitive volume: the app cannot open it either, so the gate itself refuses it as an incomplete set.
+            self.assertIn("CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)", proc.stderr)
+        self.assertNotIn(str(self.tmp), proc.stderr)
+
+    def test_r4_g1_a_set_the_gate_and_the_binding_agree_on_proceeds(self) -> None:
+        first = write_synthetic_mlv(self.tmp / ("agree" + MLV_EXTENSION), 400, file_num=0, file_count=2, guid=0x5A5A0001)
+        write_synthetic_mlv(self.tmp / ("agree" + self._continuation_extension()), 400, file_num=1, file_count=2, guid=0x5A5A0001)
+        proc = self.run_runner(first)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["clipLengthGate"], "OK")
+
+    def test_r4_g1_the_gate_returns_the_parts_it_counted_in_probe_order(self) -> None:
+        first = write_synthetic_mlv(self.tmp / ("order" + MLV_EXTENSION), 400, file_num=0, file_count=2, guid=0x5A5A0001)
+        second = write_synthetic_mlv(self.tmp / ("order" + self._continuation_extension()), 400, file_num=1, file_count=2,
+                                     guid=0x5A5A0001)
+        proc = _pwsh(f". {_q(GATE)}; (Get-GuiSmokeClipLength -Path {_q(first)}).parts | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([p.lower() for p in json.loads(proc.stdout)], [str(first).lower(), str(second).lower()])
+
     def test_a_thirty_second_clip_is_refused_for_a_longer_window(self) -> None:
         proc = self.run_runner(self.clip("thirty", FRAMES_30S_AT_23976), "-Seconds", "45")
         self.assertEqual(proc.returncode, EXIT_TOO_SHORT, proc.stdout + proc.stderr)

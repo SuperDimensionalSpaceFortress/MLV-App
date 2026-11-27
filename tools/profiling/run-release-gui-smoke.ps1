@@ -1427,6 +1427,24 @@ $launchInputBindings = [pscustomobject]@{
     receipt = if ($smokeReceiptPath) { Get-GuiSmokeImmutableFileBinding -Path $smokeReceiptPath } else { $null }
 }
 
+# GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r4 (Grok G1, adversary pass 4 A1): the length gate counted the parts the app
+# opens (probed by name, as the file system resolves it), and the binding above lists the parts by an exact-case base name.
+# On NTFS the two can disagree (a first part plus a continuation whose base differs in case: the gate admits it, the binding
+# records only the first part). A binding that is not the gate's counted set is refused, before anything is staged or launched.
+# The gate is skipped under -LaunchOnlyProbe (no parts to compare); a -DryRun with no bindable part keeps its own contract above.
+if ($clipLengthGate.PSObject.Properties['parts'] -and -not ($DryRun -and $clipParts.Count -eq 0)) {
+    $gateCountedParts = @($clipLengthGate.parts | ForEach-Object { [string]$_ })
+    $boundParts = @($clipParts | ForEach-Object { [string]$_.path })
+    $partsAgree = ($gateCountedParts.Count -eq $boundParts.Count)
+    for ($partAt = 0; $partsAgree -and $partAt -lt $gateCountedParts.Count; $partAt++) {
+        if (-not $gateCountedParts[$partAt].Equals($boundParts[$partAt], [StringComparison]::OrdinalIgnoreCase)) { $partsAgree = $false }
+    }
+    if (-not $partsAgree) {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: CLIP_LENGTH_UNKNOWN (reason=binding_parts_mismatch gate_parts=$($gateCountedParts.Count) bound_parts=$($boundParts.Count))")
+        exit (Get-GuiSmokeGateExitCode -Verdict 'CLIP_LENGTH_UNKNOWN')
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($Output)) {
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $clipBase = [IO.Path]::GetFileNameWithoutExtension($inputPath)

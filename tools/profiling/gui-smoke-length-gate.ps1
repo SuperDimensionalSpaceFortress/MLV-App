@@ -187,7 +187,7 @@ function Get-GuiSmokeClipLength {
     (0 or 1) is still followed by every probed part (Bachelor M16-1457: 1671 frames counted where the app plays 2859).
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
-    $unknown = { param($why) [pscustomobject]@{ known = $false; reason = $why; frames = 0; fps = 0.0; seconds = 0.0 } }
+    $unknown = { param($why) [pscustomobject]@{ known = $false; reason = $why; frames = 0; fps = 0.0; seconds = 0.0; parts = @() } }
     $first = Read-GuiSmokeMlviHeader -Path $Path
     if (-not $first.ok) { return (& $unknown $first.reason) }
     # Header validity precedes the block walk (as before the walk existed): a zero-fps header reports bad_fps, not the walk's verdict.
@@ -238,7 +238,10 @@ function Get-GuiSmokeClipLength {
     }
     if ($frames -le 0) { return (& $unknown 'zero_frames') }
     $fps = [double]$first.fpsNom / [double]$first.fpsDenom
-    return [pscustomobject]@{ known = $true; reason = ''; frames = $frames; fps = $fps; seconds = ([double]$frames / $fps) }
+    # parts: the full paths of the parts counted above, first part then the probed names in probe order. A launcher that BINDS
+    # the clip's parts (run-release-gui-smoke.ps1) compares its own list to this one (GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r4).
+    return [pscustomobject]@{ known = $true; reason = ''; frames = $frames; fps = $fps; seconds = ([double]$frames / $fps)
+                              parts = @(, $Path) + @($probed) }
 }
 
 function Get-GuiSmokeClipPlayFloorSeconds {
@@ -277,7 +280,7 @@ function Test-GuiSmokeClipLength {
     $required = [Math]::Max($MinSeconds, $WindowSeconds)
     $out = [pscustomobject]@{
         verdict = 'OK'; message = 'OK'; clipSeconds = $len.seconds; windowSeconds = $WindowSeconds
-        requiredSeconds = $required; frames = $len.frames; fps = $len.fps; minSeconds = $MinSeconds
+        requiredSeconds = $required; frames = $len.frames; fps = $len.fps; minSeconds = $MinSeconds; parts = @($len.parts)
     }
     if (-not $len.known) {
         $out.verdict = 'CLIP_LENGTH_UNKNOWN'
