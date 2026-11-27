@@ -995,8 +995,9 @@ TEST(PlaybackUnpacedWiring, APacedPlayHoldsAtItsRequiredFramesOnlyWhileTheMeasur
                                          QStringLiteral("void MainWindow::showPerformanceProfilingDialog"));
     ASSERT_FALSE(handling.isEmpty());
     const QString pacedHold = QStringLiteral(
-        "        if( playback_frame_range::pacedMeasuredHoldReached( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(),\n"
-        "                m_pacedMeasuredHoldSession != 0 && m_playbackSmokeActive && m_pacedMeasuredHoldSession == m_playbackSmokeSessionId,\n"
+        "        const bool pacedHoldArmed = m_pacedMeasuredHoldSession != 0 && m_playbackSmokeActive\n"
+        "                                 && m_pacedMeasuredHoldSession == m_playbackSmokeSessionId;\n"
+        "        if( playback_frame_range::pacedMeasuredHoldReached( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(), pacedHoldArmed,\n"
         "                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames ) )\n"
         "        {\n"
         "            notePacedMeasuredHold();\n"
@@ -1010,6 +1011,16 @@ TEST(PlaybackUnpacedWiring, APacedPlayHoldsAtItsRequiredFramesOnlyWhileTheMeasur
     ASSERT_TRUE(armedBefore >= 0);
     ASSERT_TRUE(pacedAt > armedBefore);
     ASSERT_TRUE(unpacedComment > pacedAt);
+    // r1 fix iteration 1 (adversary A1 on 57d1ab08): right after the hold, the tick's span is capped by the same armed paced hold,
+    // at the fps of the drop-frame request it feeds (timeDiff's only reader in playbackHandling)
+    const QString tickCap = QStringLiteral(
+        "        timeDiff = playback_frame_range::pacedMeasuredHoldTickMs( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(), pacedHoldArmed,\n"
+        "                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames, timeDiff, getPlaybackFramerate() );\n");
+    ASSERT_EQ(1, source.count(tickCap));
+    ASSERT_EQ(1, source.count(QStringLiteral("playback_frame_range::pacedMeasuredHoldTickMs(")));
+    const int capAt = handling.indexOf(tickCap);
+    ASSERT_TRUE(capAt > pacedAt);
+    ASSERT_TRUE(unpacedComment > capAt);
     // the hold and its record touch no pace guard: no pace read, no grant
     const QString holdSpan = handling.mid(armedBefore, unpacedComment - armedBefore);
     ASSERT_EQ(0, holdSpan.count(QStringLiteral("playbackPaceGuardFps()")));

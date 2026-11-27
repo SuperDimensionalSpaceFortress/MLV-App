@@ -13287,13 +13287,18 @@ void MainWindow::playbackHandling(int timeDiff)
         // frame (Bachelor fullscreen, present ~32 ms per 16.7 ms frame: one stall ran 1499 -> 2858). While that loop is armed
         // for this open session, an unpinned paced Play holds once the required source frames are consumed, so the loop's
         // next stop check sees Reached at the required frame; the loop disarms it on exit and the tail plays on.
-        if( playback_frame_range::pacedMeasuredHoldReached( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(),
-                m_pacedMeasuredHoldSession != 0 && m_playbackSmokeActive && m_pacedMeasuredHoldSession == m_playbackSmokeSessionId,
+        const bool pacedHoldArmed = m_pacedMeasuredHoldSession != 0 && m_playbackSmokeActive
+                                 && m_pacedMeasuredHoldSession == m_playbackSmokeSessionId;
+        if( playback_frame_range::pacedMeasuredHoldReached( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(), pacedHoldArmed,
                 m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames ) )
         {
             notePacedMeasuredHold();
             return;
         }
+        // r1 fix iteration 1 (adversary A1 on 57d1ab08): nor does one long-gap drop-frame tick carry it past the required frames
+        // (timeDiff feeds only that tick's request, fps x timeDiff / 1000, at the same fps)
+        timeDiff = playback_frame_range::pacedMeasuredHoldTickMs( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(), pacedHoldArmed,
+                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames, timeDiff, getPlaybackFramerate() );
 
         // CUDA-HEADROOM-1: unpaced, present -> early advance -> render -> present never yields to the smoke's stop check
         // (r1 venue: Reached at 480 frames, seen at 615). Once the required source frames are consumed, hold.

@@ -1449,6 +1449,25 @@ inline bool pacedMeasuredHoldReached( bool automationIsolated, bool unpacedReque
     return automationIsolated && !unpacedRequested && armedForOpenSession && targetPresentedFrames <= 0
         && requiredSourceFrames > 0 && consumedSourceFrames >= requiredSourceFrames;
 }
+// r1 fix iteration 1 (adversary A1 on 57d1ab08): the hold above runs BEFORE a tick, so one drop-frame tick that asks for
+// fps x timeDiff / 1000 frames after a long GUI gap (1000 ms at 60 fps: 60 frames) carried the timeline from 1499 to 1559 consumed
+// before the hold saw it. While the same paced hold applies and is not yet reached, the tick's span (ms) is capped at the time the
+// frames still short of the requirement take at the request's fps (rounded up: the tick reaches the requirement, at most a
+// fraction of a frame past it). Anything else -- not armed, pinned, unpaced, no requirement, an unknown fps, a span already short
+// enough -- returns timeDiffMs unchanged, so paced cadence before the crossing is untouched.
+inline int pacedMeasuredHoldTickMs( bool automationIsolated, bool unpacedRequested, bool armedForOpenSession,
+                                    int64_t targetPresentedFrames, int64_t consumedSourceFrames, int64_t requiredSourceFrames,
+                                    int timeDiffMs, double requestFps )
+{
+    if( !( automationIsolated && !unpacedRequested && armedForOpenSession && targetPresentedFrames <= 0 && requiredSourceFrames > 0 )
+     || consumedSourceFrames >= requiredSourceFrames || timeDiffMs <= 0 || !( requestFps > 0.0 ) || !std::isfinite( requestFps ) )
+        return timeDiffMs;
+    // consumed < required here: the difference is formed in uint64_t, exact for every int64 pair (the signed form overflows)
+    const double shortFrames = static_cast<double>( static_cast<uint64_t>( requiredSourceFrames )
+                                                    - static_cast<uint64_t>( consumedSourceFrames ) );
+    const double shortMs = std::ceil( shortFrames * 1000.0 / requestFps );
+    return shortMs < static_cast<double>( timeDiffMs ) ? static_cast<int>( shortMs < 1.0 ? 1.0 : shortMs ) : timeDiffMs;
+}
 // r8 fix 1 (adversary A2): a pinned capture is admitted only when its identity frame start + N exists and lies BEFORE the last frame
 // (lastFrameIndex, 0-based) -- the engine's end-of-clip stop can end Play before the last frame's present is credited. Refused
 // up front (exit 14) rather than played to a short count. An unpinned run (N <= 0) is never refused here.

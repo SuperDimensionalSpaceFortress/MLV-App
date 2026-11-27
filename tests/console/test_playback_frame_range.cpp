@@ -4929,6 +4929,75 @@ TEST( PlaybackPacedMeasuredHold, AStarvedStopCheckSeesTheRequiredFrameAndTheTail
     }
 }
 
+// r1 fix iteration 1 (adversary A1 on 57d1ab08): the hold runs before a tick, so a drop-frame tick after a long GUI gap asked for
+// fps x timeDiff / 1000 frames and carried the timeline past the requirement in one step (required 1500, consumed 1499, 1000 ms at
+// 60 fps: 1559). The tick's span is capped while the paced hold applies; the model applies a tick the way the engine does (the
+// request at the same fps, the slider on the floor of the position, the counter counting the start frame).
+namespace paced_tick_model
+{
+inline int64_t tick( double &position, int64_t startFrame, int timeDiffMs, double fps, bool unpaced, bool armed, int64_t target,
+                     int64_t required, int64_t *tickMsOut = nullptr )
+{
+    const int64_t consumed = static_cast<int64_t>( std::floor( position ) ) - startFrame + 1;
+    if( playback_frame_range::pacedMeasuredHoldReached( true, unpaced, armed, target, consumed, required ) ) return consumed;
+    const int tickMs = playback_frame_range::pacedMeasuredHoldTickMs( true, unpaced, armed, target, consumed, required, timeDiffMs, fps );
+    if( tickMsOut ) *tickMsOut = tickMs;
+    position += fps * static_cast<double>( tickMs ) / 1000.0;
+    return static_cast<int64_t>( std::floor( position ) ) - startFrame + 1;
+}
+}
+
+TEST( PlaybackPacedMeasuredHold, R1A1ALongGapDropFrameTickNeverCarriesTheTimelinePastTheRequiredFrames )
+{
+    using paced_tick_model::tick;
+    // the adversary's input: 60 fps, required 1500, position 1498 (consumed 1499, start 0), one 1000 ms tick
+    {
+        double position = 1498.0;
+        const int64_t after = tick( position, 0, 1000, 60.0, false, true, 0, 1500 );
+        ASSERT_TRUE( after >= 1500 );          // the tick still reaches the requirement ...
+        ASSERT_TRUE( after < 1502 );           // ... RED on 57d1ab08 (no cap): 1559
+        const int64_t held = tick( position, 0, 1000, 60.0, false, true, 0, 1500 );
+        ASSERT_EQ( after, held );              // and the next tick holds there
+    }
+    // the class: any gap, any start short of the requirement, the paced fps of the venue clips
+    for( const double fps : { 23.976, 25.0, 29.97, 59.94, 60.0, 120.0 } )
+        for( const int gapMs : { 1, 8, 17, 33, 100, 250, 1000, 5000, 22000 } )
+            for( const double startPos : { 1450.0, 1490.5, 1497.0, 1497.99, 1498.0, 1498.5 } )
+            {
+                double position = startPos;
+                int64_t consumed = static_cast<int64_t>( std::floor( position ) ) + 1;
+                for( int t = 0; t < 4000 && consumed < 1500; ++t ) consumed = tick( position, 0, gapMs, fps, false, true, 0, 1500 );
+                ASSERT_TRUE( consumed >= 1500 );
+                ASSERT_TRUE( consumed < 1502 );
+            }
+    // unchanged whenever the paced hold does not apply, and before the crossing: the span passes through untouched
+    for( const int gapMs : { 17, 1000 } )
+    {
+        int64_t tickMs = -1;
+        double position = 1498.0;
+        tick( position, 0, gapMs, 60.0, false, false, 0, 1500, &tickMs );   // not armed (the tail after the loop)
+        ASSERT_EQ( gapMs, tickMs );
+        position = 1498.0;
+        tick( position, 0, gapMs, 60.0, true, true, 0, 1500, &tickMs );     // unpaced: CUDA-HEADROOM-1's hold, unchanged
+        ASSERT_EQ( gapMs, tickMs );
+        position = 1498.0;
+        tick( position, 0, gapMs, 60.0, false, true, 480, 1500, &tickMs );  // pinned
+        ASSERT_EQ( gapMs, tickMs );
+    }
+    ASSERT_EQ( 17, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 100, 1500, 17, 60.0 ) );   // far from it
+    ASSERT_EQ( 1000, playback_frame_range::pacedMeasuredHoldTickMs( false, false, true, 0, 1499, 1500, 1000, 60.0 ) );
+    ASSERT_EQ( 1000, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 0, 1000, 60.0 ) );
+    ASSERT_EQ( 1000, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1000, 0.0 ) );
+    ASSERT_EQ( 1000, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1000,
+                                                                    std::numeric_limits<double>::quiet_NaN() ) );
+    ASSERT_EQ( 0, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 0, 60.0 ) );
+    ASSERT_EQ( 17, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1000, 60.0 ) );
+    // no overflow at the int64 extremes: the shortfall is formed exactly, and a span shorter than it passes through
+    ASSERT_EQ( 1000, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, std::numeric_limits<int64_t>::min(),
+                                                                    std::numeric_limits<int64_t>::max(), 1000, 60.0 ) );
+    ASSERT_EQ( 1, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1000, 1.0e9 ) );
+}
+
 TEST( PlaybackPacedMeasuredHold, APinnedOrUnpacedRunIsNeverHeldByThePacedHold )
 {
     using namespace paced_starvation_model;
