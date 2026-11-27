@@ -1484,6 +1484,7 @@ function Get-DvVisualCaptureBeginRecord {
                 $postBurstDrops++
             }
             elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=playback_prep\.invalidate_generation(\s|$)'), $script:DvCi)) { }   # before the begin record: not tail evidence
+            elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture(\s|$)'), $script:DvCi)) { }   # r12 (Grok CoS G4): the app's own summary record (MainWindow.cpp logInteractionEvent "gui_smoke.visual_capture"): not tail evidence, and its free-text error="..." may name any event, so the catch-all below must not read it
             elseif ([string]$line -match '(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation') {
                 # r11 adversary A2 (sol on 6c0a9228): a record naming one of these events in any other form (a quoted event=, two spaces) was skipped
                 # silently, so a doubled or unreadable burst_end, begin, clip_changed or invalidation vanished; it now voids the whole tail binding

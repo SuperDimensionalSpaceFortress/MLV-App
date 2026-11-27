@@ -21995,7 +21995,7 @@ class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
 
 
 @requires_windows_pwsh
-class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
+class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.TestCase):
     """EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r1 (design opus-001 F1, absorbs PLAYBACK-UNPACED-TAIL-PAINTED-CPU-1). An UNPINNED every-frame run closes its
     measured window when the engine consumes its last target, so the pipeline's last targets are still in flight at the close. Receipt 231ea06e (CPU, Bachelor,
     M16-1243): the app's conform line says max_jump=1 for frames 1..477 (nothing skipped), but the engine had reached 479 at the close, and the reader derived
@@ -22209,7 +22209,12 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 # r11 adversary A1 (sol on 6c0a9228): the burst rows must be exactly 0 .. burst_captures-1, so unless a test names burst_captures, the log the
                 # fixture stands for logged the burst rows the fixture's visual.json carries
                 if "visualBurstCaptures" not in caller_pb and isinstance(rows, list):
-                    pb["visualBurstCaptures"] = sum(1 for r in rows if isinstance(r, dict) and r.get("kind") == "play_first_unbound")
+                    burst_indices = [r.get("index") for r in rows if isinstance(r, dict) and r.get("kind") == "play_first_unbound"]
+                    # r12 (Grok CoS G5 on 92e096dd): the default only stands for a fixture whose burst rows are exactly 0 .. n-1 (the app numbers them so),
+                    # so a sparse or repeated fixture fails here, loudly, and is never renumbered quietly into a log that logged what it did not
+                    self.assertEqual(burst_indices, list(range(len(burst_indices))),
+                                     "a fixture with burst rows not numbered 0..n-1 must name visualBurstCaptures itself (the helper default would otherwise satisfy TAIL_CREDIT_BURST_NOT_LOGGED for it)")
+                    pb["visualBurstCaptures"] = len(burst_indices)
                 if png != "none":
                     for row in rows if isinstance(rows, list) else []:
                         if not isinstance(row, dict) or row.get("kind") not in ("play", "play_unbound", "play_first_unbound") or not isinstance(row.get("index"), int):
@@ -23114,7 +23119,8 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         r479 = self.play(2, kind="play_first_unbound", tail_elapsed_ms=64, display_frame=479, serial=486, painted_serial=486)
         for name, rows in (("477 then 478", (r477, r478, r479)), ("478 then 477", (r478, r477, r479)), ("478 and 479 alone", ({**r478, "tail_elapsed_ms": 64}, r479))):
             with self.subTest(case=name):
-                out = self.metrics(None, app=self.app_json(*rows), criteria=crit)
+                # r12 (G5): these document orders and the pair (indices 1, 2) are not numbered 0..n-1, so each names the burst count it always stood for (its row count)
+                out = self.metrics({"visualBurstCaptures": len(rows)}, app=self.app_json(*rows), criteria=crit)
                 self.assert_no_credit(out, 2)
                 self.assertIn("TAIL_CREDIT_EQUAL_TIME", out["m"]["conformTailInFlightCreditNote"], out)
         with self.subTest(case="(control) 478 at 34 ms then 479 at 64 ms"):
@@ -23261,6 +23267,158 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 got = derive(lines)
                 self.assertEqual((got["b"], got["p"]), (None, None), got)
 
+    # R6-BURST-CUTOFF-RESIDUE-1 r12 (Grok CoS G4 on 92e096dd). Every logInteractionEvent emitter of a name the tail reader's fail-closed catch-all
+    # (Get-DvVisualCaptureBeginRecord, DualVenueRunner.psm1 `-match '(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation'`) watches, with the
+    # value each placeholder takes in a real run. The record bodies are built from the format strings read out of MainWindow.cpp, so a new field, a renamed
+    # event or a new emitter of one of these names fails the control loudly instead of leaving it stale. The free-text fields (invalidate's `reason=`, the
+    # summary record's `error="..."`) name events on purpose: a catch-all that reads the whole line voids the binding for them.
+    TAIL_EMITTER_VALUES = {
+        "gui_smoke.visual_capture.begin": {"measured_session": "3", "tail_ms": "3000", "play_frames": "6", "tail_begin_utc": BEGIN_UTC},
+        "gui_smoke.visual_capture.burst_end": {"measured_session": "3","burst_captures": "2", "generation_changes": "0", "stale_drops": "0",
+                                               "generation_drops": "0", "replaced_before": "0", "replaced_after": "0"},
+        "gui_smoke.visual_capture.clip_changed": {"refused_play_captures": "1", "capture_generation": "7"},
+        "playback_prep.invalidate_generation": {"reason": "resize-keep-playing", "new_generation": "4", "dropped_pending": "0", "dropped_results": "0",
+                                                "released_serials": "0", "cancelled_render": "0", "latest_serial": "483", "still_drawing": "0"},
+        "gui_smoke.visual_capture": {"measured_session": "3", "requested": "5", "written": "5", "stop_frame": "480", "paused_settled": "1",
+                                     "tail_begin_utc": BEGIN_UTC, "tail_end_utc": "2026-11-25T18:00:03.100Z", "error": "", "source_difference": "omitted"},
+    }
+    TAIL_CATCH_ALL = r"'(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation'"
+    TAIL_SUMMARY_EXEMPTION = (r"elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture(\s|$)'), "
+                              r"$script:DvCi)) { }")
+
+    @classmethod
+    def tail_emitters(cls) -> dict:
+        """event name -> (MainWindow.cpp line, format string) for every logInteractionEvent emitter of a name the catch-all watches."""
+        src = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
+        found = {}
+        for m in re.finditer(r'logInteractionEvent\(\s*QStringLiteral\("(gui_smoke\.visual_capture(?:\.\w+)?|playback_prep\.invalidate_generation)"\),\s*'
+                             r'QStringLiteral\("((?:[^"\\]|\\.)*)"\)', src):
+            found.setdefault(m.group(1), []).append((src.count("\n", 0, m.start()) + 1, m.group(2).replace('\\"', '"')))
+        # every literal of these names in the file is one of the emitters read above (an emitter of another shape would be missed otherwise)
+        literals = re.findall(r'"(?:gui_smoke\.visual_capture[\w.]*|playback_prep\.invalidate_generation)"', src)
+        assert len(literals) == sum(len(v) for v in found.values()), (literals, found)
+        return {name: rows[0] for name, rows in found.items() if len(rows) == 1} | {name + " (DOUBLED)": rows[0] for name, rows in found.items() if len(rows) != 1}
+
+    def tail_record(self, name: str, **free_text: str) -> str:
+        """The run-log line the app writes for one emitter: the fields of its MainWindow.cpp format string, filled from TAIL_EMITTER_VALUES (+ free_text)."""
+        line_no, fmt = self.tail_emitters()[name]
+        values = {**self.TAIL_EMITTER_VALUES[name], **free_text}
+        keys = [m.group(1) for m in re.finditer(r'(\w+)=("?)%\d+\2', fmt)]
+        self.assertEqual(sorted(keys), sorted(self.TAIL_EMITTER_VALUES[name]), f"{name} (MainWindow.cpp:{line_no}) writes other fields than the control fills")
+        body = re.sub(r'(\w+)=("?)%\d+\2', lambda m: f"{m.group(1)}={m.group(2)}{values[m.group(1)]}{m.group(2)}", fmt)
+        return f"[2026-11-25T18:00:00.000Z] [INFO] [0xa] interaction_trace event={name} {body} (C:/build/platform/qt/MainWindow.cpp:{line_no})"
+
+    def derive_tail_binding(self, lines: list, module: Path | None = None) -> dict:
+        """Get-DvPlaybackEvidence over a run log: the tail binding and counts it hands the credit (visualCaptureBeginSession / Utc / ClipChanged, the prep counts)."""
+        log = "\n".join(lines) + "\n"
+        sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
+        proc = run_pwsh(["-Command", f"Import-Module '{module or DV / 'DualVenueRunner.psm1'}' -Force\n"
+                         "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false; clipId = $env:DVE_CLIP }\n"
+                         "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
+                         "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
+                         "$pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $env:DVE_LOG -LogSha256 $env:DVE_SHA -ExpectedClipId $env:DVE_CLIP\n"
+                         "[ordered]@{ visualCaptureBeginSession = $pb.visualCaptureBeginSession; visualCaptureBeginUtc = $pb.visualCaptureBeginUtc; "
+                         "visualCaptureClipChanged = $pb.visualCaptureClipChanged; visualTailPrepDrops = $pb.visualTailPrepDrops; "
+                         "visualBurstCaptures = $pb.visualBurstCaptures; visualPostBurstPrepDrops = $pb.visualPostBurstPrepDrops } | ConvertTo-Json -Compress"],
+                        env_extra={"DVE_LOG": log, "DVE_SHA": sha, "DVE_NONCE": NONCE, "DVE_CLIP": "M16-1243"})
+        try:
+            return json.loads(proc.stdout)
+        except ValueError:
+            self.fail(proc.stdout + proc.stderr)
+
+    TAIL_SUMMARY_ERROR = "gui_smoke.visual_capture.burst_end could not be written; playback_prep.invalidate_generation followed"
+
+    def every_emitter_log(self, with_clip_changed: bool = False, error: str | None = None) -> list:
+        """A run log carrying one record from every emitter, in the app's order: an invalidation BEFORE the begin record (its free-text `reason` names an
+        event), the begin record, burst_end (two burst captures), the play-stop invalidation AFTER burst_end (its `reason` names an event too), and the
+        gui_smoke.visual_capture summary record (its `error` names two events); clip_changed (the FileOpen record) only when asked, since it refuses the
+        credit by design."""
+        measured = ["playback_smoke.measured_session id=3",
+                    "playback_smoke.conform session=3 clip_fps=23.976 playback_fps=23.976 conform_active=0 conform_enabled=1 conform_env_override=0 "
+                    "audio_sync_requests=0 paint_wait_escapes=0", conformed_summary_line()]
+        tail = [self.tail_record("playback_prep.invalidate_generation", reason="gui_smoke.visual_capture.begin"),
+                self.tail_record("gui_smoke.visual_capture.begin"),
+                self.tail_record("gui_smoke.visual_capture.burst_end")]
+        if with_clip_changed:
+            tail.append(self.tail_record("gui_smoke.visual_capture.clip_changed"))
+        tail += [self.tail_record("playback_prep.invalidate_generation", reason="playback_prep.invalidate_generation"),
+                 self.tail_record("gui_smoke.visual_capture", error=self.TAIL_SUMMARY_ERROR if error is None else error)]
+        return measured + tail
+
+    def credit_from_log(self, lines: list, module: Path | None = None) -> tuple:
+        """(the binding the log yields, the credit metrics) with the burst rows visual.json carries for a two-capture burst (frames 478 and 479, own serials)."""
+        derived = self.derive_tail_binding(lines, module)
+        burst = (self.play(0, kind="play_first_unbound", tail_elapsed_ms=8, display_frame=478, serial=484, painted_serial=484),
+                 self.play(1, kind="play_first_unbound", tail_elapsed_ms=45, display_frame=479, serial=485, painted_serial=485))
+        return derived, self.metrics({**derived, "summarySession": "3", "conformSession": "3"}, app=self.app_json(*burst, measured_session=3), criteria=self.BOTH)
+
+    def test_r12_g4_a_log_built_from_every_app_emitter_still_binds_the_tail_and_credits_two(self) -> None:
+        """Grok CoS G4 (control). The emitters, as of 92e096dd: MainWindow.cpp:4662 playback_prep.invalidate_generation (free-text `reason=%1`), :11924
+        gui_smoke.visual_capture.begin, :11978 gui_smoke.visual_capture.burst_end, :12089 gui_smoke.visual_capture.clip_changed, :12195 the
+        gui_smoke.visual_capture summary record (free-text `error=\"%8\"`). A log carrying every one of them, with event names in both free-text fields, binds
+        the tail (session 3,the begin record's UTC), counts no tail drop and one post-burst drop, and credits both burst targets. RED when the A2 catch-all
+        (DualVenueRunner.psm1:1487) reads the whole line, which voids the binding for the summary record."""
+        self.assertEqual(sorted(self.tail_emitters()), sorted(self.TAIL_EMITTER_VALUES), "MainWindow.cpp carries an emitter of a watched name the control does not build")
+        derived, out = self.credit_from_log(self.every_emitter_log())
+        self.assertEqual(derived, {"visualCaptureBeginSession": "3", "visualCaptureBeginUtc": self.BEGIN_UTC, "visualCaptureClipChanged": 0, "visualTailPrepDrops": 0,
+                                   "visualBurstCaptures": 2, "visualPostBurstPrepDrops": 1}, derived)
+        self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+        self.assertTrue(out["v"]["pass"], out)
+
+    def test_r12_g4_clip_changed_refuses_the_credit_for_its_own_reason_and_leaves_the_binding_readable(self) -> None:
+        """The clip_changed emitter (MainWindow.cpp:12089) is the one record that refuses the credit by design (the open clip changed during the tail). The
+        refusal must come from its own count, never from a voided binding: the session and UTC still read, clipChanged is 1, the note names clip_changed."""
+        derived, out = self.credit_from_log(self.every_emitter_log(with_clip_changed=True))
+        self.assertEqual((derived["visualCaptureBeginSession"], derived["visualCaptureBeginUtc"], derived["visualCaptureClipChanged"]), ("3", self.BEGIN_UTC, 1), derived)
+        self.assertNotIn("conformTailInFlightCreditedFrames", out["m"], out)
+        self.assertIn("clip_changed count=1", out["m"]["conformTailInFlightCreditNote"], out)
+
+    def test_r12_g4_mutation_the_catch_all_without_its_trailing_dot_turns_the_control_red(self) -> None:
+        """Mutation rows for the A2 catch-all (DualVenueRunner.psm1:1487). On 92e096dd the catch-all read the whole line, so (a) the summary record's own event
+        name (`gui_smoke.visual_capture `) matched it as soon as its trailing `\\.` was dropped, and (b) an `error=\"...\"` naming an event matched it with the
+        `\\.` in place; either voided every real run's binding (the control RED: no session, no UTC, no drops, no credit). r12 exempts the summary record
+        (TAIL_SUMMARY_EXEMPTION) ahead of the catch-all, so rows 1 and 2 drive the module with that exemption removed, and row 3 is the equivalent mutant."""
+        self.assertEqual(self.tail_catch_all_count(), 1)
+        dotless = (self.TAIL_CATCH_ALL, self.TAIL_CATCH_ALL.replace(r"visual_capture\.|", r"visual_capture|"))
+        no_exemption = (self.TAIL_SUMMARY_EXEMPTION, "elseif ($false) { }")
+        empty_error = self.every_emitter_log(error="")
+        voided = {"visualCaptureBeginSession": None, "visualCaptureBeginUtc": None, "visualTailPrepDrops": None}
+        for name, edits, log, red in (
+                ("row 1: exemption removed, the error names events (the 92e096dd behaviour)", [no_exemption], self.every_emitter_log(), True),
+                ("row 2: exemption removed and the trailing dot dropped, an empty error", [no_exemption, dotless], empty_error, True),
+                ("row 2 control: exemption removed, the trailing dot in place, an empty error (the unmutated 92e096dd binds)", [no_exemption], empty_error, False),
+                ("row 3 (equivalent mutant): the trailing dot dropped alone, the exemption in place", [dotless], self.every_emitter_log(), False)):
+            with self.subTest(case=name):
+                derived, out = self.credit_from_log(log, module=self.mutated_module(edits))
+                if red:
+                    self.assertEqual({k: derived[k] for k in voided}, voided, derived)
+                    self.assertNotIn("conformTailInFlightCreditedFrames", out["m"], out)
+                    self.assertTrue(out["m"]["conformTailInFlightCreditNote"].startswith("TAIL_VISUAL_NOT_THIS_RUN"), out)
+                else:
+                    self.assertEqual((derived["visualCaptureBeginSession"], derived["visualBurstCaptures"]), ("3", 2), derived)
+                    self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+
+    def test_r12_g5_a_sparse_or_repeated_burst_fixture_fails_loudly_unless_it_names_its_burst_count(self) -> None:
+        """Grok CoS G5: metrics() defaults visualBurstCaptures to the fixture's own play_first_unbound row count, which satisfies TAIL_CREDIT_BURST_NOT_LOGGED by
+        construction. The default now stands only for burst rows numbered exactly 0 .. n-1 (the app's numbering); a sparse (0, 2) or repeated (0, 0) fixture fails
+        in the helper, and a test that means such a fixture names visualBurstCaptures itself (which then reaches TAIL_CREDIT_BURST_NOT_LOGGED)."""
+        def row(index: int, ms: int, frame: int, serial: int) -> dict:
+            return self.play(index, kind="play_first_unbound", tail_elapsed_ms=ms, display_frame=frame, serial=serial, painted_serial=serial)
+        for name, rows in (("sparse 0, 2", (row(0, 8, 478, 484), row(2, 45, 479, 486))), ("repeated 0, 0", (row(0, 8, 478, 484), row(0, 45, 479, 486))),
+                           ("starts at 1", (row(1, 8, 478, 484), row(2, 45, 479, 486)))):
+            with self.subTest(case=name):
+                with self.assertRaises(AssertionError) as raised:
+                    self.metrics(None, app=self.app_json(*rows), criteria=self.BOTH)
+                self.assertIn("0..n-1", str(raised.exception))
+        sparse = self.app_json(row(0, 8, 478, 484), row(2, 45, 479, 486))
+        out = self.metrics({"visualBurstCaptures": 2}, app=sparse, criteria=self.BOTH)
+        self.assertIn("TAIL_CREDIT_BURST_NOT_LOGGED", out["m"]["conformTailInFlightCreditNote"], out)
+        dense = self.metrics(None, app=self.app_json(row(0, 8, 478, 484), row(1, 45, 479, 485)), criteria=self.BOTH)
+        self.assertEqual(dense["m"].get("conformTailInFlightCreditedFrames"), 2, dense)
+
+    def tail_catch_all_count(self) -> int:
+        return (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8").count(self.TAIL_CATCH_ALL)
+
     def test_r4r_r4_the_play_first_unbound_burst_before_the_first_forced_paint_is_credited(self) -> None:
         """R4: the app's play_first_unbound burst (index 0, play-first-unbound-0.png, forced_paints_before=0, saved, Play active, label-bound, a 16-hex source_id,
         display_frame = the in-flight target 479, its recorded PNG) with no qualifying play_unbound row: credited. 9a5baab0's reader ignored the kind (dormant
@@ -23278,7 +23436,8 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             self.assert_no_credit(out, 1)
             self.assertIn("TAIL_VISUAL_FILE_AMBIGUOUS", out["m"]["conformTailInFlightCreditNote"], out)
         with self.subTest(case="a duplicate kind|index is refused"):
-            out = self.metrics(app=self.app_json(self.play(0, kind="play_first_unbound", display_frame=478, serial=483, painted_serial=483),
+            out = self.metrics({"visualBurstCaptures": 2},   # r12 (G5): a repeated index is not numbered 0..n-1, so the count it always stood for (its row count) is named
+                               app=self.app_json(self.play(0, kind="play_first_unbound", display_frame=478, serial=483, painted_serial=483),
                                                  self.play(0, kind="play_first_unbound")), criteria=self.BOTH)
             self.assertFalse(out["haveVisual"], out)
             self.assert_no_credit(out, 2)
