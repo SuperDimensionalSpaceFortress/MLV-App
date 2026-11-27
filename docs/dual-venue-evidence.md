@@ -718,6 +718,79 @@ pwsh -NoProfile -File tools\profiling\dual-venue\Invoke-VenueStageNightly.ps1 [-
   (`.claude-state\hub-autopilot\disk-floor.ps1`, `host-commit-gate.ps1`): exit 3 with the gate's own text, and a missing gate is
   `GATE_UNAVAILABLE`. It bounds every child by `-MaxTotalSec`. The typed exit table is in the script header.
 
+## The display-path block (`venue.displayPath`, VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2)
+
+Why it exists: two legs on one venue with a byte-identical exe, clip and spec can still differ, and a receipt that does not say which video
+adapters and display device the venue reported cannot show whether its display route was the same on both (Bachelor's 59.56 -> 38.78 fps control,
+BACHELOR-1457-NATIVE-GUI-LATE-ENV-DIFF-1, is the case that raised the question; that investigation left the cause open, recorded a cadence change on
+identical app inputs and a later display-route sample, and established no earlier adapter route, so this block does not say an adapter caused it).
+A receipt therefore carries ONE display-path block, written by ONE writer and read by ONE reader. It replaces the closed PR #904 (VENUE-LEG-DISPLAY-PATH-RECEIPT-1), whose wider collector and
+timing work were not carried over: this block adds no venue read, no CIM query, no clock and no wait.
+
+**Writer.** `New-DvDisplayPathBlock -ProbeStdout <the health probe job's stdout>` (`DualVenueRunner.psm1`), called once by `Invoke-VenueLeg.ps1`
+right after the health probe job returns and BEFORE the probe's other fields are parsed and copied (so the block is attached even when
+`ConvertFrom-DvProbeStdout` later refuses the line, and an unhealthy or host-mismatched leg carries the block too). It reads the same `DVE_PROBE=` line
+`ConvertFrom-DvProbeStdout` reads (the first one), but with `System.Text.Json` and strict options, and copies three fields the probe already reports:
+
+| Field | Type | Value |
+|---|---|---|
+| `schema` | string | exactly `mlv-app/venue-display-path/v2` (`v1` was the closed #904 shape; it reads malformed) |
+| `source` | string | exactly `health-probe`: the probe's sample, taken before the measurement job is submitted, never re-read during the run |
+| `adapters` | list of strings | the probe's `gpuNames` (every `Win32_VideoController` name, in probe order), 1 to 64 of them |
+| `firstAdapterDriverVersion` | string or null | the probe's `driverVersion` (the first video controller's driver) |
+| `primaryDisplayDevice` | string or null | the probe's `displayDevice` (`Screen.PrimaryScreen.DeviceName`, e.g. `\\.\DISPLAY1`) |
+
+The writer writes **no** block, never a malformed one and never a throw, when the line is missing or not a strict JSON object, or when a field
+is missing, appears twice, appears in another letter case or has the wrong type. The same goes for a member name at the root of the probe line
+that cannot be read back, for an unreadable string among the three copied values (each `gpuNames` element, `driverVersion`, `displayDevice`), and for
+any block its reader would not type `present` (for example an empty adapter list or a name that lost a letter on the way). A receipt written
+without a block reads `NO_SIGNAL`. The writer validates exactly those three copied fields and the member names at the root of the line, and no other
+probe string: a probe whose `hostName` (not a copied field) is an unreadable escape such as `"\ud800"` still yields a present block, which never
+carries that string, so that receipt does not read `NO_SIGNAL`. Since the line is read with `System.Text.Json`, a time-looking device name is copied as the text the probe printed. The block names the
+adapters and the primary display device. It does not say which adapter drives that display.
+Because the block copies the probe's own report and no hashed artifact carries it, `Test-DvReceiptValid` lists `DISPLAY_PATH_UNBOUND` among the
+`unbound` claims of a PASS / FAIL receipt that carries it, and a sheet-pair record lists `venue.displayPath` as unbound. It is never a verdict input.
+
+**The receipt text at the validator.** `ConvertFrom-Json` (object and `-AsHashtable`) keeps only the last of two same-name members, so a parsed
+receipt cannot show a first `venue` block that the strict reader types `malformed`. `Test-DvReceiptValid -ReceiptText <the text the receipt was
+parsed from>` therefore reads the text too (`Get-DvReceiptTextDisplayPathFacts`, `System.Text.Json`, the same name rule as the reader). The two
+file readers that pair receipts (`New-VenueSheetPair.ps1`, `New-VenueFlavorPair.ps1`), `Invoke-VenueBaseline.ps1` and `Write-DvReceipt` pass it.
+With the text, the `DISPLAY_PATH_UNBOUND` marker and the duplicate finding come from one of two sources, which are these two cases:
+(a) The member scan completes: the text is strict JSON for `System.Text.Json` default options, has an object root and stays within its depth limit.
+A lone-surrogate string or member name elsewhere does not stop the scan, which looks only at the `venue` and `displayPath` member names, and it owes no marker
+of its own. The marker is owed when ANY `venue` occurrence in the text holds a `displayPath` member, and a PASS / FAIL receipt that names `venue` more than
+once, or one `venue` that names `displayPath` more than once, in any letter case, is `INVALID` with `DISPLAY_PATH_DUPLICATE_MEMBER` (it fails closed). The scan keeps
+its marker and its duplicate finding even when the readability check then finds a lone surrogate.
+(b) The scan yields no facts (a comment, a trailing comma, nesting past its depth limit, a root that is not an object, or a scan that threw): nothing comes from the text,
+and the marker follows the parsed object alone (`ConvertFrom-Json` keeps the last of two same-name members), so it is not guaranteed when only an earlier duplicate
+`venue` holds the block.
+In every case the strict reader cannot inspect (those in (b), and a lone surrogate in (a)) a PASS / FAIL receipt is `INVALID` with `DISPLAY_PATH_TEXT_UNREADABLE`, whatever the marker says. A text that was supplied and that the strict reader cannot inspect
+(not strict JSON for `System.Text.Json` default options: a comment, a trailing comma, nesting deeper than 64, which `ConvertFrom-Json` reads up to 1024;
+or a root that is not an object, or any name or string that cannot be read back, an escaped lone surrogate) cannot be ruled free of a duplicate member, so a PASS / FAIL receipt carrying it is `INVALID` with
+`DISPLAY_PATH_TEXT_UNREADABLE`; the parsed object's own status is never the answer for it. The depth limit is not raised: the strict reader's grammar is
+the contract. A caller that omits `-ReceiptText` (or passes an empty one) is judged on the parsed object alone, as before.
+
+**Reader.** `Read-DvReceiptDisplayPath -ReceiptText <the receipt file's text>` reads with `System.Text.Json` and its strict default options
+(no comments, no trailing commas, double-quoted names and strings only, depth 64), every string exactly as written. There is no second reader,
+no `ConvertFrom-Json` fallback and no recovery rewrite. It returns `{ state; block; reason }` with `state` one of:
+
+* `present`: `block` is the typed block above.
+* `NO_SIGNAL`: no `venue` member, or a `venue` object with no `displayPath` member. That is every receipt written before this card, so a legacy
+  receipt reads as it did on fork/master. `Test-DvReceiptValid` does not read the block, and its status for a receipt that names `venue` once is unchanged.
+* `malformed`: any parse failure of the block. That covers a text that is not strict JSON, a root that is not an object, `venue` or `displayPath`
+  twice in any letter case, a `venue` that is not an object, a block member not spelled `displayPath`, a block that is not an object (JSON
+  `null` included), and a missing, unknown, doubled or wrongly typed field. So are a `schema`/`source` that is not the exact string, an empty
+  adapter list (every Windows host has a video controller, so none is a failed read) or more than 64 adapters, and a name or string anywhere
+  in the receipt that cannot be read back (an escaped lone surrogate). So is a block string that carries U+FFFD or `?`. Those are the marks
+  of a text that was not carried as reported: a decoder turns a lone surrogate into U+FFFD, and a venue agent that writes its result as ASCII
+  turns a non-ASCII letter into `?`. No adapter, driver or display name holds either. Every name and string comparison is ordinal:
+  PowerShell's `-ceq` / `-cne` / `-cnotcontains` compare by culture and ignore a NUL or a soft hyphen inside a text.
+
+`ConvertFrom-Json` reads several of those texts differently: it keeps the last of two same-name keys, accepts `//` comments, single quotes and
+trailing commas, reads a lone surrogate and turns `2026-11-24T00:00:00Z` into a `[datetime]`. That is why the block is read with one grammar
+only (pass-2 A3 of #904). `tools/repo_hygiene/test_venue_leg_display_path.py` pins the four rows: grammar parity, malformed, legacy `NO_SIGNAL`
+and the round trip through `Write-DvReceipt` and `Invoke-VenueLeg`.
+
 ## How to read the evidence
 
 * **Acceptance** reads only receipts whose `venue.role` is `acceptance` for the card, and only `PASS`/`FAIL`.
