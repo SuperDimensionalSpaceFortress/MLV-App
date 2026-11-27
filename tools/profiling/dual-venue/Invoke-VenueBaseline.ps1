@@ -495,6 +495,9 @@ foreach ($b in $StandardBackends) {
             $hl = $(if ($figRefused -or $chainRefusedHostLoad) { Get-VenueLegHostLoad -ReceiptPath '' -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' }
                     elseif ($null -ne $fig.resultJsonSha256) { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -ExpectResultJsonSha256 ([string]$fig.resultJsonSha256) -PlannedLegType $hlPlanned -ExpectReceiptSha256 $hlExpectSha -CallDeadlineUtc $deadline }
                     else { Get-VenueLegHostLoad -ReceiptPath $hlReceipt -PlannedLegType $hlPlanned -ExpectReceiptSha256 '' -CallDeadlineUtc $deadline })
+            # R2-NARROW-1 r7 (sol r7 A3, key3 fable r7 parity gap): the standing is judged against the run's absolute end where it is CONSUMED, by the same VenueChain.psm1 guard the chain and the lease batch
+            # use. A standing the reader returned at 899.9 s of a 900 s cap, consumed after a suspension at 901 s, reads unknown, provisional and uncollected: the row is kept for the trend file, never measured.
+            $hl = Limit-VenueHostLoadToDeadline -Standing $hl -DeadlineUtc $deadline
             $hlLine = Get-VenueReferenceHostLoadRefusal -LegId $(if ($hlReceipt) { [IO.Path]::GetFileNameWithoutExtension($hlReceipt) } else { [string]$planLeg.legId }) -Standing $hl
             if ($hlLine -and $legStatus -ceq 'RAN') { Out-Line $hlLine }
             $rows.Add([ordered]@{

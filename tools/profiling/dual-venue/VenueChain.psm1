@@ -2095,6 +2095,16 @@ function Get-VenueLegHostLoad {
     }
 }
 
+function Limit-VenueHostLoadToDeadline {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r7 (sol r7 A3): the ONE guard every caller of Get-VenueLegHostLoad applies where it CONSUMES the standing (the chain, the lease batch and
+    # the baseline; it was an inline copy in the first two). A standing a caller sees after its own absolute end is never acted on, whatever the reader returned: the caller can be
+    # suspended after the reader's last check (a standing that passed at 899.9 s of a 900 s cap and is consumed at 901 s must not become a counted row). Past the end it reads
+    # unknown, provisional and uncollected; before it, the standing comes back unchanged.
+    param([AllowNull()][object]$Standing, [Parameter(Mandatory)][DateTime]$DeadlineUtc)
+    if ($DeadlineUtc -le [DateTime]::UtcNow) { return [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'the standing was seen after the absolute end (-DeadlineUtc) and is never acted on'; applies = $true } }
+    $Standing
+}
+
 function Get-VenueReferenceHostLoadRefusal {
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the typed line for a leg that must not be counted as a control/reference arm, or $null when it may be.
     # REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state> (hostload-provisional when the state reads quiet but the leg is provisional).
@@ -2533,5 +2543,5 @@ Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, ConvertFrom-VenueSmokeHostLoad, ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember, Get-VenuePlannedLegType, Get-VenueLegHostLoad, Test-VenueReceiptIsExportLeg, Get-VenueReferenceHostLoadRefusal, Get-VenueReferenceArmVerdict, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, ConvertFrom-VenueSmokeHostLoad, ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember, Get-VenuePlannedLegType, Get-VenueLegHostLoad, Limit-VenueHostLoadToDeadline, Test-VenueReceiptIsExportLeg,Get-VenueReferenceHostLoadRefusal, Get-VenueReferenceArmVerdict, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Get-VenueClaimAgeSec, Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

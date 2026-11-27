@@ -3146,7 +3146,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # (adversary-7efea617.json A4: each file read is bounded by 20 s or what is left before -DeadlineUtc, whichever is less; under 1 s left it is not started and the standing is unknown, uncounted)
                 $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType $plannedType -ExpectReceiptSha256 $receiptSha -ReadTimeoutSec 20.0 -CallDeadlineUtc $deadline
                 # R2-RESIDUE-1 r2 (adversary-f1221390.json A2): a standing this caller sees after its own -DeadlineUtc is never acted on, whatever the reader returned (the caller can be suspended after the reader's last check)
-                if ($deadline -le [DateTime]::UtcNow) { $hl = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'the standing was seen after the absolute end (-DeadlineUtc) and is never acted on'; applies = $true } }
+                # R2-NARROW-1 r7 (sol r7 A3): the guard is VenueChain.psm1's one Limit-VenueHostLoadToDeadline (the baseline applies the same one)
+                $hl = Limit-VenueHostLoadToDeadline -Standing $hl -DeadlineUtc $deadline
                 $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 $class = $(if ($leaseClass) { $leaseClass } elseif ($legFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })
                 $counted = ($class -ceq 'QUIET_PRELOAD_OK')

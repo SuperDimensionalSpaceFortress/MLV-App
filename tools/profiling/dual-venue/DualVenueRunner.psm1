@@ -8058,6 +8058,10 @@ function Write-DvReceipt {
     $path
 }
 
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r7 (sol r7 B3, key3 fable r7 B3): initialised at module scope. This module runs Set-StrictMode -Version Latest, so a read of the
+# variable before the first successful Write-DvReceipt threw VariableIsUndefined instead of answering the '' the getter below promises.
+$script:DvLastWrittenReceiptSha256 = ''
+
 function Get-DvLastWrittenReceiptSha256 {
     # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes Write-DvReceipt last wrote in this session ('' when none).
     [string]$script:DvLastWrittenReceiptSha256

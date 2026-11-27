@@ -921,7 +921,8 @@ class PlannedLegTypeExemptionTests(unittest.TestCase):
         self.assertEqual(got["Y"], "unknown/True", "an export answer seen after the read budget is not exempt: " + p.stdout)
         for label, script in (("chain", "Invoke-VenueChain.ps1"), ("batch", "Invoke-VenueLeaseBatch.ps1")):
             text = (DV_DIR / script).read_text(encoding="utf-8")
-            self.assertRegex(text, r"-CallDeadlineUtc \$deadline\r?\n\s+#[^\n]*\r?\n\s+if \(\$deadline -le \[DateTime\]::UtcNow\) \{ \$hl = \[pscustomobject\]@\{ state = 'unknown'; provisional = \$true", f"{label}: the standing is judged against -DeadlineUtc where it is consumed")
+            # R2-NARROW-1 r7 (sol r7 A3): the inline guard became the one shared Limit-VenueHostLoadToDeadline (its body is pinned by the r7 tests); the same position and the same -DeadlineUtc
+            self.assertRegex(text, r"-CallDeadlineUtc \$deadline\r?\n(?:\s+#[^\n]*\r?\n)+\s+\$hl = Limit-VenueHostLoadToDeadline -Standing \$hl -DeadlineUtc \$deadline", f"{label}: the standing is judged against -DeadlineUtc where it is consumed")
 
     def test_r2_pass2_a5_a7_a13_the_matrix_refuses_a_replaced_receipt_the_planner_refuses_a_duplicated_legtype_the_verdict_keeps_a_list(self) -> None:
         # adversary-b3d61554.json A5: the matrix drops the receipt whose bytes are not the ones the child published (as the baseline refuses them), so a replacement's outcome and
@@ -1135,6 +1136,59 @@ class VenueChainImportResolvesTests(unittest.TestCase):
             for n in ns:
                 with self.subTest(script=script, name=n):
                     self.assertIn(n + "=True", p.stdout, f"{script} imports {n} from VenueChain.psm1, which does not export it")
+
+
+@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+class R7ReceiptDigestGetterAndBaselineObservationGuardTests(unittest.TestCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r7 (sol r7 B3 and A3, key3 fable r7 B3)."""
+
+    def test_r7_b3_the_receipt_digest_getter_answers_empty_on_a_fresh_module_before_any_write(self) -> None:
+        # sol r7 B3, its input: import the REAL DualVenueRunner.psm1 and call the exported Get-DvLastWrittenReceiptSha256 before any Write-DvReceipt. RED on 8bdb42a5: the module runs
+        # Set-StrictMode -Version Latest and the variable was assigned only after a successful write, so the getter threw VariableIsUndefined instead of the '' its comment promises.
+        module = DV_DIR / "DualVenueRunner.psm1"
+        body = ("$ErrorActionPreference = 'Stop'; Import-Module '" + str(module) + "' -Force -DisableNameChecking; "
+                "$r = Get-DvLastWrittenReceiptSha256; Write-Output ('TYPE=' + $r.GetType().FullName); Write-Output ('VALUE=[' + $r + ']')")
+        p = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", body],
+                           capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=120)
+        self.assertEqual(p.returncode, 0, "the getter must not throw on a fresh module: " + p.stdout + p.stderr)
+        self.assertIn("TYPE=System.String", p.stdout)
+        self.assertIn("VALUE=[]", p.stdout)
+        text = module.read_text(encoding="utf-8")
+        init = text.index("$script:DvLastWrittenReceiptSha256 = ''")
+        self.assertLess(init, text.index("function Get-DvLastWrittenReceiptSha256"), "the variable is initialised at module scope, before the getter that reads it")
+
+    def test_r7_a3_one_shared_guard_judges_a_standing_against_the_callers_absolute_end(self) -> None:
+        # sol r7 A3, its input: the final row's reader passes quiet/nonprovisional/collected at elapsed 899.9 s and the baseline resumes at 901 s with MaxTotalSec=900. The standing
+        # is judged where it is consumed: past the end it reads unknown, provisional and uncollected (never counted); before the end it is returned as it came.
+        p = run_ps(
+            "$q = [pscustomobject]@{ state = 'quiet'; provisional = $false; collected = $true; reason = 'peak 18% <= 75%'; applies = $true }; "
+            "$late = Limit-VenueHostLoadToDeadline -Standing $q -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(-1.1)); "
+            "Write-Output ('LATE=' + $late.state + '/' + $late.provisional + '/' + $late.collected + '/' + $late.applies); Write-Output ('LATEWHY=' + $late.reason); "
+            "$early = Limit-VenueHostLoadToDeadline -Standing $q -DeadlineUtc ([DateTime]::UtcNow.AddSeconds(60)); "
+            "Write-Output ('EARLY=' + $early.state + '/' + $early.provisional + '/' + $early.collected + '/' + [object]::ReferenceEquals($early, $q)); "
+            "$row = [ordered]@{ status = 'RAN'; fps = 59.9; hostLoadState = [string]$late.state; hostLoadProvisional = [bool]$late.provisional; hostLoadCollected = ($late.collected -is [bool] -and $late.collected) }; "
+            "Import-Module '" + str(DV_DIR / "DualVenueRunner.psm1") + "' -Force -DisableNameChecking; "
+            "Write-Output ('COUNTED=' + [bool](Test-DvHostLoadRowClean -Row $row))")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["LATE"], "unknown/True/False/True", p.stdout)
+        self.assertIn("absolute end", got["LATEWHY"], p.stdout)
+        self.assertEqual(got["EARLY"], "quiet/False/True/True", p.stdout)
+        self.assertEqual(got["COUNTED"], "False", "a row built from a late standing is never a measured row: " + p.stdout)
+
+    def test_r7_a3_chain_batch_and_baseline_all_consume_the_standing_through_that_one_guard(self) -> None:
+        import re
+        for script in ("Invoke-VenueChain.ps1", "Invoke-VenueLeaseBatch.ps1", "Invoke-VenueBaseline.ps1"):
+            text = (DV_DIR / script).read_text(encoding="utf-8")
+            self.assertEqual(text.count("$hl = Limit-VenueHostLoadToDeadline -Standing $hl -DeadlineUtc $deadline"), 1, f"{script}: the standing is judged against its run's end where it is consumed, through the shared guard")
+            self.assertNotIn("the standing was seen after the absolute end", text, f"{script}: no private copy of the guard's body")
+        baseline = (DV_DIR / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
+        self.assertRegex(baseline, r"-ExpectReceiptSha256 '' -CallDeadlineUtc \$deadline \}\)\r?\n(?:[ \t]*#[^\n]*\r?\n)*[ \t]*\$hl = Limit-VenueHostLoadToDeadline -Standing \$hl -DeadlineUtc \$deadline\r?\n(?:[ \t]*#[^\n]*\r?\n)*[ \t]*\$hlLine = ",
+                         "the baseline judges the standing after the reader returns and before the refusal line and the row take it")
+        chain_text = MODULE.read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r"^function Limit-VenueHostLoadToDeadline ", chain_text, re.M)), 1)
+        exports = re.search(r"Export-ModuleMember -Function ([^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*)", chain_text).group(1)
+        self.assertIn("Limit-VenueHostLoadToDeadline", exports)
 
 
 if __name__ == "__main__":
