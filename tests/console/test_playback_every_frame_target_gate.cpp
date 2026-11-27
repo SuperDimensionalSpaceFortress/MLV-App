@@ -173,6 +173,7 @@ QString readRepoFile( const QString & relativePath )
 
 int countOccurrences( const QString & haystack, const QString & needle )
 {
+    if( needle.isEmpty() ) return 0;   // r7 (adversary A3 on cca976f5): an empty needle matched at 0 forever
     int count = 0;
     int from = 0;
     while( true )
@@ -271,6 +272,69 @@ QString tokenBefore( const QString & s, int i )
     return token;
 }
 
+// When a string or char literal (any prefix) or a raw string literal opens at \a i (a '"' or '\'' in code), the index just past
+// it; -1 when the '\'' is a digit separator (`1'000`), which is code. Shared by stripComments and enclosingBlockHeaders, so both
+// read literals the way the compiler does (r7, adversary A1/A2 on cca976f5 and their sibling in enclosingBlockHeaders):
+//   - a raw string `R"d(...)d"` runs to its own closer, with no splicing and no escapes inside; the delimiter d is up to 16
+//     characters other than space, parentheses, backslash and control characters (so `"` is allowed: `R""(a)""`);
+//   - in an ordinary literal, phase-2 splices come first: a backslash followed by a splice escapes the character after the splice
+//     (`"a\\` + newline + `b"` is `"a\b"`), and a splice continues the literal; an unspliced newline ends an unterminated one.
+int literalEnd( const QString & s, int i )
+{
+    const int n = s.size();
+    const QChar quote = s.at( i );
+    if( quote == QLatin1Char( '\'' ) )
+    {
+        const QString token = tokenBefore( s, i );
+        const bool digitSeparator = !token.isEmpty()
+                                    && ( token.at( 0 ).isDigit()
+                                         || ( token.at( 0 ) == QLatin1Char( '.' ) && token.size() > 1 && token.at( 1 ).isDigit() ) );
+        if( digitSeparator ) return -1;
+    }
+    else
+    {
+        const QString prefix = tokenBefore( s, i );
+        const bool raw = prefix == QLatin1String( "R" ) || prefix == QLatin1String( "LR" ) || prefix == QLatin1String( "uR" )
+                         || prefix == QLatin1String( "UR" ) || prefix == QLatin1String( "u8R" );
+        if( raw )
+        {
+            const int open = s.indexOf( QLatin1Char( '(' ), i + 1 );
+            const QString delimiter = open > i ? s.mid( i + 1, open - i - 1 ) : QString();
+            bool delimiterValid = open > i && delimiter.size() <= 16;
+            for( const QChar d : delimiter )
+                if( d.isSpace() || d.category() == QChar::Other_Control || d == QLatin1Char( ')' ) || d == QLatin1Char( '\\' ) )
+                    delimiterValid = false;
+            if( delimiterValid )
+            {
+                const QString closer = QLatin1Char( ')' ) + delimiter + QLatin1Char( '"' );
+                const int close = s.indexOf( closer, open + 1 );
+                return close < 0 ? n : close + closer.length();
+            }
+        }
+    }
+    int k = i + 1;
+    while( k < n )
+    {
+        const int afterSplices = skipLineSplices( s, k );
+        if( afterSplices > k )
+        {
+            k = afterSplices;   // a splice continues the literal
+            continue;
+        }
+        const QChar d = s.at( k );
+        if( d == quote ) return k + 1;
+        if( d == QLatin1Char( '\n' ) ) return k;   // unterminated: the newline is code
+        if( d == QLatin1Char( '\\' ) )
+        {
+            k = skipLineSplices( s, k + 1 );   // the escaped character is the one after any splices
+            if( k < n ) ++k;
+            continue;
+        }
+        ++k;
+    }
+    return n;
+}
+
 QString stripComments( const QString & s )
 {
     QString out;
@@ -287,72 +351,15 @@ QString stripComments( const QString & s )
             i = end;
             continue;
         }
-        if( c == QLatin1Char( '"' ) )
-        {
-            const QString prefix = tokenBefore( s, i );
-            const bool raw = prefix == QLatin1String( "R" ) || prefix == QLatin1String( "LR" ) || prefix == QLatin1String( "uR" )
-                             || prefix == QLatin1String( "UR" ) || prefix == QLatin1String( "u8R" );
-            if( raw )
-            {
-                const int open = s.indexOf( QLatin1Char( '(' ), i + 1 );
-                const QString delimiter = open > i ? s.mid( i + 1, open - i - 1 ) : QString();
-                bool delimiterValid = open > i && delimiter.size() <= 16;
-                for( const QChar d : delimiter )
-                    if( d.isSpace() || d == QLatin1Char( ')' ) || d == QLatin1Char( '\\' ) || d == QLatin1Char( '"' ) )
-                        delimiterValid = false;
-                if( delimiterValid )
-                {
-                    const QString closer = QLatin1Char( ')' ) + s.mid( i + 1, open - i - 1 ) + QLatin1Char( '"' );
-                    const int close = s.indexOf( closer, open + 1 );
-                    const int end = close < 0 ? n : close + closer.length();
-                    out.append( s.mid( i, end - i ) );
-                    i = end;
-                    continue;
-                }
-            }
-        }
-        if( c == QLatin1Char( '\'' ) )
-        {
-            const QString token = tokenBefore( s, i );
-            const bool digitSeparator = !token.isEmpty()
-                                        && ( token.at( 0 ).isDigit()
-                                             || ( token.at( 0 ) == QLatin1Char( '.' ) && token.size() > 1 && token.at( 1 ).isDigit() ) );
-            if( digitSeparator )
-            {
-                out.append( c );
-                ++i;
-                continue;
-            }
-        }
         if( c == QLatin1Char( '"' ) || c == QLatin1Char( '\'' ) )
         {
-            out.append( c );
-            ++i;
-            while( i < n && s.at( i ) != c && s.at( i ) != QLatin1Char( '\n' ) )
+            const int end = literalEnd( s, i );   // -1: a digit separator, which is code
+            if( end >= 0 )
             {
-                if( s.at( i ) == QLatin1Char( '\\' ) && skipLineSplices( s, i ) > i )
-                {
-                    const int end = skipLineSplices( s, i );   // a splice continues the literal
-                    out.append( s.mid( i, end - i ) );
-                    i = end;
-                    continue;
-                }
-                if( s.at( i ) == QLatin1Char( '\\' ) && i + 1 < n )
-                {
-                    out.append( s.at( i ) );
-                    out.append( s.at( i + 1 ) );
-                    i += 2;
-                    continue;
-                }
-                out.append( s.at( i ) );
-                ++i;
+                out.append( s.mid( i, end - i ) );   // the literal, verbatim (its splices included)
+                i = end;
+                continue;
             }
-            if( i < n && s.at( i ) == c )
-            {
-                out.append( c );
-                ++i;
-            }
-            continue;
         }
         if( c == QLatin1Char( '/' ) )
         {
@@ -418,23 +425,21 @@ QStringList enclosingBlockHeaders( const QString & code, int pos )
     const QString elseWord = QStringLiteral( "else" );
     const QString link = QStringLiteral( " / " );
     int lastSeparator = -1;
-    QChar inLiteral;   // null outside a string or char literal
     for( int i = 0; i < pos && i < code.size(); ++i )
     {
         const QChar c = code.at( i );
-        if( !inLiteral.isNull() )
+        // r7 sibling of adversary A1/A2 on cca976f5: literals are skipped with literalEnd (raw strings, digit separators, splices),
+        // so a brace inside `R"x({")x"` or after `1'000` is read as the compiler reads it.
+        if( c == QLatin1Char( '"' ) || c == QLatin1Char( '\'' ) )
         {
-            if( c == QLatin1Char( '\\' ) )
+            const int end = literalEnd( code, i );
+            if( end >= 0 )
             {
-                ++i;
+                i = end - 1;   // the loop's ++i lands just past the literal
                 continue;
             }
-            if( c == inLiteral || c == QLatin1Char( '\n' ) ) inLiteral = QChar();
-            continue;
         }
-        if( c == QLatin1Char( '"' ) || c == QLatin1Char( '\'' ) )
-            inLiteral = c;
-        else if( c == QLatin1Char( '{' ) )
+        if( c == QLatin1Char( '{' ) )
         {
             const QString header = code.mid( lastSeparator + 1, i - lastSeparator - 1 ).simplified();
             QStringList full = chain.back();
@@ -955,6 +960,16 @@ TEST( EveryFrameTargetGate, StripCommentsKeepsCodeAfterALiteralThatHoldsAComment
         // a blank before the splice ends the token: `R "x(` is the identifier R and an ordinary string, so `// b)x"` is in it
         { QStringLiteral( "log(R \\\n\"x(a // b)x\"); forbidden_code(); // gone\n" ),
           QStringLiteral( "log(R \\\n\"x(a // b)x\"); forbidden_code(); \n" ) },
+        // adversary A1 on cca976f5: '"' is a valid raw-string delimiter character
+        { QStringLiteral( "log(R\"\"(a // b)\"\"); forbidden_code(); // gone\n" ),
+          QStringLiteral( "log(R\"\"(a // b)\"\"); forbidden_code(); \n" ) },
+        // adversary A2 on cca976f5: `"a\\` + newline + `b // text"` is `"a\b // text"` after splicing (the second backslash splices)
+        { QStringLiteral( "log(\"a\\\\\nb // text\"); forbidden_code(); // gone\n" ),
+          QStringLiteral( "log(\"a\\\\\nb // text\"); forbidden_code(); \n" ) },
+        { QStringLiteral( "c = '\\\\\n''; forbidden_code(); // gone\n" ),
+          QStringLiteral( "c = '\\\\\n''; forbidden_code(); \n" ) },
+        { QStringLiteral( "log(\"a \\\n// still the string\"); forbidden_code(); // gone\n" ),
+          QStringLiteral( "log(\"a \\\n// still the string\"); forbidden_code(); \n" ) },
     };
     for( const Case & item : cases )
     {
@@ -966,4 +981,32 @@ TEST( EveryFrameTargetGate, StripCommentsKeepsCodeAfterALiteralThatHoldsAComment
     // text without comments is returned unchanged
     const QString plain = QStringLiteral( "if( a ) { b(); }\nreturn c;\n" );
     ASSERT_EQ( plain.toStdString(), stripComments( plain ).toStdString() );
+}
+
+// r7 sibling sweep (adversary A1/A2/A3 on cca976f5): enclosingBlockHeaders skips literals with the same literalEnd, so a brace in
+// a raw string, after a digit separator or in a spliced literal does not change the path of blocks; countOccurrences of an empty
+// needle is 0 (it used to loop forever).
+TEST( EveryFrameTargetGate, StripCommentsSiblingHelpersLexLiteralsLikeTheCompiler )
+{
+    struct Case
+    {
+        QString code;
+        std::string headers;
+    };
+    const std::vector<Case> cases = {
+        { QStringLiteral( "void f() { const char * r = R\"x({\")x\"; if( a ) { target(); } }" ), "void f() | if( a )" },
+        { QStringLiteral( "void f() { const char * r = R\"\"(})\"\"; if( a ) { target(); } }" ), "void f() | if( a )" },
+        { QStringLiteral( "void f() { const int n = 1'000; if( a ) { target(); } }" ), "void f() | if( a )" },
+        { QStringLiteral( "void f() { log( \"a\\\\\n}\" ); if( a ) { target(); } }" ), "void f() | if( a )" },
+        { QStringLiteral( "void f() { const char c = '{'; if( a ) { target(); } }" ), "void f() | if( a )" },
+        { QStringLiteral( "void f() { log( \"q\\\"}\" ); if( a ) { target(); } }" ), "void f() | if( a )" },
+    };
+    for( const Case & item : cases )
+    {
+        const int at = item.code.indexOf( QStringLiteral( "target();" ) );
+        ASSERT_TRUE( at > 0 );
+        ASSERT_EQ( item.headers, enclosingBlockHeaders( item.code, at ).join( QStringLiteral( " | " ) ).toStdString() );
+    }
+    ASSERT_EQ( 0, countOccurrences( QStringLiteral( "x" ), QString() ) );
+    ASSERT_EQ( 2, countOccurrences( QStringLiteral( "a1'0a" ), QStringLiteral( "a" ) ) );
 }
