@@ -1012,6 +1012,21 @@ OVERRUN_CASES = [
     ("O19 an exact decimal counter inside the tolerance is still clean", dict(
         _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="648.0", required_source_frames="600.0", presented_frames=600),
      25, False, True, 1200, False, False, False),
+    # r8 (adversary 3701447f A1): a double the parser made from exponent notation is read EXACTLY below 2^53 (a [decimal] cast
+    # rounds it to 15 digits) and refused at 2^53 (the parser rounded it, so its digits are unknown).
+    ("O20 reversed endpoints printed as doubles are a wrap", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+        first_presented_frame="9.007199254740991e15", last_presented_frame="9.007199254740990e15"),
+     25, False, True, 1200, True, False, True),
+    ("O21 a counter read as 2^53 is refused, not rounded into a pass", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254740993e0", required_source_frames=9007199254740944),
+     25, False, True, 1200, True, False, False),
+    ("O22 an exact double below 2^53 keeps its 49-frame overrun", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254740991e0", required_source_frames=9007199254740942),
+     25, False, True, 1200, True, True, False),
+    ("O22 the same at the tolerance", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254740990e0", required_source_frames=9007199254740942),
+     25, False, True, 1200, False, False, False),
 ]
 
 
@@ -1140,6 +1155,12 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
             "oracle guard always false": ("if ($RequireWindowStop -and ", "if ($false -and "),
             "RequireWindowStop default ignored": ("if ($RequireWindowStop -and ", "if ($true -and "),
             "presented-over-clip suppression dropped": (" -and -not $overranWithoutWrap", ""),
+            # r8 (adversary A1): the exact double read and its 2^53 bound
+            "double counter read through a 15-digit decimal cast": ("$exact = [decimal][int64]$d }", "$exact = [decimal]$d }"),
+            "2^53 double accepted as exact": ("[Math]::Abs($d) -ge 9007199254740992.0", "[Math]::Abs($d) -gt 9007199254740992.0"),
+            "overrun block reads a double through its printed digits": (
+                "[Math]::Abs([double]$v) -lt 9007199254740992.0) { [decimal][int64][double]$v }",
+                "[Math]::Abs([double]$v) -lt 0.0) { [decimal][int64][double]$v }"),
         }
         for name, (needle, replacement) in mutations.items():
             with self.subTest(name):

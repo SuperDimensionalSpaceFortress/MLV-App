@@ -631,8 +631,8 @@ function Get-GuiSmokeExactCounter {
     } elseif ($Value -is [double] -or $Value -is [single]) {
         $d = [double]$Value
         if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or [Math]::Floor($d) -ne $d) { $reason = 'not_an_integer' }
-        elseif ([Math]::Abs($d) -gt 9007199254740992.0) { $reason = 'inexact_double' }
-        else { $exact = [decimal]$d }
+        elseif ([Math]::Abs($d) -ge 9007199254740992.0) { $reason = 'inexact_double' }    # r8 (adversary A1): 2^53 itself is where 2^53+1 rounds to
+        else { $exact = [decimal][int64]$d }    # r8 (adversary A1): [decimal]$d rounds a double to 15 digits; the int64 cast of an integral |d| < 2^53 is exact
     } elseif ([decimal]::TryParse([string]$Value, [Globalization.NumberStyles]::Float, $inv, [ref]$m)) {
         if ([decimal]::Truncate($m) -eq $m) { $exact = $m }
     } elseif ([double]::TryParse([string]$Value, [Globalization.NumberStyles]::Float, $inv, [ref]$d) -and
@@ -1070,6 +1070,9 @@ function Get-GuiSmokeLoopVerdict {
         $overranWindow = $false
         $frameNumber = { param($v) $m = [decimal]0; $d = 0.0
             if ($null -eq $v -or $v -is [bool]) { $null }
+            # r8 (adversary A1 sibling): [string] of a double keeps 15 digits, so an integral double below 2^53 is cast, not printed.
+            elseif (($v -is [double] -or $v -is [single]) -and -not [double]::IsNaN([double]$v) -and -not [double]::IsInfinity([double]$v) -and
+                    [Math]::Floor([double]$v) -eq [double]$v -and [Math]::Abs([double]$v) -lt 9007199254740992.0) { [decimal][int64][double]$v }
             elseif ([decimal]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$m) -and
                     [Math]::Abs($m) -le [decimal]1e27) { $m }    # r7: past 1e27 the decimal difference / product could overflow, so a double
             elseif ([double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d) -and
