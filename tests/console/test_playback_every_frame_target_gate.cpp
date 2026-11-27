@@ -643,9 +643,13 @@ TEST( EveryFrameTargetGate, TheAcceptedFrameIsResetAtPlayStartAndSetRightAfterTh
 TEST( EveryFrameTargetGate, ConformStillReturnsFalseWithoutConformAndDelegatesToTheModeNeutralCheck )
 {
     const QString source = mainWindowSource();
-    const QString conform = functionBody( source,
+    // r6 (hosted run 46063672035, job 140723964877): a body runs up to the NEXT signature, so it carries that function's leading
+    // comment block. Since the r4 merge of fork/master, the comment above conformTargetPresentOutstanding names m_newPosDropMode
+    // (PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2), which failed the negative check below on a comment, not on code. Both bodies
+    // are read with comments removed, as TheModeNeutralChecksAndTheConformDelegateAreLive does; every assertion is unchanged.
+    const QString conform = stripComments( functionBody( source,
                                           QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding( double position )" ),
-                                          QStringLiteral( "bool MainWindow::conformAcceptedTargetPresentPending( double position )" ) );
+                                          QStringLiteral( "bool MainWindow::conformAcceptedTargetPresentPending( double position )" ) ) );
     ASSERT_FALSE( conform.isEmpty() );
     const int noConform = conform.indexOf( QStringLiteral( "if( !m_pRenderThread || !playbackConformActive() ) return false;" ) );
     const int earlyOut = conform.indexOf(
@@ -657,9 +661,9 @@ TEST( EveryFrameTargetGate, ConformStillReturnsFalseWithoutConformAndDelegatesTo
     ASSERT_FALSE( conform.contains( QStringLiteral( "hasReadyFrameForPlaybackTarget" ) ) );
     ASSERT_FALSE( conform.contains( QStringLiteral( "hasPlaybackLookaheadRequest" ) ) );
 
-    const QString neutral = functionBody( source,
+    const QString neutral = stripComments( functionBody( source,
                                           QStringLiteral( "bool MainWindow::playbackTargetPresentOutstanding( int target )" ),
-                                          QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding( double position )" ) );
+                                          QStringLiteral( "bool MainWindow::conformTargetPresentOutstanding( double position )" ) ) );
     ASSERT_FALSE( neutral.isEmpty() );
     // fix 1 (adversary A4 sibling): each check with its polarity -- each one found means a present is coming
     ASSERT_TRUE( neutral.contains( QStringLiteral( "if( renderThreadBusyForPlaybackAdvance( target ) ) return true;" ) ) );
