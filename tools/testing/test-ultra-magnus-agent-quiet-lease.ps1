@@ -4306,6 +4306,12 @@ function Exit-HeavySlot {
             Add-LeaseSlotSnapshot -JobId 'jHtP1' -Phase 'grant'
             $e1 = @($script:LeaseSlotSnapshots | Where-Object { $_.jobId -eq 'jHtP1' })
             Assert-True ($e1.Count -eq 1) "probe-watchdog S1: the grant probe started: $($e1.Count)"
+            # CI-FLAKE-HEAVY-SLOT-GATE-PURE-FUNCTION-CASES-1 r2: with no scripted scheduler set (the agent's own state), the probe's watchdog is the
+            # two-argument real-timer one: a System.Threading.Timer is armed and the scripted flag is off.
+            $dogBind = [Reflection.BindingFlags]'NonPublic, Instance'
+            $dogTimer = $e1[0].dog.GetType().GetField('_timer', $dogBind).GetValue($e1[0].dog)
+            $dogScripted = $e1[0].dog.GetType().GetField('_scripted', $dogBind).GetValue($e1[0].dog)
+            Assert-True ($null -eq $script:LeaseProbeWatchdogScheduler -and $dogTimer -is [System.Threading.Timer] -and $dogScripted -eq $false) "probe-watchdog S1: the default path arms the real thread-pool timer (scheduler=$($null -ne $script:LeaseProbeWatchdogScheduler) timer=$(if ($null -ne $dogTimer) { $dogTimer.GetType().FullName } else { 'null' }) scripted=$dogScripted)"
             $pidP = $e1[0].call.proc.Id
             $tB = [Diagnostics.Stopwatch]::StartNew()
             $rn = Complete-HeavySlotCli -Call (Start-HeavySlotCli -Arguments @('lease', 'renew', '--label', $script:QuietLeaseLabel)) -TimeoutSec 15 -HeartbeatActivity 'pre-launch job=jHtP1'
@@ -4328,20 +4334,29 @@ function Exit-HeavySlot {
             $lP3 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtP3 *' })
             Assert-True ($lP3.Count -eq 1 -and $lP3[0] -match ' slots=unknown\(timeout 30 s; killed at 31\.4 s\)$' -and (Wait-Until { -not (Test-PidAlive $pidL) } 5)) "probe-watchdog S1: a probe the poll kills past its bound is logged with its real age (31.4 s of a 30 s bound): $($lP3 -join ' || ')"
             # adversary r5-2ca9f68f A1: a status root that exits at once, leaving a 300 s child holding its stdout/stderr, is not done: the
-            # watchdog (nothing polls) and the poll's own bound kill both end that child. Bound 5 s here so a slow python start-up still spawns it.
+            # watchdog (nothing polls) and the poll's own bound kill both end that child.
+            # CI-FLAKE-HEAVY-SLOT-GATE-PURE-FUNCTION-CASES-1 r2: the bound is FIRED BY THIS CASE through the agent's scripted-scheduler seam
+            # ($script:LeaseProbeWatchdogScheduler), only after the explicit status-orphan signal: a real 5 s timer killed the root before a slow
+            # python start-up had spawned the child (hosted: "spawned its orphan child: 0"). The kill's age is the injected one (5.1 s of a 5 s bound).
+            # S1 above keeps the real thread-pool timer: it is the proof that the agent's own path fires while nothing polls.
             $script:LeaseSnapshotProbeSec = 5; $script:StatusDelaySec = 0; $script:StatusOrphan = $true
             Reset-Case @{ request = 'active' }
             Sync-FakeStatus
-            Add-LeaseSlotSnapshot -JobId 'jHtP4' -Phase 'grant'
+            $script:DogFire = $null; $script:DogDueMs = [long]-1
+            $script:LeaseProbeWatchdogScheduler = [Action[Threading.TimerCallback, long]]{ param($cb, $due) $script:DogFire = $cb; $script:DogDueMs = $due }
+            try { Add-LeaseSlotSnapshot -JobId 'jHtP4' -Phase 'grant' } finally { $script:LeaseProbeWatchdogScheduler = $null }
+            $e4 = @($script:LeaseSlotSnapshots | Where-Object { $_.jobId -eq 'jHtP4' })
+            Assert-True ($e4.Count -eq 1 -and $null -ne $script:DogFire -and $script:DogDueMs -eq 5000) "probe-watchdog A1(r5): the probe started with the scripted scheduler holding its 5 s bound (started=$($e4.Count) due=$($script:DogDueMs) ms)"
             $null = Wait-Until { $script:Kc = @(Get-Calls | Where-Object { $_.cmd -eq 'status-orphan' }); $script:Kc.Count -ge 1 } 10
             Assert-True ($script:Kc.Count -eq 1) "probe-watchdog A1(r5): the status root spawned its orphan child: $($script:Kc.Count)"
             $kid4 = [int]$script:Kc[0].child; $script:OrphanKids.Add($kid4)
+            Assert-True ((Test-PidAlive $kid4) -and $e4[0].dog.KilledAtMs -lt 0) "probe-watchdog A1(r5): no real timer holds the scripted bound: the orphan child is alive and nothing was killed before the case fires (killedAtMs=$($e4[0].dog.KilledAtMs))"
+            $script:DogFire.Invoke([long]5100)   # the bound fires, at a probe age of 5.1 s of the 5 s bound
             $kid4Gone = Wait-Until { -not (Test-PidAlive $kid4) } 10   # nothing polls meanwhile
-            $age4 = ($script:LeaseSlotSnapshots | Where-Object { $_.jobId -eq 'jHtP4' } | Select-Object -First 1).clock.Elapsed.TotalSeconds
             Update-LeaseSlotSnapshots
             $lP4 = @($script:Log | Where-Object { $_ -like 'quiet-lease: slots-snapshot job=jHtP4 *' })
-            Assert-True ($kid4Gone) "probe-watchdog A1(r5): the child a finished root left holding the probe's pipes is killed at the bound with no poll (alive after $([Math]::Round([double]$age4, 1)) s of a 5 s bound)"
-            Assert-True ($lP4.Count -eq 1 -and $lP4[0] -match ' slots=unknown\(timeout 5 s; killed at (5\.\d|6\.[0-4]) s\)$') "probe-watchdog A1(r5): the watchdog's kill is logged with its age: $($lP4 -join ' || ')"
+            Assert-True ($kid4Gone) "probe-watchdog A1(r5): the child a finished root left holding the probe's pipes is killed at the bound with no poll (alive after the scripted 5.1 s fire of a 5 s bound)"
+            Assert-True ($lP4.Count -eq 1 -and $lP4[0] -match ' slots=unknown\(timeout 5 s; killed at 5\.1 s\)$') "probe-watchdog A1(r5): the watchdog's kill is logged with its age: $($lP4 -join ' || ')"
             $script:LeaseSnapshotProbeSec = 30
             Reset-Case @{ request = 'active' }
             Sync-FakeStatus
@@ -4358,7 +4373,7 @@ function Exit-HeavySlot {
             $results.leaseHeatTraceProbeWatchdog = [ordered]@{ renewBlockedSec = [Math]::Round($blockedSec, 2); probeAgeAtRenewEnd = [Math]::Round($ageAtRenewEnd, 2); line = $lP[0]; pollLine = $lP3[0]; orphanLine = $lP4[0]; orphanPollLine = $lP5[0] }
         }
         finally {
-            $script:StatusOrphan = $false
+            $script:StatusOrphan = $false; $script:LeaseProbeWatchdogScheduler = $null
             foreach ($k in @($script:OrphanKids)) { Stop-Process -Id $k -Force -ErrorAction SilentlyContinue }
             $script:LeaseSnapshotProbeSec = 30; $script:StatusDelaySec = 0
             if (Get-Command Update-LeaseSlotSnapshots -ErrorAction SilentlyContinue) { Update-LeaseSlotSnapshots -Abandon 'test case end' }
