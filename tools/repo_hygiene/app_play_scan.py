@@ -1133,18 +1133,30 @@ _QUALIFIER_DEFINING_SOURCE = "platform/qt/PlaybackFrameRange.h"
 _QUALIFIER_TOKEN = re.compile(r"(?<!\w)playback_frame_range(?!\w)")
 _QUALIFIER_QUALIFIES = re.compile(r"\s*::")
 _QUALIFIER_OPENING = re.compile(r"(?<!\w)namespace\s+(playback_frame_range)\s*\{")
+# r4 fix iteration 2 (adversary A1 on ebdc7a65): a SECOND opening at the end of the defining header added a mutable overload that the pinned
+# call then selected. The header opens the namespace ONCE (only its first opening is exempt), and names each pinned callee ONCE: a second
+# pacedMeasuredHoldLanding is an overload, a second SourceFrameAdvanceCounter can be a function that hides the counter's class name.
+# (Adversary A2 on ebdc7a65: the trigraph `??/` is a backslash in translation phase 1, so it splices a line like `\` does.)
+_QUALIFIER_PINNED_CALLEES = ("pacedMeasuredHoldLanding", "SourceFrameAdvanceCounter")
 
 
 def _scan_counter_macros(sources: dict[str, str], main_blank: str) -> list[str]:
     problems: list[str] = []
     for path, text in sources.items():
-        normalised = _COUNTER_RESPELL_SPLICE.sub("", text.replace("??=", "#").replace("%:", "#"))
+        normalised = _COUNTER_RESPELL_SPLICE.sub("", text.replace("??=", "#").replace("??/", "\\").replace("%:", "#"))
         blank = main_blank if path == "platform/qt/MainWindow.cpp" and normalised == text else strip_cpp(normalised)[0]
         for match in _COUNTER_DEFINE_ANYWHERE.finditer(blank):
             if match.group(1) in COUNTER_MACRO_IDENTIFIERS:
                 problems.append(f"{path}:{_line_of(blank, match.start())}: #define of {match.group(1)}, a token the source-frame "
                                 "counter's pinned reads and writes rely on")
-        openings = ({m.start(1) for m in _QUALIFIER_OPENING.finditer(blank)} if path == _QUALIFIER_DEFINING_SOURCE else set())
+        first_opening = _QUALIFIER_OPENING.search(blank) if path == _QUALIFIER_DEFINING_SOURCE else None
+        openings = {first_opening.start(1)} if first_opening else set()
+        if path == _QUALIFIER_DEFINING_SOURCE:
+            for callee in _QUALIFIER_PINNED_CALLEES:
+                named = len(re.findall(r"(?<!\w)" + callee + r"(?!\w)", blank))
+                if named != 1:
+                    problems.append(f"{path}: names the pinned callee {callee} {named}x in playback_frame_range, pinned 1 (an overload or a "
+                                    "hiding function redirects the source-frame counter's pinned call)")
         for match in _QUALIFIER_TOKEN.finditer(blank):
             if _QUALIFIER_QUALIFIES.match(blank, match.end()) or match.start() in openings:
                 continue

@@ -928,6 +928,50 @@ class CounterWritePinTests(unittest.TestCase):
                                                                       "const char *s = \"playback_frame_range\";\n"})
             self.assertFalse(any(needle in p for p in problems), problems)
 
+    def test_r4_fix2_the_defining_header_opens_the_namespace_once_and_declares_each_pinned_callee_once(self) -> None:
+        """r4 fix iteration 2 (adversary A1 on ebdc7a65): a SECOND `namespace playback_frame_range {` block at the end of PlaybackFrameRange.h
+        (under `#ifdef MAINWINDOW_H`) added a mutable overload of pacedMeasuredHoldLanding, which the pinned call then selected. The defining
+        header opens the namespace once, and names each pinned callee once (pacedMeasuredHoldLanding, SourceFrameAdvanceCounter): an overload,
+        or a function that hides the counter's class name, fails. Adversary A2 on ebdc7a65: the trigraph `??/` is a backslash in translation
+        phase 1, so `#de??/<newline>fine` is the protected macro too."""
+        from tools.repo_hygiene import app_play_scan
+        header_path = "platform/qt/PlaybackFrameRange.h"
+        header = (Path(app_play_scan.__file__).resolve().parents[2] / header_path).read_text(encoding="utf-8")
+        tail = "#endif"
+        cut = header.rindex(tail)
+        def with_tail(insert: str) -> dict[str, str]:
+            return {header_path: header[:cut] + insert + header[cut:]}
+        def caught(sources: dict[str, str], needle: str) -> bool:
+            return any(needle in p for p in scan_app_play_sources(sources))
+        with self.subTest("the real header is clean"):
+            problems = [p for p in scan_app_play_sources({header_path: header}) if p.startswith(header_path)]
+            self.assertEqual(problems, [])
+        overload = ("inline double pacedMeasuredHoldLanding(double start, DropFrameTickResult &tick, int64_t &mark, int64_t consumed, "
+                    "int64_t required) { mark = 0; return tick.position; }\n")
+        cases = (
+            ("A1: a second opening under #ifdef", "#ifdef MAINWINDOW_H\nnamespace playback_frame_range {\n" + overload + "}\n#endif\n",
+             "rebinds playback_frame_range"),
+            ("a second opening, plain", "namespace playback_frame_range {\nint extra();\n}\n", "rebinds playback_frame_range"),
+        )
+        for name, insert, needle in cases:
+            with self.subTest(name):
+                self.assertTrue(caught(with_tail(insert), needle), scan_app_play_sources(with_tail(insert)))
+        close = "} // namespace playback_frame_range"
+        self.assertIn(close, header)
+        for name, insert in (("an overload inside the one block", overload),
+                             ("a function hiding the counter's class", "inline SourceFrameAdvanceCounter SourceFrameAdvanceCounter() "
+                                                                         "{ return {}; }\n")):
+            with self.subTest(name):
+                sources = {header_path: header.replace(close, insert + close, 1)}
+                self.assertTrue(caught(sources, "pinned callee"), scan_app_play_sources(sources))
+        landing = "pacedMeasuredHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)"
+        anchor = "void MainWindow::playbackHandling("
+        for name, define in (("A2: a trigraph splice in the directive word", "#de??/\nfine " + landing),
+                             ("a trigraph splice with trailing blanks", "#de??/  \r\nfine " + landing),
+                             ("a trigraph splice in the name", "#define pacedMeasured??/\nHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)")):
+            with self.subTest(name):
+                self.assert_caught(self.mutated(anchor, define + "\n" + anchor), "#define of")
+
     LANDING_CALL = ("dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,\n"
                     "                        m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );")
 
