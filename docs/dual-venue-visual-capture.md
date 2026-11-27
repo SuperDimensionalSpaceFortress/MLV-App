@@ -97,7 +97,11 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
   for `paused-unbound.png` against `paused.png`;
 * `frozenJudgedOn`: `play_unbound` when the app published unforced play captures (the play-frame numbers above are then computed
   from THEM: the frozen check never judges a force-painted set), else `play`. Beside it, `forcedPlayDistinctContentHashes`; a
-  forced set that moved over an unforced one that did not is said in the reason ("the force-paint would have masked this"). (r5:
+  forced set that moved over an unforced one that did not is said in the reason ("the force-paint would have masked this") only when
+  the judged unforced frames carry two or more display frame numbers, and never beside `NOT_A_MOTION_WITNESS`: over one held display
+  frame the hold, not a force-paint, explains the one unforced picture (UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2). It also needs the judged
+  frames' own source ids to be KNOWN to differ (`sourceDifference` `known-differ`): over identical or unknown source frames one picture
+  may be the source's own. The visual `reason` is one line: everything outside printable ASCII (control characters, U+2028 / U+2029, and characters a legacy code page best-fits to CR / LF, such as U+25D9) is written as `\uXXXX`; the same rule prints `DVE_DETAIL`. `Get-DvVisualVerdict` never quotes a count that cannot be true for the judged frames (a distinct-picture count outside 1..PlayFrames, a repeat count over PlayFrames, ...): the verdict is unchanged and the reason leaves the number out. (r5:
   no forced-k vs unforced-k pairing is reported; under the r3 order such a pair compares two moments half a tail apart.)
 * `observerPaintedPlayFrames`: unforced play captures not judged because they record another `forced_paints_before` than the
   first (or none: an r2 build); `stopUnboundObserverClean`: whether `stop-unbound.png` also follows them with no forced paint;
@@ -145,9 +149,16 @@ Numbers are computed from the VIDEO VIEWPORT only -- the window's timecode and f
 | `CAPTURE_UNBOUND` | a capture the divergence compares is not shown bound to its label: on a binding build (either side carries `label_bound`), the stop OR the paused capture's `label_bound` is false or missing; the stop-vs-paused difference then compares two moments | yes, and the detail says so |
 | `VISUAL_DIVERGENCE` | the playback frame is further than the threshold from its paused full-quality re-render | yes, and the detail says so |
 | `CAPTURE_BLANK` | every play frame's viewport is flat (std < 1): the capture judges nothing | yes |
+| `NOT_A_MOTION_WITNESS` | not blank, but the judged play frames carry fewer than two distinct display frames (`appDistinctDisplayFrames` 0 or 1): the judged frames' labels carry one display frame number at most (none, when no judged frame carries a valid frame number), so they cannot witness motion during playback, whatever their pictures show; the reason speaks of the judged frames' label numbers only, never of a timeline position (`visual.json` carries no clip token: clip A frame 479 and clip B frame 479 are one number), never of the pictures (a picture may be an older paint than its label) or of the whole strip (other tiles, the forced ones say, may carry other labels). Judged after `NOT_REQUESTED`, `VISUAL_ASSESSMENT_UNAVAILABLE`, `NOT_CAPTURED` and right after `CAPTURE_BLANK`, so it outranks `FROZEN_DISPLAY` / `FROZEN_DISPLAY_SUSPECTED` (disjoint anyway: they need two or more display frames), `PARTIAL_FREEZE`, `CAPTURE_UNBOUND`, `VISUAL_DIVERGENCE`, `EXPOSURE_OUT_OF_RANGE` and the known-identical waiver; generic on the display-frame fact, not on a leg flag; the reason names the judged count, how many of them carry a frame number, and the one frame | yes, and the detail says so (the measured window closed before the tail, so the speed numbers are untouched); a self-heal pre-launch with it is `INVALID` |
 | `NOT_CAPTURED` / `NOT_REQUESTED` | nothing published (an old build, a failed run) / the spec opts out | yes |
 | `EXPOSURE_OUT_OF_RANGE` | none of the verdicts above, but the leg's median luma, near-black fraction or clipped fraction is outside its band (see Exposure above); the reason quotes the three numbers and the band | yes, and the detail says so (a flag, never an exclusion; judged after every other verdict; a self-heal pre-launch may show it too, where every other non-OK verdict still makes the leg `INVALID`) |
 | `OK` | none of the above | yes |
+
+Known limit (UNPACED-VISUAL-MIDPLAY-CAPTURE-1): an unpaced Play holds its last required frame through the capture tail (`MainWindow.cpp`
+`playbackHandling`, `playback_frame_range::pinnedUnpacedHoldReached`), so an unpaced visual leg's play captures are labelled with its end frame
+(every play tile carried display frame 479 on the 2026-11-25 every-frame CUDA legs) and it reads `NOT_A_MOTION_WITNESS` unless an earlier verdict
+(`CAPTURE_BLANK`, say) applies; releasing that hold only while the
+tail runs, after the measured session closes, is the follow-up card UNPACED-VISUAL-TAIL-HOLD-RELEASE-1.
 
 `sourceDifference` is derived from the app's own per-frame records over the SAME frames the picture is judged over (the play
 frames with a content hash): `Get-DvVisualSourceDifference` applies the app's rule (next section) to those frames' `source_id`, so
