@@ -3303,6 +3303,104 @@ class EnvelopePreemptR1ResidueTests(_Probe):
         self.assertEqual(dict(item.split("=", 1) for item in self.ok(body).split()), {"EXACT": "True", "OTHER-CASE": "False"})
         self.assertIn("(@($heldFullPaths | Where-Object { Test-FpsPathAlias $_ $diskPath }).Count -gt 0)", source)
 
+    # ---- r6 (hub ruling 2026-11-27T13:17Z): ONE identity rule for the packager's paths (volume serial + file id), and the batch deadline read without Get-Variable ----
+
+    # a stand-in for the module's raw identity reader, with a case-SENSITIVE volume R: (R:\r\Run and R:\r\run are two directories) and a drive S: that is a SUBST of R:\r\Run
+    _MOCK_VOLUME = (
+        "$m = Get-Module FpsArmGate\n"
+        "& $m { Set-Item -Path function:script:Read-FpsFileIdentity -Value { param([string]$Path)\n"
+        "    $p = $Path.TrimEnd([char]92)\n"
+        "    if ($p -ceq 'S:') { $p = 'R:\\r\\Run' } elseif ($p.StartsWith('S:\\', [StringComparison]::Ordinal)) { $p = 'R:\\r\\Run' + $p.Substring(2) }\n"
+        "    if ($p -ceq 'locked') { return [pscustomobject]@{ state = 'UNREADABLE'; id = $null; error = 5 } }\n"
+        "    if (@('R:', 'R:\\r', 'R:\\r\\Run', 'R:\\r\\run', 'R:\\r\\Run\\sub') -ccontains $p) { return [pscustomobject]@{ state = 'EXISTS'; id = 'ID:' + $p; error = 0 } }\n"
+        "    if ($p -like '*locked*') { return [pscustomobject]@{ state = 'UNREADABLE'; id = $null; error = 5 } }\n"
+        "    [pscustomobject]@{ state = 'MISSING'; id = $null; error = 2 } } }\n")
+
+    @requires_windows_pwsh
+    def test_r6_adversary_d68bc1e8_a1_two_paths_are_one_file_when_volume_serial_and_file_id_agree(self) -> None:
+        # r6: Test-FpsPathAlias compared SPELLINGS (case, volume, SUBST, root case: a new spelling every pass). Two existing paths are the same file iff they open to the same volume serial number and file
+        # id; a path that does not exist yet is its existing ancestor's identity plus the names below it (compared ignoring case). Real files here: a hard link is the same file, a copy with the same
+        # bytes is not, and the answer does not depend on how the path is spelled.
+        a = self.tmp / "a.json"
+        a.write_text("{}", encoding="utf-8")
+        copy = self.tmp / "copy.json"
+        copy.write_text("{}", encoding="utf-8")
+        link = self.tmp / "link.json"
+        (self.tmp / "sub").mkdir()
+        cases = [
+            ("same-path", a, a, "True"), ("hard-link", a, link, "True"), ("copy-with-the-same-bytes", a, copy, "False"),
+            ("dot-dot-spelling", self.tmp / "sub" / ".." / "a.json", a, "True"),
+            ("missing-case-twins", self.tmp / "New.json", self.tmp / "new.json", "True"), ("missing-distinct", self.tmp / "x.json", self.tmp / "y.json", "False"),
+            ("missing-below-a-missing-directory", self.tmp / "nodir" / "q" / "p.json", self.tmp / "NODIR" / "Q" / "p.json", "True"),
+            ("existing-and-missing", a, self.tmp / "other.json", "False"),
+        ]
+        body = f"$null = New-Item -ItemType HardLink -Path '{link}' -Target '{a}'\n"
+        body += "".join(f"Write-Host ('{label}=' + (Test-FpsPathAlias '{x}' '{y}'))\n" for label, x, y, _ in cases)
+        got = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertEqual(got, {label: want for label, _, _, want in cases})
+
+    @requires_windows_pwsh
+    def test_r6_adversary_d68bc1e8_a1_a_subst_drive_over_the_run_root_is_the_run_root(self) -> None:
+        # adversary d68bc1e8 A1 (input): SUBST X: -> the run root; -PacketPath X:\proof-report.json beside the run root's own proof-report.json. Both are fresh names, so only the identity of the directory
+        # that will hold them can show they are one file; the ZIP replaced the JSON report after it was published. The drive is made and removed by this test; without `subst` the row is skipped.
+        repo, run, original = self._pkg_fixture()
+        letter = next((c for c in "ZYXWVUTSRQPONM" if not Path(f"{c}:\\").exists()), None)
+        if letter is None or subprocess.run(["subst", f"{letter}:", str(run)], capture_output=True, text=True, creationflags=_NO_WINDOW).returncode != 0:
+            self.skipTest("SUBST_UNAVAILABLE: no free drive letter or `subst` cannot map one on this host")
+        try:
+            proc = self._package(repo, "-RunRoot", str(run), "-PacketPath", f"{letter}:\\proof-report.json")
+            self.assertNotEqual(proc.returncode, 0, proc.stdout)
+            self.assertFalse((run / "proof-report.json").exists(), "the JSON report must not be published beside a packet that is the same file")
+            self.assertEqual((run / "summary.json").read_bytes(), original)
+            self.assertEqual(self._private_dirs(), [])
+        finally:
+            subprocess.run(["subst", f"{letter}:", "/D"], capture_output=True, text=True, creationflags=_NO_WINDOW)
+
+    @requires_windows_pwsh
+    def test_r6_an_identity_that_cannot_be_read_is_a_typed_refusal_never_different(self) -> None:
+        body = self._MOCK_VOLUME + (
+            "function T($a, $b) { try { [string](Test-FpsPathAlias $a $b) } catch { if ($_.Exception.Message -like '*FPS_PATH_IDENTITY_UNREADABLE*') { 'TYPED-REFUSAL' } else { 'OTHER: ' + $_.Exception.Message } } }\n"
+            "Write-Host ('unreadable-first=' + (T 'R:\\r\\Run\\locked.json' 'R:\\r\\Run\\b.json'))\n"
+            "Write-Host ('unreadable-second=' + (T 'R:\\r\\Run\\b.json' 'R:\\r\\Run\\locked.json'))\n"
+            "Write-Host ('readable=' + (T 'R:\\r\\Run\\a.json' 'R:\\r\\Run\\b.json'))\n")
+        self.assertEqual(dict(line.split("=", 1) for line in self.ok(body).split()),
+                         {"unreadable-first": "TYPED-REFUSAL", "unreadable-second": "TYPED-REFUSAL", "readable": "False"})
+
+    @requires_windows_pwsh
+    def test_r6_adversary_d68bc1e8_a2_held_names_are_keyed_by_the_path_below_the_identity_resolved_run_root(self) -> None:
+        # adversary d68bc1e8 A2 (input): case-sensitive C:\review holds distinct Run and run; -RunRoot C:\review\Run -SummaryPath C:\review\run\summary.json. GetRelativePath collapsed the root's case, so the
+        # external summary was keyed summary.json and the distinct Run\summary.json vanished from the packet. The relative name is taken under the ancestor that IS the run root (by identity); a path with no
+        # such ancestor is outside the run root and holds no name in it. The stand-in volume is case sensitive and S: is a SUBST of R:\r\Run.
+        body = self._MOCK_VOLUME + (
+            "function T($root, $path) { $r = Get-FpsRelativeUnderRoot -Root $root -Path $path; if ($null -eq $r) { '<outside>' } else { $r } }\n"
+            "Write-Host ('other-case-root=' + (T 'R:\\r\\Run' 'R:\\r\\run\\summary.json'))\n"
+            "Write-Host ('own-root=' + (T 'R:\\r\\Run' 'R:\\r\\Run\\summary.json'))\n"
+            "Write-Host ('below-a-subdirectory=' + (T 'R:\\r\\Run' 'R:\\r\\Run\\sub\\x.json'))\n"
+            "Write-Host ('through-the-subst-drive=' + (T 'R:\\r\\Run' 'S:\\x.json'))\n"
+            "Write-Host ('root-itself=' + (T 'R:\\r\\Run' 'R:\\r\\Run'))\n"
+            "Write-Host ('elsewhere=' + (T 'R:\\r\\Run' 'R:\\other\\summary.json'))\n")
+        self.assertEqual(dict(line.split("=", 1) for line in self.ok(body).split()), {
+            "other-case-root": "<outside>", "own-root": "summary.json", "below-a-subdirectory": "sub/x.json", "through-the-subst-drive": "x.json", "root-itself": "<outside>", "elsewhere": "<outside>"})
+        source = self.PACKAGER.read_text(encoding="utf-8")
+        self.assertIn("Get-FpsRelativeUnderRoot -Root $runRootResolved -Path", source)
+        self.assertNotIn("[System.IO.Path]::GetRelativePath($runRootResolved", source)
+
+    @requires_pwsh
+    def test_r6_adversary_d68bc1e8_a3_the_spec_read_bound_ignores_a_get_variable_default_parameter_redirect(self) -> None:
+        # adversary d68bc1e8 A3 (input): a caller's $PSDefaultParameterValues['Get-Variable:Scope']='Global' sent Get-Variable's lookup of the batch deadline to the global scope, which has none, so the spec read got
+        # the 120 s cap instead of the time left and SPEC_READ_TIMEOUT could land after -DeadlineUtc. The deadline is read from the script scope directly.
+        funcs = _extract_functions(LEASE_BATCH_SCRIPT, ["Get-SpecReadBoundSec"])
+        body = funcs + (
+            "$PSDefaultParameterValues['Get-Variable:Scope'] = 'Global'\n"
+            "$deadline = [datetime]::UtcNow.AddSeconds(30)\n"
+            "Write-Host ('BOUND=' + [Math]::Round((Get-SpecReadBoundSec), 0))\n"
+            "Remove-Variable deadline -Scope Script\n"
+            "Write-Host ('NO-DEADLINE=' + (Get-SpecReadBoundSec))\n")
+        got = dict(line.split("=", 1) for line in self.ok(body).split())
+        self.assertIn(int(float(got["BOUND"])), (27, 28), got)
+        self.assertEqual(float(got["NO-DEADLINE"]), 120.0, got)
+        self.assertNotIn("Get-Variable -Name deadline", LEASE_BATCH_SCRIPT.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

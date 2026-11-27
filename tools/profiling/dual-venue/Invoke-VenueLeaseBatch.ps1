@@ -1570,7 +1570,9 @@ function Get-LegSpecTelemetryArm([string]$Path) {
 function Get-SpecReadBoundSec {
     # r19 (sol r18 B2 = pass20-A2): the longest a spec read may take now: what is left before -DeadlineUtc less the refusal's reserve, under the preflight child's own cap (120 s). A guard
     # worker (no -DeadlineUtc in its scope) has the cap: the worker is itself given up on at its guard budget, and its callers pass that budget's remainder instead.
-    $dl = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
+    # R4-DEADLINE-RESIDUE-1 r6 (adversary d68bc1e8 A3): the deadline is read from the script scope directly. Get-Variable took its scope from $PSDefaultParameterValues, so a caller's
+    # 'Get-Variable:Scope'='Global' sent the lookup to a scope with no deadline and the spec read got the 120 s cap instead of the time left (SPEC_READ_TIMEOUT after -DeadlineUtc).
+    $dl = $script:deadline
     $cap = 120.0
     if ($dl -isnot [datetime]) { return $cap }
     # adversary pass 22 A1 (on d8ad4c8d): no floor. A 1 s floor let a read that started with 0.25 s left end 0.75 s past the deadline; a room under the reserve is a bound of 0, and

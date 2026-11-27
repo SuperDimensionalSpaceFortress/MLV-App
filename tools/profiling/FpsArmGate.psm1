@@ -860,17 +860,124 @@ function Test-FpsFilesHoldTheSameBytes {
     } catch { $true }
 }
 
-function Test-FpsPathAlias {
-    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A2): are two output paths the SAME name on the volume that holds them? The comparison asked of the INPUT's directory does not describe a directory elsewhere (a
-    # case-sensitive input directory, a case-insensitive output directory: Proof.json and proof.json are one file there). Equal ordinally: the same. Different ignoring case too: distinct. Different only
-    # by case: the volume of a name that EXISTS is asked (Get-VolumeNameComparison); when neither exists nothing can show the directory case sensitive, so they are refused as one name.
-    param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B)
-    if ([string]::Equals($A, $B, [StringComparison]::Ordinal)) { return $true }
-    if (-not [string]::Equals($A, $B, [StringComparison]::OrdinalIgnoreCase)) { return $false }
-    foreach ($path in @($A, $B)) {
-        if (Test-Path -LiteralPath $path -PathType Leaf) { return ((Get-VolumeNameComparison -ExistingFile $path) -eq [StringComparison]::OrdinalIgnoreCase) }
+# R4-DEADLINE-RESIDUE-1 r6 (hub ruling 2026-11-27T13:17Z; adversary d68bc1e8 A1, A2): ONE identity rule for "are these two paths the same file" in place of a spelling comparison per pass (case, volume, SUBST,
+# root case: each pass found another spelling). Two EXISTING paths are the same file iff opening each (share read/write/delete, no access rights asked, so a file another process holds open still answers,
+# and no elevation: `fsutil file queryfileid` needs it) gives the same volume serial number and file id (GetFileInformationByHandleEx FileIdInfo, 64-bit serial + 128-bit id, which sees through a SUBST
+# drive, a junction or symlink, a hard link, an 8.3 name and a case spelling alike; the older 64-bit index is the answer on a file system that has no FileIdInfo). A path that does NOT exist yet is its
+# nearest existing ancestor's identity plus the names below it, those compared ignoring case (nothing can show a directory to be case sensitive when the names are not there). An identity that cannot be
+# read is a typed refusal (FPS_PATH_IDENTITY_UNREADABLE), never "different". Off Windows the identity is `stat -L -c %d:%i`.
+$script:FpsIdentityTypeReady = $false
+$script:FpsIdentityTypeSource = @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class FpsFileIdentityNative {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern SafeFileHandle CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandleEx(SafeFileHandle handle, int infoClass, IntPtr buffer, uint size);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, IntPtr buffer);
+    // access 0 (attributes only), share read|write|delete, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS (a directory opens too); a link is FOLLOWED, so a link and its target are one identity
+    public static string Read(string path, out int error) {
+        error = 0;
+        using (SafeFileHandle handle = CreateFileW(path, 0, 7, IntPtr.Zero, 3, 0x02000000, IntPtr.Zero)) {
+            if (handle.IsInvalid) { error = Marshal.GetLastWin32Error(); return null; }
+            IntPtr buffer = Marshal.AllocHGlobal(64);
+            try {
+                if (GetFileInformationByHandleEx(handle, 18, buffer, 24)) {
+                    byte[] bytes = new byte[24];
+                    Marshal.Copy(buffer, bytes, 0, 24);
+                    return "X" + BitConverter.ToString(bytes).Replace("-", "");
+                }
+                if (GetFileInformationByHandle(handle, buffer)) {
+                    byte[] info = new byte[52];
+                    Marshal.Copy(buffer, info, 0, 52);
+                    return "L" + BitConverter.ToUInt32(info, 28).ToString("X8") + BitConverter.ToUInt32(info, 44).ToString("X8") + BitConverter.ToUInt32(info, 48).ToString("X8");
+                }
+                error = Marshal.GetLastWin32Error();
+                return null;
+            } finally { Marshal.FreeHGlobal(buffer); }
+        }
     }
-    $true
+} // FpsFileIdentityNative (never a bare column-0 brace: the function extractors end a function at one)
+'@
+
+function Read-FpsFileIdentity {
+    # The raw read: [pscustomobject]@{ state = EXISTS | MISSING | UNREADABLE; id; error }. MISSING is only "there is no such name" (file or path not found, an invalid name, a file used as a directory);
+    # every other failure (access denied, a share that does not answer, no compiler for the reader) is UNREADABLE. The one place the file system is asked: the tests stand a volume in for it here.
+    param([Parameter(Mandatory)][string]$Path)
+    if ([IO.Path]::DirectorySeparatorChar -eq [char]92) {
+        try {
+            if (-not $script:FpsIdentityTypeReady) {
+                if (-not ('FpsFileIdentityNative' -as [type])) { Add-Type -TypeDefinition $script:FpsIdentityTypeSource -Language CSharp }
+                $script:FpsIdentityTypeReady = $true
+            }
+            $err = 0
+            $id = [FpsFileIdentityNative]::Read($Path, [ref]$err)
+        } catch {
+            return [pscustomobject]@{ state = 'UNREADABLE'; id = $null; error = -1 }
+        }
+        if ($null -ne $id) { return [pscustomobject]@{ state = 'EXISTS'; id = [string]$id; error = 0 } }
+        if (@(2, 3, 123, 161, 267) -contains [int]$err) { return [pscustomobject]@{ state = 'MISSING'; id = $null; error = [int]$err } }
+        return [pscustomobject]@{ state = 'UNREADABLE'; id = $null; error = [int]$err }
+    }
+    if (-not ([IO.File]::Exists($Path) -or [IO.Directory]::Exists($Path))) { return [pscustomobject]@{ state = 'MISSING'; id = $null; error = 2 } }
+    $stat = & stat -L -c '%d:%i' -- $Path 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$stat)) { return [pscustomobject]@{ state = 'UNREADABLE'; id = $null; error = $LASTEXITCODE } }
+    [pscustomobject]@{ state = 'EXISTS'; id = ([string]$stat).Trim(); error = 0 }
+}
+
+function Get-FpsPathIdentity {
+    # [pscustomobject]@{ kind = EXISTS | BELOW; id; below }: EXISTS = the path opens (id is its volume serial + file id, below is empty); BELOW = it does not exist yet, id is its nearest existing ancestor's
+    # and below the names under that ancestor. Throws FPS_PATH_IDENTITY_UNREADABLE when a name on the way cannot be read, or when no part of the path exists (no ancestor to take an identity from).
+    param([Parameter(Mandatory)][string]$Path)
+    try { $current = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Path)) }
+    catch { throw "FPS_PATH_IDENTITY_UNREADABLE: '$Path' is not a path that can be resolved ($($_.Exception.Message -replace '\s+', ' '))" }
+    $full = $current
+    $below = [System.Collections.Generic.List[string]]::new()
+    while ($true) {
+        $read = Read-FpsFileIdentity -Path $current
+        if ([string]$read.state -ceq 'EXISTS') { return [pscustomobject]@{ kind = $(if ($below.Count -eq 0) { 'EXISTS' } else { 'BELOW' }); id = [string]$read.id; below = ($below -join '/') } }
+        if ([string]$read.state -cne 'MISSING') { throw "FPS_PATH_IDENTITY_UNREADABLE: the identity of '$current' (a part of '$full') cannot be read (error $($read.error)); refusing rather than calling it different." }
+        $parent = [IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrEmpty($parent) -or [string]::Equals($parent, $current, [StringComparison]::Ordinal)) { throw "FPS_PATH_IDENTITY_UNREADABLE: no part of '$full' exists, so it has no identity to compare." }
+        $below.Insert(0, [IO.Path]::GetFileName($current))
+        $current = $parent
+    }
+}
+
+function Test-FpsPathAlias {
+    # Are two paths the SAME file (see the rule above)? Two existing paths: the same volume serial and file id. Two paths that do not exist yet: the same existing ancestor and the same names below it
+    # (ignoring case). One that exists and one that does not cannot be the same file. Throws FPS_PATH_IDENTITY_UNREADABLE for an identity that cannot be read.
+    param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B)
+    $left = Get-FpsPathIdentity $A
+    $right = Get-FpsPathIdentity $B
+    if ([string]$left.kind -cne [string]$right.kind) { return $false }
+    if (-not [string]::Equals([string]$left.id, [string]$right.id, [StringComparison]::Ordinal)) { return $false }
+    [string]::Equals([string]$left.below, [string]$right.below, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-FpsRelativeUnderRoot {
+    # The name of -Path below -Root as /-joined segments, as -Path itself spells them, when an ancestor of -Path IS the root by identity (so a SUBST drive over the root, a link to it, or a root spelled in
+    # another case all count), else $null: the path is outside the root and holds no name in it. The root itself is not below itself. The root must exist.
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Path)
+    $rootIdentity = Get-FpsPathIdentity $Root
+    if ([string]$rootIdentity.kind -cne 'EXISTS') { throw "FPS_PATH_IDENTITY_UNREADABLE: the root '$Root' does not exist, so no name can be taken below it." }
+    $current = [IO.Path]::TrimEndingDirectorySeparator([IO.Path]::GetFullPath($Path))
+    $segments = [System.Collections.Generic.List[string]]::new()
+    while ($true) {
+        $parent = [IO.Path]::GetDirectoryName($current)
+        if ([string]::IsNullOrEmpty($parent) -or [string]::Equals($parent, $current, [StringComparison]::Ordinal)) { return $null }
+        $segments.Insert(0, [IO.Path]::GetFileName($current))
+        $current = $parent
+        $read = Read-FpsFileIdentity -Path $current
+        if ([string]$read.state -ceq 'EXISTS') {
+            if ([string]::Equals([string]$read.id, [string]$rootIdentity.id, [StringComparison]::Ordinal)) { return ($segments -join '/') }
+        } elseif ([string]$read.state -cne 'MISSING') {
+            throw "FPS_PATH_IDENTITY_UNREADABLE: the identity of '$current' cannot be read (error $($read.error)); refusing rather than calling it outside the root."
+        }
+    }
 }
 
 function Get-FpsJsonRepeatedKeyProblem {
@@ -1023,4 +1130,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-VolumeNameComparison, Test-FpsFilesHoldTheSameBytes, Test-FpsPathAlias, Get-FpsCompareBindingProblem, Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Test-FpsProofReportSpeedQuotable, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-VolumeNameComparison, Test-FpsFilesHoldTheSameBytes, Get-FpsPathIdentity, Test-FpsPathAlias, Get-FpsRelativeUnderRoot, Get-FpsCompareBindingProblem, Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Test-FpsProofReportSpeedQuotable, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal

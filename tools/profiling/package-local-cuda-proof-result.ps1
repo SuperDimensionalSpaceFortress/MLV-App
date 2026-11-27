@@ -402,9 +402,11 @@ try {
     # (Test-FpsPathAlias, below); the outputs were already checked against each other and the input by Assert-OutputPathsAreSafe, so no two held names are one file.
     $heldBytes = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::Ordinal)
     foreach ($held in @(@($summaryFullPath, $summaryBytes), @($ReportPath, $summarizerResult.markdownBytes), @($jsonReportPath, $summarizerResult.jsonBytes))) {
-        $relative = [System.IO.Path]::GetRelativePath($runRootResolved, [IO.Path]::GetFullPath([string]$held[0]))
-        if ($relative -eq ".." -or $relative.StartsWith(".." + [IO.Path]::DirectorySeparatorChar, [StringComparison]::Ordinal) -or [IO.Path]::IsPathRooted($relative)) { continue }
-        $heldBytes[($relative -replace '\\', '/')] = $held[1]
+        # R4-DEADLINE-RESIDUE-1 r6 (adversary d68bc1e8 A2): the name is the path below the ancestor that IS the run root by identity (Get-FpsRelativeUnderRoot), never GetRelativePath, which collapsed a root
+        # spelled in another case: on a case-sensitive volume an external <root-in-other-case>\summary.json was keyed summary.json and hid the distinct <root>\summary.json. Outside the root: no name in it.
+        $relative = Get-FpsRelativeUnderRoot -Root $runRootResolved -Path ([string]$held[0])
+        if ($null -eq $relative) { continue }
+        $heldBytes[$relative] = $held[1]
     }
     # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A2): a disk file is this run's own output, the manifest or the packet when the volume that holds it says it is the same name (Test-FpsPathAlias), not by the
     # comparison taken from the input's directory
