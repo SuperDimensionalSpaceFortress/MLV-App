@@ -306,7 +306,9 @@ $realUmRun = [IO.Path]::GetFullPath((Join-Path $here '..\um-run.ps1'))
 # r2 (adversary pass 4 A1): the content test is on the LINE-ENDING-NORMALISED hash (Get-DvLegSpecSha256, CRLF -> LF), not the raw bytes: a second checkout's production um-run.ps1 that differs from this one only
 # by line endings (an autocrlf checkout) is still the real one, so it is refused every offline seam, -SkipCommittedSpecPreflight among them.
 function Get-NormalisedFileSha256([string]$Path) { Get-DvLegSpecSha256 ([IO.File]::ReadAllBytes($Path)) }
-$umRunIsReal = ([IO.Path]::GetFullPath($UmRunScript) -ieq $realUmRun) -or ((Test-Path -LiteralPath $realUmRun -PathType Leaf) -and (Get-NormalisedFileSha256 $UmRunScript) -ceq (Get-NormalisedFileSha256 $realUmRun))
+# (pass 5 A1: the path is the one PowerShell resolved, the one Test-Path above accepted: a RELATIVE -UmRunScript is relative to PowerShell's location, which Set-Location moves and .NET's current directory does not)
+$umRunFull = (Resolve-Path -LiteralPath $UmRunScript).ProviderPath
+$umRunIsReal = ($umRunFull -ieq $realUmRun) -or ((Test-Path -LiteralPath $realUmRun -PathType Leaf) -and (Get-NormalisedFileSha256 $umRunFull) -ceq (Get-NormalisedFileSha256 $realUmRun))
 if ($umRunIsReal -and $LeaseBudgetWindowSec -lt 10800) {
     Stop-Usage "LEASE_CAP_RELAXED -LeaseBudgetWindowSec $LeaseBudgetWindowSec is looser than Bachelor's 10800 s window"
 }
@@ -322,7 +324,7 @@ if ($SkipCommittedSpecPreflight -and $CommittedSpecRepoRoot) { Stop-Usage '-Skip
 # resolves for itself (its own ..\..\..), and the bounded child Test-LegSpecCommitted.ps1 resolves it from the leg script path, the seam value too: no file-system work on the root here, where no deadline holds yet.
 $script:CommittedSpecPreflightOn = -not $SkipCommittedSpecPreflight
 $script:CommittedSpecRepoRoot = $CommittedSpecRepoRoot   # as spelled; '' = the repo the leg script resolves for itself
-$script:CommittedSpecLegScript = [IO.Path]::GetFullPath($LegScript)   # a string operation only
+$script:CommittedSpecLegScript = (Resolve-Path -LiteralPath $LegScript).ProviderPath   # the file Test-Path accepted above, as PowerShell resolved it (a leaf, not the ..\..\.. root, which the bounded child resolves)
 if ($umRunIsReal -and $CommittedSpecScript) { Stop-Usage '-CommittedSpecScript is an offline test seam: with the real um-run.ps1 the committed-spec preflight always runs Test-LegSpecCommitted.ps1' }
 $script:CommittedSpecScript = $(if ($CommittedSpecScript) { $CommittedSpecScript } else { Join-Path $here 'Test-LegSpecCommitted.ps1' })
 if (-not $ExportBudgetScript) { $ExportBudgetScript = Join-Path $here '..\bachelor\export-stage-job.ps1' }

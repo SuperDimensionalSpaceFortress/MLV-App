@@ -615,12 +615,16 @@ def leg_receipt_root_guard_ps(leg: Path, root: str, offline: bool = False) -> st
     )
 
 
+# A digest no other process shares: the cases that can reach the REAL leg hand it this as -BuildManifestSha256 (a leg's receipt records it as subject.buildManifestSha256), so a receipt that
+# carries it was written by THIS test process (adversary r2 passes 4-5 A2: the shared MANIFEST constant was not distinctive enough).
+THIS_PROCESS_MANIFEST = uuid.uuid4().hex * 2
+
+
 def receipt_state_written_by_this_harness(base: Path) -> dict[str, tuple[int, int]]:
-    """Every file under `base` that carries this harness's build manifest digest (MANIFEST, the -BuildManifestSha256 every batch_cmd run hands the leg, which a leg's receipt records as
-    subject.buildManifestSha256), as name -> (size, mtime_ns). A file another process wrote there is not this harness's and is not counted (adversary r2 pass 4 A2)."""
+    """Every file under `base` that carries THIS_PROCESS_MANIFEST, as name -> (size, mtime_ns). A file another process wrote there (whatever manifest it carries) is not counted."""
     if not base.exists():
         return {}
-    return {str(p.relative_to(base)): (p.stat().st_size, p.stat().st_mtime_ns) for p in base.rglob("*") if p.is_file() and MANIFEST.encode("ascii") in p.read_bytes()}
+    return {str(p.relative_to(base)): (p.stat().st_size, p.stat().st_mtime_ns) for p in base.rglob("*") if p.is_file() and THIS_PROCESS_MANIFEST.encode("ascii") in p.read_bytes()}
 
 
 def canonical_receipt_state_for(spec: Path) -> dict[str, tuple[int, int]]:
@@ -5912,6 +5916,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # (r2 hermetic: a regression here lets the real leg run, and it writes its refusal receipt under -ReceiptRoot; this case's own temp dir keeps that out of the canonical root)
         args, e = self.batch_cmd([self._untracked_copy_of_a_committed_spec()], *self._hermetic_receipt_root(), OMIT_DEFAULTS="-SkipCommittedSpecPreflight")
         args[args.index("-LegScript") + 1] = str(LEG)
+        args[args.index("-BuildManifestSha256") + 1] = THIS_PROCESS_MANIFEST   # (a receipt this case's real leg writes anywhere is then recognisably ours: the class teardown check)
         r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
         self._assert_nothing_claimed_or_leased("real leg script", r)
         self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
@@ -6021,6 +6026,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self._reset_committed_case()
         args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
         args[args.index("-LegScript") + 1] = str(leg_copy_dir / "Invoke-VenueLeg.ps1")
+        args[args.index("-BuildManifestSha256") + 1] = THIS_PROCESS_MANIFEST
         r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=e)
         self._assert_nothing_claimed_or_leased("second checkout, line-ending copy of the leg, stand-in um-run", r)
         self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
@@ -6101,13 +6107,36 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertIn(needle, r.stderr)
                 self.assertEqual(self.kinds(), [])
 
+    # adversary r2 pass 5 A1: a RELATIVE -UmRunScript is the file Test-Path accepts under PowerShell's location; reading it for the content test through .NET (its own current directory, which
+    # Set-Location does not move) threw before any preflight. Both the path test and the content test judge the path PowerShell resolved.
+    def test_legspec_committed_r2_a_relative_um_run_path_is_judged_from_powershells_location_not_the_process_directory(self) -> None:
+        child = self.case / "recording-relative.ps1"
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         "Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'child-args-relative.log') -Value ('LegScript={0}' -f $LegScript)\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        log = self.case / "child-args-relative.log"
+        self._reset_committed_case()
+        log.unlink(missing_ok=True)
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        args[args.index("-UmRunScript") + 1] = ".\\fake-umrun.ps1"   # (the leg stays absolute: a relative leg is launched in a child process that does not share this location, which this card does not touch)
+        runner_at = args.index("-File") + 1
+        command = f"Set-Location -LiteralPath '{psq(self.tmp)}'; & '{psq(args[runner_at])}' " + " ".join(a if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", a) else f"'{psq(a)}'" for a in args[runner_at + 1:]) + "; exit $LASTEXITCODE"   # (parameter names bare, values quoted)
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=300, env=e, cwd=str(ROOT))
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+        self.assertNotIn("Could not find file", r.stdout + r.stderr)
+        self.assertNotIn("Invoke-VenueLeaseBatch.ps1:", r.stderr, r.stderr[-1500:])   # (no PowerShell error from the script itself)
+        self.assertTrue(self.kinds(), "the batch ran its lease and legs through the relative um-run: " + r.stdout[-2500:] + r.stderr[-1500:])
+        # the preflight child ran (the gate is on) and was handed the leg script PowerShell resolved
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1].lower(), str(self.tmp / "fake-leg.ps1").lower())
+
     # adversary r2 pass 4 A2: the canonical-receipt teardown check counts only what this harness wrote, so another process's receipt in the same directory is not a false failure
     def test_legspec_committed_r2_the_receipt_state_check_ignores_files_another_process_wrote(self) -> None:
         base = self.case / "receipts-under-watch"
         (base / "bachelor").mkdir(parents=True)
         (base / "bachelor" / "parallel.json").write_text("{}\n", encoding="utf-8")
+        (base / "bachelor" / "parallel-shared-digest.json").write_text(json.dumps({"subject": {"buildManifestSha256": MANIFEST}}), encoding="utf-8")   # the digest every harness process shares
         self.assertEqual(receipt_state_written_by_this_harness(base), {})
-        (base / "bachelor" / "ours.json").write_text(json.dumps({"subject": {"buildManifestSha256": MANIFEST}}), encoding="utf-8")
+        (base / "bachelor" / "ours.json").write_text(json.dumps({"subject": {"buildManifestSha256": THIS_PROCESS_MANIFEST}}), encoding="utf-8")
         self.assertEqual(list(receipt_state_written_by_this_harness(base)), [str(Path("bachelor") / "ours.json")])
         self.assertEqual(receipt_state_written_by_this_harness(self.case / "no-such-dir"), {})
 
@@ -10081,6 +10110,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
     _init_case = VenueLeaseBatchRunnerTests._init_case
     run_batch = VenueLeaseBatchRunnerTests.run_batch
     batch_cmd = VenueLeaseBatchRunnerTests.batch_cmd
+    offline_switch_args = VenueLeaseBatchRunnerTests.offline_switch_args   # r2: batch_cmd adds -SkipCommittedSpecPreflight through it
     kinds = VenueLeaseBatchRunnerTests.kinds
     batches = VenueLeaseBatchRunnerTests.batches
 
