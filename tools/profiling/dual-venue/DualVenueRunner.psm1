@@ -4392,7 +4392,10 @@ function Get-DvVisualVerdict {
     # count under PlayFrames the tuple disagrees and no reason claims a known source difference, a repeat or a cause on it
     $sourceIncoherent = ($SourceDifference -ne 'unknown' -and $null -ne $labelledCount -and $labelledCount -lt $PlayFrames)
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
-        $differText = $(if ($sourceIncoherent) { "the source difference supplied disagrees with the $labelledCount labelled of the $PlayFrames judged frames and is not quoted" } else { 'the source frames are known to differ' })
+        # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (key3 r4 H1): and a source claim beside an app count this same reason calls impossible is not quoted either
+        $differText = $(if ($sourceIncoherent) { "the source difference supplied disagrees with the $labelledCount labelled of the $PlayFrames judged frames and is not quoted" }
+                        elseif (-not $appCountFits) { 'the source difference supplied beside it is not quoted' }
+                        else { 'the source frames are known to differ' })
         return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them and $differText" }
     }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'unknown') {
@@ -4401,7 +4404,10 @@ function Get-DvVisualVerdict {
     if ($RepeatedPlayFrames -ge 2 -and $SourceDifference -ceq 'known-differ') {
         # a repeat is a judged frame equal to the one before it: N frames over D distinct pictures hold at most N - D of them (N - 1 when D itself cannot be true)
         # (sol r1 pass A1: 4 repeats over 6 frames and 3 pictures, or 6 repeats over 6 frames, were quoted although no judged set holds them)
-        $repeatMax = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { $PlayFrames - $DistinctContentHashes } else { $PlayFrames - 1 })
+        # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (sol r4 B1 = key3 r4 B1): this branch is reached only with a known source difference, two or more app frames and a picture
+        # count other than 1 (a 1 is FROZEN_DISPLAY above), so a real judged set holds at least two pictures and at most N - 2 repeats: that is the bound when the
+        # picture count itself cannot be true (N - 1 let 5 repeats over 6 frames and 0 pictures read as observed)
+        $repeatMax = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { $PlayFrames - $DistinctContentHashes } else { $PlayFrames - 2 })
         # sol r1c pass A2: a repeat needs two adjacent labelled frames (the label advanced), so L labelled frames hold at most L - 1 of them
         if ($null -ne $labelledCount) { $repeatMax = [Math]::Min($repeatMax, [Math]::Max(0, $labelledCount - 1)) }
         # pass 2 A1: when the supplied count is over that bound, "two or more of them repeat" is the same impossible claim in words (N = D = 2 holds no repeat at
@@ -4411,7 +4417,9 @@ function Get-DvVisualVerdict {
         if ($sourceIncoherent -and $RepeatedPlayFrames -le $repeatMax) {
             return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "the repeat count and source difference supplied for the $PlayFrames judged play frames disagree with the $labelledCount labelled of them and are not quoted: they establish no repeat, no source difference and no cause (the verdict follows the counts supplied, not an observation)" }
         }
-        if ($RepeatedPlayFrames -gt $repeatMax) {
+        # ... and a repeat count beside an app distinct-frame count that cannot be true for the judged frames (over PlayFrames, or over the labelled count) is a
+        # tuple no judged set produces: the repeat is not observed there either, so the same withheld wording
+        if ($RepeatedPlayFrames -gt $repeatMax -or -not $appCountFits) {
             return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "the repeat count supplied for the $PlayFrames judged play frames cannot be true for them and is not quoted: it establishes no repeat and no cause, so the judged frames are not described as repeating (the verdict follows the count supplied, not an observation)" }
         }
         return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "$RepeatedPlayFrames of the $PlayFrames judged play frames repeat the picture before them while the app's label advanced and the source frames are known to differ: the display's own paint stopped landing for part of the tail" }

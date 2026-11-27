@@ -11194,11 +11194,19 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         # the consistent zero still says none (no sole frame, no labelled count)
         proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -FlatPlayFrames 0 | ConvertTo-Json -Compress")
         self.assertTrue(out["reason"].startswith("none of the 6 judged play frames carries a valid display frame number"), out["reason"])
-        for distinct, repeats in ((2, 4), (6, 0), (9, 5), (0, 5)):
+        for distinct, repeats in ((2, 4), (6, 0), (9, 4), (0, 4)):
             if repeats >= 2:
                 with self.subTest(distinct=distinct, repeats=repeats, quoted=True):
                     out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
                     self.assertTrue(out["reason"].startswith(f"{repeats} of the 6 judged play frames repeat"), out["reason"])
+        # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (sol r4 B1 = key3 r4 B1): this branch is reached only with a known source difference, two or more app frames and a picture
+        # count other than 1 (1 would be FROZEN_DISPLAY), so a real judged set holds at least two pictures and at most PlayFrames - 2 repeats. With the picture count
+        # out of range the bound is therefore 4 here, and 5 repeats (the old PlayFrames - 1 fallback) is withheld like any other impossible count.
+        for distinct, repeats in ((9, 5), (0, 5)):
+            with self.subTest(distinct=distinct, repeats=repeats, quoted=False):
+                out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertTrue(out["reason"].startswith(self.IMPOSSIBLE_REPEAT_LEAD), out["reason"])
         # a negative judged-frame count is worded as unknown (the early verdicts are unchanged)
         proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames -1 -DistinctContentHashes 0 -AppDistinctDisplayFrames 0 -FlatPlayFrames 0 "
                                   "| ConvertTo-Json -Compress")
@@ -11207,6 +11215,48 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                   "-ViewportUnavailablePlayFrames 3 | ConvertTo-Json -Compress")
         self.assertEqual(out["verdict"], "VISUAL_ASSESSMENT_UNAVAILABLE")
         self.assertNotIn("-1", out["reason"])
+
+    def test_the_visual_gate_never_reads_an_impossible_tuple_as_an_observed_repeat_or_source_claim(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (sol r4 B1 = key3 opus r4 B1, their inputs verbatim; key3 r4 H1). DEFECT_CLASS: an
+        impossible count quoted as observed evidence or cause. The verdict and counted stay; the reason withholds the repeat observation, the cause and the source claim.
+        Red on ba4f45d4: (a)/(b) read '5 of the 6 judged play frames repeat ... the display's own paint stopped landing for part of the tail' beside 0 or 9 distinct
+        pictures, (c) read '2 of the 4 ... repeat' beside an app count of 5 over 4 judged frames, H1 read '... and the source frames are known to differ' beside an app
+        count the same reason had just called impossible."""
+        base = "Get-DvVisualVerdict -Requested $true -Captured $true -FlatPlayFrames 0 "
+        cases = [
+            ("a", "-PlayFrames 6 -DistinctContentHashes 0 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 -SourceDifference known-differ"),
+            ("b", "-PlayFrames 6 -DistinctContentHashes 9 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 -SourceDifference known-differ"),
+            ("c", "-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 5 -LabelledPlayFrames 4 -RepeatedPlayFrames 2 -SourceDifference known-differ"),
+            ("c-no-labelled", "-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 5 -RepeatedPlayFrames 2 -SourceDifference known-differ"),
+        ]
+        for name, args in cases:
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json(f"{base}{args} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertIn("cannot be true for them", out["reason"])
+                for claim in ("of the 6 judged play frames repeat", "of the 4 judged play frames repeat", "as supplied", "they repeat", "stopped landing", "label advanced",
+                              "paint", "known to differ"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+        # the bound is PlayFrames - 2 when the picture count cannot be true (two or more pictures are there): 4 of 6 is still quoted, 5 of 6 is not
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 0 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 4 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("4 of the 6 judged play frames repeat"), out["reason"])
+        # a tuple that fits (two pictures over four labelled frames, an app count of four) is quoted as before
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 4 -LabelledPlayFrames 4 -RepeatedPlayFrames 2 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("2 of the 4 judged play frames repeat"), out["reason"])
+        # key3 r4 H1 (its input verbatim): FROZEN_DISPLAY must not say the source frames are known to differ beside an app count it has just called impossible
+        for labelled in ("-LabelledPlayFrames 2 ", ""):
+            with self.subTest(h1_labelled=labelled):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 2 -DistinctContentHashes 1 -AppDistinctDisplayFrames 3 {labelled}-SourceDifference known-differ | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+                self.assertIn("a distinct-frame count that cannot be true for them and is not quoted", out["reason"])
+                self.assertNotIn("known to differ", out["reason"])
+                self.assertNotIn("3 distinct", out["reason"])
+        # ... and a count that fits still says it
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 2 -DistinctContentHashes 1 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 2 -SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertIn("the app presented 2 distinct frames across them and the source frames are known to differ", out["reason"])
 
     def test_the_visual_gate_reason_never_outruns_the_labelled_frame_count(self) -> None:
         """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R1C-REASON-RESIDUE-1 r2 (sol r1c pass A1-A3, their inputs verbatim): -LabelledPlayFrames is how many judged frames carry
