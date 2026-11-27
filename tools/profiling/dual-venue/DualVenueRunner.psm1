@@ -1458,6 +1458,7 @@ function Get-DvVisualCaptureBeginRecord {
     $tailDrops = 0L
     $postBurstDrops = 0L
     $burstCaptures = $null
+    $malformedTail = $false
     if (-not [string]::IsNullOrEmpty($LogText)) {
         $bodies = Get-DvLogRecordBodies -LogText $LogText   # (assigned, never @()-wrapped: it returns `, $array`, as Get-DvSmokeSummaryFields reads it)
         # r4 adversary fix 2 (A1 on b6c53917): the app writes these through its interaction formatter (MainWindow.cpp logInteractionEvent), so the record body is
@@ -1482,9 +1483,16 @@ function Get-DvVisualCaptureBeginRecord {
                 # before it; it is counted apart, and Get-DvTailInFlightCredit refuses it for any other qualifying capture
                 $postBurstDrops++
             }
+            elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=playback_prep\.invalidate_generation(\s|$)'), $script:DvCi)) { }   # before the begin record: not tail evidence
+            elseif ([string]$line -match '(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation') {
+                # r11 adversary A2 (sol on 6c0a9228): a record naming one of these events in any other form (a quoted event=, two spaces) was skipped
+                # silently, so a doubled or unreadable burst_end, begin, clip_changed or invalidation vanished; it now voids the whole tail binding
+                $malformedTail = $true
+            }
         }
     }
     $session = $null; $utc = $null
+    if ($malformedTail) { return [pscustomobject]@{ session = $null; tailBeginUtc = $null; clipChanged = $null; tailPrepDrops = $null; burstCaptures = $null; postBurstPrepDrops = $null } }
     if ($begin.Count -eq 1 -and $begin[0].IndexOf($script:DvQuotedEqualsMask) -lt 0 -and -not $begin[0].EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) {
         $read = ConvertFrom-DvRecordKeyValues -Record $begin[0]
         if (@($read.conflicts).Count -eq 0) {
@@ -7971,6 +7979,13 @@ function Get-DvTailVisualEvidence {
             $kind = Get-DvProp $row 'kind'
             $index = Get-DvProp $row 'index'
             if ($kind -isnot [string]) { continue }
+            # r11 adversary A1 (sol on 6c0a9228): a play row whose index is not a non-negative JSON integer (a string "1") was skipped here, so a repeat it
+            # records never reached the credit's refusal checks; it now refuses the whole tail (typed)
+            if (([string]::Equals($kind, 'play', [StringComparison]::Ordinal) -or [string]::Equals($kind, 'play_unbound', [StringComparison]::Ordinal) -or
+                 [string]::Equals($kind, 'play_first_unbound', [StringComparison]::Ordinal)) -and
+                (-not (($index -is [int]) -or ($index -is [long])) -or [int64]$index -lt 0)) {
+                return (& $refuse "TAIL_VISUAL_ROW_UNREADABLE: a $kind capture carries index=$([string]$index), not a non-negative JSON integer, so a paint it records cannot be ordered and the post-close tail is not credited")
+            }
             if (-not (($index -is [int]) -or ($index -is [long]))) { continue }
             if ([int64]$index -lt 0) { continue }
             # R4-RESIDUE-1: an unforced kind (play_unbound, or the play_first_unbound burst) is the only kind whose PNG can supply credit
@@ -8182,6 +8197,18 @@ function Get-DvTailInFlightCredit {
     $firstNonBurstRaw = Get-DvProp $Visual 'firstNonBurstMs'
     $firstNonBurstMs = $(if ($firstNonBurstRaw -is [double] -or $firstNonBurstRaw -is [int] -or $firstNonBurstRaw -is [long]) { [double]$firstNonBurstRaw } else { $null })
     $nonBurstTimed = (Get-DvProp $Visual 'nonBurstUntimed') -is [bool] -and -not (Get-DvProp $Visual 'nonBurstUntimed')
+    # r11 adversary A1 (sol on 6c0a9228): the app numbers its burst captures 0 .. burst_captures-1 and writes every one (MainWindow.cpp visualBurstCount),
+    # so visual.json's play_first_unbound rows (any of them, saved or not) must be exactly those indices: a missing one may be a repeat or a backward paint
+    if ($null -ne $burstCaptures -and $burstCaptures -ge 0) {
+        $burstIdx = [System.Collections.Generic.SortedSet[int64]]::new()
+        foreach ($f in @($tailFrames)) {
+            if ($null -ne $f -and [string]::Equals([string](Get-DvProp $f 'kind'), 'play_first_unbound', [StringComparison]::Ordinal) -and $null -ne (Get-DvProp $f 'index')) { [void]$burstIdx.Add([int64](Get-DvProp $f 'index')) }
+        }
+        $wholeBurst = ([int64]$burstIdx.Count -eq $burstCaptures) -and ($burstIdx.Count -eq 0 -or ($burstIdx.Min -eq 0 -and $burstIdx.Max -eq ($burstCaptures - 1)))
+        if (-not $wholeBurst) {
+            return (& $no "TAIL_CREDIT_BURST_NOT_LOGGED: the burst_end record logged burst_captures=$burstCaptures but visual.json carries play_first_unbound row(s) $(@($burstIdx) -join ', '), not exactly 0..$($burstCaptures - 1), so a burst capture (a repeat or a backward paint) may be missing and the tail is not credited")
+        }
+    }
     foreach ($q in $ordered) {
         $qIndex = Get-DvProp $q 'index'; $qMs = [double](Get-DvProp $q 'tailElapsedMs')
         if ([string]::Equals([string](Get-DvProp $q 'kind'), 'play_first_unbound', [StringComparison]::Ordinal)) {

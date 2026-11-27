@@ -22157,6 +22157,11 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             frame["file"] = f"{frame['kind'].replace('_', '-')}-{index}.png"
         return frame
 
+    @staticmethod
+    def renumber(row: dict, index: int) -> dict:
+        """r11 (adversary A1 on 6c0a9228): the same capture row at another index (and its own file name): the burst rows are numbered 0 .. burst_captures-1."""
+        return {**row, "index": index, "file": f"{row['kind'].replace('_', '-')}-{index}.png"}
+
     @classmethod
     def app_json(cls, *frames: dict, **top) -> dict:
         doc = {"schema": "mlv-app/visual-capture/v1", "error": "", "measured_session": 1, "method": "PrintWindow(PW_RENDERFULLCONTENT)", "tail_ms": 3000,
@@ -22184,7 +22189,8 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         Test-DvCriteria over `criteria` if given. r2 (adversary A1 on 9f327333): `recorded` is the receipt's visual.frames the PNGs are bound to ('good': each
         written PNG's own sha256 | 'replaced': the sha256 of a different valid PNG, as if the file on disk was swapped after collection | 'none': no frames).
         `verbatim` adds keys to the verbatim summary metrics (adversary A4). r11: `unrecorded` names row indices the receipt records no sha256 for."""
-        pb = {**self.PB, **(pb or {})}
+        caller_pb = pb or {}
+        pb = {**self.PB, **caller_pb}
         doc = self.app_json() if isinstance(app, str) else app
         rec: list[dict] = []
         with tempfile.TemporaryDirectory() as d:
@@ -22200,6 +22206,10 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 except ValueError:
                     parsed = None
                 rows = (parsed[0] if isinstance(parsed, list) and parsed else parsed).get("frames") if isinstance(parsed, (dict, list)) and parsed else None
+                # r11 adversary A1 (sol on 6c0a9228): the burst rows must be exactly 0 .. burst_captures-1, so unless a test names burst_captures, the log the
+                # fixture stands for logged the burst rows the fixture's visual.json carries
+                if "visualBurstCaptures" not in caller_pb and isinstance(rows, list):
+                    pb["visualBurstCaptures"] = sum(1 for r in rows if isinstance(r, dict) and r.get("kind") == "play_first_unbound")
                 if png != "none":
                     for row in rows if isinstance(rows, list) else []:
                         if not isinstance(row, dict) or row.get("kind") not in ("play", "play_unbound", "play_first_unbound") or not isinstance(row.get("index"), int):
@@ -22956,11 +22966,12 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         criteria never ask a fully painted run's tail for a credit. The throw now fires only when the criteria asked (conformTailUnpaintedAtCloseFrames set)."""
         first = self.play(0, kind="play_first_unbound", tail_elapsed_ms=4)
         raw = json.dumps(self.app_json(first)).encode("utf-8")
-        painted = {**self.PB, "conformLastFrame": 479, "conformSourceAdvanced": 478, "conformPresented": 479}
+        one_burst = {**self.PB, "visualBurstCaptures": 1}   # (r11 adversary A1: the log logged the one burst row visual.json carries)
+        painted = {**one_burst, "conformLastFrame": 479, "conformSourceAdvanced": 478, "conformPresented": 479}
         results = {}
         # r6 fix 2 (sol A1 on 806d496b): a held target whose credit an earlier gate refuses (a prepared result dropped) never needed the file either
-        dropped = {**self.PB, **self.HELD, "prepStaleDrops": 1, "prepGenerationDrops": 1}
-        for name, pb in (("fully painted", painted), ("(control) one target held", {**self.PB, **self.HELD}), ("held, prep dropped", dropped)):
+        dropped = {**one_burst, **self.HELD, "prepStaleDrops": 1, "prepGenerationDrops": 1}
+        for name, pb in (("fully painted", painted), ("(control) one target held", {**one_burst, **self.HELD}), ("held, prep dropped", dropped)):
             with tempfile.TemporaryDirectory() as d:
                 vis = Path(d) / "visual"
                 vis.mkdir()
@@ -23027,8 +23038,10 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
         self.assertFalse(out["v"]["pass"], out)
         with self.subTest(case="(control) 478 then 479, the end frame 479 held on a new serial"):
-            held = self.play(3, kind="play_first_unbound", tail_elapsed_ms=98, display_frame=479, serial=487, painted_serial=487)
-            out = self.metrics(None, app=self.app_json(rows[0], rows[2], held), criteria=self.BOTH)
+            # (r11 adversary A1: the burst rows are numbered 0 .. burst_captures-1, so the two later rows are 1 and 2)
+            later = self.play(1, kind="play_first_unbound", tail_elapsed_ms=68, display_frame=479, serial=486, painted_serial=486)
+            held = self.play(2, kind="play_first_unbound", tail_elapsed_ms=98, display_frame=479, serial=487, painted_serial=487)
+            out = self.metrics(None, app=self.app_json(rows[0], later, held), criteria=self.BOTH)
             self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
 
     def test_r6_r9_sol_a1_a_locked_png_whose_row_has_no_recorded_hash_never_refuses_the_tail(self) -> None:
@@ -23054,7 +23067,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback $pb -Visual $vis\n"
                 "[ordered]@{ refused = [string]$vis.refused; unreadable = [string]$vis.unreadablePath; credited = $m.conformTailInFlightCreditedFrames\n"
                 "            tail = $m.conformTailUnpaintedFrames } | ConvertTo-Json -Compress",
-                DVE_DIR=d, DVE_LEG=self.LEG, DVE_SHA=hashlib.sha256(raw).hexdigest(), DVE_REC=json.dumps(rec), DVE_PB=json.dumps({**self.PB, **self.HELD}))
+                DVE_DIR=d, DVE_LEG=self.LEG, DVE_SHA=hashlib.sha256(raw).hexdigest(), DVE_REC=json.dumps(rec), DVE_PB=json.dumps({**self.PB, **self.HELD, "visualBurstCaptures": 2}))
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         self.assertEqual((out["refused"], out["unreadable"]), ("", ""), out)
         self.assertEqual((out["credited"], out["tail"]), (1, 0), out)
@@ -23071,7 +23084,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         self.assert_no_credit(out, 2)
         self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
         with self.subTest(case="(control) 478 then 479"):
-            out = self.metrics(None, app=self.app_json(rows[1], rows[2]), criteria=crit)
+            out = self.metrics(None, app=self.app_json(self.renumber(rows[1], 0), self.renumber(rows[2], 1)), criteria=crit)
             self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
             self.assertTrue(out["v"]["pass"], out)
 
@@ -23088,7 +23101,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         self.assert_no_credit(out, 2)
         self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
         with self.subTest(case="(control) 478 then 479"):
-            out = self.metrics(None, app=self.app_json(rows[1], rows[2]), criteria=crit)
+            out = self.metrics(None, app=self.app_json(self.renumber(rows[1], 0), self.renumber(rows[2], 1)), criteria=crit)
             self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
 
     def test_r6_r10_g3_two_captures_at_the_same_tail_time_are_refused_explicitly(self) -> None:
@@ -23105,7 +23118,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 self.assert_no_credit(out, 2)
                 self.assertIn("TAIL_CREDIT_EQUAL_TIME", out["m"]["conformTailInFlightCreditNote"], out)
         with self.subTest(case="(control) 478 at 34 ms then 479 at 64 ms"):
-            out = self.metrics(None, app=self.app_json({**r478, "tail_elapsed_ms": 34}, r479), criteria=crit)
+            out = self.metrics(None, app=self.app_json(self.renumber({**r478, "tail_elapsed_ms": 34}, 0), self.renumber(r479, 1)), criteria=crit)
             self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
 
     def test_r6_r11_a1_a_paint_recording_row_that_cannot_credit_still_refuses(self) -> None:
@@ -23137,8 +23150,17 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 out = self.metrics(pb, app=self.app_json(*rows, forced), criteria=crit, unrecorded=unrecorded)
                 self.assert_no_credit(out, 2)
                 self.assertIn(why, out["m"]["conformTailInFlightCreditNote"], out)
-        with self.subTest(case="(control) 478 then 479, no third row"):
-            out = self.metrics(pb, app=self.app_json(burst(0, 8, 478, 484), burst(2, 68, 479, 486), forced), criteria=crit)
+        # r11 adversary A1 (sol on 6c0a9228), its input: the base rows with row 1's index the JSON string "1" (the reader skipped it), and the sibling with
+        # row 1 omitted (burst_captures=3 but rows 0 and 2 only): both credited 478 and 479
+        for name, rows, why in (("adversary A1: a string index on the unsaved repeat", (burst(0, 8, 478, 484), {**burst(1, 38, 478, 485, saved=False), "index": "1"},
+                                                                                          burst(2, 68, 479, 486)), "TAIL_VISUAL_ROW_UNREADABLE"),
+                                ("adversary A1 sibling: burst row 1 omitted", (burst(0, 8, 478, 484), burst(2, 68, 479, 486)), "TAIL_CREDIT_BURST_NOT_LOGGED")):
+            with self.subTest(case=name):
+                out = self.metrics(pb, app=self.app_json(*rows, forced), criteria=crit)
+                self.assert_no_credit(out, 2)
+                self.assertIn(why, out["m"]["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="(control) 478 then 479, the burst logged both"):
+            out = self.metrics({"visualBurstCaptures": 2}, app=self.app_json(burst(0, 8, 478, 484), burst(1, 68, 479, 486), forced), criteria=crit)
             self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
             self.assertTrue(out["v"]["pass"], out)
         with self.subTest(case="(control) an unsaved row that records no paint (unbound) does not refuse"):
@@ -23223,6 +23245,15 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         self.assertEqual(derive([ms, conform, summary, begin, bend, drop]), {"d": 0, "b": 0, "p": 1})
         self.assertEqual(derive([ms, conform, summary, begin, bend.replace("burst_captures=0", "burst_captures=3")]), {"d": 0, "b": 3, "p": 0})
         self.assertEqual(derive([ms, conform, summary, begin, drop, bend]), {"d": 1, "b": 0, "p": 0})
+        # r11 adversary A2 (sol on 6c0a9228), its input: a quoted event= burst_end (generation_changes=1) before a readable one (burst_captures=2); the reader
+        # skipped the quoted record and returned b=2, d=0. Any record naming a visual-capture or invalidate event in another form voids the binding
+        quoted = bend.replace("event=gui_smoke.visual_capture.burst_end", 'event="gui_smoke.visual_capture.burst_end"').replace("generation_changes=0", "generation_changes=1")
+        for name, lines in (("a quoted burst_end before a readable one", [ms, conform, summary, begin, quoted, bend.replace("burst_captures=0", "burst_captures=2")]),
+                            ("a two-space invalidation", [ms, conform, summary, begin, bend, drop.replace("interaction_trace event=", "interaction_trace  event=")]),
+                            ("a two-space clip_changed", [ms, conform, summary, begin, bend, pre.replace("event=", " event=") + "gui_smoke.visual_capture.clip_changed measured_session=3" + loc])):
+            with self.subTest(case=name):
+                got = derive(lines)
+                self.assertEqual((got["d"], got["b"], got["p"]), (None, None, None), got)
         for name, lines in (("no burst_end", [ms, conform, summary, begin, drop]), ("two burst_end", [ms, conform, summary, begin, bend, bend]),
                             ("burst_captures unreadable", [ms, conform, summary, begin, bend.replace("burst_captures=0", "burst_captures=x")]),
                             ("burst_captures absent", [ms, conform, summary, begin, bend.replace("burst_captures=0 ", "")])):
