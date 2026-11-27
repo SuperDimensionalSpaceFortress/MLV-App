@@ -3248,6 +3248,56 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "const QString kRefusalEnd = QStringLiteral ( \"        return 2;\\n    }\\n    if (!ok || seconds <= 0.0)\" ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r10 (hosted CI run 46021899954, ubuntu shard 2/4): the text of a mutation anchor in a source-text wiring test. kRefusalEnd is a QStringLiteral copy of main.cpp's `--seconds` refusal tail that mutateOnce() finds and replaces in memory before secondsRefusalWiringDefect() reads the result. `seconds` is a CLI argument value, not a timer read, and nothing is compared at run time here; the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        5304
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "QStringLiteral ( \"        return 2; // }\\n        if (seconds < 0) return 0;\\n    }\\n    if (!ok || seconds <= 0.0)\" ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r10 (hosted CI run 46021899954): RED mutant text (SecondsRefusalWiringRedB1CommentBrace) fed to the source-text wiring checker, a `}` in a comment hiding a second return. `seconds` is the CLI argument value of main.cpp's text, not a timer read; nothing is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        5314
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "QStringLiteral ( \"        err << \\\"}\\\";\\n        return 2;\\n        if (seconds < 0) return 0;\\n    }\\n    if (!ok || seconds <= 0.0)\" ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r10 (hosted CI run 46021899954): RED mutant text (SecondsRefusalWiringRedB1LiteralBrace) fed to the source-text wiring checker, a `}` in a string literal hiding a second return. `seconds` is the CLI argument value of main.cpp's text, not a timer read; nothing is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        5325
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "QStringLiteral ( \"    {\\n        if (seconds < 0) return\\t0;\\n        err << \\\"[GUI-SMOKE] ERROR: SECONDS_OUT_OF_RANGE\" ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r10 (hosted CI run 46021899954): RED mutant text (SecondsRefusalWiringRedB2TabReturn) fed to the source-text wiring checker, a `return<TAB>0;` early exit. `seconds` is the CLI argument value of main.cpp's text, not a timer read; nothing is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        5336
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "QStringLiteral ( \"        return 2;\\n        err << parser.value(secondsOpt).trimmed() << \\\"at most 2147483647\\\";\\n    }\\n    if (!ok || seconds <= 0.0)\" ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r10 (hosted CI run 46021899954): RED mutant text (SecondsRefusalWiringRedB3TextAfterReturn) fed to the source-text wiring checker, the diagnostic emitted after `return 2;`. `seconds` is the CLI argument value of main.cpp's text, not a timer read; nothing is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        5351
+      ]
+    },
+    {
       "path": "platform/qt/GuiPresentGapIdle.h",
       "anchor": "if ( ! ( inclusiveMs > 0.0 ) || ! std :: isfinite ( inclusiveMs ) ) inclusiveMs = 0.0 ;",
       "class": "value_fallback_select",

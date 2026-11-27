@@ -5183,6 +5183,7 @@ namespace
 // the source text so the RED mutants below can feed it edited text. Returns an empty string when the wiring holds, else the tag
 // of the first failed check. Braces and tokens are read on a comment-and-literal-masked copy (B1), `return` is a token whatever
 // blank follows it (B2), and the diagnostic is read only up to the exit (B3).
+// Threat model: accidental edits, not deliberate obfuscation.
 QString secondsRefusalWiringDefect( const QString &source )
 {
     const QString code = maskCppSource( source, false );        // comments blanked, literals kept
@@ -5360,8 +5361,8 @@ TEST( PlaybackFrameRangeArgOverflow, SecondsRefusalWiringRedB3ReturnBeforeDiagno
     const QString mutant = mutateOnce( source, kRefusalBegin,
         QStringLiteral( "    {\n        return 2;\n        err << \"[GUI-SMOKE] ERROR: SECONDS_OUT_OF_RANGE" ) );
     ASSERT_FALSE( mutant.isEmpty() );
-    const QString defect = secondsRefusalWiringDefect( mutant );
-    ASSERT_FALSE( defect.isEmpty() );                                  // 'returns' (a second return) or 'tail': either names it
+    // CoS G2: the exact tag, like its siblings. The block now holds two `return` tokens, and the "returns" check runs before "tail".
+    ASSERT_EQ( std::string( "returns" ), secondsRefusalWiringDefect( mutant ).toStdString() );
 }
 
 // A4: the parse is inside a disabled region.
