@@ -829,7 +829,7 @@ class CounterWritePinTests(unittest.TestCase):
                                 ("a plain read outside the pinned site", "const bool advArmed = m_sourceAdvance.armed;"),
                                 ("the pinned expression outside its function", "const long long advHigh = ( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 );"),
                                 ("r3: the landing's pinned argument outside playbackHandling",
-                                 "const double advLand = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,"
+                                 "const double advLand = playback_frame_range::pacedMeasuredHoldLanding( dropFrameTick.correctedStart, dropFrameTick,"
                                  " m_sourceAdvance.highWater, 0, 0 );")):
             with self.subTest(name):
                 self.assert_caught(self.inject_in_smoke(statement), "unreviewed use of m_sourceAdvance")
@@ -972,13 +972,14 @@ class CounterWritePinTests(unittest.TestCase):
             with self.subTest(name):
                 self.assert_caught(self.mutated(anchor, define + "\n" + anchor), "#define of")
 
-    LANDING_CALL = ("dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,\n"
+    # r6 (the fork/master merge of #905): the landing's tick start is dropFrameTick.correctedStart, the start the counter reads
+    LANDING_CALL = ("const double pacedLanding = playback_frame_range::pacedMeasuredHoldLanding( dropFrameTick.correctedStart, dropFrameTick,\n"
                     "                        m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );")
 
     def test_r3_the_paced_hold_landing_mark_is_the_one_reviewed_high_water_read_in_playback_handling(self) -> None:
         """GUI-SMOKE-PACED-STOP-STARVATION-1 r3 (hub ruling HUB-TICK 20261127T1152Z, adversary A1 on 8b386cb9): the paced hold's landing clamp
         needs the counter's real high-water mark, so playbackHandling has ONE reviewed `.highWater` read, matched only by its own pinned expression:
-        the third argument of the guarded `pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick, m_sourceAdvance.highWater, ...`
+        the third argument of the guarded `pacedMeasuredHoldLanding( dropFrameTick.correctedStart, dropFrameTick, m_sourceAdvance.highWater, ...`
         (an int64_t by value, nothing writes through it). Every other `.highWater` use in playbackHandling, a second landing call, the argument in
         another position, and the other site's pinned expression there all stay unreviewed (the real sources are clean)."""
         self.assertEqual(scan_app_play_sources(self.sources), [])
@@ -989,7 +990,7 @@ class CounterWritePinTests(unittest.TestCase):
             ("a plain read beside the landing", call + "\n                const long long advHigh = m_sourceAdvance.highWater;"),
             ("a second landing call", call + "\n                " + call),
             ("the mark in another argument position",
-             call + "\n                dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick,"
+             call + "\n                dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( dropFrameTick.correctedStart,"
                     " dropFrameTick, m_sourceAdvance.consumed(), m_sourceAdvance.highWater, m_playRequiredSourceFrames );"),
             ("the landing with another tick start",
              call + "\n                dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( m_newPosDropMode, dropFrameTick,"

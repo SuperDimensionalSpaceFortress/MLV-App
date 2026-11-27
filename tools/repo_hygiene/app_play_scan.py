@@ -1086,9 +1086,10 @@ _ADV_PINNED_READ = re.compile(r"\bm_sourceAdvance\s*\.\s*armed\s*\?\s*m_sourceAd
 # GUI-SMOKE-PACED-STOP-STARVATION-1 r3 (hub ruling HUB-TICK 20261127T1152Z, adversary A1 on 8b386cb9): the paced hold's landing clamp needs the
 # counter's real high-water mark. Its one reviewed read is the THIRD argument of the guarded landing call, an int64_t taken by value, matched only
 # by this expression and only inside playbackHandling; any other .highWater / .armed use there (a plain read, a second call, another argument
-# position, the conform line's expression) stays unreviewed.
-_ADV_PINNED_HOLD_READ = re.compile(r"\bplayback_frame_range::pacedMeasuredHoldLanding\s*\(\s*sourcePositionBeforeDropTick\s*,\s*dropFrameTick\s*,"
-                                   r"\s*m_sourceAdvance\s*\.\s*highWater\s*,")
+# position, the conform line's expression) stays unreviewed. r6 (the fork/master merge of #905, which removed sourcePositionBeforeDropTick and
+# feeds the counter dropFrameTick.correctedStart): the landing's tick start is that same correctedStart.
+_ADV_PINNED_HOLD_READ = re.compile(r"\bplayback_frame_range::pacedMeasuredHoldLanding\s*\(\s*dropFrameTick\s*\.\s*correctedStart\s*,"
+                                   r"\s*dropFrameTick\s*,\s*m_sourceAdvance\s*\.\s*highWater\s*,")
 # each reviewed read is matched only by its own pinned expression, in its own function
 PINNED_COUNTER_READ_EXPRESSIONS = {"MainWindow::finishPlaybackSmokeTelemetry": _ADV_PINNED_READ,
                                    "MainWindow::playbackHandling": _ADV_PINNED_HOLD_READ}
@@ -1112,7 +1113,7 @@ COUNTER_MACRO_IDENTIFIERS = frozenset({
     "m_sourceAdvance", "m_playRequiredSourceFrames", "SourceFrameAdvanceCounter", "playback_frame_range",
     "armed", "startFrame", "highWater", "forwardSteps", "wrapOrBackwardTicks", "beginsIgnored", "externalJumpRebases",
     "begin", "noteEngineTick", "consumed",
-    "pacedMeasuredHoldLanding", "sourcePositionBeforeDropTick", "dropFrameTick", "verdict", "requiredFrames"})
+    "pacedMeasuredHoldLanding", "correctedStart", "dropFrameTick", "verdict", "requiredFrames"})
 
 
 # r3 fix iteration 2 (adversary A1 on 60e25099): the digraph `%:define` and a line-spliced `#de\<nl>fine` re-spelled that macro past

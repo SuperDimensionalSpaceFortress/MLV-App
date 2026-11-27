@@ -22,7 +22,10 @@
 #         The lease is never released and re-requested on a busy desktop. The lease's own end bounds the retries;
 #      c. the leg's agent result is read BY NAME (outbox\<jobId>.result.json). The leg counts only if it ran on THIS batch's lease (admission.leaseBatch
 #         .leaseId) and kept it (slotContinuity). Class: QUIET_PRELOAD_OK (counted) when its own pre-load mean is <= 30 %; otherwise QUIET_PRELOAD_HIGH,
-#         QUIET_PRELOAD_UNKNOWN or LEASE_LOST (uncounted). r5 (V-01): a FOREIGN_FLOOR line from ANY probe of the leg (an earlier attempt or batch included)
+#         QUIET_PRELOAD_UNKNOWN or LEASE_LOST (uncounted); a quiet pre-load whose smoke host load (result.json hostLoad) is provisional or was not collected is
+#         HOSTLOAD_PROVISIONAL (uncounted, line REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state>; VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1). The class takes that
+#         name only for a pre-load <= 30 %: a provisional leg whose pre-load is > 30 % or unknown keeps QUIET_PRELOAD_HIGH / QUIET_PRELOAD_UNKNOWN (still uncounted,
+#         the typed line still printed), and a lease or foreign-floor class keeps its own name (r3, sol r2). r5 (V-01): a FOREIGN_FLOOR line from ANY probe of the leg (an earlier attempt or batch included)
 #         sticks: the leg is COOLDOWN_UNMET (uncounted) whatever a later QUIET probe reads, as in Invoke-VenueChain. It never carries into the next leg.
 #   4. END. A batch ends when its legs are done (ALL_LEGS_DONE), the claim is lost (CLAIM_LOST, 8b), the open's sidecar cannot be written (LIVENESS_UNAVAILABLE,
 #      8a), the next leg would outlive the lease (LEASE_REMAINING_SHORT: the rest go to the next batch; also
@@ -307,6 +310,7 @@ $script:ExportBudgetPreflightCleanupMs = 1500   # (adversary r11 A6: the one bud
 # a.json shared one digest and the second read overwrote the first's (a false SPEC_CHANGED_AFTER_PREFLIGHT before the claim, and the guard and child bound to the other file's bytes).
 $script:SpecBudgetSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 $script:SpecShapeSha256 = [Collections.Hashtable]::new([StringComparer]::Ordinal)   # (and of the bytes the preflight's shape check judged, which the budget's read must equal)
+$script:SpecPlannedLegType = [Collections.Hashtable]::new([StringComparer]::Ordinal)   # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6: spec digest key -> planned leg type judged from the preflight's bytes
 # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (key r10 B1): the key those two maps are read and written under, resolved ONCE per spelled path (Get-SpecDigestKey), and the offline delay seam's state
 $script:SpecDigestKeyMemo = [Collections.Hashtable]::new([StringComparer]::Ordinal)
 $script:SpecDigestKeyCalls = 0
@@ -1550,6 +1554,11 @@ function Get-LegSpecRefusal([string]$Path, [string]$Backend, [double]$BoundSec =
     if ($specRead.state -ceq 'TIMEOUT') { return 'SPEC_READ_TIMEOUT', "'$Path' cannot be run: the leg spec could not be read within the time left before -DeadlineUtc (or the guard's budget); no claim or lease is taken on it" }
     $spec = $(if ($specRead.state -ceq 'OK') { try { [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate } catch { $null } } else { $null })
     if ($null -eq $spec -or $spec -isnot [System.Management.Automation.PSCustomObject]) { return 'LEG_SPEC_INVALID', "'$Path' is not a JSON object" }
+    # R2-NARROW-1 r2 (adversary-7c5bfe86.json A7): a spec the strict reader cannot type (a member repeated in any spelling) is refused here, before any claim, as the set planner already refuses it (DVE_LEGSET_INVALID).
+    # The shape check and the export budget read these bytes last-wins; the host-load classification takes the strict reader's answer ('unknown'): one set of bytes must never be planned as one thing and classified as another.
+    if ([string]::Equals((Get-VenuePlannedLegType -SpecText ([Text.Encoding]::UTF8.GetString($specRead.bytes).TrimStart([char]0xFEFF))), 'unknown', [StringComparison]::Ordinal)) {
+        return 'LEG_SPEC_INVALID', "'$Path' cannot be run: its legType cannot be judged by the strict spec reader (a member repeated in any spelling): a spec whose legType is ambiguous is never planned or run"
+    }
     # r19 (sol r18 B1 sibling): the bytes this shape check judged, so the budget preflight can prove it judged the same ones (Get-ExportBudgetRefusal)
     # r20: and the third element of a '' answer, so the content guard compares THESE bytes with the judged ones (one read, after master's own typed refusals)
     $judgedSha = Get-BytesSha256 $specRead.bytes
@@ -1598,6 +1607,9 @@ function Get-ExportBudgetRefusal([string]$Path) {
         return 'SPEC_CHANGED_AFTER_PREFLIGHT', "'$Path' cannot be run: the leg spec changed between the preflight's shape check (sha256 $($script:SpecShapeSha256[$digestKey])) and its export budget read (sha256 $judgedSha); no claim or lease is taken on bytes no single check judged"
     }
     $script:SpecBudgetSha256[$digestKey] = $judgedSha
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (adversary-fa329743.json A3/A4): the planned leg type is judged HERE, from the judged bytes, and recorded; the
+    # host-load read after the leg uses the record and never reopens the spec (no unbounded read at classification, no later file change can grant or revoke)
+    $script:SpecPlannedLegType[$digestKey] = Get-VenuePlannedLegType -SpecText ([Text.Encoding]::UTF8.GetString($specBytes).TrimStart([char]0xFEFF))
     try { $spec = [Text.Encoding]::UTF8.GetString($specBytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec no longer parses on the export budget preflight's read ($($_.Exception.Message -replace '\s+', ' ')), so its job budget is unchecked; no claim or lease is taken on it" }
     if ($spec -isnot [System.Management.Automation.PSCustomObject]) { return 'SPEC_READ_FAILED', "'$Path' cannot be run: the leg spec is no longer one JSON object on the export budget preflight's read, so its job budget is unchecked; no claim or lease is taken on it" }
@@ -1659,6 +1671,10 @@ function Get-ScalarLegShapeRefusal([string]$Path) {
     try { $spec = [Text.Encoding]::UTF8.GetString($specRead.bytes) | ConvertFrom-Json -NoEnumerate -ErrorAction Stop }
     catch { return "the leg spec is not valid JSON ($($_.Exception.Message -replace '\s+', ' '))" }
     try { $refusal = Get-DvLegSpecShapeRefusal -Spec $spec } catch { return "the leg spec cannot be shape-checked ($($_.Exception.Message -replace '\s+', ' '))" }
+    # R2-NARROW-1 r2 (adversary-7c5bfe86.json A7, sibling of Get-LegSpecRefusal): a spec the strict reader cannot type (a member repeated in any spelling) is refused on the scalar route too, before any claim
+    if ($null -eq $refusal -and [string]::Equals((Get-VenuePlannedLegType -SpecText ([Text.Encoding]::UTF8.GetString($specRead.bytes).TrimStart([char]0xFEFF))), 'unknown', [StringComparison]::Ordinal)) {
+        return "the leg spec cannot be run: its legType cannot be judged by the strict spec reader (a member repeated in any spelling): a spec whose legType is ambiguous is never planned or run"
+    }
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
 
@@ -3036,8 +3052,14 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $legLines = @($text -split "`r?`n")
                 $o = $legLines | Where-Object { $_ -match '^DVE_OUTCOME=(\S+)' } | Select-Object -Last 1
                 $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
-                $pl = $legLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
+                # R2-NARROW-1 r2 (adversary-7c5bfe86.json A5, adversary-baf2e69a.json A3): the receipt PATH and its sha256 are read from the child's STDOUT alone (as Invoke-VenueChain does), the same stream, so a line on
+                # stderr can neither replace the hash the leg published nor name another receipt to pair with it
+                $legStdoutLines = @(([string]$lp.stdout) -split "`r?`n")
+                $pl = $legStdoutLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
                 $receipt = $(if ($pl -and $pl -match '^DVE_RECEIPT_PATH=(.+)$') { $Matches[1].Trim() } else { $null })
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes the child wrote ('' when it printed none: the read is unknown)
+                $rs = $legStdoutLines | Where-Object { $_ -cmatch '^DVE_RECEIPT_SHA256=[0-9A-Fa-f]{64}$' } | Select-Object -Last 1
+                $receiptSha = $(if ($rs) { $rs.Substring('DVE_RECEIPT_SHA256='.Length) } else { '' })
                 $dl = $legLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
                 $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
                 $legJobId = @(Get-VenueRemoteJobIds -Text $text | Where-Object { $_ -and $_ -cnotmatch '-health$' }) | Select-Object -Last 1
@@ -3114,9 +3136,23 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 # Only a QUIET probe reaches here, so the class is the lease, then the leg's sticky foreign floor (r5, V-01: a FOREIGN_FLOOR in ANY probe of this
                 # leg, an earlier attempt or batch included, leaves it contended: COOLDOWN_UNMET, never counted), then the pre-load.
                 $legFF = $legForeign.ContainsKey($leg.name)
-                $class = $(if ($leaseClass) { $leaseClass } elseif ($legFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { 'QUIET_PRELOAD_OK' } else { 'QUIET_PRELOAD_HIGH' })
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the smoke's own host-load verdict (result.json hostLoad). A leg whose host load was provisional or not collected
+                # (2026-11-21 a134532e: CimException, state unknown) is recorded as RAN but is never a counted class: HOSTLOAD_PROVISIONAL, with its typed line.
+                # r6 (sol r5 B2): the export exemption comes only from the leg's PLANNED type (its spec's legType, bound to the bytes the preflight judged when it
+                # recorded them), never from the receipt's shape
+                $plannedTypeKey = Get-SpecDigestKey ([string]$leg.spec)   # the one key the budget preflight wrote under (master's ordinal digest key; one file under two spellings is one key)
+                $plannedType = $(if ($script:SpecPlannedLegType.ContainsKey($plannedTypeKey)) { [string]$script:SpecPlannedLegType[$plannedTypeKey] } else { 'unknown' })
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): read only from the receipt bytes the child wrote (a receipt and result.json swapped in together read unknown)
+                # (adversary-7efea617.json A4: each file read is bounded by 20 s or what is left before -DeadlineUtc, whichever is less; under 1 s left it is not started and the standing is unknown, uncounted)
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType $plannedType -ExpectReceiptSha256 $receiptSha -ReadTimeoutSec 20.0 -CallDeadlineUtc $deadline
+                # R2-RESIDUE-1 r2 (adversary-f1221390.json A2): a standing this caller sees after its own -DeadlineUtc is never acted on, whatever the reader returned (the caller can be suspended after the reader's last check)
+                # R2-NARROW-1 r7 (sol r7 A3): the guard is VenueChain.psm1's one Limit-VenueHostLoadToDeadline (the baseline applies the same one)
+                $hl = Limit-VenueHostLoadToDeadline -Standing $hl -DeadlineUtc $deadline
+                $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
+                $class = $(if ($leaseClass) { $leaseClass } elseif ($legFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })
                 $counted = ($class -ceq 'QUIET_PRELOAD_OK')
                 $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'RAN'; outcome = $outcome; class = $class; counted = $counted; quietVerdict = $q.verdict; quietMean = $q.mean; preLoadMean = $preLoad
+                    hostLoadState = [string]$hl.state; hostLoadProvisional = [bool]$hl.provisional
                     receipt = $receipt; jobId = $legJobId; jobLease = $jobLease; onLease = $onLease; renewOkMaxGapSec = $gap; legSec = $legSec; legExit = $legCode; exit75Refusals = $legRef; foreignFloor = $legFF }
                 if ($legFF) { $row['foreignFloorLine'] = $legForeign[$leg.name] }
                 if ($detail) { $row['outcomeDetail'] = $detail }
@@ -3132,7 +3168,8 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $b.legs.Add([pscustomobject]$row); Add-Result $leg 'RAN' $row; $pending.RemoveAt(0)
                 Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                 $b.legsRan++; if ($counted) { $b.legsCounted++ }
-                LogBest "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
+                LogBest "LEG $($leg.name) RAN batch=$batchNo exit=$legCode outcome=$outcome class=$class counted=$counted quietMean=$(Format-Mean $q.mean) preLoadMean=$(Format-Mean $preLoad) hostLoadState=$($hl.state) hostLoadProvisional=$([bool]$hl.provisional) legSec=$legSec receipt=$receipt $leaseWhy$(if ($legFF) { ' foreignFloor=1' })"
+                if ($hlRefusal -and $receipt) { LogBest $hlRefusal }   # r1 (adversary-b0c05520.json A5): whatever the class (a high or unknown pre-load too)
                 if ($leaseClass -ceq 'LEASE_IDLE_ENDED') { $b.endDetail = $leaseWhy; Set-BatchLeaseIdleEnded $b $legIe $leg.name "before leg $($leg.name)'s job was admitted: it ran off the lease, uncounted" 'a leg ran off the lease: uncounted' -AppendDetail; break }
                 if ($leaseClass) { $b.endReason = $leaseClass; $b.endDetail = $leaseWhy; break }
                 if ($pending.Count -gt 0 -and $CooldownSec -gt 0) {

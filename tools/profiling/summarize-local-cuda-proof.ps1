@@ -475,7 +475,15 @@ if (!(Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
 }
 
 $summaryFullPath = (Resolve-Path -LiteralPath $SummaryPath).Path
-$summary = Get-Content -LiteralPath $summaryFullPath -Raw | ConvertFrom-Json -Depth 100
+$summaryText = Get-Content -LiteralPath $summaryFullPath -Raw
+# adversary-ac6205bd.json A2: ConvertFrom-Json keeps the LAST of two same-named members ("hostLoadCollected":false,"hostLoadCollected":true reads true),
+# so a summary that repeats a member anywhere is refused, never summarized
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function Find-VenueJsonDuplicateMember -DisableNameChecking
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A2): a summary the strict scanner cannot read (a comment between two repeated
+# members: ConvertFrom-Json accepts it and keeps the LAST value) is refused, never summarized by the looser reader.
+$summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All } catch { throw "Summary JSON is not strict JSON ($summaryFullPath), so its members cannot be proved unique: $($_.Exception.Message -replace '\s+', ' ')" }
+if ($summaryDuplicate) { throw "Summary JSON repeats the member $summaryDuplicate ($summaryFullPath); a repeated member is never read as evidence." }
+$summary = $summaryText | ConvertFrom-Json -Depth 100
 $failures = @($summary.failures | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
 $warnings = @($summary.warnings | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
 
@@ -648,11 +656,9 @@ else {
     # host load at all. Check the relevant legs' hostLoadProvisional independently, defaulting a
     # missing/absent property to provisional (fail toward provisional, same stance as every other
     # reader in this card).
-    $playbackAbCandidateLeg = if ($playbackAbComparisonBasis -eq "candidateSpeed") {
-        $playbackAb.candidateSpeed
-    } else {
-        $playbackAb.candidate
-    }
+    # adversary-7efea617.json A3: a plain assignment, never `$x = if (...) { $list }` (an if-expression unrolls a one-element list into its member, past the list guard)
+    $playbackAbCandidateLeg = $playbackAb.candidate
+    if ($playbackAbComparisonBasis -eq "candidateSpeed") { $playbackAbCandidateLeg = $playbackAb.candidateSpeed }
     $playbackAbHostLoadLegs = @(
         [pscustomobject]@{ Name = "baseline"; Leg = $playbackAb.baseline },
         [pscustomobject]@{ Name = $playbackAbComparisonBasis; Leg = $playbackAbCandidateLeg }
@@ -670,15 +676,16 @@ else {
     # provisional.
     $playbackAbHostLoadProvisional = $false
     foreach ($legEntry in $playbackAbHostLoadLegs) {
-        $legProvisionalValue = Get-Field $legEntry.Leg "hostLoadProvisional"
-        $legProvisionalDeclared = if ($null -eq $legProvisionalValue) { $true } else { [bool]$legProvisionalValue }
-        $legStateValue = Get-Field $legEntry.Leg "hostLoadState"
-        $legState = if ($null -eq $legStateValue -or [string]::IsNullOrWhiteSpace([string]$legStateValue)) {
-            "unknown"
-        } else {
-            [string]$legStateValue
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the ONE strict predicate (hostLoadState exactly 'quiet' ordinal, hostLoadProvisional
+        # a real [bool] $false, hostLoadCollected a real [bool] $true). Members are assigned directly from PSObject.Properties (Get-Field's return
+        # would unroll [false] into $false), and nothing is coerced.
+        $legProvisionalRaw = $null; $legStateRaw = $null; $legCollectedRaw = $null
+        if ($null -ne $legEntry.Leg -and $legEntry.Leg -isnot [System.Collections.IList]) {
+            $legProperty = $legEntry.Leg.PSObject.Properties["hostLoadProvisional"]; if ($null -ne $legProperty) { $legProvisionalRaw = $legProperty.Value }
+            $legProperty = $legEntry.Leg.PSObject.Properties["hostLoadState"]; if ($null -ne $legProperty) { $legStateRaw = $legProperty.Value }
+            $legProperty = $legEntry.Leg.PSObject.Properties["hostLoadCollected"]; if ($null -ne $legProperty) { $legCollectedRaw = $legProperty.Value }
         }
-        $legProvisional = ($legProvisionalDeclared -or $legState -ne "quiet")
+        $legProvisional = -not ($legProvisionalRaw -is [bool] -and -not $legProvisionalRaw -and $legStateRaw -is [string] -and [string]::Equals($legStateRaw, 'quiet', [StringComparison]::Ordinal) -and $legCollectedRaw -is [bool] -and $legCollectedRaw)
         if ($legProvisional) {
             $playbackAbHostLoadProvisional = $true
             [void]$playbackAbBlockers.Add("playback A/B $($legEntry.Name) leg host load was PROVISIONAL or unrecorded")

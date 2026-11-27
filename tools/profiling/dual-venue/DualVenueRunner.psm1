@@ -231,6 +231,17 @@ $script:BlanketScope = 'any clip id, any venue'
 $script:ConsentRelativePath = 'tools/profiling/dual-venue/venue-clip-consent.json'
 $script:VenueTableRelativePath = 'tools/profiling/dual-venue/venues.json'
 
+function Test-DvOrdinalIn {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r1 (adversary-fd0141e8.json A2): membership by ORDINAL, case-sensitive comparison of printable ASCII only.
+    # -ceq / -cin / -cnotin compare by the current culture, which ignores a soft hyphen (U+00AD): 'PA<U+00AD>SS' -cin @('PASS') is true. A token with any
+    # character outside 0x20-0x7E is never in the set.
+    param([object]$Value, [string[]]$Set)
+    if ($Value -isnot [string]) { return $false }
+    foreach ($ch in $Value.ToCharArray()) { if ([int]$ch -lt 0x20 -or [int]$ch -gt 0x7E) { return $false } }
+    foreach ($member in $Set) { if ([string]::Equals($Value, $member, [StringComparison]::Ordinal)) { return $true } }
+    return $false
+}
+
 function Get-DvProp {
     # A property of a hashtable OR an object, $null when absent (StrictMode-safe). `return ,` keeps an empty array an
     # empty array (it is unrolled once by the caller, so a scalar still arrives as a scalar).
@@ -2781,7 +2792,10 @@ function Test-DvVisualTwinName {
     <#
     .SYNOPSIS
     M16-1457-VENUE-BASELINE-DRIFT-1 r6 (sol r5 B1, luna r5 B1): is this leg id or spec file name a VISUAL TWIN (its id carries the word `visual` between hyphens)? A twin is the
-    capture-on copy of a speed arm: its fps is observer-perturbed (the capture tail keeps playing unpaced past the measured window), so it is never a measured matrix speed cell.
+    capture-on copy of a speed arm, and the planner keeps it out of the measured matrix speed cells by this name. (UNPACED-VISUAL-MIDPLAY-CAPTURE-1, adversary r1 A2 and
+    pass 2 A3: the capture tail starts only after finishPlaybackSmokeTelemetry("visual-capture") has closed the measured session, and an unpaced Play does NOT keep playing
+    past the measured window: it holds its last required frame through the tail, so an unpaced twin's play captures are labelled with its end frame and its visual
+    verdict is NOT_A_MOTION_WITNESS unless an earlier one, CAPTURE_BLANK say, applies.)
     Judged on the RESOLVED spec's own identity (its legId and its file leaf), never on the spelling of the reference that reached it, and case-folded (Windows resolves
     `LEGS\X.JSON` to the file `legs/x.json`).
     #>
@@ -2868,7 +2882,34 @@ function Get-DvLegSetPlan {
         if ($specLegId -cnotmatch '^[a-z0-9][a-z0-9-]{1,62}$' -or -not [string]::Equals([IO.Path]::GetFileName($full), "$specLegId.json", [StringComparison]::OrdinalIgnoreCase)) {
             throw "DVE_LEGSET_INVALID '$ref' read as legId '$($spec.legId)': a committed leg spec is named <legId>.json, so a spec reached under another name (an alias, a hard link, a link swapped in) is refused"
         }
-        $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256 })
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3): the PLANNED leg type comes from THESE bytes (the ones the child is pinned to by
+        # specSha256), by the child's own rule (Invoke-VenueLeg.ps1 $isExport: legType exactly the string 'export'), so no caller re-reads the path to learn it
+        # adversary-b3d61554.json A7: a spec that declares legType more than once is ambiguous (ConvertFrom-Json keeps the LAST one, so a playback declaration ahead of an export one read
+        # as export and earned the export exemption). VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R3-MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A1): the planner no longer re-derives that by counting
+        # the literal text "legType": a JSON-escaped spelling of the name ("legType") is the same member to the parser and was invisible to the count, so the plan said export where the
+        # strict reader the chain, the baseline, the leg job and the batch judge by (Get-VenuePlannedLegType: one JSON walk, a repeated member anywhere in any spelling is 'unknown') said
+        # unknown. The planned type is now that ONE function's answer for these bytes; every consumer of plannedLegType (Invoke-VenueChain, Invoke-VenueLeg, Invoke-VenueBaseline's
+        # chain rows) takes it from this plan, so none can disagree with the strict reader.
+        if (-not (Get-Command -Name Get-VenuePlannedLegType -ErrorAction SilentlyContinue)) {
+            Import-Module (Join-Path $PSScriptRoot 'VenueChain.psm1') -Function Get-VenuePlannedLegType -DisableNameChecking
+        }
+        $specPlannedLegType = Get-VenuePlannedLegType -SpecText $specText
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A6, NARROWED): a spec the strict reader types 'unknown' (a repeated member in any spelling, not one JSON
+        # object, unreadable) is refused here, typed. It used to be planned with plannedLegType 'unknown' beside a cellId and downstream branches (preflight, dispatch) made by the
+        # last-wins object, so two readers disagreed about one leg: an ambiguous ProRes spec took the 'cpu-export-prores' cell and collided with an unambiguous one.
+        if ([string]::Equals($specPlannedLegType, 'unknown', [StringComparison]::Ordinal)) {
+            throw "DVE_LEGSET_INVALID leg '$($spec.legId)' has a legType the strict spec reader cannot judge (a member repeated in any spelling, or a spec that is not one JSON object); a spec whose legType is ambiguous is never planned"
+        }
+        # adversary-ac722a96.json A5: the strict reader types ["export"] or "ex<soft hyphen>port" as playback, while the loose casts downstream took them for export. A legType that is present must be ONE string of the schema's
+        # enum, compared ordinally (the rule Get-DvLegSpecShapeRefusal applies to a leg that runs), or the spec is refused here; and the cell is chosen from the strict planned type below, never from the raw member.
+        # adversary-d10f5241.json A3: PRESENCE, not a non-null value, is what the child tests (Get-DvLegSpecShapeRefusal: the legType PROPERTY exists), so "legType": null is refused here too
+        $legTypeProp = $spec.PSObject.Properties['legType']
+        $rawLegType = $null
+        if ($null -ne $legTypeProp) { $rawLegType = $legTypeProp.Value }   # (a plain assignment: a $(if ...) would unroll a one-element array into its member)
+        if ($null -ne $legTypeProp -and -not ($rawLegType -is [string] -and @($script:LegTypes | Where-Object { [string]::Equals([string]$_, $rawLegType, [StringComparison]::Ordinal) }).Count -eq 1)) {
+            throw "DVE_LEGSET_INVALID leg '$($spec.legId)' has a legType that is not one string of the schema's enum ($($script:LegTypes -join ', ')); a spec whose legType is an array, an object or a look-alike spelling is never planned"
+        }
+        $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256; plannedLegType = $specPlannedLegType })
     }
     $backends = [System.Collections.Generic.List[string]]::new()
     foreach ($s in $specs) { foreach ($b in @($s.spec.backends)) { if ($b -notin $backends) { $backends.Add([string]$b) } } }
@@ -2879,10 +2920,10 @@ function Get-DvLegSetPlan {
             if ($b -notin @($s.spec.backends)) { continue }
             $mode = $(if ($null -ne (Get-DvProp $s.spec 'displayMode')) { [string]$s.spec.displayMode } else { 'fullscreen' })
             # EXPORT-VENUE-LEG-1: an export leg plays nothing and has no display mode; its cell is its format, so both formats of one clip are two cells
-            $cellId = $(if ([string](Get-DvProp $s.spec 'legType') -ceq 'export') { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
+            $cellId = $(if ([string]::Equals([string]$s.plannedLegType, 'export', [StringComparison]::Ordinal)) { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
             if ($seen.ContainsKey($cellId)) { throw "DVE_LEGSET_INVALID two legs of the set make the cell $cellId" }
             $seen[$cellId] = $true
-            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
+            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor; plannedLegType = $s.plannedLegType })
         }
     }
     $cellList = @($cells | Where-Object { [string]::IsNullOrEmpty($Backend) -or $_.backend -ceq $Backend })
@@ -2893,7 +2934,7 @@ function Get-DvLegSetPlan {
         $walk = $(if ($r % 2 -eq 1) { $cellList } else { @($cellList[($cellList.Count - 1)..0]) })
         foreach ($c in $walk) {
             $seq++
-            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; specSha256 = $c.specSha256; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor })
+            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; specSha256 = $c.specSha256; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor; plannedLegType = $c.plannedLegType })
         }
     }
     [pscustomobject]@{ legSet = $setName; card = $card; clipId = $clipId; repeats = $Repeats; cells = @($cellList); plan = @($plan) }
@@ -3191,13 +3232,33 @@ function Get-DvMatrixRow {
     One planned leg's row of the matrix summary, from the receipt the leg wrote. Rates are read only when the outcome is a measurement (PASS or FAIL: every other outcome is no signal,
     its row carries the outcome and no numbers) AND the hashed run log still hashes to receipt.evidence.logSha256 (a swapped log is no measurement: rates stay absent and `note` says so).
     #>
-    param([Parameter(Mandatory)]$PlanEntry, $Receipt)
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): -HostLoad is the leg's host-load standing (VenueChain.psm1 Get-VenueLegHostLoad, read by the caller from the leg's
+    # hash-bound smoke result). The row carries hostLoadState and hostLoadProvisional; no standing reads 'unknown' / provisional, and a provisional row is never
+    # a measurement (Test-DvMatrixRowMeasured), whatever its outcome and rates.
+    param([Parameter(Mandatory)]$PlanEntry, $Receipt, $HostLoad = $null)
     $row = [ordered]@{
         seq = $PlanEntry.seq; repeat = $PlanEntry.repeat; cellId = $PlanEntry.cellId; backend = $PlanEntry.backend
         requestedDisplay = $PlanEntry.displayMode; observedDisplay = 'UNKNOWN'; requestedScale = $PlanEntry.scaleFactor; effectiveScale = 'UNKNOWN'
         windowSize = $null; previewSize = $null; outcome = 'NO_RECEIPT'; receiptId = $null
         presentedFps = $null; timelineFpsAfterFirstPresent = $null; renderWorkMs = $null; dualIsoMs = $null; note = $null
+        hostLoadState = 'unknown'; hostLoadProvisional = $true; hostLoadCollected = $false
     }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): the standing's members are read without unrolling (Get-DvProp returns through the pipeline)
+    $hlState = $null; $hlProv = $null; $hlColl = $null
+    if ($null -ne $HostLoad -and $HostLoad -isnot [System.Collections.IList]) {
+        foreach ($hlName in 'state', 'provisional', 'collected') {
+            $hlVal = $null
+            if ($HostLoad -is [System.Collections.IDictionary]) { if ($HostLoad.Contains($hlName)) { $hlVal = $HostLoad[$hlName] } }
+            else { $hlP = $HostLoad.PSObject.Properties[$hlName]; if ($null -ne $hlP) { $hlVal = $hlP.Value } }
+            switch ($hlName) { 'state' { $hlState = $hlVal } 'provisional' { $hlProv = $hlVal } 'collected' { $hlColl = $hlVal } }
+        }
+    }
+    if ($hlState -is [string] -and [regex]::IsMatch($hlState, '\A[a-z][a-z_-]{0,31}\z')) { $row.hostLoadState = $hlState }
+    # r1 (sol r6 B3): the row keeps the standing's collected (only a real $true is collected), so collected=false is never dropped on the way to the count
+    $row.hostLoadCollected = ($hlColl -is [bool] -and $hlColl)
+    # r6 (sol r5 B3) + residue r1 (sol r6 B3): provisional unless the standing is clean by Test-DvHostLoadRowClean's rule (state exactly 'quiet', provisional
+    # a real $false AND collected a real $true): the rule Get-VenueReferenceHostLoadRefusal applies to the same standing
+    $row.hostLoadProvisional = -not ($hlProv -is [bool] -and -not $hlProv -and $hlState -is [string] -and [string]::Equals($hlState, 'quiet', [StringComparison]::Ordinal) -and $hlColl -is [bool] -and $hlColl)
     if ($null -eq $Receipt) { $row.note = 'the leg wrote no receipt'; return [pscustomobject]$row }
     $row.outcome = [string](Get-DvProp $Receipt 'outcome'); $row.receiptId = [string](Get-DvProp $Receipt 'receiptId')
     # r6 (sol r5 B1): a visual twin's rates are never read, whichever path its plan entry or receipt came through (the entry's leg id and the receipt's leg id both count)
@@ -3216,7 +3277,7 @@ function Get-DvMatrixRow {
     }
     $scale = Get-DvProp $Receipt 'scale'
     if ($null -ne $scale) { $row.effectiveScale = Get-DvProp $scale 'effectiveScale' }
-    if ($row.outcome -cnotin @('PASS', 'FAIL')) { $row.note = [string](Get-DvProp $Receipt 'outcomeDetail'); return [pscustomobject]$row }
+    if (-not (Test-DvOrdinalIn $row.outcome @('PASS', 'FAIL'))) { $row.note = [string](Get-DvProp $Receipt 'outcomeDetail'); return [pscustomobject]$row }
     $evidence = Get-DvProp $Receipt 'evidence'
     $dir = [string](Get-DvProp $evidence 'localEvidenceDir'); $claimed = [string](Get-DvProp $evidence 'logSha256')
     $logPath = $(if ($dir) { Join-Path $dir 'logs\smoke-run.log' } else { '' })
@@ -3234,8 +3295,54 @@ function Test-DvMatrixRowMeasured {
     M16-1457-VENUE-BASELINE-DRIFT-1 r7 (sol r6 INV-2): is this matrix row a MEASUREMENT? Only a PASS or FAIL row that carries a presented-fps value is (the reader leaves the rates null for a
     visual twin, a missing or swapped run log and every non-measurement outcome). The ONE predicate the table's `measured / ran` column and the summary header's `N measured` both use.
     #>
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): and only a row whose hostLoadProvisional is the boolean false; a provisional, unknown or absent
+    # host-load standing is recorded in the row and never counted. (r6: a matrix row is a playback measurement, so an export leg's not-applicable is not counted.)
+    # r6 (sol r5 B3, opus r5 A4): the host-load half is Test-DvHostLoadRowClean (state exactly 'quiet' AND provisional a real $false): a row that says
+    # unknown, exceeded or no state beside provisional=false is never counted, whoever built it.
     param([Parameter(Mandatory)]$Row)
-    ($Row.outcome -cin @('PASS', 'FAIL')) -and ($null -ne $Row.presentedFps)
+    (Test-DvOrdinalIn $Row.outcome @('PASS', 'FAIL')) -and ($null -ne $Row.presentedFps) -and (Test-DvHostLoadRowClean -Row $Row)
+}
+
+function Test-DvHostLoadRowClean {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B3): the ONE strict host-load predicate for a recorded row (a matrix row, a baseline trend row): clean only when
+    hostLoadState is exactly the string 'quiet' (ordinal) AND hostLoadProvisional is a real [bool] $false. Anything else (unknown, exceeded, not-applicable,
+    missing, 'QUIET', provisional 0, 'false', [false] or absent) is not clean. Pure.
+    #>
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): and hostLoadCollected a real [bool] $true (Get-DvMatrixRow and the baseline row carry it), so a
+    # row whose standing said collected=false is never measured and never in a median, the same refusal as VenueChain.psm1 Get-VenueReferenceHostLoadRefusal.
+    # Members are read without unrolling (a [false] is an array, never the boolean inside it).
+    param([AllowNull()]$Row)
+    if ($null -eq $Row -or $Row -is [System.Collections.IList]) { return $false }
+    $st = $null; $prov = $null; $coll = $null
+    foreach ($rn in 'hostLoadState', 'hostLoadProvisional', 'hostLoadCollected') {
+        $rv = $null
+        if ($Row -is [System.Collections.IDictionary]) { if ($Row.Contains($rn)) { $rv = $Row[$rn] } }
+        else { $rp = $Row.PSObject.Properties[$rn]; if ($null -ne $rp) { $rv = $rp.Value } }
+        switch ($rn) { 'hostLoadState' { $st = $rv } 'hostLoadProvisional' { $prov = $rv } 'hostLoadCollected' { $coll = $rv } }
+    }
+    # adversary-de8e3799.json A5: ordinal, never -ceq (culture-aware: 'qui<soft hyphen>et' -ceq 'quiet' is true)
+    ($st -is [string]) -and [string]::Equals($st, 'quiet', [StringComparison]::Ordinal) -and ($prov -is [bool]) -and (-not $prov) -and ($coll -is [bool]) -and $coll
+}
+
+function ConvertTo-DvMatrixHostLoadTable {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the per-leg host-load table under the matrix summary: every leg's hostLoad.state and provisional, and whether
+    it was counted as a measurement (Test-DvMatrixRowMeasured), so a provisional or unknown leg is visible in the report and never silently in the medians.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('| seq | repeat | cell | outcome | hostLoad.state | provisional | counted |')
+    $lines.Add('|---|---|---|---|---|---|---|')
+    foreach ($r in $Rows) {
+        $prov = Get-DvProp $r 'hostLoadProvisional'
+        $provText = $(if ($prov -is [bool]) { $(if ($prov) { 'true' } else { 'false' }) } else { 'unknown' })
+        $state = [string](Get-DvProp $r 'hostLoadState'); if (-not $state) { $state = 'unknown' }
+        $lines.Add("| $($r.seq) | $($r.repeat) | $($r.cellId) | $($r.outcome) | $state | $provText | $(if (Test-DvMatrixRowMeasured -Row $r) { 'yes' } else { 'no' }) |")
+    }
+    $lines.ToArray()
 }
 
 function Get-DvMatrixMeasuredCount {
@@ -3674,7 +3781,10 @@ function Get-DvLegSpecShapeRefusal {
     # leg's -eq against the array was truthy and indexed the absent look before any receipt. An array, object, number, null, empty or other-case value is
     # refused here, for the leg and every batch preflight alike. An ABSENT legType stays a speed leg, as the runner has always read it.
     $legTypeProp = $Spec.PSObject.Properties['legType']
-    if ($null -ne $legTypeProp -and -not ($legTypeProp.Value -is [string] -and $legTypeProp.Value -cin $script:LegTypes)) {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (adversary-ac6205bd.json A8): ORDINAL membership. -cin is culture-aware and ignores a soft hyphen, so
+    # "ex<U+00AD>port" passed here and every later -ceq 'export' dispatched it as an export, while the ordinal planned-type reader (VenueChain.psm1
+    # Get-VenuePlannedLegType) read playback. Refusing it here makes the validator, the dispatch and the exemption agree.
+    if ($null -ne $legTypeProp -and -not ($legTypeProp.Value -is [string] -and @($script:LegTypes | Where-Object { [string]::Equals($_, [string]$legTypeProp.Value, [StringComparison]::Ordinal) }).Count -eq 1)) {
         return "legType must be one of $(($script:LegTypes | ForEach-Object { '"' + $_ + '"' }) -join ', ') (one JSON string; it is $(ConvertTo-Json -InputObject $legTypeProp.Value -Compress -Depth 3))"
     }
     $exportRefusal = Get-DvExportShapeRefusal -Spec $Spec -IsExportLeg ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'export')
@@ -4065,6 +4175,18 @@ function Get-DvVisualCaptureRequest {
     [pscustomobject]@{ applies = $applies; requested = $applies; optOutReason = $null }
 }
 
+function ConvertTo-DvOneLineText($Value) {
+    # UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2 (pass 4 A2, pass 5 A1) and R2-RESIDUE-1: the one rule for outside text printed inside a record line (the visual
+    # reason, Invoke-VenueLeg's DVE_DETAIL). Every control character (Cc: CR, LF, VT, FF, NEL, the C1 set, ...) and the Unicode line and paragraph separators
+    # (Zl U+2028, Zp U+2029) is written as \uXXXX, so nothing a detail quotes can split the line into a second record, for a CR/LF reader or for
+    # Python's splitlines. $null stays $null.
+    if ($null -eq $Value) { return $null }
+    # R3-KEY-RESIDUE-1 (fable r3 B1): by category (Cc/Zl/Zp) was not enough -- a printable character the leg's console code page best-fits to a CR or LF
+    # (cp437: U+25D9 -> 0x0A, U+266A -> 0x0D) still forged a second record. So everything outside printable ASCII is written as \uXXXX (UTF-16 unit by
+    # unit); the receipt keeps the raw text.
+    [regex]::Replace([string]$Value, '[^\x20-\x7E]', { param($m) '\u{0:X4}' -f [int][char]$m.Value })
+}
+
 function ConvertTo-DvVisualUtcText($Value) {
     # ConvertFrom-Json turns an ISO date string into a DateTime on some pwsh versions and leaves it a string on others: one round-trip UTC text either way.
     if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
@@ -4417,24 +4539,114 @@ function Get-DvVisualVerdict {
     else the absolute fallback band). Counted and surfaced like VISUAL_DIVERGENCE, never an exclusion, and judged after every other verdict: a picture that
     is equally wrong in both A/B arms (M16-1457: mean luma 6.9/255, 84% near-black) used to be a plain OK. The reason quotes the three numbers and the band
     limits they broke. Without -ExposureBand, or without the three medians, nothing is judged on exposure and every verdict is what it was.
+    UNPACED-VISUAL-MIDPLAY-CAPTURE-1: NOT_A_MOTION_WITNESS -- fewer than two distinct display frames across the judged play frames
+    (-AppDistinctDisplayFrames 0 or 1): their labels carry one display frame number (or none), so they cannot witness motion during playback,
+    whatever their pictures show (the number only: visual.json carries no clip token, so one number is not claimed to be one timeline position). Measured on an unpaced Play, which holds its last required frame through the capture tail (MainWindow.cpp
+    playbackHandling, pinnedUnpacedHoldReached), so every play capture carried display frame 479. Counted (the measured window closed before the tail,
+    so the speed numbers are untouched) and surfaced, never OK. Judged right after CAPTURE_BLANK, so it outranks the frozen verdicts (which need two or
+    more display frames, so they are disjoint from it), PARTIAL_FREEZE, CAPTURE_UNBOUND, VISUAL_DIVERGENCE, EXPOSURE_OUT_OF_RANGE and the known-identical
+    waiver (the app's own rule needs two display frames for known-identical). Generic on the display-frame fact, not on a leg flag: a paced leg stuck on
+    one frame is no motion witness either. -SoleDisplayFrame (optional) is that one frame's number and -LabelledPlayFrames (optional) how many judged frames
+    carry a valid frame number (1..PlayFrames when one number is declared; anything else is not known); the reason quotes both and speaks of the judged
+    frames only, never of the whole strip (r1 adversary A1).
     #>
     param([bool]$Requested, [bool]$Captured, [int]$PlayFrames, [int]$DistinctContentHashes, [int]$AppDistinctDisplayFrames, [int]$FlatPlayFrames,
           $PlayVsPausedMeanAbsDiff, [bool]$SamePosition, [double]$Threshold = $script:VisualDivergenceThreshold,
           [ValidateSet('known-differ', 'known-identical', 'unknown')][string]$SourceDifference = 'unknown', [int]$ViewportUnavailablePlayFrames = 0, $LabelBound = $null,
           $PausedLabelBound = $null, [int]$ObserverPaintedPlayFrames = 0, [int]$RepeatedPlayFrames = 0,
-          $ExposureMedianLuma = $null, $ExposureMedianNearBlackFraction = $null, $ExposureMedianClippedFraction = $null, $ExposureBand = $null, [string]$ExposureBandSource = '')
+          $ExposureMedianLuma = $null, $ExposureMedianNearBlackFraction = $null, $ExposureMedianClippedFraction = $null, $ExposureBand = $null, [string]$ExposureBandSource = '',
+          $SoleDisplayFrame = $null, $LabelledPlayFrames = $null)
     if (-not $Requested) { return [pscustomobject]@{ verdict = 'NOT_REQUESTED'; counted = $true; reason = 'the leg spec opts out of window captures' } }
-    if ($ViewportUnavailablePlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ViewportUnavailablePlayFrames play frame(s) have no usable viewport rectangle (visual.json), leaving $PlayFrames judged, so the picture cannot be told from the window's timecode and chrome: no visual assessment" } }
-    if ($ObserverPaintedPlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ObserverPaintedPlayFrames unforced play frame(s) were taken after a forced paint their predecessor did not see, or do not record how many forced paints preceded them (forced_paints_before), leaving $PlayFrames judged: a forced paint stays on screen when the display's own paint is stuck, so those pictures cannot tell a moving display from a frozen one: no visual assessment" } }
-    if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $PlayFrames play frame(s) were captured" } }
+    # R3-KEY-RESIDUE-1: a negative judged-frame count cannot be true, so it is worded as unknown, never quoted (the verdicts below are unchanged)
+    $playText = $(if ($PlayFrames -ge 0) { "$PlayFrames" } else { 'an unknown number of' })
+    if ($ViewportUnavailablePlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ViewportUnavailablePlayFrames play frame(s) have no usable viewport rectangle (visual.json), leaving $playText judged, so the picture cannot be told from the window's timecode and chrome: no visual assessment" } }
+    if ($ObserverPaintedPlayFrames -gt 0 -and $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'VISUAL_ASSESSMENT_UNAVAILABLE'; counted = $true; reason = "$ObserverPaintedPlayFrames unforced play frame(s) were taken after a forced paint their predecessor did not see, or do not record how many forced paints preceded them (forced_paints_before), leaving $playText judged: a forced paint stays on screen when the display's own paint is stuck, so those pictures cannot tell a moving display from a frozen one: no visual assessment" } }
+    if (-not $Captured -or $PlayFrames -lt 2) { return [pscustomobject]@{ verdict = 'NOT_CAPTURED'; counted = $true; reason = "only $playText play frame(s) were captured" } }
     if ($FlatPlayFrames -ge $PlayFrames) { return [pscustomobject]@{ verdict = 'CAPTURE_BLANK'; counted = $true; reason = 'every play frame''s viewport is flat: the capture shows no picture, so it judges nothing' } }
+    # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: one display frame number (or none) across the judged play frames witnesses no motion, whatever the pictures show.
+    # r1 adversary A1: the reason says only what the JUDGED frames establish -- how many carry a frame number (-LabelledPlayFrames, when the caller
+    # counted them), the one number they carry -- and never describes the whole strip (unjudged tiles, forced ones say, may carry other labels).
+    # r1 adversary pass 2 A1: the claim is about the LABELS (display_frame), never about the pictures: a picture may be an older paint than its label.
+    # Pass 2 A2: -LabelledPlayFrames counts only as a whole number in 0..PlayFrames (Get-DvFrameNumber; never a throw); anything else is not known, and
+    # an unknown count never reads as "all".
+    # r2 (r1 adversary pass 3 A2): every branch speaks of the label NUMBER only, never of a timeline position: visual.json carries no clip token, so
+    # clip A frame 479 and clip B frame 479 are one number and two positions. r2 (pass 3 A3): a count that contradicts -AppDistinctDisplayFrames (no
+    # labelled frame while one display frame is declared) is not known either, so a caller-supplied tuple cannot make the reason say "0 of".
+    # R3-KEY-RESIDUE-1 (sol r3 blocker, opus VISUAL-GATE-DISTINCT-HASHES-RANGE-1): the CONTRACT is "omit": a count that cannot be true for the judged set
+    # (a distinct-picture count outside 1..PlayFrames, a distinct-display-frame count outside 0..PlayFrames, a repeat count over PlayFrames minus the distinct pictures) is never quoted
+    # as observed evidence. The verdict is whatever it was (production derives every count from the judged set, so none of these fires there); only the
+    # reason drops the number, in words that state no more than the verdict's own condition.
+    # R1C-REASON-RESIDUE-1 r2 (sol r1c pass A1-A3): -LabelledPlayFrames is how many judged frames carry a valid label, so a VALID ZERO is a statement (no judged
+    # frame carries one) and a distinct-label count over it, or a repeat count over (labelled - 1), cannot be true; $labelledCount is that count (0..PlayFrames) or $null
+    $labelledCount = Get-DvFrameNumber $LabelledPlayFrames
+    if ($null -ne $labelledCount -and $labelledCount -gt $PlayFrames) { $labelledCount = $null }
+    if ($AppDistinctDisplayFrames -lt 2) {
+        $sole = Get-DvFrameNumber $SoleDisplayFrame
+        $labelled = $(if ($null -ne $labelledCount -and $labelledCount -ge 1) { $labelledCount } else { $null })
+        $numberText = $(if ($null -ne $sole) { "display frame number $sole" } else { 'one display frame number' })
+        $pictureText = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { " ($DistinctContentHashes distinct picture(s) among them)" } else { '' })
+        # pass 2 A2: "none carries a valid number" needs the rest of the tuple to agree: a sole frame number or a labelled count beside -AppDistinctDisplayFrames 0
+        # (also what an OMITTED -AppDistinctDisplayFrames binds to) contradicts it, so that reason abstains too
+        # R1C-REASON-RESIDUE-1 (sol r1c A2): the same for the rest of the tuple. A known source difference (either value: the app's rule needs a valid label on
+        # every judged frame and two distinct ones) and a repeat (a pair with two distinct valid labels) both need two distinct display frame numbers, so
+        # either beside fewer than two disagrees with the count, and the reason claims neither "none" nor "all one number" (Get-DvVisualSourceDifference, Read-DvVisualCaptures)
+        $needsTwoLabels = ($SourceDifference -ne 'unknown' -or $RepeatedPlayFrames -ge 1)   # -ne: the binder accepts any case of the enum (sol r1c A4 is open, not mine)
+        # sol r1c pass A1: an explicit labelled count of 0 beside one declared display frame disagrees too ("all valid labels are frame 479" over no valid label)
+        $contradicted = (($AppDistinctDisplayFrames -eq 0 -and ($null -ne $sole -or $null -ne $labelled)) -or ($AppDistinctDisplayFrames -ge 0 -and $needsTwoLabels) -or
+                         ($AppDistinctDisplayFrames -ge 1 -and $null -ne $labelledCount -and $labelledCount -eq 0))
+        $position = $(if ($AppDistinctDisplayFrames -lt 0) { "the $PlayFrames judged play frames do not establish two distinct display frame numbers" }
+                      elseif ($contradicted) { "the $PlayFrames judged play frames do not establish two distinct display frame numbers (the counts supplied disagree on how many carry a valid one)" }
+                      elseif ($AppDistinctDisplayFrames -eq 0) { "none of the $PlayFrames judged play frames carries a valid display frame number" }
+                      elseif ($null -eq $labelled) { "the valid display frame numbers among the $PlayFrames judged play frames are all ${numberText}: one display frame number across them at most" }
+                      elseif ($labelled -lt $PlayFrames) { "$labelled of the $PlayFrames judged play frames carry $numberText and the other $($PlayFrames - $labelled) carry no valid display frame number: one display frame number across them at most" }
+                      else { "all $PlayFrames judged play frames carry ${numberText}: one display frame number across them" })
+        return [pscustomobject]@{ verdict = 'NOT_A_MOTION_WITNESS'; counted = $true; reason = "${position}${pictureText}, so they cannot witness motion during playback (one known cause: an unpaced Play holds its last required frame through the capture tail)" }
+    }
+    # sol r1c pass A3: distinct labels cannot outnumber the labelled frames, so a count over a known labelled count is not quoted either (nor waived on)
+    $appCountFits = ($AppDistinctDisplayFrames -le $PlayFrames -and ($null -eq $labelledCount -or $AppDistinctDisplayFrames -le $labelledCount))
+    $appFramesText = $(if ($appCountFits) { "$AppDistinctDisplayFrames distinct frames" } else { 'a distinct-frame count that cannot be true for them and is not quoted' })
+    # sol r1c pass 2 A1: a known source difference (either value) needs a valid label on EVERY judged frame (the <2 branch above says the same), so beside a labelled
+    # count under PlayFrames the tuple disagrees and no reason claims a known source difference, a repeat or a cause on it
+    $sourceIncoherent = ($SourceDifference -ne 'unknown' -and $null -ne $labelledCount -and $labelledCount -lt $PlayFrames)
+    # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 adversary pass 1 A1: a repeat count over what the judged frames can hold (N - D adjacent repeats over D pictures, N - 1 when D cannot
+    # be true, L - 1 over L labelled frames) is a tuple no judged set produces, so the whole-freeze reason and the known-identical waiver (which return before the
+    # repeat branch below) claim no source difference beside it either; the PARTIAL_FREEZE branch below keeps its own, stricter N - 2 bound for an out-of-range D
+    $repeatHold = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { $PlayFrames - $DistinctContentHashes } else { $PlayFrames - 1 })
+    if ($null -ne $labelledCount) { $repeatHold = [Math]::Min($repeatHold, [Math]::Max(0, $labelledCount - 1)) }
+    # pass 2 A1: and a negative count is no count of repeats at all
+    $repeatOverHold = ($RepeatedPlayFrames -lt 0 -or $RepeatedPlayFrames -gt $repeatHold)
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
-        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them and the source frames are known to differ" }
+        # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (key3 r4 H1): and a source claim beside an app count this same reason calls impossible is not quoted either
+        $differText = $(if ($sourceIncoherent) { "the source difference supplied disagrees with the $labelledCount labelled of the $PlayFrames judged frames and is not quoted" }
+                        elseif (-not $appCountFits) { 'the source difference supplied beside it is not quoted' }
+                        elseif ($repeatOverHold) { 'the source difference supplied beside a repeat count they cannot hold is not quoted' }
+                        else { 'the source frames are known to differ' })
+        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them and $differText" }
     }
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'unknown') {
-        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY_SUSPECTED'; counted = $true; reason = "the $PlayFrames play frames show ONE picture while the app presented $AppDistinctDisplayFrames distinct frames across them, but nothing records whether the source frames differ (a static clip shows one picture legitimately): suspected, not excluded" }
+        return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY_SUSPECTED'; counted = $true; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them, but nothing records whether the source frames differ (a static clip shows one picture legitimately): suspected, not excluded" }
     }
     if ($RepeatedPlayFrames -ge 2 -and $SourceDifference -ceq 'known-differ') {
+        # a repeat is a judged frame equal to the one before it: N frames over D distinct pictures hold at most N - D of them (N - 1 when D itself cannot be true)
+        # (sol r1 pass A1: 4 repeats over 6 frames and 3 pictures, or 6 repeats over 6 frames, were quoted although no judged set holds them)
+        # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (sol r4 B1 = key3 r4 B1): this branch is reached only with a known source difference, two or more app frames and a picture
+        # count other than 1 (a 1 is FROZEN_DISPLAY above), so a real judged set holds at least two pictures and at most N - 2 repeats: that is the bound when the
+        # picture count itself cannot be true (N - 1 let 5 repeats over 6 frames and 0 pictures read as observed)
+        $repeatMax = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { $PlayFrames - $DistinctContentHashes } else { $PlayFrames - 2 })
+        # sol r1c pass A2: a repeat needs two adjacent labelled frames (the label advanced), so L labelled frames hold at most L - 1 of them
+        if ($null -ne $labelledCount) { $repeatMax = [Math]::Min($repeatMax, [Math]::Max(0, $labelledCount - 1)) }
+        # pass 2 A1: when the supplied count is over that bound, "two or more of them repeat" is the same impossible claim in words (N = D = 2 holds no repeat at
+        # all), so the reason says the count cannot be true and speaks of what was SUPPLIED, never of what the judged frames show
+        # R1C-REASON-RESIDUE-1 (sol r1c A1): and an impossible count supports neither an observed repeat ("as supplied, they repeat") nor the freeze
+        # diagnosis ("the display's own paint stopped landing"): the verdict is what it was, the reason names the impossible input and claims nothing
+        if ($sourceIncoherent -and $RepeatedPlayFrames -le $repeatMax) {
+            return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "the repeat count and source difference supplied for the $PlayFrames judged play frames disagree with the $labelledCount labelled of them and are not quoted: they establish no repeat, no source difference and no cause (the verdict follows the counts supplied, not an observation)" }
+        }
+        # ... and a repeat count beside an app distinct-frame count that cannot be true for the judged frames (over PlayFrames, or over the labelled count) is a
+        # tuple no judged set produces: the repeat is not observed there either, so the same withheld wording
+        if ($RepeatedPlayFrames -gt $repeatMax -or -not $appCountFits) {
+            return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "the repeat count supplied for the $PlayFrames judged play frames cannot be true for them and is not quoted: it establishes no repeat and no cause, so the judged frames are not described as repeating (the verdict follows the count supplied, not an observation)" }
+        }
         return [pscustomobject]@{ verdict = 'PARTIAL_FREEZE'; counted = $true; reason = "$RepeatedPlayFrames of the $PlayFrames judged play frames repeat the picture before them while the app's label advanced and the source frames are known to differ: the display's own paint stopped landing for part of the tail" }
     }
     if (($null -ne $LabelBound -or $null -ne $PausedLabelBound) -and -not ($LabelBound -eq $true -and $PausedLabelBound -eq $true)) {
@@ -4446,7 +4658,7 @@ function Get-DvVisualVerdict {
         return [pscustomobject]@{ verdict = 'VISUAL_DIVERGENCE'; counted = $true; reason = "the playback-path frame is $PlayVsPausedMeanAbsDiff (per-channel mean absolute difference, 0..255) from its paused full-quality re-render; the threshold is $Threshold" }
     }
     # one picture over source frames the app itself records as identical: the frozen check was waived on its word, so the receipt says so
-    $waivedReason = $(if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
+    $waivedReason = $(if ($appCountFits -and -not $sourceIncoherent -and -not $repeatOverHold -and $DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
     # VISUAL-GATE-EXPOSURE-FLOOR-1: last, so every other verdict keeps its precedence; counted, a flag and never an exclusion
     if ($null -ne $ExposureBand -and $null -ne $ExposureMedianLuma -and $null -ne $ExposureMedianNearBlackFraction -and $null -ne $ExposureMedianClippedFraction) {
         # compared UNROUNDED; the reason rounds to 6 places for display (a median 0.000434 against a cap of 0.00042 is over, and reads as 0.000434)
@@ -4621,8 +4833,12 @@ function Read-DvVisualCaptures {
     $reasonBeforeStrip = $null   # the step reason standing when the strip failed (a NOT_CAPTURED leg keeps it between the capture count and the strip failure)
     $exposureNote = $null    # set when the exposure band file could not be used (missing / malformed): reported beside the verdict, never silently OK
     # the exposure inputs of the verdict, read from the block when the verdict is taken (all $null until the judged frames are measured)
+    # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: the one display frame every judged play frame carries, when they carry exactly one ($null otherwise); quoted by NOT_A_MOTION_WITNESS
+    $soleDisplayFrame = $null
+    $labelledPlayFrames = $null   # r1 adversary A1: how many judged play frames carry a valid display frame number (quoted beside it)
     $exposureArgs = { @{ ExposureMedianLuma = $block.exposureMedianLuma; ExposureMedianNearBlackFraction = $block.exposureMedianNearBlackFraction
-                         ExposureMedianClippedFraction = $block.exposureMedianClippedFraction; ExposureBand = $block.exposureBand; ExposureBandSource = [string]$block.exposureBandSource } }
+                         ExposureMedianClippedFraction = $block.exposureMedianClippedFraction; ExposureBand = $block.exposureBand; ExposureBandSource = [string]$block.exposureBandSource
+                         SoleDisplayFrame = $soleDisplayFrame; LabelledPlayFrames = $labelledPlayFrames } }
     $finish = {
         $exArgs = & $exposureArgs
         $v = Get-DvVisualVerdict -Requested $Requested -Captured ([bool]$block.captured) -PlayFrames ([int]$block.playFrames) -DistinctContentHashes ([int]$block.distinctContentHashes) `
@@ -4633,13 +4849,20 @@ function Read-DvVisualCaptures {
         # (the verdict reason comes first, then the notes that some saved play frames were not judged, then the masking and repeat notes, then the strip failure;
         # a PARTIAL_FREEZE reason already says what the repeat note says, so the note stays in repeatedPlayFramesNote only)
         # PLAYBACK-SOURCE-FRAME-IDENTITY-1: the source-difference cross-check note follows the not-judged note.
-        $notes = (@($notJudgedNote, $crossCheckNote, $observerNote, $maskNote, $(if ($v.verdict -cne 'PARTIAL_FREEZE') { $repeatNote }), $exposureNote, $stripNote) | Where-Object { $_ }) -join '; '
+        # UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2 (r1 adversary pass 3 A1): a NOT_A_MOTION_WITNESS reason never carries the masking or repeat note: over one
+        # held display frame the hold, not a force-paint, explains the one unforced picture (the forced set was taken half a tail earlier)
+        $noMotion = ($v.verdict -ceq 'NOT_A_MOTION_WITNESS')
+        $notes = (@($notJudgedNote, $crossCheckNote, $observerNote, $(if (-not $noMotion) { $maskNote }), $(if ($v.verdict -cne 'PARTIAL_FREEZE' -and -not $noMotion) { $repeatNote }), $exposureNote, $stripNote) | Where-Object { $_ }) -join '; '
         # a NOT_CAPTURED leg whose strip also failed keeps both: the capture count, any step reason from before the strip, then the strip failure
         if ($v.verdict -ceq 'NOT_CAPTURED' -and $stripNote) { $block.reason = (@($v.reason, $reasonBeforeStrip, $stripNote) | Where-Object { $_ }) -join '; ' }
         elseif ($null -ne $v.reason -and -not ($v.verdict -ceq 'NOT_CAPTURED' -and $null -ne $block.reason)) { $block.reason = $(if ($notes) { "$($v.reason); $notes" } else { $v.reason }) }
         elseif ($null -eq $v.reason -and $crossCheckNote -and (-not $block.reason -or $block.reason -ceq $notJudgedNote)) { $block.reason = (@($notJudgedNote, $crossCheckNote) | Where-Object { $_ }) -join '; ' }   # no gate reason: the cross-check note stands beside the not-judged note
         # an unusable exposure band file is always said in the reason, beside whatever note or verdict reason is already there (the first-wins rule above would drop it)
         if ($exposureNote -and -not ([string]$block.reason).Contains($exposureNote)) { $block.reason = (@($block.reason, $exposureNote) | Where-Object { $_ }) -join '; ' }
+        # r2 pass 4 A2: the reason is one line. A note may quote outside text (an exposure band key, say) and Invoke-VenueLeg prints the reason inside its
+        # DVE_DETAIL line, so a control character (a line break above all) is written as \uXXXX: no note can forge a second record line.
+        # (r2 pass 5 A1: and the Unicode line and paragraph separators U+2028 / U+2029, which split a line for Python's splitlines too)
+        if ($null -ne $block.reason) { $block.reason = ConvertTo-DvOneLineText $block.reason }
         $block.verdict = $v.verdict; $block.counted = $v.counted
         $block
     }
@@ -4773,7 +4996,11 @@ function Read-DvVisualCaptures {
     }
     $block.distinctContentHashes = @($play | ForEach-Object { $_.contentHash } | Sort-Object -Unique).Count
     # r5 (sol r3 key class sweep): the same display frames reach here; a value that is not a frame number (Get-DvFrameNumber) is not counted, never a throw
-    $block.appDistinctDisplayFrames = @($play | ForEach-Object { Get-DvFrameNumber $_.displayFrame } | Where-Object { $null -ne $_ } | Sort-Object -Unique).Count
+    $labelledNumbers = @($play | ForEach-Object { Get-DvFrameNumber $_.displayFrame } | Where-Object { $null -ne $_ })
+    $labelledPlayFrames = $labelledNumbers.Count
+    $judgedDisplayFrames = @($labelledNumbers | Sort-Object -Unique)
+    $block.appDistinctDisplayFrames = $judgedDisplayFrames.Count
+    if ($judgedDisplayFrames.Count -eq 1) { $soleDisplayFrame = $judgedDisplayFrames[0] }
     $block.flatPlayFrames = @($play | Where-Object { $null -ne $_.viewportStd -and [double]$_.viewportStd -lt $script:VisualFlatViewportStd }).Count
     # VISUAL-GATE-EXPOSURE-FLOOR-1: the leg's exposure is the MEDIAN over the judged play frames (the same population as the picture), judged against the
     # clip's band (exposure-bands.json) or the absolute fallback. An unusable band file is reported (exposureBandNote, and the reason), never a silent OK.
@@ -4789,7 +5016,12 @@ function Read-DvVisualCaptures {
         # (never pre-set as block.reason, r2 fable H2: that displaced a NOT_CAPTURED verdict's own reason; the finish clause appends it to every reason)
         if ($bandInfo.note) { $exposureNote = $bandInfo.note }
     }
-    if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1) {
+    # r2 (r1 adversary pass 3 A1): only when the judged frames carry two or more display frame numbers: one held number explains one picture by itself.
+    # r2 pass 4 A1: and never over judged frames whose own source ids are identical: a static source explains one picture by itself (the waiver says so).
+    # r2 pass 5 A2: only over judged frames whose own source ids are KNOWN to differ: over an unknown source one picture may be the source's own, so the
+    # captures support no masking claim
+    if ($judgeKind -ceq 'play_unbound' -and $block.distinctContentHashes -eq 1 -and [int]$block.forcedPlayDistinctContentHashes -gt 1 -and [int]$block.appDistinctDisplayFrames -ge 2 -and
+        $block.sourceDifference -ceq 'known-differ') {
         $maskNote = "the forced play captures show $($block.forcedPlayDistinctContentHashes) distinct pictures where the unforced ones show one: the force-paint would have masked this"
         if (-not $block.reason) { $block.reason = $maskNote }
     }
@@ -6350,7 +6582,7 @@ function Get-DvExportOutcome {
     $base = Resolve-DvJobOutcome -ResultToken $ResultToken -ExitCode $ExitCode
     # Only the export's own failure terminals are a product FAIL. A clip-length refusal (the job's RESULT is the gate's verdict), an owner-footage or work-dir
     # refusal, a missing RESULT line or any unknown token falls through Resolve-DvJobOutcome to FAIL; for an export leg that is no measurement: INVALID.
-    if ($base.outcome -eq 'FAIL' -and $ResultToken -cnotin $script:ExportFailResults) {
+    if ($base.outcome -eq 'FAIL' -and -not (Test-DvOrdinalIn $ResultToken $script:ExportFailResults)) {
         $why = $(if ($ResultToken -cin $script:PlayLengthRefusalReasons) { 'the clip failed the export length gate' } else { 'not an export failure terminal' })
         return [pscustomobject]@{ outcome = 'INVALID'; detail = "$(if ([string]::IsNullOrEmpty($ResultToken)) { 'no RESULT line' } else { $ResultToken }) (job exit ${ExitCode}): $why, so it is no product result"; criteria = $null }
     }
@@ -6478,7 +6710,7 @@ function Test-DvExportReceiptValid {
             $role = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'role')
             $criteria = Get-DvProp (Get-DvProp (Get-DvProp $contract 'criteria') $role) 'cpu'
             $derived = Get-DvExportOutcome -ResultToken ([string](Get-DvProp $umRun 'resultToken')) -ExitCode ([int]$exit) -Evidence $ev -Criteria $criteria
-            if ($derived.outcome -cnotin @('PASS', 'FAIL')) { $Invalid.Add("OUTCOME_NOT_DERIVABLE: the export evidence derives $($derived.outcome) ($($derived.detail)), which is not a PASS/FAIL signal") }
+            if (-not (Test-DvOrdinalIn $derived.outcome @('PASS', 'FAIL'))) { $Invalid.Add("OUTCOME_NOT_DERIVABLE: the export evidence derives $($derived.outcome) ($($derived.detail)), which is not a PASS/FAIL signal") }
             elseif ($derived.outcome -cne $Outcome) { $Invalid.Add("OUTCOME_NOT_DERIVED: the export evidence and the leg's criteria derive $($derived.outcome) but the receipt says $Outcome") }
         }
     }
@@ -6531,8 +6763,9 @@ function Test-DvReceiptValid {
     $invalid = [System.Collections.Generic.List[string]]::new()
     $outcome = [string](Get-DvProp $Receipt 'outcome')
     # Case-sensitive on purpose: 'pass' / 'PASS ' is not an outcome the writer can produce, so it is neither a signal nor "no signal".
-    if ($outcome -cnotin $script:OutcomeEnum) { return [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @('OUTCOME_UNKNOWN: the receipt outcome is not one of the typed outcomes'); unbound = @() } }
-    if ($outcome -cnotin @('PASS', 'FAIL')) { return [pscustomobject]@{ valid = $true; status = 'NO_SIGNAL'; reasons = @(); unbound = @() } }
+    # adversary-fd0141e8.json A2: ORDINAL ASCII, so 'PA<U+00AD>SS' is neither PASS nor a typed outcome
+    if (-not (Test-DvOrdinalIn $outcome $script:OutcomeEnum)) { return [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @('OUTCOME_UNKNOWN: the receipt outcome is not one of the typed outcomes'); unbound = @() } }
+    if (-not (Test-DvOrdinalIn $outcome @('PASS', 'FAIL'))) { return [pscustomobject]@{ valid = $true; status = 'NO_SIGNAL'; reasons = @(); unbound = @() } }
     # Claims the receipt makes that NO hashed artifact carries (fable r1 B1 / sol r1 B3). They are recorded, typed, and never used as a verdict input.
     $unbound = @('CLIP_CONTENT_UNBOUND: subject.clipContentSha256 is computed by the local generator and written to no artifact the venue returns; it is recorded, never trusted',
                  'LEG_IDENTITY_UNBOUND: legId / legSpecSha256 name a committed spec, but no hashed artifact carries them; only the leg TYPE (summary.lookLeg), look flavor, backend, venue, clip and build are bound')
@@ -7355,7 +7588,7 @@ function Resolve-DvJobOutcome {
     if ($reasonSuffix -and $SmokeRefusalReason -in $script:PlayLengthRefusalReasons -and $ResultToken -notin $script:VenueConditionResults -and $ResultToken -notin $script:DeviceUnavailableResults) {
         return [pscustomobject]@{ outcome = 'INVALID'; detail = ($ResultToken + $reasonSuffix) }
     }
-    if ($ResultToken -cin $script:ExportFailResults) { return [pscustomobject]@{ outcome = 'FAIL'; detail = "$ResultToken (job exit $ExitCode)" } }
+    if (Test-DvOrdinalIn $ResultToken $script:ExportFailResults) { return [pscustomobject]@{ outcome = 'FAIL'; detail = "$ResultToken (job exit $ExitCode)" } }
     if ($ResultToken -cin $script:ExportInvalidResults) { return [pscustomobject]@{ outcome = 'INVALID'; detail = "$ResultToken (job exit $ExitCode): the export's stage evidence or output does not bind, so it is no measurement" } }
     if ($ResultToken -cin $script:ExportToolingResults) { return [pscustomobject]@{ outcome = 'VENUE_TOOLING'; detail = "$ResultToken (job exit $ExitCode): the staged package carries no ffmpeg.exe for the rendered export" } }
     if ($ResultToken -eq 'VENUE_NOT_QUIESCENT') { return [pscustomobject]@{ outcome = 'VENUE_NOT_QUIESCENT'; detail = $ResultToken } }
@@ -7787,8 +8020,8 @@ function Write-DvReceipt {
     Returns the path written.
     #>
     param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot, [string]$RepoRoot = '', [switch]$OfflineTestMode, [byte[]]$LegSpecBytes = $null)
-    if ($Receipt['outcome'] -notin $script:OutcomeEnum) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
-    if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {
+    if (-not (Test-DvOrdinalIn $Receipt['outcome'] $script:OutcomeEnum)) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
+    if (Test-DvOrdinalIn $Receipt['outcome'] @('PASS', 'FAIL')) {
         # The writer never records a signal without its proof, whatever the caller believed: the SAME evidence-bearing validator a
         # reader calls re-derives the admission from the committed blobs and the run from the hashed evidence files.
         # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r5 (sol r4 B4): the validator RE-READS the hashed evidence. A throw there (a file held with FileShare.None
@@ -7819,7 +8052,19 @@ function Write-DvReceipt {
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json + "`n")
     $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)   # CreateNew: never overwrite
     try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the exact bytes just written, so the runner can print it
+    # (DVE_RECEIPT_SHA256=) and its parent binds every later read of the receipt to the receipt this run wrote, never to one swapped in afterwards.
+    $script:DvLastWrittenReceiptSha256 = Get-DvSha256OfBytes $bytes
     $path
+}
+
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r7 (sol r7 B3, key3 fable r7 B3): initialised at module scope. This module runs Set-StrictMode -Version Latest, so a read of the
+# variable before the first successful Write-DvReceipt threw VariableIsUndefined instead of answering the '' the getter below promises.
+$script:DvLastWrittenReceiptSha256 = ''
+
+function Get-DvLastWrittenReceiptSha256 {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes Write-DvReceipt last wrote in this session ('' when none).
+    [string]$script:DvLastWrittenReceiptSha256
 }
 
 # --- the display-path block (VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2) -----------------------------
@@ -8167,11 +8412,11 @@ function Get-DvAcceptanceVerdict {
     }
 }
 
-Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
+Export-ModuleMember -Function Test-DvOrdinalIn, Get-DvLastWrittenReceiptSha256, Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
-    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
+    Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, ConvertTo-DvOneLineText, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Test-DvHostLoadRowClean, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, ConvertTo-DvMatrixHostLoadTable,Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict, Get-DvStoredPlaybackFieldProblems,
     Read-DvReceiptDisplayPath, New-DvDisplayPathBlock

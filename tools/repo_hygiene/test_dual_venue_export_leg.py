@@ -359,6 +359,111 @@ class ExportPlanAndOutcomeTests(unittest.TestCase):
         self.assertIsNotNone(got, proc.stdout + proc.stderr)
         self.assertEqual(sorted(got), ["cpu-export-cdng-lossless", "cpu-export-prores"], proc.stdout + proc.stderr)
 
+    def test_mr1_a1_a_legtype_declared_twice_in_any_spelling_is_refused_at_planning_like_the_strict_reader(self) -> None:
+        # adversary-55dcf49e.json A1, its input: the export spec with "legType":"speed" inserted immediately before the literal "legType":"export". RED on 55dcf49e: the planner
+        # counted the literal text "legType": (one), so it planned `export` where the strict reader (Get-VenuePlannedLegType, one JSON walk) says `unknown`, and a matching export
+        # receipt then earned the host-load exemption. The planned type is now that reader's answer, so the two never differ: the plan, the chain, the baseline, the leg job.
+        # adversary-6596e055.json A6 (NARROWED, R4-NARROW-1 r2): a spec the strict reader types `unknown` is no longer planned at all (it was planned `unknown` beside a cellId made by the
+        # last-wins object); the planner refuses it, typed (DVE_LEGSET_INVALID), so no cell, plan row or downstream branch ever sees a leg whose type two readers disagree on.
+        import re
+        name = EXPORT_LEGS[1]
+        original = (DV / "legs" / f"{name}.json").read_text(encoding="utf-8")
+        self.assertEqual(len(re.findall(r'"legType"\s*:', original)), 1, "the shipped export spec declares legType once")
+        variants = {
+            "single": original,
+            "escaped-first": re.sub(r'("legType"\s*:)', r'"leg\\u0054ype":"speed",\n  \1', original, count=1),
+            "literal-first": re.sub(r'("legType"\s*:)', r'"legType":"speed",\n  \1', original, count=1),
+            "escaped-last": re.sub(r'("legType"\s*:\s*"export"\s*,?)', r'\1\n  "leg\\u0054ype":"speed",', original, count=1),
+        }
+        results: dict[str, dict] = {}
+        for label, text in variants.items():
+            with tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / "legs").mkdir()
+                (root / "legsets").mkdir()
+                (root / "legs" / f"{name}.json").write_text(text, encoding="utf-8", newline="")
+                (root / "legsets" / "x.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": "export-x", "card": CARD, "clipId": "M16-1243",
+                                                                     "legs": [f"legs/{name}.json"]}), encoding="utf-8")
+                proc, got = run_pwsh_json(f"Import-Module '{DV / 'VenueChain.psm1'}' -Function Get-VenuePlannedLegType -DisableNameChecking\n"
+                                          "try {\n"
+                                          f"  $p = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'x.json'}' -Repeats 1 -Backend cpu\n"
+                                          "  $typed = Get-VenuePlannedLegType -SpecText ([IO.File]::ReadAllText($p.plan[0].specPath))\n"
+                                          "  [ordered]@{ refused = $false; planned = [string]$p.plan[0].plannedLegType; strict = [string]$typed; message = '' } | ConvertTo-Json -Compress\n"
+                                          "} catch { [ordered]@{ refused = $true; planned = ''; strict = ''; message = [string]$_.Exception.Message } | ConvertTo-Json -Compress }")
+                self.assertIsNotNone(got, label + proc.stdout + proc.stderr)
+                results[label] = got
+        self.assertFalse(results["single"]["refused"], results)
+        self.assertEqual(results["single"]["planned"], "export", results)
+        self.assertEqual(results["single"]["planned"], results["single"]["strict"], f"the plan and the strict reader disagree: {results}")
+        for label in ("escaped-first", "literal-first", "escaped-last"):
+            self.assertTrue(results[label]["refused"], f"{label}: a spec the strict reader types unknown is refused at planning: {results[label]}")
+            self.assertIn("DVE_LEGSET_INVALID", results[label]["message"], label)
+            self.assertIn("legType", results[label]["message"], label)
+
+    def test_r4n2_a6_a_duplicated_legtype_spec_cannot_collide_with_an_unambiguous_export_cell(self) -> None:
+        # adversary-6596e055.json A6, its input: the ProRes export spec with a "legType":"speed" member inserted before its "legType":"export", plus an unambiguous
+        # second ProRes spec of the same card and clip. RED on 077be843: the first was planned plannedLegType=unknown but cellId=cpu-export-prores (the last-wins object), so the
+        # set was refused as "two legs of the set make the cell" (or, with one spec, planned an export cell the strict reader calls unknown). Now the ambiguous spec itself is refused,
+        # typed, with its own message, before any cell is made.
+        import re
+        name = EXPORT_LEGS[1]
+        original = (DV / "legs" / f"{name}.json").read_text(encoding="utf-8")
+        ambiguous = re.sub(r'("legType"\s*:)', r'"leg\\u0054ype":"speed",\n  \1', original, count=1)
+        self.assertNotEqual(ambiguous, original)
+        spec = json.loads(original)
+        twin_id = "m16-1243-export-prores-b"
+        twin = json.loads(original)
+        twin["legId"] = twin_id
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "legs").mkdir()
+            (root / "legsets").mkdir()
+            (root / "legs" / f"{name}.json").write_text(ambiguous, encoding="utf-8", newline="")
+            (root / "legs" / f"{twin_id}.json").write_text(json.dumps(twin), encoding="utf-8", newline="")
+            (root / "legsets" / "x.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": "export-x", "card": CARD, "clipId": "M16-1243",
+                                                                 "legs": [f"legs/{name}.json", f"legs/{twin_id}.json"]}), encoding="utf-8")
+            proc, got = run_pwsh_json(f"try {{ $p = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'x.json'}' -Repeats 1 -Backend cpu; [ordered]@{{ refused = $false; message = '' }} | ConvertTo-Json -Compress }} "
+                                      "catch { [ordered]@{ refused = $true; message = [string]$_.Exception.Message } | ConvertTo-Json -Compress }")
+        self.assertIsNotNone(got, proc.stdout + proc.stderr)
+        self.assertTrue(got["refused"], got)
+        self.assertIn("DVE_LEGSET_INVALID", got["message"])
+        self.assertIn("legType", got["message"])
+        self.assertNotIn("two legs of the set make the cell", got["message"], "the ambiguous spec is refused for its own reason, never as a cell collision")
+        self.assertEqual(spec["legId"], name)
+
+    def test_r4n2_p2_a5_a_legtype_that_is_not_one_enum_string_cannot_take_an_export_cell(self) -> None:
+        # adversary-ac722a96.json A5, its input: the shipped ProRes export spec with "legType":["export"] (an array), or "ex­port" (a soft hyphen), plus the intact twin spec. RED on ac722a96: the
+        # strict reader typed both `playback`, the planner only refused `unknown`, and the cell id came from the loose cast (an array cast to the string export; a culture-aware compare that skips the soft
+        # hyphen): the one-leg plan was plannedLegType=playback with cellId=cpu-export-prores, and with the twin the invalid spec took the valid cell. Now a present legType must be one string of the
+        # schema's enum (ordinal), else DVE_LEGSET_INVALID, and the cell comes from the strict planned type: the intact export spec still plans its export cell.
+        name = EXPORT_LEGS[1]
+        original = (DV / "legs" / f"{name}.json").read_text(encoding="utf-8")
+        variants = {"array": original.replace('"legType": "export"', '"legType": ["export"]'),
+                    "soft-hyphen": original.replace('"legType": "export"', '"legType": "ex\\u00adport"'),
+                    "uppercase": original.replace('"legType": "export"', '"legType": "EXPORT"'),
+                    # adversary-d10f5241.json A3: a present-but-null member is refused too (the child tests the property's presence, not a non-null value)
+                    "null": original.replace('"legType": "export"', '"legType": null')}
+        twin_id = "m16-1243-export-prores-b"
+        twin = json.loads(original)
+        twin["legId"] = twin_id
+        for label, text in variants.items():
+            self.assertNotEqual(text, original, f"{label}: the shipped spec spells legType as \"legType\": \"export\"")
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                root = Path(d)
+                (root / "legs").mkdir()
+                (root / "legsets").mkdir()
+                (root / "legs" / f"{name}.json").write_text(text, encoding="utf-8", newline="")
+                (root / "legs" / f"{twin_id}.json").write_text(json.dumps(twin), encoding="utf-8", newline="")
+                (root / "legsets" / "x.json").write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": "export-x", "card": CARD, "clipId": "M16-1243",
+                                                                     "legs": [f"legs/{name}.json", f"legs/{twin_id}.json"]}), encoding="utf-8")
+                proc, got = run_pwsh_json(f"try {{ $p = Get-DvLegSetPlan -LegSetPath '{root / 'legsets' / 'x.json'}' -Repeats 1 -Backend cpu; [ordered]@{{ refused = $false; message = '' }} | ConvertTo-Json -Compress }} "
+                                          "catch { [ordered]@{ refused = $true; message = [string]$_.Exception.Message } | ConvertTo-Json -Compress }")
+                self.assertIsNotNone(got, proc.stdout + proc.stderr)
+                self.assertTrue(got["refused"], (label, got))
+                self.assertIn("DVE_LEGSET_INVALID", got["message"])
+                self.assertIn("legType", got["message"])
+                self.assertNotIn("two legs of the set make the cell", got["message"], label)
+
     def test_every_export_token_maps_to_its_outcome(self) -> None:
         want = {"EXPORT_CAPTURED": "CAPTURED", "EXPORT_EXIT_NONZERO": "FAIL", "EXPORT_TIMEOUT": "FAIL", "EXPORT_NO_FRAMES": "FAIL",
                 "EXPORT_FRAMES_SHORT": "FAIL", "EXPORT_PROFILE_ABSENT": "INVALID", "EXPORT_OUTPUT_MISMATCH": "INVALID",

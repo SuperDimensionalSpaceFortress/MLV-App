@@ -269,7 +269,72 @@ struct DropFrameTickResult
     // cross more than one lap when its applied delta is wider than the cut (a skipped backlog on a two-frame cut), so the
     // position moved back by wrapWidth * wrapLaps, and MainWindow records every lap.
     int wrapLaps = 0;
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S2 on 6aaac7f5): how far a stale start already at or past the tick's
+    // lap limit was moved back, in whole laps, into the cut onto its own phase before the delta applied (those laps were the
+    // stale position's, never travelled, so they are not counted in wrapLaps or recorded; the tick reads wrapped, with
+    // wrapLaps 0 unless the delta itself crosses the wrap point: pass 11 A1). r9 (sol r8 on 4eb1cfd5): under Loop EVERY start
+    // at or past wrapAt is folded onto its own phase, at any distance. PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B2): a
+    // start below the cut's first position is folded onto it, and foldedFrames is then NEGATIVE (a forward correction, reported
+    // through corrected / correctedStart below, never as travel). 0 on every other tick. In exact arithmetic the
+    // applied advance equals position - before + foldedFrames + clampedFrames + wrapWidth * wrapLaps, but MainWindow's
+    // grantedDropFrames reads appliedFrames below, never that endpoint sum.
+    double foldedFrames = 0.0;
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r8 (sol r7 on 75ed5094): how far the non-Loop clamp moved a stale start PAST the
+    // cut's last frame back onto it (start - lastFrame), a correction the tick never travelled; 0 on every other tick (a
+    // start at or before the last frame travels to it, and that travel is the advance). Sol's row: Drop Frame position 100,
+    // cut 1..50, Loop off, a zero or 8 ms request: the clamp returns 49, clampedFrames is 51 and the applied advance is 0,
+    // where 75ed5094 read -51. fl(position - start) and fl(start - position) are exact negatives, so the sum is exactly 0.
+    double clampedFrames = 0.0;
+    // r8 iteration 1 (adversary pass 14 A1 on a2983bf2): the advance the tick APPLIED, the position's own move from the start
+    // the delta was applied to (after a fold; r8 iteration 2, pass 15 A1: a delta the position cannot hold applied nothing),
+    // up to the lap limit, or the travel to the last frame under the non-Loop clamp (0 from a start already past it). MainWindow's grantedDropFrames (the present trace's advance and the slip histogram's granted share)
+    // is this value. The identity position - before + foldedFrames + clampedFrames + wrapWidth * wrapLaps holds in exact
+    // arithmetic but rounds next to a far stale start (1100000 + 0.18445 on cut 1..2 read 0.1844500000588596, and a grant of
+    // 5e-10 from 8400000 read 0), so it is never used to recover the grant. Not a number when the position is.
+    double appliedFrames = 0.0;
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B1 + B2 on 4279b9ee): the tick made a POSITION CORRECTION, a move of the
+    // start that its delta did not make: the Loop fold of a start at or past wrapAt (foldedFrames > 0), the Loop fold of a start
+    // below the cut's first position (foldedFrames < 0), or the non-Loop clamp of a start past the last frame (clampedFrames > 0).
+    // A correction is never travel, never a jump, never a lap and never consumed source frames: MainWindow hands it to the paint
+    // tracker as a REBASE (PlaybackWrapRecorder::noteEngineCorrection), the source-frame counter and the slip histogram read the
+    // corrected start, and only what the delta applies from there (appliedFrames) is travel.
+    bool corrected = false;
+    // The position the delta was applied from: the folded start, or the clamp's lastFrame. currentPosition on an uncorrected tick.
+    double correctedStart = 0.0;
 };
+
+// r1 iteration 1 (adversary pass 1 A1 on fc9e3e93, introduced major): whether the tick's DELTA crossed a lap. The r9 fold of a start
+// at or past wrapAt marks the tick wrapped with wrapLaps 0 (the position moved back), but that move is a correction, not a wrap: a
+// reader that skips a "wrapped" tick (the source-frame counter, the slip histogram's LoopWrap path, the startup skip count) lost
+// the real step the delta made from correctedStart (stale 120 + 1.2 frames on cut 1..50: 22 -> 23.2 counted nothing).
+inline bool dropFrameTickLapped( const DropFrameTickResult & tick )
+{
+    return tick.wrapLaps > 0;   // every lap branch sets wrapped with wrapLaps >= 1; only the fold sets it with none
+}
+
+// r1 iteration 2 (adversary pass 2 A2 on 7de55386, introduced major): the start the coming tick's delta will be applied from,
+// computed before the delta is shaped. Conform's whole-frame shaping (conformDropFrameDelta) and its target gate
+// (conformTargetShown) read the position the delta moves FROM, so they must read the corrected start, never the stale one:
+// conformed 60 -> 25, Loop, cut 41..50, stale 10.75, 1.5 frames granted was shaped from 10.75 (two integers crossed: delta 0.5,
+// debt 1.0) and landed on 40.5, where from 40 it crosses one integer and lands on 41.5 with no debt.
+inline DropFrameTickResult advanceDropFrameTick( double currentPosition, double frameDelta, int cutInValue, int cutOutValue,
+                                                 bool loopEnabled, bool presentLastFrame );
+inline double dropFrameCorrectedStart( double currentPosition, int cutInValue, int cutOutValue, bool loopEnabled,
+                                       bool presentLastFrame )
+{
+    // the tick's own correctedStart, which depends on the start alone (the fold and the clamp never read the delta)
+    return advanceDropFrameTick( currentPosition, 0.0, cutInValue, cutOutValue, loopEnabled, presentLastFrame ).correctedStart;
+}
+
+// r1: the frame a corrected start sits on (the slider's frame for it), floor, held inside int; not a number reads 0.
+inline int dropFrameCorrectionFrame( double position )
+{
+    if( std::isnan( position ) ) return 0;
+    const double frame = std::floor( position );
+    if( frame <= static_cast<double>( std::numeric_limits<int>::min() ) ) return std::numeric_limits<int>::min();
+    if( frame >= static_cast<double>( std::numeric_limits<int>::max() ) ) return std::numeric_limits<int>::max();
+    return static_cast<int>( frame );
+}
 
 // advanceDropFrameTick mirrors MainWindow::playbackHandling's drop-frame-mode per-tick position
 // update exactly (MainWindow.cpp ~10432-10447): add this tick's frame delta, then either wrap
@@ -303,10 +368,102 @@ inline DropFrameTickResult advanceDropFrameTick(
     bool loopEnabled, bool presentLastFrame = false )
 {
     DropFrameTickResult result;
-    result.position = currentPosition + frameDelta;
     const double lastFrame = static_cast<double>( cutOutValue - 1 );
     const double wrapAt = dropFrameLoopWrapAt( cutOutValue, presentLastFrame );
-    if( loopEnabled && result.position >= wrapAt )
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: at most kMaxLoopLapsPerTick laps per tick (see the lap branch below).
+    constexpr double kMaxLoopLapsPerTick = 1000000.0;
+    // r6 (sol r5 S2 on 6aaac7f5): the bound holds from a start already AT or PAST the tick's lap limit too. Such a start kept
+    // the base arithmetic, so its laps were the stale distance's own (1100000 + 1 on cut 1..2: 1,100,001 laps, one recorder
+    // append each; a +inf start, INT_MAX - 1). r6 iteration 2 (pass 11 A1 on 4c41c80b): it is folded INTO THE CUT, onto its
+    // own phase in [wrapAt - width, wrapAt), where the base's laps would have landed it, so the stale distance records no lap
+    // at all (folding it onto [wrapAt, wrapAt + width) made 1100000 + 0.192, or + 0, record one), and only the delta can wrap.
+    // The fold is taken before the wrap test (pass 11 A2: a negative delta that ended inside the cut skipped it), and the
+    // phase comes from exact fmods of the start and of the wrap point, never from a rounded difference (pass 11 A3: 2^54 lost
+    // it). The fold is reported as foldedFrames and marks the tick wrapped (the position moved back) with wrapLaps 0 unless the
+    // delta crosses wrapAt, so position - before + foldedFrames + wrapWidth * wrapLaps is the advance the tick applied. A +inf
+    // start has no phase and folds to the cut's first position.
+    // r9 (sol r8 on 4eb1cfd5, DC-06 "a correction of a stale start counted as travelled laps"): the fold covers EVERY start
+    // at or past wrapAt, at any distance, not only one at or past the lap limit. A stale start between the wrap point and the
+    // limit kept the base arithmetic, so its stale distance was counted as travelled laps: Drop Frame position 100, cut
+    // 1..50, Loop, a zero request moved 100 -> 2 with nothing applied and recorded two 49-frame laps (the paint credit read
+    // 2 + 98 - 10 = 90 frames). It folds onto its own phase as above (the position lands where the base's laps put it; only
+    // the laps change, to the ones the delta itself crosses from the folded start), so wrapLaps counts only laps the applied
+    // delta crossed.
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B1 + B2 on 4279b9ee), THE CONTRACT: a POSITION CORRECTION is a move of the
+    // start that the tick's delta did not make. There are three: (i) the Loop fold above of a start at or past wrapAt; (ii) the
+    // Loop fold of a start BELOW the cut's first position wrapAt - width (cutIn - 1: Cut In moved past a playhead still at 0),
+    // onto that first position with no phase kept (foldedFrames negative; wrapped stays false and wrapWidth 0 unless the delta
+    // itself crosses wrapAt, and its laps are counted from the folded start); (iii) the non-Loop clamp below of a start past the
+    // last frame. Each sets corrected and correctedStart. A correction is never painted travel, never max_jump, never a wrap or
+    // lap, never consumed source frames and never slip-histogram path advance or deadlines: MainWindow hands it to the paint
+    // tracker as a rebase (PlaybackWrapRecorder::noteEngineCorrection, stamped and consumed like a wrap), and feeds
+    // correctedStart to every reader of the tick's start. Only what the delta applies FROM the corrected start is travel, as
+    // appliedFrames reports. r9 iteration 1 withdrew 76e554e3's below-cut fold because the paint credit took 10 -> 40 as 30
+    // frames played; the rebase closes that at the engine -> paint-tracker seam instead. A NaN start fails both comparisons and
+    // is not folded; a -inf start folds to the first position. A start inside [wrapAt - width, wrapAt) is unchanged, bit for
+    // bit; without Loop nothing is folded (the non-Loop clamp below owns a start past the last frame).
+    double start = currentPosition;
+    result.correctedStart = currentPosition;
+    const int loopWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
+    if( loopEnabled && loopWidth > 0 )
+    {
+        const double width = static_cast<double>( loopWidth );
+        if( currentPosition >= wrapAt )
+        {
+            double phase = std::fmod( currentPosition, width ) - std::fmod( wrapAt, width );
+            if( phase < 0.0 ) phase += width;
+            if( !( phase >= 0.0 && phase < width ) ) phase = 0.0;
+            start = ( wrapAt - width ) + phase;
+            if( !( start < wrapAt ) ) start = wrapAt - width;
+            result.foldedFrames = currentPosition - start;
+            result.wrapped = true;
+            result.wrapWidth = loopWidth;
+            result.corrected = true;
+            result.correctedStart = start;
+        }
+        else if( currentPosition < wrapAt - width )
+        {
+            start = wrapAt - width;   // the cut's first position, no phase kept
+            result.foldedFrames = currentPosition - start;   // negative: a forward correction
+            result.corrected = true;
+            result.correctedStart = start;
+        }
+    }
+    else if( loopEnabled && loopWidth == 0 )
+    {
+        // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r3 (adversary pass 4 A1 on b30cd3a1): a ONE-FRAME Loop cut (Cut In = Cut Out,
+        // conform off: width 0) has no phase to keep, but a start outside its one frame [wrapAt, wrapAt + 1) is still corrected
+        // onto that frame (wrapAt = cutIn - 1) before the delta: corrections (i) and (ii) for width 0. The `loopWidth > 0` guard
+        // above skipped them, so a playhead at 10 advanced to 10.192 and a stale 100 to 100.192 with a lap. A start inside the
+        // frame is not corrected (and, iteration 1, no tick on a zero-width cut laps: see the lap branch below); a NaN start
+        // fails both comparisons and is not corrected; +-inf are corrected onto the frame.
+        if( currentPosition < wrapAt || currentPosition >= wrapAt + 1.0 )
+        {
+            start = wrapAt;
+            result.foldedFrames = currentPosition - start;
+            result.corrected = true;
+            result.correctedStart = start;
+        }
+    }
+    result.position = start + frameDelta;
+    // r8 iteration 1 (pass 14 A1): the applied advance, never recovered from the stale endpoints. r8 iteration 2 (pass 15 A1
+    // on 437108e0): it is the move the position really made from the (folded) start, not the delta: a conform residue of
+    // 1.7763568394002505e-15 leaves 1024 at 1024 and applied nothing. Under Loop the start is below wrapAt here (r9: every
+    // start at or past it was folded above), so this subtraction is never 1100000 away from a stale start past the cut.
+    double applied = result.position - start;
+    // r3 iteration 2 (adversary pass 7 A2 on 506b35d4): a zero-width Loop cut HOLDS its one source frame. It has no room to
+    // advance into and no lap to wrap by, so the delta is dropped: a cut edited to 41..41 under a playhead at 10 with three frames
+    // granted went 10 -> 40 -> 43, past a 41-frame clip's last frame, and credited three frames of source, trace and histogram
+    // travel. The tick applies nothing (a NaN start stays NaN, as the base's).
+    if( loopEnabled && loopWidth == 0 )
+    {
+        result.position = start;
+        applied = 0.0;
+    }
+    // r3 iteration 1 (adversary pass 6 A1 on f8d80862): a zero-width Loop cut has no lap. A zero-width lap moves nothing back,
+    // so it was never a wrap: the base recorded one per tick from the cut's one frame (DROP-FRAME-ZERO-WIDTH-LOOP-STALE-LAP-1),
+    // and r3's correction onto that frame turned a 10 + 0 tick, which applies nothing, into one. Every other width is unchanged.
+    if( loopEnabled && loopWidth != 0 && result.position >= wrapAt )
     {
         result.wrapWidth = cutOutValue - cutInValue + ( presentLastFrame ? 1 : 0 );
         // r33 (adversary A1 on e0947e37): wrap by as many whole laps as the applied delta crossed, so the position lands back
@@ -316,6 +473,27 @@ inline DropFrameTickResult advanceDropFrameTick(
         double laps = 1.0;
         if( width > 0.0 )
         {
+            // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r4 (adversary pass 5 A1 on b70f718d): at most kMaxLoopLapsPerTick laps from ANY
+            // start. MainWindow records every lap (PlaybackWrapRecorder::noteEngineWrap, one append each), and the frame bound on the
+            // request (playback_fps_meter::kMaxTickFrames) cannot see a stale start: the normalizer clamps a stale position to the
+            // clip, not the cut, so 20 on cut 1..2 plus 999,990 frames made 1,000,010 laps. Only the DELTA is cut (iteration 2,
+            // pass 7 A2 on 7a0f5a1c: cutting the position made a negative advance from a far stale start): a tick that would wrap
+            // more stops at the last position of the 1e6th lap (the rest of the delta is dropped, as a skipped backlog is), so
+            // position - before + wrapWidth * wrapLaps is still the advance it made. A start already at or past the limit no longer
+            // keeps the base arithmetic (r6, sol r5 S2: its laps were the stale start's own, unbounded); it was folded into the cut
+            // above, so the bound holds from ANY start, that one included. Every tick of up to that many laps from a start inside
+            // the cut is unchanged, bit for bit (r9: every start at or past wrapAt is folded first; r1: so is one below the cut's
+            // first position). An infinite delta stops there too.
+            // r5 (pass 8 A1 on c37d6fd5): it stops at the LAST position below lapLimit (one double step under it), not at the
+            // lap's first position lapLimit - width, so the clipped tick keeps all the room the bound allows (r9: only a start
+            // below wrapAt reaches here; 1.5 + 2000001 conformed on cut 1..2 advances to just below wrapAt, 1e6 laps).
+            const double lapLimit = wrapAt + kMaxLoopLapsPerTick * width;   // laps <= kMaxLoopLapsPerTick iff position < lapLimit
+            // the start is below lapLimit here: under Loop it is below wrapAt (r9 fold above), before the delta
+            if( result.position >= lapLimit && start < lapLimit )
+            {
+                result.position = std::max( start, std::nextafter( lapLimit, -HUGE_VAL ) );
+                applied = result.position - start;   // the delta the bound kept
+            }
             laps = std::floor( ( result.position - wrapAt ) / width ) + 1.0;
             laps = std::min( std::max( laps, 1.0 ), static_cast<double>( std::numeric_limits<int>::max() - 1 ) );
             // the division's rounding: never one lap too many, never one too few
@@ -328,8 +506,17 @@ inline DropFrameTickResult advanceDropFrameTick(
     }
     else if( !loopEnabled && result.position >= lastFrame )
     {
+        // r8 (sol r7): a start already past the last frame is corrected back onto it, not advanced (clampedFrames above)
+        if( start > lastFrame )
+        {
+            result.clampedFrames = start - lastFrame;
+            result.corrected = true;   // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: correction (iii)
+            result.correctedStart = lastFrame;
+        }
+        applied = start < lastFrame ? lastFrame - start : 0.0;   // the travel to the last frame, none from past it
         result.position = lastFrame;
     }
+    result.appliedFrames = std::isnan( result.position ) ? result.position : applied;
     return result;
 }
 
@@ -360,7 +547,20 @@ inline double normalizeDropFramePosition( double position, const CutRange & rang
     if( std::isnan( position ) ) return static_cast<double>( clampFrameIndex( firstFrameIndex( range ), totalFrames ) );
     const double top = static_cast<double>( std::max( totalFrames, 1 ) - 1 );
     const double bounded = std::max( 0.0, std::min( position, top ) );
-    return static_cast<double>( clampFrameIndex( static_cast<int>( bounded ), totalFrames ) );
+    const int repairedFrame = clampFrameIndex( static_cast<int>( bounded ), totalFrames );
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1 (adversary pass 10 A1 on 87a6d64b): a position ABOVE the
+    // cut that is still inside the clip keeps its fraction. advanceDropFrameTick corrects it (the Loop fold onto its own phase in
+    // the cut, or the non-Loop clamp onto the last frame), and the fold reads the phase, fraction included: a stale 100.9 with Cut
+    // Out lowered to 50 (Cut In 1) truncated to 100 folded onto 2 where its phase is 2.9. That is now the dispatch of every Drop
+    // Frame Loop tick (the outer last-frame branch no longer takes one). Outside the clip and below the cut the repair is unchanged.
+    // r2 (adversary pass 11 A1 on 6ff14cd4): "inside the clip" is the clip's whole last source frame, [top, top + 1), not
+    // position <= top. A stale 199.5 on a 200-frame 60 fps clip conformed to 25 fps, Cut Out lowered to 50 (Cut In 1), was
+    // clipped to 199, so the Loop fold lost the half frame of phase: a 0.6 grant ended at 49.6 with no lap where the phase-kept
+    // start laps once to about 0.1.
+    if( position > static_cast<double>( lastFrameIndex( range ) ) && position < top + 1.0
+     && static_cast<double>( repairedFrame ) == std::floor( position ) )
+        return position;
+    return static_cast<double>( repairedFrame );
 }
 
 // HFR-NATIVE-60FPS-FULLRES-1 r32 fix iteration 2 (adversary A1 + A2 on 03850f7b): whether MainWindow::playbackHandling's outer
@@ -371,11 +571,22 @@ inline double normalizeDropFramePosition( double position, const CutRange & rang
 // Under conform with Drop Frame and Loop, a playhead exactly on the last frame is the drop-frame engine's: advanceDropFrameTick
 // wraps once the position is past it, phase kept, through conformDropFrameDelta's gate. A playhead PAST the last frame (Cut Out
 // moved below it) still goes to cut-in through the outer branch, as does every non-conform, non-drop or non-loop tick.
+//
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1 (sol r10 blocker on 9c454dd6, pass8-A1 / pass9-A1): EVERY
+// Drop Frame Loop tick is the drop-frame engine's, at any conform state and from any playhead. The outer branch booked a playhead
+// at or past the wrap point as one Loop lap of loopWrapWidth(slider, cut-in), plus one trace frame, and landed on cut-in. That
+// bypassed advanceDropFrameTick's correction contract (the r1 note above it). With Cut In 1 and Cut Out lowered to 50 under a
+// playhead at 100, it booked a width-101 lap where the contract rebases to 2, the start's phase in the cut, and counts only the
+// travel from there. On a terminal one-frame cut (1000..1000, slider 999) it booked a width-1 lap and a trace frame while the
+// picture held. advanceDropFrameTick corrects such a start (folds it onto its phase, or holds a zero-width cut's one frame) and
+// MainWindow hands the correction to the paint tracker as a rebase. Normal (whole-frame) mode has no drop-frame correction
+// contract and keeps the outer branch. So does Loop off, which stops playback on the last frame. Both are unchanged.
 inline bool outerLastFrameBranchHandlesTick( int sliderValue, int cutOutValue, bool dropFrameMode, bool loopEnabled,
                                              bool conformActive )
 {
+    (void)conformActive;   // r1: the Drop Frame Loop exclusion below no longer depends on conform
     if( sliderValue < cutOutValue - 1 ) return false;
-    if( dropFrameMode && loopEnabled && conformActive && sliderValue == cutOutValue - 1 ) return false;
+    if( dropFrameMode && loopEnabled ) return false;
     return true;
 }
 
@@ -561,6 +772,22 @@ inline bool isContactSheetLoopWrapTransition(
     return backwardJump >= loopWidth - kOvershootToleranceFrames;
 }
 
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r2 (adversary pass 11 A2 on 6ff14cd4): the presented-frame
+// heuristic's decision for a presentation that crossed \a correctionsCrossed engine POSITION CORRECTIONS (the stamped count
+// notePlaybackSmokePresentedFrame computes for the paint hand-off). Every Drop Frame Loop tick is now the engine's, so a stale
+// playhead past an edited Cut Out is folded onto its phase (100 -> 2 on cut 1..50) as a correction, never a wrap. That backward
+// jump of 98 passed the heuristic (98 >= 49 - 8), which set inferredWrap and m_playbackSmokeWrapped: wrapped=1 with wrap_count=0
+// and a contact-sheet span of the whole cut. A presentation that lands a correction is explained by it. The drop-frame engine
+// that made the correction counts its own wraps (noteEngineWrap, authoritative), so suppressing the second signal here never
+// hides one. Without a crossed correction the decision is isContactSheetLoopWrapTransition's, unchanged.
+inline bool presentedTransitionInfersLoopWrap(
+    bool loopActive, int cutInFrame, int cutOutFrame,
+    int lastPresentedFrame, int displayFrame, int correctionsCrossed )
+{
+    if( correctionsCrossed > 0 ) return false;
+    return isContactSheetLoopWrapTransition( loopActive, cutInFrame, cutOutFrame, lastPresentedFrame, displayFrame );
+}
+
 // PlaybackWrapRecorder -- PLAYBACK-CLIP-LENGTH-ENFORCE-1 round 2 (sol BLOCKER 4), widened in ENFORCE-2: the
 // runtime backstop against a looped or replayed clip. The AUTHORITATIVE wrap signal is noteEngineWrap(), called
 // from the engine's own wrap branches in MainWindow::playbackHandling (the Loop branch that jumps the slider
@@ -601,7 +828,48 @@ struct PlaybackWrapRecorder
     void noteInferredWrap() { inferredWrap = true; }
     int replayCount() const { return engineWraps + jumpToFirstCount + restartCount; }
     bool wrapped() const { return replayCount() > 0 || inferredWrap; }
+
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: a POSITION CORRECTION the engine made (DropFrameTickResult::corrected), counted and
+    // stamped like a wrap (RenderFrameThread's engineCorrectionsAtRequest, presentationLoopWraps), so the presentation that lands on
+    // it rebases the paint tracker to rebaseFrame instead of crediting the move. wrapsBefore is engineWraps when it was made: only
+    // wraps from that index on are travel after it. A correction is not a replay: replayCount() and wrapped() never read it.
+    struct EngineCorrection { int rebaseFrame; int wrapsBefore; };
+    int engineCorrections = 0;
+    std::vector<EngineCorrection> engineCorrectionRecords;
+    void noteEngineCorrection( int rebaseFrame )
+    {
+        engineCorrectionRecords.push_back( { rebaseFrame, engineWraps } );
+        ++engineCorrections;
+    }
 };
+
+// r1: what notePlaybackSmokePresentedFrame hands the paint ledger for a presentation that crossed \a wrapsCrossed wraps from
+// wrap \a wrapsBefore and \a correctionsCrossed corrections from correction \a correctionsBefore.
+struct PaintCreditHandOff
+{
+    bool rebase = false;
+    int rebaseFrame = 0;
+    int64_t wrapsWidth = 0;   // the crossed wraps' width; with a rebase, only those made after the last crossed correction
+    int wrapsAfterRebase = 0; // r2 (r1 adversary pass 2 A1): with a rebase, how many crossed wraps the engine made after that correction
+};
+inline PaintCreditHandOff paintCreditHandOff( const PlaybackWrapRecorder & recorder, int wrapsBefore, int wrapsCrossed,
+                                              int correctionsBefore, int correctionsCrossed )
+{
+    PaintCreditHandOff handOff;
+    handOff.wrapsWidth = recorder.engineWrapsWidth( wrapsBefore, wrapsCrossed );
+    const int last = correctionsBefore + correctionsCrossed - 1;   // the last correction this presentation crossed
+    if( correctionsCrossed <= 0 || last < 0 || last >= static_cast<int>( recorder.engineCorrectionRecords.size() ) )
+        return handOff;
+    const PlaybackWrapRecorder::EngineCorrection &correction = recorder.engineCorrectionRecords[static_cast<size_t>( last )];
+    handOff.rebase = true;
+    handOff.rebaseFrame = correction.rebaseFrame;
+    // only the crossed wraps the engine made after that correction are travel from its rebase frame
+    const int from = std::max( wrapsBefore, correction.wrapsBefore );
+    const int end = wrapsBefore + wrapsCrossed;
+    handOff.wrapsWidth = end > from ? recorder.engineWrapsWidth( from, end - from ) : 0;
+    handOff.wrapsAfterRebase = end > from ? end - from : 0;   // r2: the landing's lap after the rebase (the slip histogram's wrap)
+    return handOff;
+}
 
 // ---------------------------------------------------------------------------------------------------------
 // PLAYBACK-CLIP-LENGTH-ENFORCE-2 (owner rule 2026-09-30): THE APP IS THE GATE.
@@ -1474,13 +1742,16 @@ inline bool pacedMeasuredHoldReached( bool automationIsolated, bool unpacedReque
 // When the tick lands on or past the completing frame on the counter's rounding, the landing is clamped into [frame, frame + 0.5],
 // where both roundings agree on the frame: consumed reaches the requirement exactly and the hold freezes ON the rendered frame. A
 // landing already inside that span is returned unchanged (bit for bit).
-// Anything else -- a wrap (never counted as footage), a backward or non-finite tick, an unarmed counter (consumed 0), no
+// Anything else -- a lap (never counted as footage), a backward or non-finite tick, an unarmed counter (consumed 0), no
 // requirement, the requirement already met, a landing short of the completing frame -- returns tick.position unchanged.
 // MainWindow calls it only while pacedMeasuredHoldApplies.
+// r6 (the fork/master merge of PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1, #905): MainWindow passes the tick's correctedStart, the start the
+// counter's noteEngineTick reads, and the guard reads whether the tick LAPPED (dropFrameTickLapped), as the counter does: #905's fold of a
+// stale Loop start marks a tick wrapped with no lap, and the counter counts that tick's step from correctedStart, so the clamp applies.
 inline double pacedMeasuredHoldLanding( double tickStartPosition, const DropFrameTickResult & tick, int64_t counterHighWater,
                                         int64_t consumedSourceFrames, int64_t requiredSourceFrames )
 {
-    if( tick.wrapped || requiredSourceFrames <= 0 || consumedSourceFrames < 1 || consumedSourceFrames >= requiredSourceFrames
+    if( dropFrameTickLapped( tick ) || requiredSourceFrames <= 0 || consumedSourceFrames < 1 || consumedSourceFrames >= requiredSourceFrames
      || !std::isfinite( tickStartPosition ) || !std::isfinite( tick.position ) || !( tick.position >= tickStartPosition ) )
         return tick.position;
     // 1 <= consumed < required here: the shortfall is formed in uint64_t, exact for every int64 pair (the signed form overflows)
@@ -1494,6 +1765,16 @@ inline double pacedMeasuredHoldLanding( double tickStartPosition, const DropFram
     if( !( insideFrame > completingFrame ) || !( completingFrame > tickStartPosition ) ) return tick.position;
     if( tick.position < completingFrame ) return completingFrame;   // the epsilon band: counted as the frame, rendered as the one before
     return tick.position > insideFrame ? insideFrame : tick.position;
+}
+// r6 (the #905 merge): the landing above applied to the tick. #905's readers take the tick's grant from appliedFrames, never from its
+// endpoints, so a landing the clamp MOVED also moves appliedFrames, to the move the position made from correctedStart -- the subtraction
+// advanceDropFrameTick itself makes on a tick that did not lap, which is the only kind the clamp moves. A landing equal to the tick's
+// position (the clamp did not apply) leaves the tick bit for bit as it was; a NaN landing (only from a NaN position) is never applied.
+inline void pacedMeasuredHoldLandTick( DropFrameTickResult & tick, double landing )
+{
+    if( std::isnan( landing ) || landing == tick.position ) return;
+    tick.position = landing;
+    tick.appliedFrames = landing - tick.correctedStart;
 }
 // r8 fix 1 (adversary A2): a pinned capture is admitted only when its identity frame start + N exists and lies BEFORE the last frame
 // (lastFrameIndex, 0-based) -- the engine's end-of-clip stop can end Play before the last frame's present is credited. Refused

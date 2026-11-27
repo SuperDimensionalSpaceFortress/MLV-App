@@ -18,6 +18,9 @@ $ErrorActionPreference = "Stop"
 # gap: this comparator's own list used to omit capture-invalid and capture-too-dark, so an
 # A/B leg with an unusable or artifacted capture could still report PASS.
 . (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): the host-load block is judged by the venue reader's ONE strict rule (VenueChain.psm1
+# ConvertFrom-VenueSmokeHostLoad and Get-VenueReferenceHostLoadRefusal), never by a second, looser parser here.
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal, ConvertFrom-VenueSmokeResultText -DisableNameChecking
 
 function Read-SmokeJson {
     param([string]$Path)
@@ -27,6 +30,123 @@ function Read-SmokeJson {
         throw "Smoke JSON not found: $resolved"
     }
     Get-Content -LiteralPath $resolved -Raw | ConvertFrom-Json -Depth 100
+}
+
+function Get-SmokeFileIdentity {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A6): the physical identity of an OPEN file: on Windows the volume serial
+    # number and the 64-bit file index of the handle (GetFileInformationByHandle), equal for every hard link and every spelling of one file and
+    # different for two files; elsewhere the device and inode the runtime reports for the path. A handle whose identity cannot be read throws, so the
+    # caller records a typed read failure rather than guessing.
+    param([IO.FileStream]$Stream, [string]$ResolvedPath)
+
+    if ($IsWindows -or $null -eq $IsWindows) {
+        # adversary-88890049.json A1: the native struct has 4-byte alignment (its FILETIMEs are two DWORDs), so it is declared Pack = 4: with the default
+        # 8-byte alignment of a long the volume serial and file index were read from the wrong offsets (VolumeSerialNumber at 32 instead of 28). The type
+        # is versioned so a session holding the old layout never reuses it.
+        if (-not ('MlvSmokeFileIdentityV2' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class MlvSmokeFileIdentityV2 {
+    [StructLayout(LayoutKind.Sequential, Pack = 4)]
+    private struct BY_HANDLE_FILE_INFORMATION {
+        public uint FileAttributes; public long CreationTime; public long LastAccessTime; public long LastWriteTime;
+        public uint VolumeSerialNumber; public uint FileSizeHigh; public uint FileSizeLow; public uint NumberOfLinks;
+        public uint FileIndexHigh; public uint FileIndexLow;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out BY_HANDLE_FILE_INFORMATION info);
+    public static string Of(SafeFileHandle handle) {
+        BY_HANDLE_FILE_INFORMATION info;
+        if (!GetFileInformationByHandle(handle, out info)) { throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error()); }
+        return info.VolumeSerialNumber.ToString("X8") + ":" + info.FileIndexHigh.ToString("X8") + info.FileIndexLow.ToString("X8");
+    }
+    public static int VolumeSerialOffset() { return (int)Marshal.OffsetOf(typeof(BY_HANDLE_FILE_INFORMATION), "VolumeSerialNumber"); }
+    public static int FileIndexHighOffset() { return (int)Marshal.OffsetOf(typeof(BY_HANDLE_FILE_INFORMATION), "FileIndexHigh"); }
+    public static int Size() { return Marshal.SizeOf(typeof(BY_HANDLE_FILE_INFORMATION)); }
+} // MlvSmokeFileIdentityV2 (never a bare column-0 brace: the function extractors end a function at one)
+'@
+        }
+        return [MlvSmokeFileIdentityV2]::Of($Stream.SafeFileHandle)
+    }
+    # adversary-c2bbe5f8.json A8: off Windows the identity is read from the OPEN descriptor (/proc/<pid>/fd/<fd>), never by re-resolving the path, so a
+    # rename between the open and the stat cannot attribute another file's identity to these bytes; a system without /proc fails closed
+    $fd = $Stream.SafeFileHandle.DangerousGetHandle().ToInt64()
+    $fdPath = "/proc/$PID/fd/$fd"
+    if (-not (Test-Path -LiteralPath $fdPath)) { throw "the identity of $ResolvedPath could not be read from its open descriptor" }
+    $stat = & stat -L -c '%d:%i' -- $fdPath 2>$null
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace([string]$stat)) { throw "the identity of $ResolvedPath could not be read" }
+    return ([string]$stat).Trim()
+}
+
+# R2-NARROW-1 r2: the owned-folder / handle-held temporary-file helper (native NtCreateFile, CreateFileW and SetFileInformationByHandle) and the reparse-point walk are
+# REVERTED with the report write that used them: this script writes its report as master does (see the end of the script).
+
+function Read-SmokeSourceOnce {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): the comparator's ONE read of a smoke file. One ReadAllBytes feeds both the parse (the
+    # figures) and the strict host-load reader (the text). A text the parser refuses (keys differing only in case, malformed JSON) does not throw: the
+    # figures object is empty and parseError says why, so the caller records a typed failure and the host-load reader still judges the same text.
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A6): -SameFileAs is the source already read for the other leg. Whether two
+    # inputs are one physical file is decided by the file system's identity of the OPEN handle (volume serial + file index), never by path spelling:
+    # a hard link or a case variant of one file is that same file (returned as-is, so it is read once and the same-input refusal fires), and two
+    # paths that differ only in case in a case-sensitive directory are two files, each read independently.
+    param([string]$Path, [object]$SameFileAs = $null)
+
+    $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
+    if (-not (Test-Path -LiteralPath $resolved -PathType Leaf)) {
+        throw "Smoke JSON not found: $resolved"
+    }
+    # adversary-ac6205bd.json A4: a read that fails (a lock taken by another process, a sharing violation) is a typed parse error, never a throw that
+    # aborts the report. A5: the bytes are decoded by their BOM (UTF-8, UTF-16 LE/BE), as Get-Content did; no BOM reads UTF-8.
+    $bytes = [byte[]]@()
+    $text = ''
+    $smoke = $null
+    $parseError = $null
+    $identity = $null
+    try {
+        $stream = [IO.FileStream]::new($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+        try {
+            $identity = Get-SmokeFileIdentity -Stream $stream -ResolvedPath $resolved
+            if ($null -ne $SameFileAs -and $null -ne $SameFileAs.identity -and [string]::Equals($identity, [string]$SameFileAs.identity, [StringComparison]::Ordinal)) {
+                return $SameFileAs
+            }
+            $buffer = [IO.MemoryStream]::new()
+            $stream.CopyTo($buffer)
+            $bytes = $buffer.ToArray()
+        }
+        finally {
+            $stream.Dispose()
+        }
+        $text = [IO.StreamReader]::new([IO.MemoryStream]::new($bytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
+    }
+    catch {
+        $parseError = "the smoke JSON could not be read: $($_.Exception.Message -replace '\s+', ' ')"
+    }
+    $parseText = if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text.Substring(1) } else { $text }
+    if ($null -eq $parseError) {
+        try {
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A7): -NoEnumerate, so a root that is a ONE-element array stays an array (refused below as "not one object"),
+            # never unwrapped into its member and read as the figure object
+            $smoke = ConvertFrom-Json -InputObject $parseText -Depth 100 -NoEnumerate
+        }
+        catch {
+            $parseError = ($_.Exception.Message -replace '\s+', ' ')
+        }
+    }
+    if ($null -eq $smoke -or $smoke -is [System.Collections.IList]) {
+        if ($null -eq $parseError) { $parseError = 'the smoke JSON is not one object' }
+        $smoke = [pscustomobject]@{}
+    }
+    [pscustomobject]@{
+        path = $resolved
+        text = $text
+        smoke = $smoke
+        parseError = $parseError
+        identity = $identity
+        sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+        length = [int64]$bytes.Length
+    }
 }
 
 function Resolve-ExistingFileBinding {
@@ -224,10 +344,17 @@ function Get-LegEvidenceBinding {
     param(
         [string]$Name,
         [object]$Smoke,
-        [string]$JsonPath
+        [string]$JsonPath,
+        [object]$JsonSource
     )
 
-    $json = Resolve-ExistingFileBinding -Path $JsonPath -Label "$Name smoke JSON"
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): the smoke JSON's binding comes from the comparator's one read (Read-SmokeSourceOnce) when
+    # given, so the file is not opened a second time to hash it.
+    $json = if ($null -ne $JsonSource) {
+        [pscustomobject]@{ path = [string]$JsonSource.path; sha256 = [string]$JsonSource.sha256; length = [int64]$JsonSource.length }
+    } else {
+        Resolve-ExistingFileBinding -Path $JsonPath -Label "$Name smoke JSON"
+    }
     if ([string](Get-NestedValue $Smoke "schema") -ne "mlvapp-gui-smoke-result.v2") {
         throw "$Name smoke result schema is not mlvapp-gui-smoke-result.v2."
     }
@@ -399,18 +526,33 @@ function Get-HostLoadComparisonEvidence {
     # gate existed has no hostLoad field at all, which is also UNKNOWN, never "quiet"). An fps
     # number measured on a loaded host is not a property of the build, so a provisional leg is
     # never usable as a regression signal, whatever the other leg's state is.
+    # adversary-de8e3799.json A1: -BeforeText / -AfterText (the smoke result files' own text) are judged by VenueChain.psm1 ConvertFrom-VenueSmokeResultText,
+    # so a singleton root or hostLoad array is never unrolled and a repeated member is 'unknown'. Without the text, the hostLoad member is read as it is
+    # (never through the pipeline), so an array-valued hostLoad stays an array and reads 'unknown'.
     param(
         [object]$BeforeSmoke,
-        [object]$AfterSmoke
+        [object]$AfterSmoke,
+        [AllowNull()][AllowEmptyString()][string]$BeforeText,
+        [AllowNull()][AllowEmptyString()][string]$AfterText,
+        # R2-NARROW-1 r2 (adversary-baf2e69a.json A2): -BeforeRefused / -AfterRefused say the comparator's own figure parser REFUSED that smoke text (Read-SmokeSourceOnce parseError), whatever the
+        # text judge read from it; a refused source never keeps a clean standing (the two parsers accept different depths)
+        [bool]$BeforeRefused = $false,
+        [bool]$AfterRefused = $false
     )
 
     $evidence = [ordered]@{}
     $failures = @()
     foreach ($leg in @(
-        [pscustomobject]@{ Name = "before"; Smoke = $BeforeSmoke },
-        [pscustomobject]@{ Name = "after"; Smoke = $AfterSmoke }
+        [pscustomobject]@{ Name = "before"; Smoke = $BeforeSmoke; HasText = $PSBoundParameters.ContainsKey('BeforeText'); Text = $BeforeText; Refused = $BeforeRefused },
+        [pscustomobject]@{ Name = "after"; Smoke = $AfterSmoke; HasText = $PSBoundParameters.ContainsKey('AfterText'); Text = $AfterText; Refused = $AfterRefused }
     )) {
-        $legHostLoad = Get-NestedValue $leg.Smoke "hostLoad"
+        $legHostLoad = $null
+        $smokeObj = $leg.Smoke
+        if ($null -ne $smokeObj -and $smokeObj -isnot [Array] -and $smokeObj -isnot [string] -and $smokeObj -isnot [ValueType]) {
+            # a plain assignment keeps an array value an array (no pipeline), so ConvertFrom-VenueSmokeHostLoad sees it and refuses it
+            if ($smokeObj -is [System.Collections.IDictionary]) { if ($smokeObj.Contains('hostLoad')) { $legHostLoad = $smokeObj['hostLoad'] } }
+            else { $hlProp = $smokeObj.PSObject.Properties['hostLoad']; if ($null -ne $hlProp) { $legHostLoad = $hlProp.Value } }
+        }
         # round 3: a hostLoad block that is PRESENT but missing "provisional" (or "state") must
         # read the same as a missing block entirely -- provisional/unknown, never coerced to
         # clean. [bool]$null -eq $false is the trap: it would make a degenerate block silently
@@ -425,19 +567,25 @@ function Get-HostLoadComparisonEvidence {
         # compare-machine-perf.ps1's Get-PlaybackAbLegHostLoadProvisional for the full cross-file
         # note): clean iff state=="quiet" AND provisional==false; every other combination is
         # provisional.
-        $legProvisionalRaw = if ($null -eq $legHostLoad) { $null } else { Get-NestedValue $legHostLoad "provisional" }
-        $legProvisionalDeclared = if ($null -eq $legHostLoad -or $null -eq $legProvisionalRaw) { $true } else { [bool]$legProvisionalRaw }
-        $legStateRaw = if ($null -eq $legHostLoad) { $null } else { Get-NestedValue $legHostLoad "state" }
-        $legState = if ($null -eq $legHostLoad -or [string]::IsNullOrWhiteSpace([string]$legStateRaw)) { "unknown" } else { [string]$legStateRaw }
-        $legProvisional = ($legProvisionalDeclared -or $legState -ne "quiet")
-        $legReason = if ($null -eq $legHostLoad) {
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): the block is judged by VenueChain.psm1's ConvertFrom-VenueSmokeHostLoad, the venue reader's own rule:
+        # clean only when state is exactly the string 'quiet', provisional is a real [bool] $false (not 0, not [false], not a string) and the before and after
+        # snapshots (and every during sample) are collected = a real [bool] $true. A quiet/false block beside before.collected=false (a CimException), state
+        # 'QUIET', provisional 0 or [false] all read state 'unknown' (or the declared state) and provisional, so the verdict is INCONCLUSIVE, never PASS.
+        $judged = if ($leg.HasText) { ConvertFrom-VenueSmokeResultText -Text $leg.Text } else { ConvertFrom-VenueSmokeHostLoad -HostLoad $legHostLoad }
+        if ($leg.Refused -and -not [bool]$judged.provisional) {
+            $judged = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'the smoke JSON was refused by the comparator''s figure parser (see the failure list), so its host load cannot be told clean' }
+        }
+        $legState = [string]$judged.state
+        $legProvisional = [bool]$judged.provisional
+        $legReason = if ($null -eq $legHostLoad -and -not $leg.Refused) {
             "no hostLoad telemetry recorded in the smoke result"
         } else {
-            [string](Get-NestedValue $legHostLoad "reason")
+            [string]$judged.reason
         }
         $evidence[$leg.Name] = [pscustomobject]@{
             state = $legState
             provisional = $legProvisional
+            collected = [bool]$judged.collected
             reason = $legReason
         }
         if ($legProvisional) {
@@ -452,6 +600,41 @@ function Get-HostLoadComparisonEvidence {
     [pscustomobject]@{
         evidence = [pscustomobject]$evidence
         failures = @($failures)
+    }
+}
+
+function Get-GuiSmokeAbVerdict {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a leg whose host load is provisional or unknown (the
+    # before leg is the control) is never counted in the comparison verdict. It used to join the failures and
+    # read FAIL (a regression-shaped verdict). Now each such leg prints the typed line
+    # REFERENCE_PROVISIONAL leg=<before|after> reason=hostload-<state> and the verdict is INCONCLUSIVE, never
+    # PASS and never FAIL; the other failures are still listed. Pure: -HostLoadEvidence is
+    # Get-HostLoadComparisonEvidence's evidence (its provisional is already the canonical predicate).
+    param(
+        [object[]]$Failures,
+        [object]$HostLoadEvidence
+    )
+    $refusals = @()
+    foreach ($legName in @("before", "after")) {
+        # adversary-b3d61554.json A13: plain assignments, never `$x = if (...) { $list }`: an if-expression's output unrolls a one-element list into its member, which then read as a
+        # clean standing. A leg evidence that is a list (not one object) is no standing: it is passed on as $null, which Get-VenueReferenceHostLoadRefusal refuses.
+        $legEvidence = $null
+        if ($null -ne $HostLoadEvidence) { $legEvidence = $HostLoadEvidence.$legName }
+        # r6 (sol r5 B1): the venue reader's own refusal rule (VenueChain.psm1 Get-VenueReferenceHostLoadRefusal): clean only for state exactly 'quiet',
+        # provisional a real $false and collected a real $true. Only those three members are passed, so no caller-supplied applies=$false can skip the rule.
+        $standing = $null
+        if ($null -ne $legEvidence -and $legEvidence -isnot [System.Collections.IList]) {
+            $standing = [pscustomobject]@{ state = $legEvidence.state; provisional = $legEvidence.provisional; collected = $legEvidence.collected }
+        }
+        $line = Get-VenueReferenceHostLoadRefusal -LegId $legName -Standing $standing
+        if ($null -eq $line) { continue }
+        $refusals += $line
+    }
+    $failureList = @($Failures | Where-Object { $null -ne $_ })
+    $verdictText = if ($refusals.Count -gt 0) { "INCONCLUSIVE" } elseif ($failureList.Count -eq 0) { "PASS" } else { "FAIL" }
+    [pscustomobject]@{
+        verdict = $verdictText
+        referenceProvisional = @($refusals)
     }
 }
 
@@ -825,10 +1008,24 @@ function Compare-SmokeScreenshots {
     }
 }
 
-$beforeSmoke = Read-SmokeJson -Path $Before
-$afterSmoke = Read-SmokeJson -Path $After
-$beforeJsonPath = (Resolve-Path -LiteralPath $Before).Path
-$afterJsonPath = (Resolve-Path -LiteralPath $After).Path
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): each smoke file is opened ONCE (Read-SmokeSourceOnce: one ReadAllBytes); the figures and the
+# host-load verdict both come from that one text, so a file locked or replaced after the read changes nothing. A text ConvertFrom-Json refuses
+# (hostLoad beside HostLoad: KeysWithDifferentCasingInJsonString) is no throw: its figures read empty, a typed failure names it, and the strict host-load
+# reader judges the same text unknown (a repeated member), so the comparison is INCONCLUSIVE with REFERENCE_PROVISIONAL, never an abort.
+$beforeSource = Read-SmokeSourceOnce -Path $Before
+# adversary-ac6205bd.json A4: the same physical file given twice is read once (the same-input refusal below then records it).
+# adversary-07b6a932.json A6: "the same file" is the open handle's file-system identity (a hard link or a case variant is the same file; two
+# case-distinct files in a case-sensitive directory are two files), never path spelling.
+$afterSource = Read-SmokeSourceOnce -Path $After -SameFileAs $beforeSource
+# adversary-b3d61554.json A2: the paths the OUTPUT must never alias are the two paths the caller GAVE, each resolved on its own. When -After is the same physical file as -Before,
+# Read-SmokeSourceOnce returns the before source (read once), whose .path is the before path: taking the after path from it left the real -After path unwatched, so a later swap of it
+# for a hard link to the report was never seen at the write. The source objects still carry the figures and the identity; the paths come from the parameters.
+$beforeJsonPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Before)
+$afterJsonPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($After)
+$beforeSmokeText = $beforeSource.text
+$afterSmokeText = $afterSource.text
+$beforeSmoke = $beforeSource.smoke
+$afterSmoke = $afterSource.smoke
 $resolvedOutput = $null
 if (-not [string]::IsNullOrWhiteSpace($Output)) {
     $resolvedOutput = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Output)
@@ -836,6 +1033,7 @@ if (-not [string]::IsNullOrWhiteSpace($Output)) {
         [string]::Equals($resolvedOutput, $afterJsonPath, [StringComparison]::OrdinalIgnoreCase)) {
         throw "Output must not overwrite either smoke JSON input."
     }
+    # R2-NARROW-1 r2: master's path-spelling check above is the whole output-alias guard again (the handle-identity alias checks are reverted, see the write below).
 }
 $beforeScreenshot = Resolve-SmokeScreenshotPath -Smoke $beforeSmoke
 $afterScreenshot = Resolve-SmokeScreenshotPath -Smoke $afterSmoke
@@ -845,6 +1043,16 @@ $screenshotCompare = Compare-SmokeScreenshots `
     -RequestedSampleStep $SampleStep
 
 $failures = @()
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2): a smoke text the parser refused is a typed failure (its figures read empty); the host-load
+# reader below judges the same text, and an ambiguous hostLoad/HostLoad member reads unknown, so the verdict is INCONCLUSIVE.
+foreach ($sourceLeg in @([pscustomobject]@{ Name = 'before'; Source = $beforeSource }, [pscustomobject]@{ Name = 'after'; Source = $afterSource })) {
+    if ($sourceLeg.Name -ceq 'after' -and [object]::ReferenceEquals($afterSource, $beforeSource)) {
+        $failures += "Before and after name the same smoke JSON file ($($beforeSource.path)); same-input A/B is refused."
+    }
+    if ($null -ne $sourceLeg.Source.parseError) {
+        $failures += "$($sourceLeg.Name) smoke JSON could not be parsed (ambiguous or malformed member): $($sourceLeg.Source.parseError)"
+    }
+}
 $declaredBeforeCommit = [string](Get-NestedValue $beforeSmoke "log.runMetadata.build_sha")
 $declaredAfterCommit = [string](Get-NestedValue $afterSmoke "log.runMetadata.build_sha")
 if (-not [string]::IsNullOrWhiteSpace($declaredBeforeCommit) -and
@@ -866,14 +1074,16 @@ catch {
 $evidenceBindings = $null
 try {
     $beforeBinding = Get-LegEvidenceBinding `
-        -Name "before" -Smoke $beforeSmoke -JsonPath $beforeJsonPath
+        -Name "before" -Smoke $beforeSmoke -JsonPath $beforeJsonPath -JsonSource $beforeSource
     $afterBinding = Get-LegEvidenceBinding `
-        -Name "after" -Smoke $afterSmoke -JsonPath $afterJsonPath
+        -Name "after" -Smoke $afterSmoke -JsonPath $afterJsonPath -JsonSource $afterSource
     $evidenceBindings = [pscustomobject]@{
         before = $beforeBinding
         after = $afterBinding
     }
-    if ([string]::Equals($beforeBinding.json.path, $afterBinding.json.path, [StringComparison]::OrdinalIgnoreCase)) {
+    # adversary-07b6a932.json A6: distinct means distinct physical files (the handle identity Read-SmokeSourceOnce recorded), not distinct spellings.
+    if ([object]::ReferenceEquals($afterSource, $beforeSource) -or $null -eq $beforeSource.identity -or $null -eq $afterSource.identity -or
+        [string]::Equals([string]$beforeSource.identity, [string]$afterSource.identity, [StringComparison]::Ordinal)) {
         $failures += "Before and after smoke JSON paths must be distinct."
     }
     if ([string]::Equals($beforeBinding.executable.path, $afterBinding.executable.path, [StringComparison]::OrdinalIgnoreCase)) {
@@ -975,9 +1185,12 @@ foreach ($leg in @(
         $failures += "$($leg.Name) smoke did not prove displayed-frame advancement."
     }
 }
-$hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke
+# adversary-de8e3799.json A1: the host load is judged from each smoke file's own text (no root/hostLoad unrolling, a repeated member is unknown)
+$hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke -BeforeText $beforeSmokeText -AfterText $afterSmokeText -BeforeRefused ($null -ne $beforeSource.parseError) -AfterRefused ($null -ne $afterSource.parseError)
 $hostLoadEvidence = $hostLoadComparison.evidence
-$failures += @($hostLoadComparison.failures)
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a host-load refusal is no longer a failure (it read FAIL);
+# it is kept in hostLoadRefusals and makes the verdict INCONCLUSIVE (Get-GuiSmokeAbVerdict, below).
+$hostLoadRefusals = @($hostLoadComparison.failures)
 
 # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): refuse the whole comparison
 # -- never merely note it -- when the two legs are not known to have presented on the same
@@ -1030,6 +1243,9 @@ if ($FailOnScreenshotDelta) {
         )
     }
 }
+
+$abVerdict = Get-GuiSmokeAbVerdict -Failures $failures -HostLoadEvidence $hostLoadEvidence
+foreach ($referenceLine in @($abVerdict.referenceProvisional)) { Write-Host $referenceLine }
 
 $result = [pscustomobject]@{
     schema = "gui-smoke-ab-compare.v3"
@@ -1085,23 +1301,65 @@ $result = [pscustomobject]@{
         afterColorArtifactVerdict = Get-NestedValue $afterSmoke "visualQuality.colorArtifactScan.verdict"
     }
     failures = $failures
-    verdict = if ($failures.Count -eq 0) { "PASS" } else { "FAIL" }
+    hostLoadRefusals = @($hostLoadRefusals)
+    referenceProvisional = @($abVerdict.referenceProvisional)
+    verdict = $abVerdict.verdict
 }
 
 # UM-DISPLAY-SELECT-AND-LOG-1 round 1c (sol pre-review BLOCKER 1): withheld here, AFTER
 # $result exists, rather than skipping New-DeltaObject above -- each leg's own raw FPS value
 # is still true regardless of the other leg, and is kept; only delta/deltaPercent (the
 # cross-leg comparison) are nulled when the legs are not known to be the same display/mode.
-if ($displayComparability.status -ne 'same') {
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (fable key3 r5, GUI-SMOKE-AB-INCONCLUSIVE-WITHHOLD-DELTA-1): an INCONCLUSIVE verdict (a leg whose host load is
+# provisional or unknown) withholds the cross-leg deltas the same way, so no fps delta is printed or stored beside it.
+if ($displayComparability.status -ne 'same' -or [string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal)) {
     foreach ($fpsField in @('visibleBottomLeftGuiFps', 'smokePresentedFps', 'smokeTimelineFps')) {
         $result.fps.$fpsField.delta = $null
         $result.fps.$fpsField.deltaPercent = $null
+    }
+}
+# adversary-de8e3799.json A2: an INCONCLUSIVE comparison publishes no cross-leg delta at all: every autoDecision delta object (averageMs,
+# averageFpsEquivalent, targetFps, ...) loses its delta and deltaPercent too, in the JSON and in the summary line below.
+if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal) -and $null -ne $result.autoDecision) {
+    foreach ($adProp in @($result.autoDecision.PSObject.Properties)) {
+        $adVal = $adProp.Value
+        if ($null -ne $adVal -and $adVal -isnot [string] -and $adVal -isnot [ValueType] -and $null -ne $adVal.PSObject.Properties['delta']) {
+            $adVal.delta = $null
+            if ($null -ne $adVal.PSObject.Properties['deltaPercent']) { $adVal.deltaPercent = $null }
+        }
+    }
+}
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A7): the screenshot comparison is a cross-leg delta too. An INCONCLUSIVE
+# comparison keeps each leg's own image metadata but withholds every before-vs-after figure (sameSha256, meanAbsRgbDelta, maxAbsRgbDelta,
+# changedSampleRatio, sampledPixels), in the JSON and in the summary line below; status reads withheld-inconclusive.
+# adversary-c2bbe5f8.json A1: the -FailOnScreenshotDelta failure text names the figures too, so an INCONCLUSIVE report keeps the failure but not its numbers.
+if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal)) {
+    $result.failures = @(@($result.failures) | ForEach-Object {
+        if (([string]$_).StartsWith('Screenshot delta exceeded threshold', [StringComparison]::Ordinal)) { 'Screenshot delta exceeded threshold (figures withheld: the verdict is INCONCLUSIVE).' } else { $_ }
+    })
+}
+if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal) -and $null -ne $result.screenshot) {
+    $result.screenshot = [pscustomobject]@{
+        status = 'withheld-inconclusive'
+        reason = 'verdict-inconclusive'
+        comparedStatus = [string]$result.screenshot.status
+        before = $result.screenshot.before
+        after = $result.screenshot.after
+        sameSha256 = $null
+        sampledPixels = $null
+        meanAbsRgbDelta = $null
+        maxAbsRgbDelta = $null
+        changedSampleRatio = $null
     }
 }
 
 $json = $result | ConvertTo-Json -Depth 24
 if (-not [string]::IsNullOrWhiteSpace($Output)) {
     $outputDir = Split-Path -Parent $resolvedOutput
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r2: the report write is master's own again (a folder made with New-Item -Force, the report written with Set-Content).
+    # The handle-held temporary file, the owned folder levels, the reparse-point walk and the output-identity checks the earlier rounds added here are REVERTED:
+    # the acceptance of this card (a leg whose host load is provisional or unknown is never counted) does not need them, and they kept producing new findings
+    # (adversary-7c5bfe86.json A1 A2 A3). The hardening is refiled as ONE P3 card (refile-hardening.md in the r2 run dir).
     if (-not [string]::IsNullOrWhiteSpace($outputDir)) {
         New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
     }
@@ -1131,6 +1389,7 @@ Write-Host ((
 
 $json
 
-if ($failures.Count -gt 0) {
+# An INCONCLUSIVE comparison is not a pass: it exits 1 as the host-load refusal always did.
+if ($failures.Count -gt 0 -or $result.verdict -ne "PASS") {
     exit 1
 }

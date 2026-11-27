@@ -840,8 +840,9 @@ TEST(PlaybackNativePaceWiring, EveryEngineAdvanceGoesThroughThePaceGuard)
     ASSERT_TRUE(wrapMove > wrapGate);
     ASSERT_TRUE(handling.indexOf(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")) < wrapGate);
     // drop-frame mode advances by the GRANTED share, never the raw fps x timeDiff
+    // (PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6, sol r5 S1: that request is taken through the finite-request helper)
     ASSERT_TRUE(handling.contains(QStringLiteral(
-        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
+        "m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),")));
     ASSERT_FALSE(handling.contains(QStringLiteral("m_newPosDropMode, getPlaybackFramerate() * (double)timeDiff / 1000.0,")));
     ASSERT_FALSE(handling.contains(QStringLiteral("m_newPosDropMode, getFramerate() * (double)timeDiff / 1000.0,")));
     ASSERT_TRUE(handling.contains(QStringLiteral("const double paceNowMs = mlv_stage_timing_now() * 1000.0;")));
@@ -942,7 +943,7 @@ TEST(PlaybackUnpacedWiring, ReadOnceAndHonouredOnlyInAutomation)
     ASSERT_EQ(1, source.count(QStringLiteral("if( !m_playbackPaceGuard.grantLoopWrap( paceNowMs, playbackPaceGuardFps() ) ) return;")));
     ASSERT_EQ(1, source.count(QStringLiteral("if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;")));
     ASSERT_EQ(1, source.count(QStringLiteral(
-        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
+        "m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),")));
     ASSERT_EQ(1, source.count(QStringLiteral("m_playbackPaceGuard.notePresent( mlv_stage_timing_now() * 1000.0, playbackPaceGuardFps() );")));
     // HFR-NATIVE-M16-1457-GUI-PRESENT-CADENCE-1: the due wake (arm and re-arm) reads the same pace, and only hands it to the guard's
     // msUntilCredit -- never unpaced (the arm refuses a pace that is not positive)
@@ -1026,10 +1027,15 @@ TEST(PlaybackUnpacedWiring, APacedPlayHoldsAtItsRequiredFramesOnlyWhileTheMeasur
     // ...and inside it the drop-frame tick's advanced position is clamped in frames, guarded by that scope (a strict no-op when it
     // does not apply), right after advanceDropFrameTick and before the position is stored or fed to the counter. The only other
     // line touched in the region is the tick result losing its const.
+    // r6 (the fork/master merge of #905): the clamp reads the tick start the counter reads (correctedStart), and a landing it moves is
+    // applied through pacedMeasuredHoldLandTick, which moves the tick's appliedFrames with it (#905's grant)
     const QString clamp = QStringLiteral(
         "                if( pacedHoldClampArmed )\n"
-        "                    dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,\n"
-        "                        m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );\n");
+        "                {\n"
+        "                    const double pacedLanding = playback_frame_range::pacedMeasuredHoldLanding( dropFrameTick.correctedStart, dropFrameTick,\n"
+        "                        m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );\n"
+        "                    playback_frame_range::pacedMeasuredHoldLandTick( dropFrameTick, pacedLanding );\n"
+        "                }\n");
     ASSERT_EQ(1, source.count(clamp));
     // r3 (hub ruling HUB-TICK 20261127T1152Z, adversary A1 on 8b386cb9): the landing reads the counter's real high-water mark, the
     // ONE reviewed .highWater read in playbackHandling (app_play_scan.py pins it as that call's third argument); the only other
@@ -1039,14 +1045,20 @@ TEST(PlaybackUnpacedWiring, APacedPlayHoldsAtItsRequiredFramesOnlyWhileTheMeasur
     ASSERT_EQ(0, handling.count(QStringLiteral("m_sourceAdvance.startFrame")));
     ASSERT_EQ(1, source.count(QStringLiteral("playback_frame_range::pacedMeasuredHoldLanding(")));
     ASSERT_EQ(2, handling.count(QStringLiteral("pacedHoldClampArmed")));
-    ASSERT_EQ(1, handling.count(QStringLiteral("dropFrameTick.position =")));
+    ASSERT_EQ(0, handling.count(QStringLiteral("dropFrameTick.position =")));
+    ASSERT_EQ(0, handling.count(QStringLiteral("dropFrameTick.appliedFrames =")));
+    ASSERT_EQ(1, source.count(QStringLiteral("playback_frame_range::pacedMeasuredHoldLandTick(")));
+    ASSERT_EQ(0, source.count(QStringLiteral("sourcePositionBeforeDropTick")));
     const int clampAt = handling.indexOf(clamp);
     const int advanceAt = handling.indexOf(QStringLiteral("playback_frame_range::advanceDropFrameTick("));
     ASSERT_TRUE(advanceAt > unpacedComment);
     ASSERT_TRUE(clampAt > advanceAt);
-    ASSERT_TRUE(clampAt < handling.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick")));
-    ASSERT_TRUE(clampAt < handling.indexOf(QStringLiteral("m_newPosDropMode = dropFrameTick.position;")));
-    ASSERT_TRUE(clampAt < handling.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );")));
+    const int grantedAt = handling.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.appliedFrames;"));
+    const int storedAt = handling.indexOf(QStringLiteral("m_newPosDropMode = dropFrameTick.position;"));
+    const int counterAt = handling.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameLapped );"));
+    ASSERT_TRUE(grantedAt > clampAt);
+    ASSERT_TRUE(storedAt > clampAt);
+    ASSERT_TRUE(counterAt > clampAt);
     ASSERT_EQ(0, handling.mid(clampAt, clamp.size()).count(QStringLiteral("m_playbackPaceGuard")));
     // the hold and its record touch no pace guard: no pace read, no grant
     const QString holdSpan = handling.mid(armedBefore, unpacedComment - armedBefore);
@@ -1168,7 +1180,7 @@ TEST(PlaybackNativePaceWiring, TheFirstPresentsCatchUpIsSampledAfterItsAdvanceAn
     ASSERT_TRUE(firstPresent >= 0);
     const int sample = source.indexOf(QStringLiteral(
         "        m_playbackSmokeFirstPresentTimelineDeltaAbs =\n"
-        "            qAbs( ui->horizontalSliderPosition->value() - m_playbackSmokeStartPosition );"), firstPresent);
+        "            qAbs( m_playbackSlipHistogram.timelineTravel( ui->horizontalSliderPosition->value() ) );"), firstPresent);
     ASSERT_TRUE(sample > firstPresent);
     ASSERT_TRUE(sample - firstPresent < 1200);
     ASSERT_TRUE(source.mid(firstPresent - 200, 200).contains(QStringLiteral("else")));

@@ -28,6 +28,7 @@ Windows-only: the job generator and runner are PowerShell-on-Windows tools (the 
 from __future__ import annotations
 
 import ast
+import base64
 import concurrent.futures
 import contextlib
 import hashlib
@@ -304,8 +305,10 @@ DRIFT_W10_LEGS = {"legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json": None,
                   "legs/m16-1457-drift-t1-hot-w10-unpaced-fullscreen-s1.json": "0x00030",
                   "legs/m16-1457-drift-t16-w10-unpaced-fullscreen-s1.json": None}
 # r5 (sol r4 BLOCKER: the cited arms had no opened strip): the visual twin of each w10 arm. Each is its w10 counterpart with only legId changed and the capture opt-out removed
-# (visualCapture / visualCaptureOptOutReason absent = the speed-leg default, on), so the same build keeps the picture the arm produced. A twin's fps is observer-perturbed (the
-# capture tail keeps playing unpaced past the measured window) and never stands in for its untraced speed leg.
+# (visualCapture / visualCaptureOptOutReason absent = the speed-leg default, on), so the same build keeps the picture the arm produced. A twin's fps never stands in for
+# its untraced speed leg. (UNPACED-VISUAL-MIDPLAY-CAPTURE-1, adversary r1 A2: the capture tail starts only after the measured session is closed, and an unpaced Play
+# holds its last required frame through it rather than playing on, so such a twin's play captures are labelled with its end frame and read NOT_A_MOTION_WITNESS unless
+# an earlier verdict, CAPTURE_BLANK say, applies.)
 DRIFT_VISUAL_LEGS = {"legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json": None,
                      "legs/m16-1457-drift-t1-cool-w10-visual-unpaced-fullscreen-s1.json": "0x00003",
                      "legs/m16-1457-drift-t1-hot-w10-visual-unpaced-fullscreen-s1.json": "0x00030",
@@ -1738,7 +1741,7 @@ class RunnerHarness:
                         manifest_nonce: str | None | bool = True, log: bool = True, result: bool = True, isolated: str | None = "run_scoped",
                         declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False,
                         exact_summary: dict | None = None, extra_log_lines: list[str] | None = None,
-                        look_assist_state: str | None = "look_assist_enabled=1") -> None:
+                        look_assist_state: str | None = "look_assist_enabled=1", host_load: dict | None = None) -> None:
         """Write the job's artifacts the way master's generator does, INCLUDING the run's own records the receipt is re-derived
         from: the launcher's result.json (evidence.runNonce = the nonce it generated, the sha256 of the log snapshot) and
         logs/smoke-run.log (the app's playback_smoke.summary line carrying source_advanced / required_source_frames / native_fps /
@@ -1773,7 +1776,10 @@ class RunnerHarness:
             evidence = {"runLogSnapshot": {"sha256": declared_log_sha or log_sha, "length": len(log_bytes)}}
             if nonce is not None:
                 evidence["runNonce"] = nonce
-            (self.artifacts / "result.json").write_text(json.dumps({"schema": "mlvapp-gui-smoke-result.v2", "evidence": evidence}), encoding="utf-8")
+            doc = {"schema": "mlvapp-gui-smoke-result.v2", "evidence": evidence}
+            if host_load is not None:   # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: the smoke's hostLoad block (the matrix reads it; none = an older result with no block)
+                doc["hostLoad"] = host_load
+            (self.artifacts / "result.json").write_text(json.dumps(doc), encoding="utf-8")
         body = {"result": "MEASUREMENT_CAPTURED", "fixtureRehearsal": False, "clipId": OWNER_CLIP, "rows": 900, "gpuFramesTotal": 900,
                 "cpuFrames": 0, "artifactRoot": "X:\\stub"}
         if source_frames is True:
@@ -1945,6 +1951,49 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         # a typed job refusal is a venue outcome, not a product FAIL
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="backend")
         self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")
+
+    def test_the_dve_detail_line_is_one_record_whatever_the_detail_quotes(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R2-RESIDUE-1 item 1: outcomeDetail quotes outside text (here the job's own summary.json display.venue, which
+        Invoke-VenueLeg quotes in a VENUE_HOST_MISMATCH detail). The printed DVE_DETAIL line goes through the one-line rule the visual reason uses
+        (ConvertTo-DvOneLineText): every control character, U+2028 and U+2029 is written as \\uXXXX, so a detail can never forge a second
+        DVE_OUTCOME / DVE_DETAIL / DVE_RECEIPT_PATH record for the chain or batch reader (which take the LAST DVE_DETAIL line). 8f785f3a printed it raw."""
+        forged = "bachelor\nDVE_OUTCOME=PASS\r\nDVE_DETAIL=forged\x1eDVE_RECEIPT_PATH=x\x0bz y end"
+        self.write_artifacts(summary={"display": {"venue": forged}})
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "VENUE_HOST_MISMATCH", receipt["outcomeDetail"])
+        self.assertIn(f"venue '{forged}' but 'ultra-magnus' was declared", receipt["outcomeDetail"], "the receipt keeps the detail as it is: JSON escapes it")
+        lines = proc.stdout.splitlines()
+        self.assertEqual([l for l in lines if l.startswith("DVE_OUTCOME=")], ["DVE_OUTCOME=VENUE_HOST_MISMATCH"], proc.stdout)
+        details = [l for l in lines if l.startswith("DVE_DETAIL=")]
+        self.assertEqual(len(details), 1, proc.stdout)
+        self.assertEqual(details[0], "DVE_DETAIL=the job's own display block says venue 'bachelor\\u000ADVE_OUTCOME=PASS\\u000D\\u000ADVE_DETAIL=forged\\u001E"
+                                     "DVE_RECEIPT_PATH=x\\u000Bz\\u2028y\\u2029end' but 'ultra-magnus' was declared", proc.stdout)
+        self.assertEqual(len([l for l in lines if l.startswith("DVE_RECEIPT_PATH=")]), 1, proc.stdout)
+        # a detail with no such character prints exactly as before
+        self.write_artifacts(summary={"display": {"venue": "bachelor"}})
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertIn("DVE_DETAIL=the job's own display block says venue 'bachelor' but 'ultra-magnus' was declared", proc.stdout.splitlines(), proc.stdout)
+
+    def test_the_dve_detail_line_is_printable_ascii_so_no_code_page_can_best_fit_a_line_break_into_it(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R3-KEY-RESIDUE-1 (fable r3 B1): the one-line rule escaped by Unicode category (Cc / Zl / Zp), but U+25D9 and
+        U+266A are category So and the OEM 437 code page a leg's stdout can be written in best-fits them to 0x0A and 0x0D, so a venue string holding them
+        still forged a second DVE_OUTCOME / DVE_DETAIL record. The printed DVE_DETAIL line is now printable ASCII only: everything else is \\uXXXX
+        (the receipt keeps the raw text). Input verbatim from the finding."""
+        forged = "bachelor◙DVE_OUTCOME=PASS◙DVE_DETAIL=forged♪DVE_RECEIPT_PATH=xé\U0001F600"
+        self.write_artifacts(summary={"display": {"venue": forged}})
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "VENUE_HOST_MISMATCH", receipt["outcomeDetail"])
+        self.assertIn(forged, receipt["outcomeDetail"], "the receipt keeps the detail as it is")
+        details = [l for l in proc.stdout.splitlines() if l.startswith("DVE_DETAIL=")]
+        self.assertEqual(len(details), 1, proc.stdout)
+        self.assertTrue(all(0x20 <= ord(c) <= 0x7E for c in details[0]), details[0])
+        self.assertIn("bachelor\\u25D9DVE_OUTCOME=PASS\\u25D9DVE_DETAIL=forged\\u266ADVE_RECEIPT_PATH=x\\u00E9\\uD83D\\uDE00' but", details[0])
+        # the same bytes read back through the OEM 437 code page (the best-fit that forged the line) are still one record
+        as_cp437 = details[0].encode("cp437")
+        self.assertEqual(len(as_cp437.splitlines()), 1, as_cp437)
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVE_OUTCOME=")], ["DVE_OUTCOME=VENUE_HOST_MISMATCH"], proc.stdout)
 
     # -- roles are data ------------------------------------------------------------------------------
     def test_role_comes_from_venues_json_acceptance_on_bachelor_supplementary_on_um(self) -> None:
@@ -2518,15 +2567,16 @@ class ReceiptOracleVerdictTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["outcome"], "PASS")
 
     def test_mutation_without_the_writer_validation_a_proofless_pass_is_written(self) -> None:
-        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {", "if ($false) {"),
-                                       ("Invoke-VenueLeg.ps1", "if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {", "if ($false) {")])
+        # R4-NARROW-1 r2 (hosted CI on 55dcf49e, heavy 12/14): the writer's PASS/FAIL check reads the outcome through Test-DvOrdinalIn (the ordinal membership the PR introduced); the mutation anchor is that text
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if (Test-DvOrdinalIn $Receipt['outcome'] @('PASS', 'FAIL')) {", "if ($false) {"),
+                                       ("Invoke-VenueLeg.ps1","if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {", "if ($false) {")])
         self.write_artifacts(line={"source_advanced": 100})
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), dv=mutated)
         self.assertEqual(receipt["outcome"], "PASS", "with both layers removed a proofless capture is a PASS -- each layer is needed")
 
     def test_mutation_the_runner_layer_alone_still_stops_a_proofless_pass(self) -> None:
         # Defence in depth: removing only the WRITER's check, the runner's own downgrade still yields INVALID ...
-        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {", "if ($false) {")])
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if (Test-DvOrdinalIn $Receipt['outcome'] @('PASS', 'FAIL')) {", "if ($false) {")])
         self.write_artifacts(line={"source_advanced": 100})
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), dv=mutated)
         self.assertEqual(receipt["outcome"], "INVALID")
@@ -4084,7 +4134,55 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
     # tests/**), never by file name; everything else, including a test-looking name outside the class, is still counted.
     PRODUCTION_RECEIPT_CALLERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
                                             "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
-    PRODUCTION_RECEIPT_READERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"})
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r4: VenueChain.psm1 reads a receipt in ONE place, Get-VenueLegHostLoad (its export test, Test-VenueReceiptIsExportLeg, names the
+    # receipt schema). That read only ever REFUSES a leg (host load unknown or provisional); its one non-refusing outcome, an export leg, is not-applicable, which is
+    # the pre-card behaviour, so it never admits a figure the validator would refuse and does not call Test-DvReceiptValid. The pin below keeps it to that function.
+    PRODUCTION_RECEIPT_READERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1",
+                                            "tools/profiling/dual-venue/VenueChain.psm1"})
+    REFUSAL_ONLY_RECEIPT_READERS = {"tools/profiling/dual-venue/VenueChain.psm1": "Test-VenueReceiptIsExportLeg"}
+
+    RECEIPT_LITERALS = ("dual-venue-receipt/v1", "dual-venue\\receipts", "dual-venue/receipts")
+
+    @staticmethod
+    def powershell_function_extents(text: str) -> list[tuple[int, int, str]]:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 H1): every function's extent as the PowerShell PARSER sees it (FunctionDefinitionAst
+        Extent.StartOffset / EndOffset, UTF-16 offsets into the text, nested functions included). The text goes over stdin as base64, so no console code page
+        can change it."""
+        pwsh = shutil.which("pwsh")
+        if pwsh is None:
+            raise unittest.SkipTest("pwsh is not on PATH (the receipt-reader pin needs the PowerShell parser)")
+        script = ("$t = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())); "
+                  "$e = $null; $k = $null; $ast = [System.Management.Automation.Language.Parser]::ParseInput($t, [ref]$k, [ref]$e); "
+                  "foreach ($f in $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { "
+                  "[Console]::Out.WriteLine([string]::Join([char]9, @([string]$f.Extent.StartOffset, [string]$f.Extent.EndOffset, $f.Name))) }")
+        p = subprocess.run([pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                           input=base64.b64encode(text.encode("utf-8")).decode("ascii"), capture_output=True, text=True, timeout=120,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+        if p.returncode != 0:
+            raise AssertionError("the PowerShell parser did not run: " + p.stdout + p.stderr)
+        out = []
+        for row in p.stdout.splitlines():
+            if row.strip():
+                start, end, name = row.split("\t", 2)
+                out.append((int(start), int(end), name.strip()))
+        return out
+
+    @classmethod
+    def receipt_literal_functions(cls, text: str) -> list[str]:
+        # The function each receipt-literal line sits in, in order; '' for a line outside any function. r6 (sol r5 H1) bounded a function by its column-0
+        # closing brace; sol r6 H1: an indented closing brace defeated that. Residue r1: the boundaries are the PARSED function extents
+        # (powershell_function_extents: the AST), so a literal below the function's real closing brace, however that brace is indented, is outside it;
+        # a literal inside a nested function is attributed to the innermost one.
+        extents = cls.powershell_function_extents(text)
+        out, offset = [], 0  # offset: UTF-16 code units, as the parser counts them
+        for line in text.split("\n"):
+            hits = [line.find(lit) for lit in cls.RECEIPT_LITERALS if lit in line]
+            if hits:
+                pos = offset + len(line[:min(hits)].encode("utf-16-le")) // 2
+                inside = [e for e in extents if e[0] <= pos < e[1]]
+                out.append(max(inside, key=lambda e: e[0])[2] if inside else "")
+            offset += len(line.encode("utf-16-le")) // 2 + 1
+        return out
 
     @staticmethod
     def is_test_module(path: str) -> bool:
@@ -4107,6 +4205,36 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         # nothing else in the tree reads a receipt file: a new reader must call the validator (and be added to this list in review)
         self.assertEqual(readers, set(self.PRODUCTION_RECEIPT_READERS),
                          "an unknown reader of dual-venue receipts must call Test-DvReceiptValid -RepoRoot and be named here")
+        # r4: a refusal-only reader that does not call the validator keeps its receipt read inside the one named function (a second read anywhere else fails here)
+        for path, fn in self.REFUSAL_ONLY_RECEIPT_READERS.items():
+            self.assertNotIn(path, callers, path)
+            self.assertEqual(self.receipt_literal_functions(texts[path]), [fn], path)
+        self.assertEqual(self.receipt_literal_functions("function Read-X {\n  $s = 'mlv-app/dual-venue-receipt/v1'\n}\n"), ["Read-X"],
+                         "the pin sees a receipt literal in a second function, so it guards the refusal-only reader")
+        # r6 (sol r5 H1): function boundaries are the function's own braces. A literal moved below the closing brace of Test-VenueReceiptIsExportLeg (module
+        # scope, before the next function) is no longer attributed to it, so the pin above fails on that mutation.
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  if ($x) { 'a' }\n}\n$s = 'mlv-app/dual-venue-receipt/v1'\nfunction Test-B { }\n"), [""])
+        # residue r1 (sol r6 H1): a brace in a comment or a string is not a boundary, a nested block's brace is not the function's, and an INDENTED closing
+        # brace still closes the function (the parser decides, not the column)
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  # a } in a comment\n  $q = '}'\n  if ($x) {\n  }\n  $s = 'mlv-app/dual-venue-receipt/v1'\n}\n"), ["Test-A"])
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  $q = '}'\n  }\n$s = 'mlv-app/dual-venue-receipt/v1'\n"), [""],
+                         "an indented closing brace closes the function: the literal after it is at module scope")
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  function Test-In {\n    $s = 'mlv-app/dual-venue-receipt/v1'\n  }\n}\n"), ["Test-In"])
+        self.assertEqual(self.receipt_literal_functions("function Test-A { $x }\n$s = 'mlv-app/dual-venue-receipt/v1'\n"), [""], "a one-line function closes on its line")
+        live = texts["tools/profiling/dual-venue/VenueChain.psm1"]
+        lines = live.splitlines(keepends=True)
+        start = next(i for i, l in enumerate(lines) if l.startswith("function Test-VenueReceiptIsExportLeg"))
+        end = next(i for i in range(start + 1, len(lines)) if lines[i].rstrip("\r\n") == "}")
+        hit = next(i for i in range(start, end) if "dual-venue-receipt/v1" in lines[i])
+        moved = "".join(lines[:hit] + lines[hit + 1:end + 1] + [lines[hit]] + lines[end + 1:])
+        self.assertNotEqual(self.receipt_literal_functions(moved), ["Test-VenueReceiptIsExportLeg"],
+                            "a schema literal moved below the function's closing brace is not attributed to it")
+        self.assertEqual(self.receipt_literal_functions(moved), [""])
+        # residue r1 (sol r6 H1, its mutation): the function's actual closing brace indented two spaces and the schema literal placed after it is at
+        # module scope, so the live function no longer owns it and the pin above fails on that mutation
+        indented = "".join(lines[:hit] + lines[hit + 1:end] + ["  }\n", lines[hit]] + lines[end + 1:])
+        self.assertNotEqual(indented, live)
+        self.assertEqual(self.receipt_literal_functions(indented), [""], "a literal after an indented closing brace is not attributed to the function")
         mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
         self.assertNotEqual(mutated, texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"])
         self.assertEqual(self.readers_without_repo_root({"New-VenueSheetPair.ps1": mutated}), ["New-VenueSheetPair.ps1:" + str(next(
@@ -6357,7 +6485,9 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         backend, mode, scale = cell.split("-")
         base = {"cellId": cell, "backend": backend, "outcome": outcome, "observedDisplay": mode, "effectiveScale": 1 if backend == "cuda" else int(scale[1:]),
                 "windowSize": "2560x1529" if mode == "windowed" else "2560x1600", "previewSize": "2380x1373" if mode == "windowed" else "2560x1600",
-                "presentedFps": fps, "timelineFpsAfterFirstPresent": 19.5, "renderWorkMs": 28.0, "dualIsoMs": 25.0}
+                "presentedFps": fps, "timelineFpsAfterFirstPresent": 19.5, "renderWorkMs": 28.0, "dualIsoMs": 25.0,
+                "hostLoadState": "quiet", "hostLoadProvisional": False,   # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: a quiet leg (a provisional one is never measured)
+                "hostLoadCollected": True}   # residue r1 (sol r6 B3): and collected (a collected=false row is never measured)
         base.update(over)
         return base
 
@@ -6414,11 +6544,37 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         for line in lines[2:]:
             self.assertNotRegex(line, r"\| \d->\S+ \|", "a bare factor in the scale column is the confusing form this card replaces")
 
+    def test_hostload_r3_a_provisional_or_unstated_row_is_ran_but_never_measured(self) -> None:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): Test-DvMatrixRowMeasured counted any PASS/FAIL row with a rate. A row whose hostLoadProvisional is not
+        the boolean false (true, absent, a string, a list) is ran, never measured; the quiet row still counts."""
+        cells = [{"cellId": "cuda-windowed-s1", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 1}]
+        absent = self.row("cuda-windowed-s1", fps=30.0); del absent["hostLoadProvisional"]
+        rows = [self.row("cuda-windowed-s1", fps=12.0), self.row("cuda-windowed-s1", fps=59.56, hostLoadState="unknown", hostLoadProvisional=True), absent,
+                self.row("cuda-windowed-s1", fps=31.0, hostLoadProvisional="false"), self.row("cuda-windowed-s1", fps=32.0, hostLoadProvisional=[False])]
+        line = self.table(rows, cells).splitlines()[2]
+        self.assertIn("| 1/5 | 12.00 (12.00-12.00) |", line, "only the quiet row is in the median")
+
+    def test_residue_b3_a_collected_false_row_is_ran_but_never_measured(self) -> None:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): a row whose standing said collected=false (or whose collected is not the boolean true)
+        is ran, never measured and never in the median, beside state quiet and provisional false."""
+        cells = [{"cellId": "cuda-windowed-s1", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 1}]
+        absent = self.row("cuda-windowed-s1", fps=30.0); del absent["hostLoadCollected"]
+        rows = [self.row("cuda-windowed-s1", fps=12.0), self.row("cuda-windowed-s1", fps=59.56, hostLoadCollected=False), absent,
+                self.row("cuda-windowed-s1", fps=31.0, hostLoadCollected="true"), self.row("cuda-windowed-s1", fps=32.0, hostLoadCollected=[True])]
+        line = self.table(rows, cells).splitlines()[2]
+        self.assertIn("| 1/5 | 12.00 (12.00-12.00) |", line, "only the collected quiet row is in the median")
+
     def test_a_cell_with_no_measurement_shows_dashes_and_its_outcome(self) -> None:
         cells = [{"cellId": "cpu-windowed-s1", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 1}]
         line = self.table([self.row("cpu-windowed-s1", outcome="INVALID", fps=None, presentedFps=None, timelineFpsAfterFirstPresent=None, renderWorkMs=None, dualIsoMs=None)], cells).splitlines()[2]
         self.assertIn("| 0/1 | - | - | - | - | INVALID x1 |", line)
         self.assertIn("| cpu | windowed / windowed |", line)
+
+
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: a quiet, collected host (the smoke result's hostLoad block), and the 2026-11-21 a134532e CimException shape.
+MATRIX_QUIET_HOSTLOAD = {"before": {"collected": True}, "after": {"collected": True}, "state": "quiet", "provisional": False, "reason": "peak 18% <= 75%"}
+MATRIX_CIM_HOSTLOAD = {"before": {"collected": False, "error": "collection failed: CimException"}, "after": {"collected": False, "error": "collection failed: CimException"},
+                       "state": "unknown", "provisional": True, "reason": "Host load telemetry could not be collected"}
 
 
 @requires_windows_pwsh
@@ -6430,8 +6586,9 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
     def setUp(self) -> None:
         self.make_harness()
 
-    def cell_artifacts(self, cell: str, placement: str, fps: float) -> str:
-        """Write one cell's run artifacts (its own app log: the placement the app ran in, the scale it rendered at, the four rates) and return the agent-side path."""
+    def cell_artifacts(self, cell: str, placement: str, fps: float, host_load: dict | None = None) -> str:
+        """Write one cell's run artifacts (its own app log: the placement the app ran in, the scale it rendered at, the four rates) and return the agent-side path.
+        `host_load`: the smoke result's hostLoad block (default a quiet, collected host: VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3, an unknown leg is never measured)."""
         _, mode, scale = cell.split("-")
         eff = int(scale[1:])   # the CUDA texture route renders at the requested 1, 2 or 4 (PLAYBACK-CUDA-HONOUR-SCALE-1)
         name = f"{cell}.artifacts"
@@ -6442,19 +6599,23 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
                                  line={"scale_request_last": eff, "scale_active_last": eff, "presented_fps": fps, "avg_render_work_ms": 28.5},
                                  extra_log_lines=[placement,
                                                   "playback_smoke.pace_summary session=3 first_present_ms=1000.000 paced_elapsed_ms=30000.000 timeline_fps_after_first_present=19.40 presented_fps_after_first_present=12.5 pace_fps=23.976 first_present_catchup_frames=0",
-                                                  "playback_smoke.cpu_summary session=3 avg_llrawproc_total_ms=26.000 avg_llrawproc_dual_iso_ms=25.5 avg_processing_ms=5.000"])
+                                                  "playback_smoke.cpu_summary session=3 avg_llrawproc_total_ms=26.000 avg_llrawproc_dual_iso_ms=25.5 avg_processing_ms=5.000"],
+                                 host_load=host_load if host_load is not None else MATRIX_QUIET_HOSTLOAD)
             self.stamp_identity("ultra-magnus", self.build_sha)
         finally:
             self.artifacts = saved
         return f"X:\\stub\\agent\\outbox\\{name}"
 
-    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str], dv: Path = DV, native_error_pref: bool = False):
-        """`native_error_pref`: run the script IN a session that has $PSNativeCommandUseErrorActionPreference = $true (a caller's preference the matrix walk inherits)."""
+    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str], dv: Path = DV, native_error_pref: bool = False,
+                   host_loads: dict[str, dict] | None = None):
+        """`native_error_pref`: run the script IN a session that has $PSNativeCommandUseErrorActionPreference = $true (a caller's preference the matrix walk inherits).
+        `host_loads`: a cell's smoke hostLoad block (default quiet)."""
         by_leg = {}
         for cell in (c for c in MATRIX_CELLS if c.startswith("cuda-")):
             _, mode, scale = cell.split("-")
             placement = placements.get(cell, WINDOWED_PLACEMENT if mode == "windowed" else FULLSCREEN_PLACEMENT)
-            by_leg[f"display-{mode}-{scale}-ultra-magnus-cuda"] = self.cell_artifacts(cell, placement, 12.0 + (0.5 if mode == "windowed" else 0.0) + 0.1 * int(scale[1:]))
+            by_leg[f"display-{mode}-{scale}-ultra-magnus-cuda"] = self.cell_artifacts(cell, placement, 12.0 + (0.5 if mode == "windowed" else 0.0) + 0.1 * int(scale[1:]),
+                                                                                     host_load=(host_loads or {}).get(cell))
         cfg = {"log": str(self.log), "genLog": str(self.gen_log), "probe": HEALTHY_PROBE, "mainMode": "capture", "healthMode": "ok", "artifactsByLeg": by_leg,
                "artifactsAgentPath": "X:\\stub\\agent\\outbox\\unused.artifacts", "genRefusal": None, "clipContentSha256": CLIP_CONTENT_SHA, "token": None, "exitCode": 0}
         self.stub_cfg.write_text(json.dumps(cfg), encoding="utf-8")
@@ -6527,6 +6688,36 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         row = json.loads(out.stdout)
         self.assertIsNone(row["presentedFps"], "a log that does not hash to the receipt is no measurement")
         self.assertIn("does not hash to the receipt", row["note"])
+
+    def test_hostload_r3_a_cim_failed_leg_is_shown_and_never_measured_and_quiet_legs_still_count(self) -> None:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1, its literal): the a134532e shape (a PASS leg whose hash-bound smoke result says before/after
+        collected=false CimException) was counted as a measurement and the matrix row carried no host-load field. It is now recorded (hostLoadState unknown,
+        hostLoadProvisional true, a REFERENCE_PROVISIONAL line, the per-leg host-load table) and never measured; the quiet legs still count."""
+        cim_cell = "cuda-fullscreen-s1"
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {}, host_loads={cim_cell: MATRIX_CIM_HOSTLOAD})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        refusals = [l for l in proc.stdout.splitlines() if l.startswith("REFERENCE_PROVISIONAL ")]
+        self.assertEqual(len(refusals), 1, proc.stdout)
+        self.assertIn("reason=hostload-unknown", refusals[0])
+        summary = Path(re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip())
+        text = summary.read_text(encoding="utf-8")
+        self.assertIn("= 6 leg(s), 5 measured.", text, "the provisional leg is not a measurement")
+        cim_row = next(l for l in text.splitlines() if l.startswith(f"| {cim_cell} "))
+        self.assertIn("| 0/1 | - |", cim_row, "the provisional leg ran, shows no median and is not counted")
+        self.assertIn(f"| {cim_cell} | PASS | unknown | true | no |", text, "the per-leg table shows its host-load state and provisional")
+        self.assertEqual(text.count("| quiet | false | yes |"), 5, "every quiet leg is shown and counted")
+        rows = json.loads((summary.parent / "summary.json").read_text(encoding="utf-8"))["rows"]
+        got = {r["cellId"]: (r["hostLoadState"], r["hostLoadProvisional"]) for r in rows}
+        self.assertEqual(got[cim_cell], ("unknown", True))
+        self.assertEqual({v for k, v in got.items() if k != cim_cell}, {("quiet", False)})
+
+    def test_hostload_r3_a_leg_whose_smoke_result_has_an_empty_hostload_block_is_unknown_and_never_measured(self) -> None:
+        """Row (d) on the matrix route: a hostLoad block with no collected snapshot and no state is 'unknown', never quiet."""
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {}, host_loads={"cuda-windowed-s4": {}})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        text = Path(re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()).read_text(encoding="utf-8")
+        self.assertIn("= 6 leg(s), 5 measured.", text)
+        self.assertIn("| cuda-windowed-s4 | PASS | unknown | true | no |", text)
 
     def run_swapped_matrix(self, source_name: str, native_error_pref: bool = False):
         """A cuda matrix run in a COPY of the runner tree (the swap must never touch the checked-in specs) whose first leg's generator stub overwrites the spec of plan entry 2
@@ -10258,15 +10449,19 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     frozen-source-partial-unsaved (frames 0-4 over source A; frame 5 over source B was never saved; the app's record "differ"),
     frozen-source-partial-noviewport (the same, but frame 5 was saved without a viewport rectangle), frozen-source-partial-differ (frames 0-4 over
     five different sources; frame 5 never saved; "differ"), frozen-source-ids-only (frames 0-4 over five different sources; frame 5 never saved and
-    has no source id, so the app records nothing), frozen-upper-source-id (every source id in upper-case hex, which is not the app's form; "differ")."""
+    has no source id, so the app records nothing), frozen-upper-source-id (every source id in upper-case hex, which is not the app's form; "differ").
+    UNPACED-VISUAL-MIDPLAY-CAPTURE-1 mode held-end-frame, shaped like the saved L3 app-visual.json (every-frame unpaced CUDA leg a0fc462a): six forced play
+    captures (forced_paints_before 0..5) then six unforced (forced_paints_before 6), every play entry play_active with display_frame 479 and ONE source_id
+    (an unpaced Play held its last required frame through the tail), no source_difference record, and two distinct pictures among the unforced."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     calls = []
+    held = mode == "held-end-frame"
     frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport",
                       "frozen-source-partial-unsaved", "frozen-source-partial-noviewport", "frozen-source-partial-differ", "frozen-source-ids-only",
-                      "frozen-upper-source-id")
-    paired = mode in ("paired-ok", "masked", "partial-freeze")
+                      "frozen-upper-source-id", "held-end-frame")
+    paired = mode in ("paired-ok", "masked", "partial-freeze", "held-end-frame")
     bound = mode in ("bound", "bound-paused-unbound", "bound-paused-missing")
     viewport = None if mode == "noviewport" else VIEWPORT
     source_difference = {"frozen": "differ", "frozen-partial": "differ", "frozen-identical": "identical",
@@ -10298,7 +10493,7 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
         if paired:
             # (seed, bias): bias 30 marks a frame of the unforced half (later than every forced capture's frame); masked repeats forced play 5's paint
-            unforced_seed, unforced_bias = {"masked": (5, 0), "partial-freeze": (min(k, 2), 30)}.get(mode, (k, 30))
+            unforced_seed, unforced_bias = {"masked": (5, 0), "partial-freeze": (min(k, 2), 30), "held-end-frame": (1 if k < 3 else 2, 0)}.get(mode, (k, 30))
             calls.append(f"New-VisPng '{dest / f'play-unbound-{k}.png'}' {unforced_seed} {60 + k * 10} {unforced_bias} $false")
     if bound:
         calls.append(f"New-VisPng '{dest / 'stop-unbound.png'}' 5 120 40 $false")
@@ -10326,17 +10521,22 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
             for f in frames:
                 if f["kind"] in ("play", "play_unbound"):
                     f["source_id"] = f"{f['display_frame']:016x}"
+        if held:
+            # L3: the held end frame -- one display frame and one source id on every play capture, forced and unforced
+            for f in frames:
+                if f["kind"] in ("play", "play_unbound"):
+                    f.update({"display_frame": 479, "source_id": "da6d7160d64f797a"})
     if bound:
         frames.append({"kind": "stop_unbound", "index": 0, "file": "stop-unbound.png", "display_frame": 612, "serial": 912, "painted_serial": 911,
                        "painted_serial_valid": True, "label_bound": False, "label_bound_basis": "gl_viewport_paint", "play_active": False, "viewport": viewport,
                        "saved": True, "reason": ""})
-    stop = {"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""}
+    stop = {"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 479 if held else 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""}
     if mode == "lagged" or bound:
         stop.update({"serial": 912, "painted_serial": 911 if mode == "lagged" else 912, "painted_serial_valid": True, "label_bound": bound})
     if bound:
         stop["label_bound_basis"] = "pixmap_item_by_construction"
     frames.append(stop)
-    paused = {"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
+    paused = {"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 479 if held else 612, "settled": True, "settled_frame": 479 if held else 612, "play_active": False,
               "viewport": viewport, "saved": True, "reason": ""}
     if mode in ("bound", "bound-paused-unbound"):
         paused.update({"serial": 913, "painted_serial": 913 if mode == "bound" else 912, "painted_serial_valid": True, "label_bound": mode == "bound",
@@ -11234,8 +11434,25 @@ class VisualExposureFloorTests(unittest.TestCase):
         self.assertEqual(len(calls), 2, "the measured run's read and the self-heal pre-launch read")
         for call in calls:
             self.assertIn("-ClipId ([string]$spec.clipId)", call)
-        self.assertIn("'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE')) {", runner, "counted for speed and surfaced in the detail, like a divergence")
+        # (UNPACED-VISUAL-MIDPLAY-CAPTURE-1 appended NOT_A_MOTION_WITNESS to the same list: the pinned tail now ends with it)
+        self.assertIn("'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE', 'NOT_A_MOTION_WITNESS')) {", runner, "counted for speed and surfaced in the detail, like a divergence")
         self.assertNotIn("EXPOSURE_OUT_OF_RANGE", runner.split("elseif ($receipt.visual.verdict -cin")[0], "never an exclusion: the FROZEN_DISPLAY branch does not name it")
+
+    def test_the_visual_leg_runner_counts_and_surfaces_a_strip_that_is_no_motion_witness(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1: NOT_A_MOTION_WITNESS (every judged play frame carries one display frame: an unpaced Play held its last
+        required frame through the capture tail) is in the measured run's counted-and-surfaced list, never the FROZEN_DISPLAY exclusion, and the
+        self-heal pre-launch rule (anything but OK / EXPOSURE_OUT_OF_RANGE is INVALID) refuses it without naming it (fail closed)."""
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        gate = re.search(r"\} elseif \(\$receipt\.visual\.verdict -cin @\(([^)]*)\)\) \{", runner)
+        self.assertIsNotNone(gate, "the counted-and-surfaced -cin list of the measured run's visual gate")
+        self.assertIn("'NOT_A_MOTION_WITNESS'", re.findall(r"'[A-Z_]+'", gate.group(1)))
+        self.assertNotIn("NOT_A_MOTION_WITNESS", runner.split("elseif ($receipt.visual.verdict -cin")[0], "counted: the FROZEN_DISPLAY exclusion does not name it")
+        self.assertIn("$detail += \"; $($receipt.visual.verdict) (counted for speed, surfaced for review): $($receipt.visual.reason)\"", runner)
+        self.assertIn("elseif ([string]$entry.verdict -cne 'OK' -and [string]$entry.verdict -cne 'EXPOSURE_OUT_OF_RANGE') {", runner,
+                      "a self-heal pre-launch held on one frame is INVALID through the generic rule")
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        self.assertIn("| `NOT_A_MOTION_WITNESS` |", doc)
+        self.assertIn("UNPACED-VISUAL-TAIL-HOLD-RELEASE-1", doc)
 
     DARK_PNG_PS = r"""
 Add-Type -AssemblyName System.Drawing
@@ -11604,7 +11821,9 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
     def test_the_visual_gate_freezes_diverges_and_blanks_only_on_its_own_evidence(self) -> None:
         rows = [  # requested, captured, play, distinct, appDistinct, flat, mad, samePosition -> verdict, counted
             ("$true", "$true", 6, 6, 6, 0, "2.0", "$true", "OK", True),
-            ("$true", "$true", 6, 1, 1, 0, "2.0", "$true", "OK", True),            # the app itself presented one frame: a stall, not a frozen display
+            # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: this row read OK, which encoded the defect: one display frame across the play frames is no motion witness
+            # (an unpaced Play holds its last required frame through the capture tail: every L3/L4/L5 play capture carried display frame 479)
+            ("$true", "$true", 6, 1, 1, 0, "2.0", "$true", "NOT_A_MOTION_WITNESS", True),
             ("$true", "$true", 6, 1, 6, 6, "$null", "$false", "CAPTURE_BLANK", True),
             ("$true", "$true", 6, 6, 6, 0, "30.0", "$true", "VISUAL_DIVERGENCE", True),
             ("$true", "$true", 6, 6, 6, 0, "30.0", "$false", "OK", True),           # not the same timeline position: the difference judges nothing
@@ -11646,12 +11865,367 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                   "-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true | ConvertTo-Json -Compress")
         self.assertEqual((proc.returncode, out["verdict"]), (0, "FROZEN_DISPLAY_SUSPECTED"), "ViewportUnavailablePlayFrames defaults to 0")
 
-    def visual_verdict(self, src, play, unavailable, distinct, repeats=None, extra=""):
+    def test_the_visual_gate_says_not_a_motion_witness_when_the_play_frames_carry_one_display_frame(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1: an unpaced Play holds its last required frame through the capture tail (MainWindow.cpp playbackHandling,
+        pinnedUnpacedHoldReached), so all 12 play captures of the every-frame CUDA legs carried display_frame 479 and the gate fell through to OK. Fewer than
+        two distinct display frames across the judged play frames is NOT_A_MOTION_WITNESS (counted, surfaced), whatever the source difference and the
+        number of pictures; two display frames judge as before."""
+        rows = [  # source difference, distinct pictures, app distinct display frames -> verdict
+            ("known-differ", 1, 1, "NOT_A_MOTION_WITNESS"), ("known-differ", 2, 1, "NOT_A_MOTION_WITNESS"),
+            ("unknown", 1, 1, "NOT_A_MOTION_WITNESS"), ("unknown", 2, 1, "NOT_A_MOTION_WITNESS"),
+            ("known-identical", 1, 1, "NOT_A_MOTION_WITNESS"), ("known-identical", 2, 1, "NOT_A_MOTION_WITNESS"),
+            (None, 2, 1, "NOT_A_MOTION_WITNESS"),
+            ("known-differ", 1, 0, "NOT_A_MOTION_WITNESS"), ("unknown", 2, 0, "NOT_A_MOTION_WITNESS"), ("known-identical", 6, 0, "NOT_A_MOTION_WITNESS"),
+            # two display frames: unchanged
+            ("known-differ", 1, 2, "FROZEN_DISPLAY"), ("unknown", 1, 2, "FROZEN_DISPLAY_SUSPECTED"), ("known-identical", 1, 2, "OK"),
+            ("known-differ", 2, 2, "OK"), ("unknown", 2, 2, "OK"),
+        ]
+        for src, distinct, app, verdict in rows:
+            with self.subTest(source=src, distinct=distinct, app=app):
+                out = self.visual_verdict(src, 6, 0, distinct, app=app)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, verdict != "FROZEN_DISPLAY"), out["reason"])
+                if verdict == "NOT_A_MOTION_WITNESS":
+                    self.assertIn(f"({distinct} distinct picture(s) among them), so they cannot witness motion during playback", out["reason"])
+                    if src in ("known-differ", "known-identical"):
+                        # R1C-REASON-RESIDUE-1 (sol r1c A2): a known source difference needs two distinct display frame numbers, so beside fewer than two the
+                        # tuple disagrees and the reason claims neither "none" nor "all one number"
+                        self.assertTrue(out["reason"].startswith("the 6 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                                 "on how many carry a valid one)"), out["reason"])
+                        self.assertNotIn("none of the", out["reason"])
+                        self.assertNotIn("are all", out["reason"])
+                    else:
+                        self.assertIn("none of the 6 judged play frames carries a valid display frame number" if app == 0
+                                      else "the valid display frame numbers among the 6 judged play frames are all one display frame number: one display frame number "
+                                           "across them at most", out["reason"])
+                    self.assertNotIn("the strip shows", out["reason"], "r1 adversary A1: the reason speaks of the judged frames, never of the whole strip")
+                    self.assertNotIn("they show", out["reason"], "r1 adversary pass 2 A1: the labels carry a number; the pictures are not claimed to show one")
+                    self.assertNotIn("timeline position", out["reason"], "r1 adversary pass 3 A2: one number is not one timeline position (no clip token)")
+        # the reason quotes the one frame when the caller names it (the reader does); a value that is not a frame number is not quoted
+        out = self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 479 ")
+        self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS")
+        self.assertIn("the valid display frame numbers among the 6 judged play frames are all display frame number 479: one display frame number across them at most "
+                      "(2 distinct picture(s) among them)", out["reason"])
+        self.assertIn("are all one display frame number", self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 1.5 ")["reason"])
+        out = self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 479 -LabelledPlayFrames 6 ")
+        self.assertIn("all 6 judged play frames carry display frame number 479: one display frame number across them (2 distinct", out["reason"])
+        # r1 adversary A1: when only some judged frames carry a frame number, the reason says how many, never "all"
+        out = self.visual_verdict("unknown", 2, 0, 2, app=1, extra="-SoleDisplayFrame 479 -LabelledPlayFrames 1 ")
+        self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS")
+        self.assertIn("1 of the 2 judged play frames carry display frame number 479 and the other 1 carry no valid display frame number: one display frame number "
+                      "across them at most", out["reason"])
+        self.assertNotIn("all 2", out["reason"])
+        # r1 adversary pass 2 A2: a count that is not a whole number in 1..PlayFrames is not known, never "all", never "-1 of", never a throw.
+        # r1 adversary pass 3 A3 (its input verbatim): -LabelledPlayFrames 0 beside one declared display frame contradicts it, so it is not known either:
+        # on 59b7ceee the reason said "0 of the 2 judged play frames are labelled display frame 479 and the other 2 carry no valid display frame label".
+        # (the "0" case moved to the r2 test below: sol r1c pass A1 says a VALID zero beside one declared display frame is a disagreement, not "not known")
+        for bad in ("$null", "-1", "1.5", "2147483648", "3", "'1'"):
+            with self.subTest(labelled=bad):
+                out = self.visual_verdict("unknown", 2, 0, 2, app=1, extra=f"-SoleDisplayFrame 479 -LabelledPlayFrames {bad} ")
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                self.assertTrue(out["reason"].startswith("the valid display frame numbers among the 2 judged play frames are all display frame number 479: one display "
+                                                         "frame number across them at most"), out["reason"])
+                self.assertNotIn(" of the 2", out["reason"])
+
+    IMPOSSIBLE_REPEAT_LEAD = "the repeat count supplied for the 6 judged play frames cannot be true for them and is not quoted: it establishes no repeat and no cause"
+
+    def test_the_visual_gate_never_quotes_a_count_that_cannot_be_true_as_observed_evidence(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R3-KEY-RESIDUE-1 (sol r3 blocker; opus VISUAL-GATE-DISTINCT-HASHES-RANGE-1): Get-DvVisualVerdict is exported, so a
+        caller can hand it a tuple no judged set produces. The CONTRACT is "omit": the verdict is what it was, and a count outside what the judged set allows
+        (distinct pictures outside 1..PlayFrames, distinct display frames over PlayFrames or negative, repeats over PlayFrames, a negative play-frame count) is
+        left out of the reason, never quoted as observed. On 57023f59 the sol repro read '(3 distinct picture(s) among them)' beside 2 judged frames and
+        the -1 one quoted '-1'. Production derives every count from the judged set (Read-DvVisualCaptures), so none of these is reachable there."""
+        # sol's repro (verbatim) and the opus one: 3 and -1 distinct pictures over 2 judged frames
+        for bad in ("3", "-1", "0", "7"):
+            with self.subTest(distinct=bad):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 2 -DistinctContentHashes {bad} -AppDistinctDisplayFrames 1 "
+                                          "-FlatPlayFrames 0 | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True), "the verdict is unchanged")
+                self.assertNotIn("distinct picture", out["reason"], out["reason"])
+                self.assertNotIn(bad, out["reason"].replace("2 judged", "").replace("the 2", ""), out["reason"])
+                self.assertIn("so they cannot witness motion during playback", out["reason"])
+        # a count the judged set can produce is still quoted (1..PlayFrames)
+        for good in ("1", "2"):
+            out = self.visual_verdict("unknown", 2, 0, int(good), app=1)
+            self.assertIn(f"({good} distinct picture(s) among them), so they cannot witness", out["reason"])
+        # a negative distinct-display-frame count is not "none carry a number": it establishes nothing, and is never quoted
+        for app in ("-1", "-7"):
+            with self.subTest(app=app):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames {app} "
+                                          "-FlatPlayFrames 0 | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                self.assertNotIn(app, out["reason"])
+                self.assertNotIn("none of the", out["reason"])
+                self.assertIn("the 4 judged play frames do not establish two distinct display frame numbers (2 distinct picture(s) among them)", out["reason"])
+        # the frozen verdicts quote the app's distinct-frame count only when it fits the judged frames
+        for src, verdict in (("known-differ", "FROZEN_DISPLAY"), ("unknown", "FROZEN_DISPLAY_SUSPECTED")):
+            out = self.visual_verdict(src, 2, 0, 1, app=9)
+            self.assertEqual(out["verdict"], verdict, out["reason"])
+            self.assertIn("the app presented a distinct-frame count that cannot be true for them and is not quoted across them", out["reason"])
+            self.assertNotIn("9", out["reason"])
+            out = self.visual_verdict(src, 6, 0, 1, app=2)
+            self.assertIn("the app presented 2 distinct frames across them", out["reason"])
+        # a repeat count over the judged frames is not quoted
+        out = self.visual_verdict("known-differ", 6, 0, 3, repeats=9)
+        self.assertEqual(out["verdict"], "PARTIAL_FREEZE", out["reason"])
+        self.assertTrue(out["reason"].startswith(self.IMPOSSIBLE_REPEAT_LEAD), out["reason"])
+        out = self.visual_verdict("known-differ", 6, 0, 3, repeats=3)
+        self.assertTrue(out["reason"].startswith("3 of the 6 judged play frames repeat"), out["reason"])
+        # adversary pass 1 A1 (its input verbatim): N frames over D distinct pictures hold at most N - D adjacent repeats, so 4 repeats over 6 frames and 3
+        # pictures (and 6 repeats over 6 frames) cannot be true; on 7f07a3e7 the reason read '4 of the 6 judged play frames repeat'. The verdict is unchanged.
+        for distinct, repeats in ((3, 4), (3, 6), (6, 2), (2, 5), (9, 6), (0, 6)):
+            with self.subTest(distinct=distinct, repeats=repeats):
+                out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertTrue(out["reason"].startswith(self.IMPOSSIBLE_REPEAT_LEAD), out["reason"])
+        # adversary pass 2 A1 (its input verbatim): 2 frames over 2 pictures hold no repeat at all, so "two or more of them repeat" is the same impossible claim in
+        # words; the reason says the supplied count cannot be true and speaks of what was SUPPLIED
+        out = self.visual_verdict("known-differ", 2, 0, 2, app=2, repeats=2)
+        self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+        self.assertTrue(out["reason"].startswith("the repeat count supplied for the 2 judged play frames cannot be true for them and is not quoted: it establishes no repeat"), out["reason"])
+        self.assertNotIn("two or more", out["reason"])
+        # R1C-REASON-RESIDUE-1 (sol r1c A1, its input verbatim): the impossible count supports neither an observed repeat nor the freeze diagnosis; the verdict
+        # and counted stay. Red on cda3ba8d: "as supplied, they repeat the picture before them ... the display's own paint stopped landing for part of the tail"
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 2 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -FlatPlayFrames 0 "
+                                  "-SourceDifference known-differ -RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+        self.assertIn("cannot be true for them", out["reason"])
+        for claim in ("as supplied", "they repeat", "stopped landing", "label advanced", "paint"):
+            self.assertNotIn(claim, out["reason"], out["reason"])
+        # every impossible repeat count says nothing about repeats or a cause; a possible one still does
+        for distinct, repeats in ((3, 4), (3, 6), (6, 2), (2, 5), (9, 6), (0, 6)):
+            out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+            self.assertNotIn("stopped landing", out["reason"], out["reason"])
+            self.assertNotIn("as supplied", out["reason"], out["reason"])
+            self.assertNotIn("repeat the picture", out["reason"], out["reason"])
+        self.assertIn("the display's own paint stopped landing for part of the tail", self.visual_verdict("known-differ", 6, 0, 3, repeats=3)["reason"])
+        # R1C-REASON-RESIDUE-1 (sol r1c A2, its inputs verbatim): AppDistinctDisplayFrames 0 (or omitted) beside a known source difference (either value) or a
+        # repeat count disagrees with itself: the verdict stays, the reason never says "none of the 2 judged play frames carries a valid display frame number"
+        for label, args in (("known-differ", "-AppDistinctDisplayFrames 0 -SourceDifference known-differ"),
+                            ("known-identical", "-AppDistinctDisplayFrames 0 -SourceDifference known-identical"),
+                            ("omitted app", "-SourceDifference known-differ"),
+                            ("unknown+repeat", "-AppDistinctDisplayFrames 0 -SourceDifference unknown -RepeatedPlayFrames 1"),
+                            ("app 1 known-differ", "-AppDistinctDisplayFrames 1 -SourceDifference known-differ"),
+                            ("app 1 repeat", "-AppDistinctDisplayFrames 1 -RepeatedPlayFrames 1")):
+            with self.subTest(a2=label):
+                proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 2 -DistinctContentHashes 1 -FlatPlayFrames 0 "
+                                          f"{args} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                for claim in ("none of the", "carries a valid display frame number", "are all"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+                self.assertTrue(out["reason"].startswith("the 2 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                         "on how many carry a valid one) (1 distinct picture(s) among them)"), out["reason"])
+        # the consistent unknown-source zero still says none
+        # adversary pass 2 A2 (its input verbatim): -AppDistinctDisplayFrames omitted (it binds to 0) or 0 beside a sole frame number / a labelled count: the
+        # tuple disagrees with itself, so the reason never says "none of the 6 ... carries a valid display frame number"
+        for app_arg in ("", "-AppDistinctDisplayFrames 0 "):
+            for extra in ("-SoleDisplayFrame 479 -LabelledPlayFrames 6 ", "-SoleDisplayFrame 479 ", "-LabelledPlayFrames 3 "):
+                with self.subTest(app=app_arg, extra=extra):
+                    proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -FlatPlayFrames 0 "
+                                              f"{app_arg}{extra}| ConvertTo-Json -Compress")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                    self.assertNotIn("none of the", out["reason"])
+                    self.assertTrue(out["reason"].startswith("the 6 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                             "on how many carry a valid one) (1 distinct picture(s) among them)"), out["reason"])
+        # the consistent zero still says none (no sole frame, no labelled count)
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -FlatPlayFrames 0 | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("none of the 6 judged play frames carries a valid display frame number"), out["reason"])
+        for distinct, repeats in ((2, 4), (6, 0), (9, 4), (0, 4)):
+            if repeats >= 2:
+                with self.subTest(distinct=distinct, repeats=repeats, quoted=True):
+                    out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+                    self.assertTrue(out["reason"].startswith(f"{repeats} of the 6 judged play frames repeat"), out["reason"])
+        # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (sol r4 B1 = key3 r4 B1): this branch is reached only with a known source difference, two or more app frames and a picture
+        # count other than 1 (1 would be FROZEN_DISPLAY), so a real judged set holds at least two pictures and at most PlayFrames - 2 repeats. With the picture count
+        # out of range the bound is therefore 4 here, and 5 repeats (the old PlayFrames - 1 fallback) is withheld like any other impossible count.
+        for distinct, repeats in ((9, 5), (0, 5)):
+            with self.subTest(distinct=distinct, repeats=repeats, quoted=False):
+                out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertTrue(out["reason"].startswith(self.IMPOSSIBLE_REPEAT_LEAD), out["reason"])
+        # a negative judged-frame count is worded as unknown (the early verdicts are unchanged)
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames -1 -DistinctContentHashes 0 -AppDistinctDisplayFrames 0 -FlatPlayFrames 0 "
+                                  "| ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["reason"]), ("NOT_CAPTURED", "only an unknown number of play frame(s) were captured"))
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames -1 -DistinctContentHashes 0 -AppDistinctDisplayFrames 0 -FlatPlayFrames 0 "
+                                  "-ViewportUnavailablePlayFrames 3 | ConvertTo-Json -Compress")
+        self.assertEqual(out["verdict"], "VISUAL_ASSESSMENT_UNAVAILABLE")
+        self.assertNotIn("-1", out["reason"])
+
+    def test_the_visual_gate_never_reads_an_impossible_tuple_as_an_observed_repeat_or_source_claim(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (sol r4 B1 = key3 opus r4 B1, their inputs verbatim; key3 r4 H1). DEFECT_CLASS: an
+        impossible count quoted as observed evidence or cause. The verdict and counted stay; the reason withholds the repeat observation, the cause and the source claim.
+        Red on ba4f45d4: (a)/(b) read '5 of the 6 judged play frames repeat ... the display's own paint stopped landing for part of the tail' beside 0 or 9 distinct
+        pictures, (c) read '2 of the 4 ... repeat' beside an app count of 5 over 4 judged frames, H1 read '... and the source frames are known to differ' beside an app
+        count the same reason had just called impossible."""
+        base = "Get-DvVisualVerdict -Requested $true -Captured $true -FlatPlayFrames 0 "
+        cases = [
+            ("a", "-PlayFrames 6 -DistinctContentHashes 0 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 -SourceDifference known-differ"),
+            ("b", "-PlayFrames 6 -DistinctContentHashes 9 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 -SourceDifference known-differ"),
+            ("c", "-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 5 -LabelledPlayFrames 4 -RepeatedPlayFrames 2 -SourceDifference known-differ"),
+            ("c-no-labelled", "-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 5 -RepeatedPlayFrames 2 -SourceDifference known-differ"),
+        ]
+        for name, args in cases:
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json(f"{base}{args} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertIn("cannot be true for them", out["reason"])
+                for claim in ("of the 6 judged play frames repeat", "of the 4 judged play frames repeat", "as supplied", "they repeat", "stopped landing", "label advanced",
+                              "paint", "known to differ"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+        # the bound is PlayFrames - 2 when the picture count cannot be true (two or more pictures are there): 4 of 6 is still quoted, 5 of 6 is not
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 0 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 4 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("4 of the 6 judged play frames repeat"), out["reason"])
+        # a tuple that fits (two pictures over four labelled frames, an app count of four) is quoted as before
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 4 -LabelledPlayFrames 4 -RepeatedPlayFrames 2 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("2 of the 4 judged play frames repeat"), out["reason"])
+        # key3 r4 H1 (its input verbatim): FROZEN_DISPLAY must not say the source frames are known to differ beside an app count it has just called impossible
+        for labelled in ("-LabelledPlayFrames 2 ", ""):
+            with self.subTest(h1_labelled=labelled):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 2 -DistinctContentHashes 1 -AppDistinctDisplayFrames 3 {labelled}-SourceDifference known-differ | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+                self.assertIn("a distinct-frame count that cannot be true for them and is not quoted", out["reason"])
+                self.assertNotIn("known to differ", out["reason"])
+                self.assertNotIn("3 distinct", out["reason"])
+        # ... and a count that fits still says it
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 2 -DistinctContentHashes 1 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 2 -SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertIn("the app presented 2 distinct frames across them and the source frames are known to differ", out["reason"])
+        # adversary pass 1 A1 (its input verbatim): the same class on the whole-freeze and waiver branches, which return before the repeat count is looked at. 6 repeats
+        # over 6 judged frames cannot be true (an adjacent repeat needs a predecessor: at most 5), so a source claim beside it is not quoted either; the verdict stays.
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 6 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+        self.assertNotIn("known to differ", out["reason"])
+        self.assertIn("the source difference supplied beside a repeat count they cannot hold is not quoted", out["reason"])
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 6 "
+                                  "-SourceDifference known-identical | ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["counted"]), ("OK", True), out["reason"])
+        self.assertIsNone(out["reason"], "no static-clip waiver text beside a repeat count the judged frames cannot hold")
+        # adversary pass 2 A1 (its input verbatim): a NEGATIVE repeat count cannot be true either (the guard checked only the upper bound)
+        for repeats in ("-1", "-2147483648"):
+            with self.subTest(negative_repeats=repeats):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames {repeats} "
+                                          "-SourceDifference known-differ | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+                self.assertNotIn("known to differ", out["reason"])
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames {repeats} "
+                                          "-SourceDifference known-identical | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("OK", True), out["reason"])
+                self.assertIsNone(out["reason"])
+        # a repeat count the frames can hold (5 of 6 over one picture) keeps both claims
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertIn("the source frames are known to differ", out["reason"])
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 "
+                                  "-SourceDifference known-identical | ConvertTo-Json -Compress")
+        self.assertIn("the app records the source frames as identical", out["reason"])
+
+    def test_the_visual_gate_reason_never_outruns_the_labelled_frame_count(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R1C-REASON-RESIDUE-1 r2 (sol r1c pass A1-A3, their inputs verbatim): -LabelledPlayFrames is how many judged frames carry
+        a valid label. A valid zero beside one declared display frame disagrees (A1); L labelled frames hold at most L - 1 repeats (A2); L labelled frames hold at
+        most L distinct labels, so a larger distinct-label count is not quoted (A3). The verdict and counted never change; only the reason abstains."""
+        base = "Get-DvVisualVerdict -Requested $true -Captured $true -FlatPlayFrames 0 "
+        # A1 (and -SoleDisplayFrame absent): "all valid labels are frame 479" over no valid label
+        for extra in ("-SoleDisplayFrame 479 ", ""):
+            with self.subTest(a1=extra):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 1 {extra}-LabelledPlayFrames 0 | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                self.assertTrue(out["reason"].startswith("the 4 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                         "on how many carry a valid one)"), out["reason"])
+                for claim in ("are all", "479", "none of the", "carry display frame number"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+        # A2: two labelled frames hold one adjacent pair at most, so two repeats cannot be true; the verdict stays PARTIAL_FREEZE
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 2 -SourceDifference known-differ "
+                                  "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+        self.assertIn("cannot be true for them", out["reason"])
+        for claim in ("as supplied", "they repeat", "stopped landing", "label advanced", "paint"):
+            self.assertNotIn(claim, out["reason"], out["reason"])
+        for labelled in (0, 1):
+            proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames {labelled} -SourceDifference known-differ "
+                                      "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+            self.assertTrue(out["reason"].startswith("the repeat count supplied"), out["reason"])
+        # ... while a repeat count the labelled frames can hold still speaks (all 4 labelled hold 3 repeats; a known source difference needs every frame labelled)
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 4 -SourceDifference known-differ "
+                                  "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("2 of the 4 judged play frames repeat"), out["reason"])
+        # A3: one labelled frame cannot show two distinct labels; every source value and the known-identical waiver
+        for src, verdict, counted in (("unknown", "FROZEN_DISPLAY_SUSPECTED", True), ("known-differ", "FROZEN_DISPLAY", False), ("known-identical", "OK", True)):
+            with self.subTest(a3=src):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 1 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 1 -SourceDifference {src} | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
+                reason = out["reason"] or ""
+                self.assertNotIn("2 distinct frames", reason)
+                self.assertNotIn("the app records the source frames as identical", reason)   # the waiver's own words ("a static clip" is also the SUSPECTED boilerplate)
+                if verdict != "OK":
+                    self.assertIn("a distinct-frame count that cannot be true for them and is not quoted", reason)
+        # a tuple that fits is still quoted
+        out = self.visual_verdict("unknown", 4, 0, 1, app=2, extra="-LabelledPlayFrames 4 ")
+        self.assertIn("the app presented 2 distinct frames across them", out["reason"])
+        # sol r1c pass 2 A1 (its input verbatim, and the app 2 variant it names): a known source difference needs a label on EVERY judged frame, so beside 3 labelled
+        # of 4 the reason claims no repeat, no known source difference and no cause (verdict and counted unchanged)
+        for app in (4, 2):
+            with self.subTest(pass2_a1=app):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames {app} -LabelledPlayFrames 3 -SourceDifference known-differ "
+                                          "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertTrue(out["reason"].startswith("the repeat count and source difference supplied for the 4 judged play frames disagree with the 3 labelled"), out["reason"])
+                for claim in ("2 of the 4", "repeat the picture", "known to differ", "stopped landing", "label advanced"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+        out = self.visual_verdict("known-differ", 4, 0, 1, app=2, extra="-LabelledPlayFrames 3 ")
+        self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+        self.assertNotIn("are known to differ", out["reason"])
+        self.assertIn("disagrees with the 3 labelled of the 4 judged frames", out["reason"])
+        # every judged frame labelled: the source difference is quoted as before
+        out = self.visual_verdict("known-differ", 4, 0, 1, app=2, extra="-LabelledPlayFrames 4 ")
+        self.assertIn("the source frames are known to differ", out["reason"])
+
+    def test_the_visual_gate_ranks_not_a_motion_witness_after_blank_and_before_the_paused_and_exposure_verdicts(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 precedence: NOT_REQUESTED, VISUAL_ASSESSMENT_UNAVAILABLE, NOT_CAPTURED and CAPTURE_BLANK outrank it; it outranks
+        CAPTURE_UNBOUND, VISUAL_DIVERGENCE, EXPOSURE_OUT_OF_RANGE and PARTIAL_FREEZE (each shown winning with two display frames)."""
+        band = "-ExposureBand ([pscustomobject]@{ minMedianLuma = 20; maxMedianLuma = 220; maxNearBlackFraction = 0.5; maxClippedFraction = 0.01 }) "
+        dark = "-ExposureMedianLuma 3.0 -ExposureMedianNearBlackFraction 0.9 -ExposureMedianClippedFraction 0.0 " + band
+        cases = [  # (description, command tail, app distinct display frames, expected)
+            ("blank outranks", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -FlatPlayFrames 6", 1, "CAPTURE_BLANK"),
+            ("not captured outranks", "-Requested $true -Captured $true -PlayFrames 1 -DistinctContentHashes 1 -FlatPlayFrames 0", 1, "NOT_CAPTURED"),
+            ("not captured, nothing saved", "-Requested $true -Captured $false -PlayFrames 0 -DistinctContentHashes 0 -FlatPlayFrames 0", 0, "NOT_CAPTURED"),
+            ("unavailable outranks", "-Requested $true -Captured $true -PlayFrames 1 -DistinctContentHashes 1 -FlatPlayFrames 0 -ViewportUnavailablePlayFrames 5", 1,
+             "VISUAL_ASSESSMENT_UNAVAILABLE"),
+            ("not requested outranks", "-Requested $false -Captured $false -PlayFrames 0 -DistinctContentHashes 0 -FlatPlayFrames 0", 0, "NOT_REQUESTED"),
+            ("outranks unbound", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -LabelBound $false -PausedLabelBound $true", 1,
+             "NOT_A_MOTION_WITNESS"),
+            ("unbound with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -LabelBound $false -PausedLabelBound $true", 2,
+             "CAPTURE_UNBOUND"),
+            ("outranks divergence", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 30 -SamePosition $true -Threshold 6", 1,
+             "NOT_A_MOTION_WITNESS"),
+            ("divergence with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 30 -SamePosition $true -Threshold 6", 2,
+             "VISUAL_DIVERGENCE"),
+            ("outranks exposure", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 " + dark, 1, "NOT_A_MOTION_WITNESS"),
+            ("exposure with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 " + dark, 2, "EXPOSURE_OUT_OF_RANGE"),
+            ("outranks partial freeze", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 3 -FlatPlayFrames 0 -SourceDifference known-differ -RepeatedPlayFrames 3", 1,
+             "NOT_A_MOTION_WITNESS"),
+            ("partial freeze with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 3 -FlatPlayFrames 0 -SourceDifference known-differ -RepeatedPlayFrames 3", 2,
+             "PARTIAL_FREEZE"),
+        ]
+        for name, tail, app, verdict in cases:
+            with self.subTest(name):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict {tail} -AppDistinctDisplayFrames {app} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True), out["reason"])
+
+    def visual_verdict(self, src, play, unavailable, distinct, repeats=None, extra="", app=6):
         """One Get-DvVisualVerdict call over `play` judged (viewport) play frames; src None omits -SourceDifference (the default); repeats None omits
-        -RepeatedPlayFrames (the default, 0)."""
+        -RepeatedPlayFrames (the default, 0); app is -AppDistinctDisplayFrames (6 unless a row says otherwise)."""
         src_arg = f"-SourceDifference {src} " if src else ""
         repeats_arg = f"-RepeatedPlayFrames {repeats} " if repeats is not None else ""
-        proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames 6 "
+        proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames {app} "
                                   f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true {src_arg}{repeats_arg}{extra}-ViewportUnavailablePlayFrames {unavailable} | ConvertTo-Json -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return out
@@ -11676,6 +12250,10 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         # more repeats is the partial one
         ("PARTIAL_FREEZE", "FROZEN_DISPLAY"): [("known-differ", 6, 0, 1, 5, "FROZEN_DISPLAY"), ("known-differ", 6, 0, 3, 3, "PARTIAL_FREEZE"),
                                                ("known-differ", 5, 1, 2, 2, "PARTIAL_FREEZE")],
+        # UNPACED-VISUAL-MIDPLAY-CAPTURE-1 (rows add repeats, extra, app distinct display frames): one picture over a known-differ source is FROZEN_DISPLAY
+        # only while the app presented two or more frames; on one display frame it is no motion witness (disjoint, so the display-frame count decides)
+        ("NOT_A_MOTION_WITNESS", "FROZEN_DISPLAY"): [("known-differ", 6, 0, 1, None, "", 1, "NOT_A_MOTION_WITNESS"), ("known-differ", 6, 0, 1, None, "", 2, "FROZEN_DISPLAY"),
+                                                     ("known-differ", 6, 0, 1, None, "", 0, "NOT_A_MOTION_WITNESS")],
     }
 
     def test_every_new_visual_verdict_is_paired_with_every_excluding_verdict(self) -> None:
@@ -11683,7 +12261,7 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         body = text[text.index("function Get-DvVisualVerdict {"):text.index("function New-DvVisualStrip {")]
         excluding = set(re.findall(r"verdict = '([A-Z_]+)'; counted = \$false", body))
         self.assertTrue(excluding, "the verdict function names no counted = $false verdict (the pairing check lost its subject)")
-        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE", "PARTIAL_FREEZE"):
+        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE", "PARTIAL_FREEZE", "NOT_A_MOTION_WITNESS"):
             for ex in sorted(excluding):
                 with self.subTest(new=new, excluding=ex):
                     rows = self.NEW_VISUAL_VERDICT_PAIRINGS.get((new, ex))
@@ -11874,6 +12452,252 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             self.assertEqual((out["frozenJudgedOn"], out["forcedPlayDistinctContentHashes"]), ("play", None),
                              "a build without unforced play captures is judged on its play captures, as before")
             self.assertNotIn("playForcedUnforcedDifferFrames", out)
+
+    @requires_windows_imaging
+    def test_the_visual_reader_says_not_a_motion_witness_for_a_held_end_frame(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1: the saved L3 shape (every play capture at display_frame 479 over one source id, two pictures among the six
+        judged unforced ones) read OK on c6ec83ae; it is NOT_A_MOTION_WITNESS, counted, and the reason names the six judged frames and frame 479. The
+        moving fixtures stay OK."""
+        with tempfile.TemporaryDirectory(prefix="vis-held-") as d:
+            _, out = self.read_visual_mode("held-end-frame", d)
+        self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True), out["reason"])
+        self.assertEqual((out["frozenJudgedOn"], out["playFrames"], out["appDistinctDisplayFrames"], out["distinctContentHashes"]), ("play_unbound", 6, 1, 2))
+        self.assertEqual(out["observerPaintedPlayFrames"], 0)
+        self.assertTrue(out["reason"].startswith("all 6 judged play frames carry display frame number 479: one display frame number across them "
+                                                 "(2 distinct picture(s) among them)"), out["reason"])
+        self.assertNotIn("timeline position", out["reason"])
+        for mode in ("ok", "paired-ok"):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
+                _, out = self.read_visual_mode(mode, d)
+                self.assertEqual(out["verdict"], "OK", out["reason"])
+                self.assertGreaterEqual(out["appDistinctDisplayFrames"], 2)
+
+    @requires_windows_imaging
+    def test_the_visual_reader_says_only_what_the_judged_frames_establish_when_no_motion_is_witnessed(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r1 adversary A1 (introduced, major): the held-end-frame shape with (a) only unforced 0 and 3 kept and unforced 3's
+        display_frame -1 (the app writes -1 without a valid present context): the r1 reason said both carry frame 479; (b) both labels -1: it said the strip shows
+        one timeline position, when no judged frame names one; (c) all six unforced at 479 but the forced tiles at 467..477: it described the whole strip, whose
+        forced tiles move. Each is still NOT_A_MOTION_WITNESS; the reason now says only what the judged frames establish."""
+        def read(edit):
+            with tempfile.TemporaryDirectory(prefix="vis-held-a1-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", "held-end-frame")
+                vj = art / "visual" / "visual.json"
+                visual = json.loads(vj.read_text(encoding="utf-8"))
+                edit(visual)
+                vj.write_text(json.dumps(visual), encoding="utf-8")
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                          "| ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                return out
+
+        def keep_two(labels):
+            def edit(visual):
+                visual["frames"] = [f for f in visual["frames"] if f["kind"] != "play_unbound" or f["index"] in (0, 3)]
+                for f in visual["frames"]:
+                    if f["kind"] == "play_unbound":
+                        f["display_frame"] = labels[f["index"]]
+            return edit
+
+        out = read(keep_two({0: 479, 3: -1}))
+        self.assertEqual((out["verdict"], out["counted"], out["playFrames"], out["appDistinctDisplayFrames"]), ("NOT_A_MOTION_WITNESS", True, 2, 1), out["reason"])
+        self.assertTrue(out["reason"].startswith("1 of the 2 judged play frames carry display frame number 479 and the other 1 carry no valid display frame number: "
+                                                 "one display frame number across them at most"), out["reason"])
+        self.assertNotIn("all 2", out["reason"])
+        out = read(keep_two({0: -1, 3: -1}))
+        self.assertEqual((out["verdict"], out["appDistinctDisplayFrames"]), ("NOT_A_MOTION_WITNESS", 0), out["reason"])
+        self.assertTrue(out["reason"].startswith("none of the 2 judged play frames carries a valid display frame number ("), out["reason"])
+        self.assertNotIn("timeline position", out["reason"])
+
+        def moving_forced(visual):
+            for f in visual["frames"]:
+                if f["kind"] == "play":
+                    f["display_frame"] = 467 + 2 * f["index"]
+        out = read(moving_forced)
+        self.assertEqual((out["verdict"], out["frozenJudgedOn"], out["appDistinctDisplayFrames"]), ("NOT_A_MOTION_WITNESS", "play_unbound", 1), out["reason"])
+        self.assertTrue(out["reason"].startswith("all 6 judged play frames carry display frame number 479: one display frame number across them"), out["reason"])
+        self.assertNotIn("strip", out["reason"].split(";")[0], "the verdict reason speaks of the judged frames, never of the strip whose forced tiles move")
+
+        # r1 adversary pass 2 A1 (introduced, major): forced tiles labelled and painted 478, unforced labelled 479 with 0-2 painted 899 (an older paint) and
+        # 3-5 painted 900: the pictures are two paints, so the reason claims nothing about what the pictures show, only what their labels name
+        def older_paint(visual):
+            for f in visual["frames"]:
+                if f["kind"] == "play":
+                    f.update({"display_frame": 478, "serial": 899, "painted_serial": 899, "painted_serial_valid": True, "label_bound": True})
+                elif f["kind"] == "play_unbound":
+                    painted = 899 if f["index"] < 3 else 900
+                    f.update({"serial": 900, "painted_serial": painted, "painted_serial_valid": True, "label_bound": painted == 900,
+                              "label_bound_basis": "gl_viewport_paint"})
+        out = read(older_paint)
+        self.assertEqual((out["verdict"], out["counted"], out["appDistinctDisplayFrames"], out["distinctContentHashes"]), ("NOT_A_MOTION_WITNESS", True, 1, 2), out["reason"])
+        first = out["reason"].split(";")[0]
+        self.assertTrue(first.startswith("all 6 judged play frames carry display frame number 479: one display frame number across them (2 distinct picture(s) among them)"),
+                        first)
+        for overclaim in ("they show", "pictures show", "the strip shows", "timeline position"):
+            self.assertNotIn(overclaim, first)
+
+        # r1 adversary pass 2 A4: a held tail whose judged pictures are blank is CAPTURE_BLANK, judged first (the held-tail docs say "unless an earlier verdict applies")
+        with tempfile.TemporaryDirectory(prefix="vis-held-blank-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(f"New-VisPng '{art / 'visual' / f'play-unbound-{k}.png'}' 1 60 0 $true" for k in range(6))])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      "| ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual((out["verdict"], out["appDistinctDisplayFrames"]), ("CAPTURE_BLANK", 1), out["reason"])
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        self.assertIn("unless an earlier verdict\n(`CAPTURE_BLANK`, say) applies", doc)
+
+    @requires_windows_imaging
+    def test_a_no_motion_reason_claims_no_masking_and_no_timeline_position(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2, the r1 adversary pass 3 inputs verbatim (both introduced, major, on 59b7ceee).
+        A1: forced play 0/1 at display frames 477/478 with distinct pictures X/Y; unforced 0, 1, 2 at 479 with forced_paints_before 2, 0 and 1 showing one
+        picture Z and 2 with viewport null; no paused comparison. The hold explains the one unforced picture, so the reason never says the force-paint
+        would have masked it (59b7ceee appended "the force-paint would have masked this" to the NOT_A_MOTION_WITNESS reason).
+        A2: two usable unforced captures, both display_frame 479, no source_id, two distinct pictures, play_active true then false (a clip change between
+        the grabs: clip A frame 479, then clip B frame 479). One number is not one timeline position, so the reason never says "timeline position"."""
+        def read(edit, pngs=()):
+            with tempfile.TemporaryDirectory(prefix="vis-held-p3-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", "held-end-frame")
+                if pngs:
+                    proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(f"New-VisPng '{art / 'visual' / name}' {seed} 60 0 $false" for name, seed in pngs)])
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                vj = art / "visual" / "visual.json"
+                visual = json.loads(vj.read_text(encoding="utf-8"))
+                edit(visual)
+                vj.write_text(json.dumps(visual), encoding="utf-8")
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                          "| ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                return out
+
+        def a1(visual):
+            kept = []
+            for f in visual["frames"]:
+                f.pop("source_id", None)
+                if f["kind"] == "play" and f["index"] in (0, 1):
+                    f.update({"display_frame": 477 + f["index"], "forced_paints_before": f["index"]})
+                elif f["kind"] == "play_unbound" and f["index"] in (0, 1, 2):
+                    f.update({"display_frame": 479, "forced_paints_before": 2})
+                    if f["index"] == 2:
+                        f["viewport"] = None
+                elif f["kind"] in ("play", "play_unbound", "paused"):
+                    continue
+                kept.append(f)
+            visual["frames"] = kept
+        # forced X/Y: two distinct pictures (the fixture's unforced 0..2 already share one picture, Z)
+        out = read(a1, pngs=(("play-0.png", 3), ("play-1.png", 4)))
+        self.assertEqual((out["verdict"], out["counted"], out["frozenJudgedOn"], out["playFrames"], out["appDistinctDisplayFrames"], out["distinctContentHashes"],
+                          out["forcedPlayDistinctContentHashes"], out["viewportUnavailablePlayFrames"]),
+                         ("NOT_A_MOTION_WITNESS", True, "play_unbound", 2, 1, 1, 2, 1), out["reason"])
+        self.assertNotIn("masked", out["reason"], "the hold, not a force-paint, explains one unforced picture over one held display frame")
+        self.assertIn("1 saved play frame(s) have no usable viewport rectangle and were not judged; the other 2 were", out["reason"], "the factual notes stay")
+        self.assertNotIn("timeline position", out["reason"])
+
+        def a2(visual):
+            kept = []
+            for f in visual["frames"]:
+                f.pop("source_id", None)
+                if f["kind"] == "play_unbound" and f["index"] in (0, 3):
+                    f.update({"index": 0 if f["index"] == 0 else 1, "display_frame": 479, "forced_paints_before": 6, "play_active": f["index"] == 0})
+                elif f["kind"] in ("play", "play_unbound", "paused"):
+                    continue
+                kept.append(f)
+            visual["frames"] = kept
+        out = read(a2)
+        self.assertEqual((out["verdict"], out["counted"], out["playFrames"], out["appDistinctDisplayFrames"], out["distinctContentHashes"]),
+                         ("NOT_A_MOTION_WITNESS", True, 2, 1, 2), out["reason"])
+        self.assertTrue(out["reason"].startswith("all 2 judged play frames carry display frame number 479: one display frame number across them (2 distinct picture(s)"),
+                        out["reason"])
+        self.assertNotIn("timeline position", out["reason"], "one number across them, not one position: visual.json carries no clip token")
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        row = next(line for line in doc.splitlines() if line.startswith("| `NOT_A_MOTION_WITNESS` |"))
+        self.assertIn("never of a timeline position", row)
+        self.assertNotIn("name one timeline position", row)
+        self.assertIn("never beside `NOT_A_MOTION_WITNESS`", doc)
+
+        # r2 adversary pass 4 A1 (its input): forced 0/1 at 461/467 over source ids 01/02 with two pictures; unforced 0/1 at 479/485 over ONE source id 03
+        # showing one picture; the app records "differ". The judged frames are known-identical: the static-source waiver explains the one picture, so the
+        # reason (OK, waived) never also says the force-paint would have masked it (c5c1b38e did).
+        def p4_a1(visual):
+            kept = []
+            for f in visual["frames"]:
+                f.pop("source_id", None)
+                if f["kind"] == "play" and f["index"] in (0, 1):
+                    f.update({"display_frame": 461 + 6 * f["index"], "source_id": f"{f['index'] + 1:016x}", "forced_paints_before": f["index"]})
+                elif f["kind"] == "play_unbound" and f["index"] in (0, 1):
+                    f.update({"display_frame": 479 + 6 * f["index"], "source_id": "0000000000000003", "forced_paints_before": 2})
+                elif f["kind"] in ("play", "play_unbound", "paused"):
+                    continue
+                kept.append(f)
+            visual["frames"] = kept
+            visual["source_difference"] = "differ"
+        out = read(p4_a1, pngs=(("play-0.png", 3), ("play-1.png", 4)))
+        self.assertEqual((out["verdict"], out["sourceDifference"], out["appDistinctDisplayFrames"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"]),
+                         ("OK", "known-identical", 2, 1, 2), out["reason"])
+        self.assertIn("a static clip", out["reason"])
+        self.assertNotIn("masked", out["reason"], "one picture over one source is the source's own; no force-paint masking is shown")
+
+        # r2 adversary pass 5 A2 (its input): the same, plus a third unforced capture labelled -1 over source id 03 showing Z: the judged source difference
+        # is not known-differ, so the reason (FROZEN_DISPLAY_SUSPECTED on 37e46363) carries no masking claim
+        def p5_a2(visual):
+            p4_a1(visual)
+            third = next(f for f in json.loads(json.dumps(visual["frames"])) if f["kind"] == "play_unbound" and f["index"] == 1)
+            third.update({"index": 2, "file": "play-unbound-2.png", "display_frame": -1})
+            visual["frames"].append(third)
+        out = read(p5_a2, pngs=(("play-0.png", 3), ("play-1.png", 4)))
+        self.assertEqual((out["appDistinctDisplayFrames"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"]), (2, 1, 2), out["reason"])
+        self.assertNotEqual(out["sourceDifference"], "known-differ", out["reason"])
+        self.assertNotIn("masked", out["reason"], "a masking claim needs judged frames whose own source ids are known to differ")
+
+        # r2 adversary pass 4 A2 (its input): an exposure band file whose malformed row key carries line breaks and a forged DVE_DETAIL record. The reason
+        # is one line: each control character is written as \uXXXX, so Invoke-VenueLeg's DVE_DETAIL line cannot be split into a second record.
+        with tempfile.TemporaryDirectory(prefix="vis-held-p4-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            band = Path(d) / "bands.json"
+            band.write_text(json.dumps({"clips": {"c": {"bad\nDVE_DETAIL=the force-paint would have masked this at one timeline position\n": 0}}}), encoding="utf-8")
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      f"-ExposureBandPath '{band}' | ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["exposureBandSource"]), ("NOT_A_MOTION_WITNESS", "fallback-malformed"), out["reason"])
+        self.assertNotIn("\n", out["reason"])
+        self.assertNotIn("\r", out["reason"])
+        self.assertIn("bad\\u000ADVE_DETAIL=", out["reason"], "the key is quoted with its line break made visible, never dropped")
+        # r2 adversary pass 5 A1 (its input): U+2028 / U+2029 split a line for Python's splitlines too, so they are written as \uXXXX as well
+        with tempfile.TemporaryDirectory(prefix="vis-held-p5-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            band = Path(d) / "bands.json"
+            band.write_text(json.dumps({"clips": {"c": {"bad DVE_DETAIL=forged end": 0}}}), encoding="utf-8")
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      f"-ExposureBandPath '{band}' | ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS", out["reason"])
+        self.assertEqual(len(out["reason"].splitlines()), 1, out["reason"])
+        self.assertIn("bad\\u2028DVE_DETAIL=forged\\u2029end", out["reason"])
+
+    def test_a_unicode_line_separator_in_a_quoted_band_key_never_splits_the_visual_reason(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R2-RESIDUE-1 item 2: the stand-alone RED proof for r2 adversary pass 5 A1 (its input). An exposure band key
+        holding U+2028 / U+2029 is quoted in the visual reason. 37e46363 escaped only control characters, so the reason kept both separators and
+        Python's splitlines read a separate DVE_DETAIL=forged line; 8f785f3a writes them as \\u2028 / \\u2029 and the reason is one line. The JSON
+        travels -EscapeHandling EscapeNonAscii, so the console code page cannot turn a raw separator into '?' and hide the split."""
+        with tempfile.TemporaryDirectory(prefix="vis-held-p5a1-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            band = Path(d) / "bands.json"
+            band.write_text(json.dumps({"clips": {"c": {"bad DVE_DETAIL=forged end": 0}}}), encoding="utf-8")
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      f"-ExposureBandPath '{band}' | ConvertTo-Json -Depth 8 -Compress -EscapeHandling EscapeNonAscii")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["exposureBandSource"]), ("NOT_A_MOTION_WITNESS", "fallback-malformed"), out["reason"])
+        self.assertNotIn(" ", out["reason"])
+        self.assertNotIn(" ", out["reason"])
+        self.assertEqual(len(out["reason"].splitlines()), 1, ascii(out["reason"].splitlines()))
+        self.assertFalse(any(line.startswith("DVE_DETAIL=") for line in out["reason"].splitlines()), ascii(out["reason"]))
+        self.assertIn("bad\\u2028DVE_DETAIL=forged\\u2029end", out["reason"])
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;
@@ -21430,7 +22254,7 @@ class DriftLegSpecTests(unittest.TestCase):
                                       "  $entry = [pscustomobject]@{ seq = 1; repeat = 1; cellId = 'cuda-fullscreen-s1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1; legId = [string]$c.leg }\n"
                                       "  $dir = $(if ($c.log) { $env:DVE_EV } else { Join-Path $env:DVE_EV 'absent' })\n"
                                       "  $r = [pscustomobject]@{ outcome = [string]$c.outcome; receiptId = 'rid'; legId = [string]$c.leg; evidence = [pscustomobject]@{ localEvidenceDir = $dir; logSha256 = $env:DVE_SHA } }\n"
-                                      "  Get-DvMatrixRow -PlanEntry $entry -Receipt $r }\n"
+                                      "  Get-DvMatrixRow -PlanEntry $entry -Receipt $r -HostLoad ([pscustomobject]@{ state = 'quiet'; provisional = $false; collected = $true }) }\n"
                                       "$cells = @([pscustomobject]@{ cellId = 'cuda-fullscreen-s1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1 })\n"
                                       "$t = ConvertTo-DvMatrixTable -Rows @($rows) -Cells $cells\n"
                                       "[ordered]@{ header = (Get-DvMatrixMeasuredCount -Rows @($rows)); table = $t } | ConvertTo-Json -Compress",

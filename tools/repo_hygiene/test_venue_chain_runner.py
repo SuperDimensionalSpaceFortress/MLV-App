@@ -106,7 +106,24 @@ if ($env:FAKE_LEG_PRELOADS) {
     $edir = Join-Path $root "evidence\$id"; New-Item -ItemType Directory -Force -Path $edir | Out-Null
     $v = $vals[[Math]::Min($n, $vals.Count - 1)]
     if ($v -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $v + '}}') }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: FAKE_LEG_HOSTLOADS per call = the smoke result.json's hostLoad: quiet (default) | cim (collected=false CimException) | none
+    $hls = @(([string]$env:FAKE_LEG_HOSTLOADS) -split ',' | Where-Object { $_ }); $hl = $(if ($hls.Count -gt 0) { $hls[[Math]::Min($n, $hls.Count - 1)] } else { 'quiet' })
+    # r6 (sol r5 B2): expshape = a CIM-failed result.json and, in the receipt slot, a receipt shaped like an export receipt that binds nothing
+    $hlBlock = $(if ($hl -eq 'cim' -or $hl -eq 'expshape') { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true}' } else { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false}' })
+    if ($hl -ne 'none') {
+        $resPath = Join-Path $edir 'result.json'; Set-Content -LiteralPath $resPath -Value ('{"hostLoad":' + $hlBlock + '}')
+        # like the real leg, the receipt binds the smoke result (evidence.resultJsonSha256; adversary-b0c05520.json A1)
+        Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $resPath -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
+    }
+    if ($hl -eq 'expshape') { Set-Content -LiteralPath $rp -Value ('{"schema":"mlv-app/dual-venue-receipt/v1","scale":null,"display":null,"evidence":{},"export":{"format":"prores","receiptSha256":"' + ('0' * 64) + '","verdict":null}}') }
     "DVE_RECEIPT_PATH=$rp"
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (A5): like the real leg, the sha256 of the receipt bytes it wrote. FAKE_LEG_SWAP_RECEIPT=1 then swaps in a quiet
+    # receipt + result.json pair that binds itself (the adversary's input): the chain must read it unknown.
+    "DVE_RECEIPT_SHA256=$((Get-FileHash -LiteralPath $rp -Algorithm SHA256).Hash)"
+    if ($env:FAKE_LEG_SWAP_RECEIPT -eq '1') {
+        $swapRes = Join-Path $edir 'result.json'; Set-Content -LiteralPath $swapRes -Value '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $swapRes -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
+    }
 }
 if ($env:FAKE_LEG_LOG) { Add-Content -LiteralPath $env:FAKE_LEG_LOG -Value ("END {0} {1} {2}" -f [DateTime]::UtcNow.Ticks, $leaf, $PID) }
 # r2: the leg whose spec file name equals FAKE_LEG_FAIL_LEAF dies with FAKE_LEG_FAIL_CODE AFTER printing DVE_OUTCOME=PASS (a crash that leaves a stale verdict line).
@@ -483,6 +500,62 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertEqual(got, [("COOLDOWN_UNMET", 29.6, "COOLDOWN_UNMET"), ("QUIET", 20.2, "QUIET_PRELOAD_OK"), ("QUIET", 43.9, "QUIET_PRELOAD_HIGH")])
         ran = [l for l in self.chain_log(rd) if " RAN " in l]
         self.assertIn("verdict=COOLDOWN_UNMET quietMean=32.0 preLoadMean=29.6 class=COOLDOWN_UNMET", ran[0])
+
+    def test_a_leg_whose_smoke_host_load_is_unknown_is_never_a_counted_class(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: pre-load 5 % on every leg; the first leg's smoke hostLoad was not collected (CimException). RED: QUIET_PRELOAD_OK.
+        rd = self.case / "lane-HL"
+        env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0", FAKE_LEG_HOSTLOADS="cim,quiet,quiet")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["class"], l.get("hostLoadState"), l.get("hostLoadProvisional")) for l in res["legs"]]
+        self.assertEqual(got, [("HOSTLOAD_PROVISIONAL", "unknown", True)] + [("QUIET_PRELOAD_OK", "quiet", False)] * 2)
+        ran = [l for l in self.chain_log(rd) if " RAN " in l]
+        self.assertIn("class=HOSTLOAD_PROVISIONAL hostLoadState=unknown hostLoadProvisional=True", ran[0])
+        self.assertIn("class=QUIET_PRELOAD_OK hostLoadState=quiet hostLoadProvisional=False", ran[1])
+        rid = Path(res["legs"][0]["receipt"]).stem
+        self.assertTrue(any(f"REFERENCE_PROVISIONAL leg={rid} reason=hostload-unknown" in l for l in self.chain_log(rd)), self.chain_log(rd))
+
+    def test_r6_b2_an_export_shaped_receipt_in_a_playback_leg_is_never_a_counted_class(self) -> None:
+        # sol r5 B2, its input: a playback leg (its spec plans no export) whose receipt slot holds the production schema shaped as an export receipt
+        # (scale/display null, prores, 64 zeroes, verdict null, no identity, no playback hashes), a CIM-failed smoke result and pre-load 5.
+        # RED: not-applicable and QUIET_PRELOAD_OK. The exemption now comes only from the planned leg type.
+        rd = self.case / "lane-EXPSHAPE"
+        env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0", FAKE_LEG_HOSTLOADS="expshape,quiet,quiet")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["class"], l.get("hostLoadState"), l.get("hostLoadProvisional")) for l in res["legs"]]
+        self.assertEqual(got, [("HOSTLOAD_PROVISIONAL", "unknown", True)] + [("QUIET_PRELOAD_OK", "quiet", False)] * 2)
+        rid = Path(res["legs"][0]["receipt"]).stem
+        self.assertTrue(any(f"REFERENCE_PROVISIONAL leg={rid} reason=hostload-unknown" in l for l in self.chain_log(rd)), self.chain_log(rd))
+
+    def test_residue_r2_a5_a_receipt_and_result_swapped_in_together_after_the_leg_read_unknown(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2, adversary-07b6a932.json A5, its input: a playback leg with pre-load 5 and an uncollected smoke result prints its
+        # receipt path; then the receipt and result.json are replaced by a quiet pair that binds itself. RED: QUIET_PRELOAD_OK (the chain read the swapped pair).
+        rd = self.case / "lane-SWAP"
+        env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET,QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0,5.0,5.0", FAKE_LEG_HOSTLOADS="cim,cim,cim", FAKE_LEG_SWAP_RECEIPT="1")
+        r = self.run_chain(rd, self.specs, env=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = chain_result(r.stdout)
+        got = [(l["class"], l.get("hostLoadState"), l.get("hostLoadProvisional")) for l in res["legs"]]
+        self.assertEqual(got, [("HOSTLOAD_PROVISIONAL", "unknown", True)] * 3)
+
+    def test_mr1_a4_the_host_load_read_gets_what_is_left_before_the_deadline_not_a_fresh_20_seconds(self) -> None:
+        # adversary-55dcf49e.json A4, its input class: the final leg ends at or past -DeadlineUtc and its result.json read would have a whole fresh 20 s. RED on 55dcf49e: the chain called
+        # Get-VenueLegHostLoad with no -ReadTimeoutSec (the reader's own 20 s default), read the (quiet) result past the deadline and counted the leg QUIET_PRELOAD_OK. Now the read is bounded by
+        # what is left before the deadline (the lease batch's rule): none left, so it is not started and the standing is unknown, provisional, never counted. The control (a deadline far
+        # off) still reads quiet.
+        rd = self.case / "lane-DL"
+        env = self.env(FAKE_QUIET_MODES="QUIET,QUIET,QUIET", FAKE_LEG_PRELOADS="5.0", FAKE_LEG_HOSTLOADS="quiet", FAKE_LEG_SLEEP="14")
+        r = self.run_chain(rd, self.specs[:1], env=env, deadline_sec=10)
+        res = chain_result(r.stdout)
+        ran = [l for l in res["legs"] if l.get("status") == "RAN"]
+        self.assertEqual(len(ran), 1, r.stdout + r.stderr)
+        self.assertEqual((ran[0]["class"], ran[0].get("hostLoadState"), ran[0].get("hostLoadProvisional")), ("HOSTLOAD_PROVISIONAL", "unknown", True), r.stdout)
+        chain = (RUNNER).read_text(encoding="utf-8")
+        # R4-NARROW-1 r2 (adversary-6596e055.json A4): the reader is handed the absolute UTC deadline, never a remainder sampled before a pause
+        self.assertIn("-ExpectReceiptSha256 $receiptSha -ReadTimeoutSec 20.0 -CallDeadlineUtc $deadline", chain)
 
     # BACHELOR-VENUE-FOREIGN-FLOOR-FAST-FAIL-1: Wait-VenueQuiet's FOREIGN_FLOOR early exit prints a typed line and then the same COOLDOWN_UNMET line; the chain must
     # still classify the leg COOLDOWN_UNMET (contended, never counted), never QUIET_PRELOAD_* and never VENUE_QUIET_UNKNOWN.

@@ -52,6 +52,18 @@ public:
             m_firstTime = nowSeconds;
             m_firstFrame = frame;
         }
+        else if( m_rebasePending )
+        {
+            // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the first presentation after a correction (noteRebase). Only its travel
+            // from the corrected frame is credited; a backward step or a repeat from there is neither counted nor booked.
+            if( wrapsCrossed > 0 ) m_wraps += static_cast<uint64_t>( wrapsCrossed );
+            const int64_t distance = static_cast<int64_t>( frame ) + wrapsCrossedWidth - m_lastFrame;
+            if( distance > 0 )
+            {
+                m_advanced += distance;
+                if( wrapsCrossedWidth == 0 && distance > m_maxJump ) m_maxJump = static_cast<int>( distance );
+            }
+        }
         else if( wrapsCrossed > 0 )
         {
             m_wraps += static_cast<uint64_t>( wrapsCrossed );
@@ -74,8 +86,22 @@ public:
         }
         m_lastTime = nowSeconds;
         m_lastFrame = frame;
+        m_rebasePending = false;
         ++m_presented;
     }
+
+    /*! PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 (sol r9 B1 + B2): the engine CORRECTED the timeline's position to \a frame (a
+     *  stale drop-frame start folded into the Loop cut, or clamped onto the cut's last frame) before the presentation that comes
+     *  next. That move is not playback: the baseline resets to \a frame, and the next presentation credits only its travel from
+     *  there. Before the first presentation there is no baseline to move, and nothing happens. */
+    void noteRebase( int frame )
+    {
+        if( m_presented == 0 ) return;
+        m_lastFrame = frame;
+        ++m_rebases;
+        m_rebasePending = true;
+    }
+    uint64_t rebases() const { return m_rebases; }
 
     uint64_t presented() const { return m_presented; }
     int64_t advancedFrames() const { return m_advanced; }
@@ -107,6 +133,8 @@ private:
     uint64_t m_wraps = 0;
     uint64_t m_backward = 0;
     uint64_t m_repeats = 0;
+    uint64_t m_rebases = 0;
+    bool m_rebasePending = false;
     int m_lastFrame = 0;
     int m_firstFrame = 0;
     double m_firstTime = 0.0;
@@ -136,18 +164,35 @@ public:
     void noteSubmitted( uint64_t serial, int frame, int wrapsCrossed, int64_t wrapsCrossedWidth,
                         PlaybackSourceAdvanceTracker &tracker )
     {
+        noteSubmitted( serial, frame, wrapsCrossed, wrapsCrossedWidth, false, 0, tracker );
+    }
+
+    /*! PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the same, where \a rebase says the engine corrected the position to
+     *  \a rebaseFrame before this frame (playback_frame_range::paintCreditHandOff); the credit rebases the tracker there first. */
+    void noteSubmitted( uint64_t serial, int frame, int wrapsCrossed, int64_t wrapsCrossedWidth, bool rebase, int rebaseFrame,
+                        PlaybackSourceAdvanceTracker &tracker )
+    {
         if( m_waiting ) supersede();
         m_frame = frame;
         m_wraps = wrapsCrossed + m_carriedWraps;
-        m_wrapsWidth = wrapsCrossedWidth + m_carriedWrapsWidth;
+        // r1: a NEW rebase drops the carried wrap width (that travel came before the correction) and keeps the carried count; a
+        // pending rebase carried from a superseded or unverified submission stays, the newest rebase frame winning
+        m_wrapsWidth = wrapsCrossedWidth + ( rebase ? 0 : m_carriedWrapsWidth );
+        m_rebase = rebase || m_carriedRebase;
+        m_rebaseFrame = rebase ? rebaseFrame : m_carriedRebaseFrame;
         m_carriedWraps = 0;
         m_carriedWrapsWidth = 0;
+        m_carriedRebase = false;
+        m_carriedRebaseFrame = 0;
         ++m_submitted;
         if( serial == 0 )
         {
             ++m_unverified;
             m_carriedWraps = m_wraps;   // never credited: its wraps go to the next frame that is
             m_carriedWrapsWidth = m_wrapsWidth;
+            m_carriedRebase = m_rebase;   // r1: and so does its rebase
+            m_carriedRebaseFrame = m_rebaseFrame;
+            m_rebase = false;
             return;
         }
         m_serial = serial;
@@ -183,8 +228,10 @@ public:
 private:
     void credit( double nowSeconds, PlaybackSourceAdvanceTracker &tracker )
     {
+        if( m_rebase ) tracker.noteRebase( m_rebaseFrame );   // r1: the correction is a new baseline, never travel
         tracker.notePresented( nowSeconds, m_frame, m_wraps, m_wrapsWidth );
         m_waiting = false;
+        m_rebase = false;
         ++m_credited;
     }
     void supersede()
@@ -193,6 +240,9 @@ private:
         ++m_superseded;
         m_carriedWraps = m_wraps;
         m_carriedWrapsWidth = m_wrapsWidth;
+        m_carriedRebase = m_rebase;   // r1: a correction crossed all the same; the next frame credited rebases there
+        m_carriedRebaseFrame = m_rebaseFrame;
+        m_rebase = false;
     }
 
     bool m_waiting = false;
@@ -202,6 +252,10 @@ private:
     int64_t m_wrapsWidth = 0;
     int m_carriedWraps = 0;
     int64_t m_carriedWrapsWidth = 0;
+    bool m_rebase = false;
+    int m_rebaseFrame = 0;
+    bool m_carriedRebase = false;
+    int m_carriedRebaseFrame = 0;
     bool m_paintedValid = false;
     uint64_t m_paintedSerial = 0;
     double m_paintedTime = 0.0;

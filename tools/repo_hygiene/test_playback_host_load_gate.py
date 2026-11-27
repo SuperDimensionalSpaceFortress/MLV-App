@@ -17,6 +17,7 @@ fixture-driven unit level only. Everything is skipped cleanly when pwsh is not o
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,12 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 
 ROOT = Path(__file__).resolve().parents[2]
 SMOKE_SCRIPT = ROOT / "tools" / "profiling" / "run-release-gui-smoke.ps1"
 COMPARE_SCRIPT = ROOT / "tools" / "profiling" / "compare-release-gui-smoke-ab.ps1"
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): the comparator judges a host-load block by VenueChain.psm1's strict rule; its probe imports the same module.
+VENUE_CHAIN_MODULE = ROOT / "tools" / "profiling" / "dual-venue" / "VenueChain.psm1"
+COMPARE_PREAMBLE = (f"Import-Module '{VENUE_CHAIN_MODULE}' -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal,"
+                    " ConvertFrom-VenueSmokeResultText -DisableNameChecking\n")
+# The shipped smoke writes before/after snapshots with collected = a real boolean (run-release-gui-smoke.ps1); a fully measured block carries them.
+SNAPS = "before = [pscustomobject]@{ collected = $true }; after = [pscustomobject]@{ collected = $true }"
 CUDA_AB_SCRIPT = ROOT / "tools" / "profiling" / "run-release-cuda-playback-ab.ps1"
 COMPARE_MACHINE_PERF_SCRIPT = ROOT / "tools" / "profiling" / "compare-machine-perf.ps1"
 P3_VALIDATION_SCRIPT = ROOT / "tools" / "profiling" / "run-ultramagnus-p3-validation.ps1"
@@ -40,6 +47,9 @@ LOCAL_GPU_CAPABILITY_SCRIPT = ROOT / "tools" / "profiling" / "run-local-gpu-capa
 
 PWSH = shutil.which("pwsh")
 requires_pwsh = unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+# r3 (CI repair of d2b38643): the same guard its sibling suites use (test_dual_venue_evidence.py, test_look_flavor_pair.py) for a test that needs GDI+ (System.Drawing)
+# or the Windows-only dual-venue runner (it splits a leg path on a backslash); on the hosted ubuntu profile those tests are skipped, on this Windows host they run.
+requires_windows_pwsh = unittest.skipIf(PWSH is None or os.name != "nt", "needs pwsh on Windows")
 
 
 def _extract_functions(script: Path, names: list[str]) -> str:
@@ -78,13 +88,15 @@ class _ProbeCase(unittest.TestCase):
 
     script: Path
     functions: list[str]
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6: lines run before the extracted functions (the comparator imports VenueChain.psm1's strict host-load rule at script top)
+    preamble: str = ""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory(prefix="hostload-probe-")
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         self.probe = self.tmp / "probe.ps1"
-        self.probe.write_text(_extract_functions(self.script, self.functions), encoding="utf-8")
+        self.probe.write_text(self.preamble + _extract_functions(self.script, self.functions), encoding="utf-8")
 
     def run_snippet(self, body: str) -> subprocess.CompletedProcess:
         script = self.tmp / "run.ps1"
@@ -1554,11 +1566,204 @@ class GuiSmokeObservedMaxSampleGapGuardExecutesTests(_ProbeCase):
 
 
 @requires_pwsh
+class CompareGuiSmokeAbInconclusiveVerdictTests(_ProbeCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1, its literal): a known-CIM-failed BeforeSmoke (the control) and a quiet AfterSmoke
+    made the host-load refusal join $failures and the comparator returned FAIL. A provisional or unknown leg is now never counted: the
+    verdict is INCONCLUSIVE (never PASS, never FAIL) with the typed line REFERENCE_PROVISIONAL leg=<before|after> reason=hostload-<state>.
+    Row (c): two quiet legs still PASS."""
+
+    script = COMPARE_SCRIPT
+    functions = ["Get-NestedValue", "Get-HostLoadComparisonEvidence", "Get-GuiSmokeAbVerdict"]
+    preamble = COMPARE_PREAMBLE
+    CIM = ("[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'unknown'; reason = 'collection failed: CimException';"
+           " before = [pscustomobject]@{ collected = $false }; after = [pscustomobject]@{ collected = $false } } }")
+    QUIET = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
+
+    def _verdict(self, before: str, after: str, failures: str = "@()") -> subprocess.CompletedProcess:
+        return self.run_snippet(
+            f"$before = {before}\n$after = {after}\n"
+            "$h = Get-HostLoadComparisonEvidence -BeforeSmoke $before -AfterSmoke $after\n"
+            f"$v = Get-GuiSmokeAbVerdict -Failures {failures} -HostLoadEvidence $h.evidence\n"
+            "Write-Host \"VERDICT=$($v.verdict)\"\n"
+            "$v.referenceProvisional | ForEach-Object { Write-Host $_ }\n"
+        )
+
+    def test_a_cim_failed_control_is_inconclusive_with_the_typed_line(self) -> None:
+        proc = self._verdict(self.CIM, self.QUIET)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout)
+        self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-unknown", proc.stdout)
+        self.assertNotIn("leg=after", proc.stdout)
+
+    def test_r6_b1_a_quiet_false_block_beside_an_uncollected_snapshot_is_inconclusive(self) -> None:
+        # sol r5 B1, its input: BeforeSmoke hostLoad {state quiet, provisional false, before.collected=false (CimException), after.collected=true}, AfterSmoke
+        # clean, no other failure -> the comparator returned PASS. The venue reader's rule reads it unknown: INCONCLUSIVE with the typed refusal.
+        uncollected = ("[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null;"
+                       " before = [pscustomobject]@{ collected = $false; error = 'collection failed: CimException' }; after = [pscustomobject]@{ collected = $true } } }")
+        proc = self._verdict(uncollected, self.QUIET)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-unknown", proc.stdout)
+        self.assertNotIn("leg=after", proc.stdout)
+
+    def test_r6_b1_coerced_provisional_and_case_folded_states_are_inconclusive(self) -> None:
+        # sol r5 B1 (and opus r5 H1 / fable key3 A3): provisional=0, provisional=[false], provisional='false' and state 'QUIET' / 'Quiet' read clean.
+        for prov, state in (("0", "'quiet'"), ("@($false)", "'quiet'"), ("'false'", "'quiet'"), ("$false", "'QUIET'"), ("$false", "'Quiet'")):
+            with self.subTest(provisional=prov, state=state):
+                before = f"[pscustomobject]@{{ hostLoad = [pscustomobject]@{{ provisional = {prov}; state = {state}; reason = $null; {SNAPS} }} }}"
+                proc = self._verdict(before, self.QUIET)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-", proc.stdout)
+
+    def test_r6_a1_an_array_wrapped_or_repeated_member_smoke_is_inconclusive(self) -> None:
+        # adversary-de8e3799.json A1, its input: before.hostLoad = [clean] (and a singleton root array, and state exceeded then quiet) read PASS.
+        clean = '{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}'
+        for text in ('{"hostLoad":[' + clean + ']}', '[{"hostLoad":' + clean + '}]',
+                     '{"hostLoad":{"state":"exceeded","state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'):
+            with self.subTest(text=text):
+                proc = self.run_snippet(
+                    f"$t = '{text}'\n$before = $t | ConvertFrom-Json\n$after = {self.QUIET}\n"
+                    "$h = Get-HostLoadComparisonEvidence -BeforeSmoke $before -AfterSmoke $after -BeforeText $t\n"
+                    "$v = Get-GuiSmokeAbVerdict -Failures @() -HostLoadEvidence $h.evidence\n"
+                    "Write-Host \"VERDICT=$($v.verdict)\"\n")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
+        # without text, a hostLoad array member is still refused (it is read as it is, never through the pipeline)
+        proc = self._verdict("('{\"hostLoad\":[" + clean + "]}' | ConvertFrom-Json)", self.QUIET)
+        self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_r6_b1_the_comparator_uses_the_venue_readers_one_rule(self) -> None:
+        # The class guard: the comparator has no second host-load parser; it imports and calls VenueChain.psm1's.
+        text = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("Import-Module (Join-Path $PSScriptRoot 'dual-venue\\VenueChain.psm1') -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal", text)
+        body = _extract_functions(COMPARE_SCRIPT, ["Get-HostLoadComparisonEvidence"])
+        self.assertIn("ConvertFrom-VenueSmokeHostLoad -HostLoad $legHostLoad", body)
+        self.assertNotIn("[bool]$legProvisionalRaw", body, "no [bool] coercion of a declared provisional")
+        self.assertIn("Get-VenueReferenceHostLoadRefusal -LegId $legName -Standing $standing", _extract_functions(COMPARE_SCRIPT, ["Get-GuiSmokeAbVerdict"]))
+        # fable key3 r5 (GUI-SMOKE-AB-INCONCLUSIVE-WITHHOLD-DELTA-1): an INCONCLUSIVE verdict withholds the cross-leg fps deltas
+        self.assertIn("if ($displayComparability.status -ne 'same' -or [string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]::Ordinal)) {", text)
+
+    def _run_comparator(self, before_text: str, after_text: str) -> tuple[subprocess.CompletedProcess, dict | None]:
+        with tempfile.TemporaryDirectory(prefix="gui-ab-entry-") as tmp:
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "out" / "compare.json"
+            before.write_text(before_text, encoding="utf-8", newline="")
+            after.write_text(after_text, encoding="utf-8", newline="")
+            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(COMPARE_SCRIPT),
+                                   "-Before", str(before), "-After", str(after), "-Output", str(out)],
+                                  capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=300)
+            report = json.loads(out.read_text(encoding="utf-8-sig")) if out.is_file() else None
+        return proc, report
+
+    def test_residue_b2_a_case_ambiguous_host_load_member_is_a_typed_inconclusive_not_a_throw(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B2, its catalogue addition): a control JSON object with both hostLoad and HostLoad threw
+        # KeysWithDifferentCasingInJsonString at the entry point's first parse, before the strict reader (which reads those bytes unknown) ran, so the
+        # comparison aborted with no verdict and no report. Now: a typed failure, REFERENCE_PROVISIONAL leg=before, verdict INCONCLUSIVE, exit 1.
+        quiet = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        for name, control in (("null-and-object", '{"hostLoad":null,"HostLoad":{}}'),
+                              ("two-quiet-spellings", '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}},'
+                                                      '"HostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}')):
+            with self.subTest(control=name):
+                proc, report = self._run_comparator(control, quiet)
+                self.assertNotIn("KeysWithDifferentCasing", proc.stderr, proc.stdout + proc.stderr)
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-unknown", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIn("GUI-SMOKE-AB verdict=INCONCLUSIVE", proc.stdout, proc.stdout + proc.stderr)
+                self.assertIsNotNone(report, "the report is written, not aborted")
+                self.assertEqual(report["verdict"], "INCONCLUSIVE")
+                self.assertTrue(any("before smoke JSON could not be parsed" in f for f in report["failures"]), report["failures"])
+
+    def test_adversary_a4_the_same_file_twice_is_read_once_and_refused_in_the_report(self) -> None:
+        # adversary-ac6205bd.json A4: -Before X -After X opened X twice (a lock between the reads aborted the report) and the distinct-path refusal was
+        # never reached. The same path is read once and the report records the same-input refusal.
+        quiet = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        with tempfile.TemporaryDirectory(prefix="gui-ab-same-") as tmp:
+            smoke, out = Path(tmp) / "smoke.json", Path(tmp) / "compare.json"
+            smoke.write_text(quiet, encoding="utf-8", newline="")
+            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(COMPARE_SCRIPT),
+                                   "-Before", str(smoke), "-After", str(smoke), "-Output", str(out)],
+                                  capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=300)
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            report = json.loads(out.read_text(encoding="utf-8-sig"))
+        self.assertTrue(any("same smoke JSON file" in f for f in report["failures"]), report["failures"])
+        # residue r2 (adversary-07b6a932.json A6): "the same file" is the open handle's identity, never the path spelling
+        self.assertIn("$afterSource = Read-SmokeSourceOnce -Path $After -SameFileAs $beforeSource", COMPARE_SCRIPT.read_text(encoding="utf-8"))
+
+    def test_adversary_a5_a_utf16_smoke_result_is_read_by_its_bom(self) -> None:
+        # adversary-ac6205bd.json A5: a valid quiet result saved as UTF-16LE with its BOM was force-decoded as UTF-8 (replacement characters and NULs) and the
+        # before arm read unknown. It is decoded by its BOM now, as Get-Content did, so its host load reads quiet.
+        quiet = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        with tempfile.TemporaryDirectory(prefix="gui-ab-utf16-") as tmp:
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+            before.write_bytes(b"\xff\xfe" + quiet.encode("utf-16-le"))
+            after.write_text(quiet, encoding="utf-8", newline="")
+            proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(COMPARE_SCRIPT),
+                                   "-Before", str(before), "-After", str(after), "-Output", str(out)],
+                                  capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=300)
+            report = json.loads(out.read_text(encoding="utf-8-sig"))
+        self.assertEqual(report["hostLoadEvidence"]["before"]["state"], "quiet", proc.stdout + proc.stderr)
+        self.assertNotIn("REFERENCE_PROVISIONAL leg=before", proc.stdout)
+        self.assertFalse(any("before smoke JSON could not be parsed" in f for f in report["failures"]), report["failures"])
+        # the venue readers decode receipts, specs and results by their BOM too (ConvertFrom-VenueBomBytes)
+        probe = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                                f"$m = Import-Module '{ROOT / 'tools' / 'profiling' / 'dual-venue' / 'VenueChain.psm1'}' -DisableNameChecking -PassThru; "
+                                "$b = [byte[]](@(0xFF, 0xFE) + [Text.Encoding]::Unicode.GetBytes('{\"legType\":\"export\"}')); "
+                                "Write-Output ('T=' + (& $m { param($x) ConvertFrom-VenueBomBytes $x } $b))"],
+                               capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=120)
+        self.assertIn('T={"legType":"export"}', probe.stdout, probe.stdout + probe.stderr)
+        venue = (ROOT / "tools" / "profiling" / "dual-venue" / "VenueChain.psm1").read_text(encoding="utf-8")
+        self.assertNotIn("[Text.Encoding]::UTF8.GetString($bytes)", venue)
+        self.assertNotIn("[Text.Encoding]::UTF8.GetString($rcBytes)", venue)
+        baseline = (ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
+        # adversary-ac6205bd.json A7: an unclean chain's receipt is never opened for its host load either
+        self.assertIn("$hlReceipt = $(if ($chainClean -and $leg.PSObject.Properties['receipt'] -and $leg.receipt)", baseline)
+
+    def test_residue_b2_the_entry_point_reads_each_smoke_file_once(self) -> None:
+        # sol r6 B2: the entry point opened each smoke file twice (Read-SmokeJson, then ReadAllText), and the evidence binding hashed it a third time,
+        # so a lock taken between the reads aborted the report. One ReadAllBytes (Read-SmokeSourceOnce) now feeds the parse, the strict host-load
+        # reader and the JSON's evidence binding.
+        text = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        main = text[text.index("$beforeSource = Read-SmokeSourceOnce -Path $Before"):]
+        self.assertEqual(main.count("Read-SmokeSourceOnce -Path"), 2)
+        for reread in ("Read-SmokeJson -Path", "[IO.File]::ReadAllText(", "Get-Content -LiteralPath $before", "ConvertFrom-Json -Depth 100"):
+            self.assertNotIn(reread, main, f"the entry point re-reads a smoke file: {reread}")
+        self.assertIn("-JsonPath $beforeJsonPath -JsonSource $beforeSource", main)
+        self.assertIn("-JsonPath $afterJsonPath -JsonSource $afterSource", main)
+        once = _extract_functions(COMPARE_SCRIPT, ["Read-SmokeSourceOnce"])
+        # residue r2 (A6): the one read is the open handle whose identity was judged (FileStream + CopyTo), never a second open by path
+        self.assertEqual(once.count("[IO.FileStream]::new("), 1)
+        self.assertEqual(once.count("$stream.CopyTo("), 1)
+        self.assertNotIn("[IO.File]::ReadAllBytes(", once)
+
+    def test_a_missing_or_exceeded_block_is_inconclusive_even_beside_other_failures(self) -> None:
+        exceeded ="[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'exceeded'; reason = 'loaded'; " + SNAPS + " } }"
+        proc = self._verdict("[pscustomobject]@{ }", exceeded, failures="@('before smoke did not independently pass validation.')")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("VERDICT=INCONCLUSIVE", proc.stdout, "never FAIL: a provisional comparison is no regression signal")
+        self.assertIn("REFERENCE_PROVISIONAL leg=before reason=hostload-unknown", proc.stdout)
+        self.assertIn("REFERENCE_PROVISIONAL leg=after reason=hostload-exceeded", proc.stdout)
+
+    def test_c_two_quiet_legs_still_pass_and_a_real_failure_still_fails(self) -> None:
+        proc = self._verdict(self.QUIET, self.QUIET)
+        self.assertIn("VERDICT=PASS", proc.stdout, proc.stdout + proc.stderr)
+        self.assertNotIn("REFERENCE_PROVISIONAL", proc.stdout)
+        proc = self._verdict(self.QUIET, self.QUIET, failures="@('after smoke did not present at least two frames.')")
+        self.assertIn("VERDICT=FAIL", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_the_script_takes_its_verdict_from_the_shared_function_and_no_longer_fails_on_host_load(self) -> None:
+        text = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("$abVerdict = Get-GuiSmokeAbVerdict -Failures $failures -HostLoadEvidence $hostLoadEvidence", text)
+        self.assertIn("verdict = $abVerdict.verdict", text)
+        self.assertNotIn("$failures += @($hostLoadComparison.failures)", text, "a host-load refusal must not read FAIL")
+
+
+@requires_pwsh
 class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
     """tools/profiling/compare-release-gui-smoke-ab.ps1's Get-HostLoadComparisonEvidence."""
 
     script = COMPARE_SCRIPT
     functions = ["Get-NestedValue", "Get-HostLoadComparisonEvidence"]
+    preamble = COMPARE_PREAMBLE
 
     def _compare(self, before: str, after: str) -> subprocess.CompletedProcess:
         return self.run_snippet(
@@ -1572,14 +1777,14 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
         )
 
     def test_two_quiet_legs_are_compared(self) -> None:
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(quiet, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("FAILURES=0", proc.stdout)
 
     def test_provisional_leg_vs_nonprovisional_leg_is_refused(self) -> None:
         exceeded = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $true; state = 'exceeded'; reason = 'CPU 96% on before' } }"
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(exceeded, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("FAILURES=0", proc.stdout)
@@ -1597,7 +1802,7 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
     def test_missing_hostload_field_reads_as_unknown_not_quiet(self) -> None:
         # A run recorded before this gate existed (or an old schema) never measured load.
         legacy = "[pscustomobject]@{ schema = 'mlvapp-gui-smoke-result.v2' }"
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(legacy, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("BEFORE_STATE=unknown", proc.stdout)
@@ -1608,7 +1813,7 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
         # degenerate/partial write, or a future schema drift) must not coerce [bool]$null to
         # $false and read as clean -- that is fail-toward-clean, backwards from this gate.
         degenerate = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ state = 'exceeded' } }"
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(degenerate, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("FAILURES=0", proc.stdout)
@@ -1621,7 +1826,7 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
         # provisional=false paired with a missing state read as an inconsistent, clean-reading
         # combination. state=unknown must now always force provisional=true.
         inconsistent = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false } }"
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(inconsistent, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("BEFORE_STATE=unknown", proc.stdout)
@@ -1633,8 +1838,8 @@ class CompareGuiSmokeAbHostLoadRefusalTests(_ProbeCase):
         # exceeded/false leg previously read clean here -- only state=="unknown" forced
         # provisional=true, so state=="exceeded" alongside provisional=false fell through as
         # FAILURES=0. Clean now requires state=="quiet" AND provisional==false.
-        contradictory = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'exceeded'; reason = 'CPU 96%' } }"
-        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null } }"
+        contradictory = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'exceeded'; reason = 'CPU 96%'; " + SNAPS + " } }"
+        quiet = "[pscustomobject]@{ hostLoad = [pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " } }"
         proc = self._compare(contradictory, quiet)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("BEFORE_STATE=exceeded", proc.stdout)
@@ -1674,8 +1879,9 @@ class SmokeSummaryHostLoadFieldsTests(_ProbeCase):
         self.assertIn("STATE=unknown", proc.stdout)
 
     def test_well_formed_quiet_hostload_reads_through_untouched(self) -> None:
+        # residue r1 (sol r6 B1): a well-formed quiet block carries its collected snapshots (the smoke always writes them)
         proc = self._fields(
-            "[pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null }"
+            "[pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " }"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("PROVISIONAL=False STATE=quiet", proc.stdout)
@@ -1695,6 +1901,107 @@ class SmokeSummaryHostLoadFieldsTests(_ProbeCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("PROVISIONAL=True STATE=exceeded", proc.stdout)
 
+    def test_residue_b1_uncollected_coerced_and_case_folded_blocks_are_provisional(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1, its catalogue addition): state quiet, provisional false, before.collected=false
+        # (CimException), after.collected=true read quiet/false here, so the A/B control produced no host-load refusal and its speed was evaluated.
+        # Also provisional 0 / [false] / 'false' and state 'QUIET'. Each is provisional; only the strict quiet block (SNAPS) is clean.
+        cases = {
+            "uncollected": "[pscustomobject]@{ provisional = $false; state = 'quiet'; before = [pscustomobject]@{ collected = $false; error = 'collection failed: CimException' }; after = [pscustomobject]@{ collected = $true } }",
+            "no-snapshots": "[pscustomobject]@{ provisional = $false; state = 'quiet' }",
+            "collected-1": "[pscustomobject]@{ provisional = $false; state = 'quiet'; before = [pscustomobject]@{ collected = 1 }; after = [pscustomobject]@{ collected = $true } }",
+            "zero": "[pscustomobject]@{ provisional = 0; state = 'quiet'; " + SNAPS + " }",
+            "array": "[pscustomobject]@{ provisional = @($false); state = 'quiet'; " + SNAPS + " }",
+            "string": "[pscustomobject]@{ provisional = 'false'; state = 'quiet'; " + SNAPS + " }",
+            "upper": "[pscustomobject]@{ provisional = $false; state = 'QUIET'; " + SNAPS + " }",
+            # adversary-ac6205bd.json A1: an uncollected interior sample, a null during and a during that is not a list
+            "during-uncollected": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = @([pscustomobject]@{ collected = $false }) }",
+            "during-null": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = $null }",
+            "during-object": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = [pscustomobject]@{ collected = $true } }",
+        }
+        for name, block in cases.items():
+            with self.subTest(case=name):
+                proc = self._fields(block)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("PROVISIONAL=True", proc.stdout, (name, proc.stdout))
+        proc = self._fields("[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = @([pscustomobject]@{ collected = $true }) }")
+        self.assertIn("PROVISIONAL=False", proc.stdout, "a collected during list is still clean")
+
+    def test_adversary_a2_the_smoke_text_is_judged_by_the_venue_reader_and_read_without_unrolling(self) -> None:
+        # adversary-ac6205bd.json A2: a singleton root array or a repeated member (before {"collected":false,"collected":true}) was parsed into a clean
+        # object (ConvertFrom-Json unrolls the root and keeps the last duplicate). Read-SmokeSummary now parses with -NoEnumerate and also judges the TEXT
+        # with VenueChain.psm1 ConvertFrom-VenueSmokeResultText; a standing it does not read clean makes the leg provisional and uncollected.
+        source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
+        body = _extract_functions(CUDA_AB_SCRIPT, ["Read-SmokeSummary"])
+        self.assertIn("$json = ConvertFrom-Json -InputObject $smokeText -Depth 100 -NoEnumerate", body)
+        self.assertIn("$textStanding = ConvertFrom-VenueSmokeResultText -Text $smokeText", body)
+        self.assertIn("if ($textProvisional) {", body)
+        self.assertNotIn("Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json", body)
+        self.assertIn("-Function ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember", source)
+        clean = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        dup = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":false,"collected":true},"after":{"collected":true}}}'
+        proc = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                               f"Import-Module '{ROOT / 'tools' / 'profiling' / 'dual-venue' / 'VenueChain.psm1'}' -DisableNameChecking; "
+                               f"foreach ($t in @('[{clean}]', '{dup}', '{clean}')) {{ $s = ConvertFrom-VenueSmokeResultText -Text $t; Write-Output ('S=' + $s.state + ',' + $s.provisional) }}"],
+                              capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=120)
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("S=")], ["S=unknown,True", "S=unknown,True", "S=quiet,False"], proc.stdout + proc.stderr)
+        p3 = P3_VALIDATION_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("$resultTextStanding = ConvertFrom-VenueSmokeResultText -Text $resultText", p3)
+        self.assertIn("$result = ConvertFrom-Json -InputObject $resultText -NoEnumerate", p3)
+        self.assertIn("Find-VenueJsonDuplicateMember -Text $summaryText -All", p3, "an imported P3 packet that repeats a member is refused")
+        self.assertIn("Find-VenueJsonDuplicateMember -Text $raw -All", COMPARE_MACHINE_PERF_SCRIPT.read_text(encoding="utf-8"))
+        self.assertIn("Find-VenueJsonDuplicateMember -Text $summaryText -All", CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8"))
+
+
+@requires_pwsh
+class CudaAbHostLoadProofFailuresStrictTests(_ProbeCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): run-release-cuda-playback-ab.ps1's Get-HostLoadProofFailures (the A/B proof's host-load
+    refusal, and since r1 the guard in front of the -RequireCandidateImprovesPresentedFps comparison) reads each leg summary through the ONE strict
+    predicate: hostLoadState exactly 'quiet', hostLoadProvisional a real [bool] $false, hostLoadCollected a real [bool] $true. A truthy test of the flag
+    let provisional 0 / [false] and an uncollected control through, and the speed comparison was evaluated on it."""
+
+    script = CUDA_AB_SCRIPT
+    functions = ["Get-HostLoadProofFailures"]
+    CLEAN = "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }"
+
+    def _failures(self, baseline: str) -> subprocess.CompletedProcess:
+        return self.run_snippet(
+            f"$b = {baseline}\n$c = {self.CLEAN}\n"
+            "$f = @(Get-HostLoadProofFailures -BaselineSummary $b -CandidateSummary $c)\n"
+            "Write-Host \"COUNT=$($f.Count)\"\n"
+            "$f | ForEach-Object { Write-Host $_ }\n"
+        )
+
+    def test_a_clean_pair_has_no_refusal(self) -> None:
+        proc = self._failures(self.CLEAN)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("COUNT=0", proc.stdout)
+
+    def test_residue_b1_an_uncollected_coerced_or_case_folded_control_is_refused(self) -> None:
+        cases = {
+            "uncollected": "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $false }",
+            "no-collected": "[pscustomobject]@{ hostLoadState = 'quiet'; hostLoadProvisional = $false }",
+            "upper": "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'QUIET'; hostLoadCollected = $true }",
+            "zero": "[pscustomobject]@{ hostLoadProvisional = 0; hostLoadState = 'quiet'; hostLoadCollected = $true }",
+            "array": "[pscustomobject]@{ hostLoadProvisional = @($false); hostLoadState = 'quiet'; hostLoadCollected = $true }",
+        }
+        for name, leg in cases.items():
+            with self.subTest(case=name):
+                proc = self._failures(leg)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("COUNT=1", proc.stdout, (name, proc.stdout))
+                self.assertIn("baseline-host-load-provisional", proc.stdout)
+
+    def test_residue_b1_the_speed_comparison_is_guarded_by_the_same_strict_refusal(self) -> None:
+        source = CUDA_AB_SCRIPT.read_text(encoding="utf-8")
+        block_start = source.index("if ($RequireCandidateImprovesPresentedFps) {")
+        block = source[block_start:source.index("\n}\n", block_start)]
+        guard = block.index("Get-HostLoadProofFailures -BaselineSummary $baselineSummary -CandidateSummary $candidateForSpeed")
+        self.assertLess(guard, block.index("$candidateFps -le $baselineFps"))
+        self.assertNotIn("if ($baselineSummary.hostLoadProvisional -or", block, "no truthy test of the flag guards the comparison")
+        # the summary carries the collected bit the strict predicate needs
+        self.assertIn("hostLoadCollected = $hostLoadCollected", source)
+        self.assertIn("$hostLoadCollected = $hostLoadFields.collected", source)
+
 
 @requires_pwsh
 class CudaPlaybackAbHostLoadGateTests(_ProbeCase):
@@ -1708,7 +2015,9 @@ class CudaPlaybackAbHostLoadGateTests(_ProbeCase):
         provisional_literal = "$true" if provisional else "$false"
         return (
             "[pscustomobject]@{ hostLoadProvisional = " + provisional_literal +
-            "; hostLoadState = '" + state + "'; hostLoadReason = " + reason_literal + " }"
+            "; hostLoadState = '" + state + "'; hostLoadReason = " + reason_literal +
+            # residue r1 (sol r6 B1): Read-SmokeSummary now carries the collected bit the strict predicate needs
+            "; hostLoadCollected = $true }"
         )
 
     def test_all_quiet_legs_pass_the_gate(self) -> None:
@@ -1838,7 +2147,7 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         provisional_literal = "$true" if provisional else "$false"
         return (
             "[pscustomobject]@{ hostLoadProvisional = " + provisional_literal +
-            "; hostLoadState = '" + resolved_state + "' }"
+            "; hostLoadState = '" + resolved_state + "'; hostLoadCollected = $true }"
         )
 
     def _record(self, baseline_provisional: bool, candidate_provisional: bool, fps_delta_pct: float = -40.0) -> str:
@@ -1979,7 +2288,7 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         provisional_literal = "$true" if provisional else "$false"
         return (
             "[pscustomobject]@{ hostLoadProvisional = " + provisional_literal +
-            "; hostLoadState = '" + resolved_state + "' }"
+            "; hostLoadState = '" + resolved_state + "'; hostLoadCollected = $true }"
         )
 
     def _record(
@@ -2510,7 +2819,50 @@ class HostLoadReaderPredicateCensusTests(unittest.TestCase):
         "run-ultramagnus-p3-validation.ps1": P3_VALIDATION_SCRIPT,
         "summarize-local-cuda-proof.ps1": CUDA_PROOF_SUMMARIZER_SCRIPT,
     }
-    EXPECTED_SITE_COUNT = 6
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): compare-release-gui-smoke-ab.ps1 no longer defines its own predicate; it judges each block with
+    # VenueChain.psm1's ConvertFrom-VenueSmokeHostLoad (the stricter venue rule: collected snapshots too). Five sites remain; the comparator stays in the
+    # scanned set, so a loose predicate re-added there makes the count six and fails here (test_the_gui_ab_comparator_defines_no_predicate_of_its_own).
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the five loose sites are gone. Every reader site is now the ONE strict predicate
+    # (STRICT_PREDICATE_PATTERN: state ordinal 'quiet', provisional a real [bool] $false, collected a real [bool] $true), and the loose shape is
+    # located nowhere. Six strict sites: compare-machine-perf.ps1 (1), run-release-cuda-playback-ab.ps1 (2: Get-HostLoadProofFailures and
+    # Get-SmokeSummaryHostLoadFields), run-ultramagnus-p3-validation.ps1 (2: Get-SmokeSummaryHostLoadFields and the per-clip guard),
+    # summarize-local-cuda-proof.ps1 (1); the GUI comparator still defines none of its own.
+    # adversary-ac6205bd.json A2: +2, the smoke-TEXT standing (VenueChain.psm1 ConvertFrom-VenueSmokeResultText) judged by the same strict line in
+    # run-release-cuda-playback-ab.ps1 Read-SmokeSummary and run-ultramagnus-p3-validation.ps1's per-clip read.
+    EXPECTED_SITE_COUNT = 8
+    # A predicate-site line (comment-stripped): mentions a provisional-named identifier and the 'quiet' literal (either quote).
+    _SITE_LOCATOR_PATTERN = re.compile(r"""^(?=.*[Pp]rovisional)(?=.*['"]quiet['"]).+$""", re.MULTILINE)
+    STRICT_PREDICATE_PATTERN = re.compile(
+        r"-not \(\$(?P<p>[A-Za-z0-9_]*[Pp]rovisional[A-Za-z0-9_]*) -is \[bool\] -and -not \$(?P=p) -and "
+        r"\$(?P<s>[A-Za-z0-9_]*[Ss]tate[A-Za-z0-9_]*) -is \[string\] -and \[string\]::Equals\(\$(?P=s), 'quiet', \[StringComparison\]::Ordinal\) -and "
+        r"\$(?P<c>[A-Za-z0-9_]*[Cc]ollected[A-Za-z0-9_]*) -is \[bool\] -and \$(?P=c)\)"
+    )
+
+    def test_residue_b1_no_reader_keeps_the_loose_predicate_and_every_site_is_strict(self) -> None:
+        sites: list[tuple[str, str]] = []
+        for name, path in self.READER_SCRIPTS.items():
+            code_only = self._strip_comments(path.read_text(encoding="utf-8"))
+            self.assertEqual(self._LOOSE_LOCATOR_PATTERN.findall(code_only), [], f"{name} still has a loose host-load predicate")
+            sites += [(name, line.strip()) for line in self._SITE_LOCATOR_PATTERN.findall(code_only)]
+        self.assertEqual(len(sites), self.EXPECTED_SITE_COUNT, sites)
+        self.assertEqual([s for s in sites if not self.STRICT_PREDICATE_PATTERN.search(s[1])], [], "every reader site is the strict predicate verbatim")
+
+    def test_residue_b1_the_strict_pattern_refuses_each_loose_variant(self) -> None:
+        strict = ("$xProvisional = -not ($xProvisionalRaw -is [bool] -and -not $xProvisionalRaw -and $xStateRaw -is [string] -and "
+                  "[string]::Equals($xStateRaw, 'quiet', [StringComparison]::Ordinal) -and $xCollectedRaw -is [bool] -and $xCollectedRaw)")
+        self.assertRegex(strict, self.STRICT_PREDICATE_PATTERN)
+        self.assertRegex(strict, self._SITE_LOCATOR_PATTERN)
+        for loose in (strict.replace(" -and $xCollectedRaw -is [bool] -and $xCollectedRaw", ""),
+                      strict.replace("[StringComparison]::Ordinal", "[StringComparison]::OrdinalIgnoreCase"),
+                      strict.replace("$xProvisionalRaw -is [bool] -and ", ""),
+                      '$xProvisional = ($xProvisionalDeclared -or $xState -ne "quiet")'):
+            with self.subTest(loose=loose):
+                self.assertIsNone(self.STRICT_PREDICATE_PATTERN.search(loose))
+
+    def test_the_gui_ab_comparator_defines_no_predicate_of_its_own(self) -> None:
+        code_only = self._strip_comments(COMPARE_SCRIPT.read_text(encoding="utf-8"))
+        self.assertEqual(self._LOOSE_LOCATOR_PATTERN.findall(code_only), [])
+        self.assertIn("ConvertFrom-VenueSmokeHostLoad -HostLoad $legHostLoad", code_only)
 
     # A predicate-DEFINING line: mentions a provisional-named identifier, an "-or", and an
     # "-eq"/"-ne" comparison against one of the three host-load state literals, all on the same
@@ -2538,7 +2890,9 @@ class HostLoadReaderPredicateCensusTests(unittest.TestCase):
         matches: list[tuple[str, str]] = []
         for name, path in self.READER_SCRIPTS.items():
             code_only = self._strip_comments(path.read_text(encoding="utf-8"))
-            for line in self._LOOSE_LOCATOR_PATTERN.findall(code_only):
+            # residue r1 (sol r6 B1): the loose round-8 shape is located nowhere; every site is the strict predicate
+            self.assertEqual(self._LOOSE_LOCATOR_PATTERN.findall(code_only), [], name)
+            for line in self._SITE_LOCATOR_PATTERN.findall(code_only):
                 matches.append((name, line.strip()))
         self.assertEqual(
             len(matches), self.EXPECTED_SITE_COUNT,
@@ -2549,7 +2903,7 @@ class HostLoadReaderPredicateCensusTests(unittest.TestCase):
         )
         non_canonical = [
             (name, line) for name, line in matches
-            if not self.CANONICAL_PREDICATE_PATTERN.search(line)
+            if not self.STRICT_PREDICATE_PATTERN.search(line)
         ]
         self.assertEqual(
             non_canonical, [],
@@ -2567,14 +2921,20 @@ class HostLoadReaderPredicateCensusTests(unittest.TestCase):
         drifted = '$provisional = ($provisionalDeclared -or $state -eq "unknown")'
         self.assertRegex(drifted, self._LOOSE_LOCATOR_PATTERN)
         self.assertIsNone(self.CANONICAL_PREDICATE_PATTERN.search(drifted))
+        self.assertIsNone(self.STRICT_PREDICATE_PATTERN.search(drifted))
 
     def test_a_seventh_reader_with_a_fresh_variable_prefix_would_still_be_recognized_as_canonical(self) -> None:
         # Sanity check on the patterns themselves: a synthetic seventh site using a variable-name
-        # prefix that appears nowhere in the real six sites still matches both patterns, proving
-        # this census is not accidentally keyed to the six existing identifier names.
-        synthetic = '$xProvisional = ($xProvisionalDeclared -or $xState -ne "quiet")'
-        self.assertRegex(synthetic, self._LOOSE_LOCATOR_PATTERN)
-        self.assertRegex(synthetic, self.CANONICAL_PREDICATE_PATTERN)
+        # prefix that appears nowhere in the real sites still matches the locator and the strict pattern,
+        # proving this census is not accidentally keyed to the existing identifier names.
+        # residue r1 (sol r6 B1): the round-8 loose shape is still LOCATED (and refused); the strict shape is the canonical one.
+        loose = '$xProvisional = ($xProvisionalDeclared -or $xState -ne "quiet")'
+        self.assertRegex(loose, self._LOOSE_LOCATOR_PATTERN)
+        self.assertIsNone(self.STRICT_PREDICATE_PATTERN.search(loose))
+        synthetic = ("$yProvisional = -not ($yProvisionalRaw -is [bool] -and -not $yProvisionalRaw -and $yStateRaw -is [string] -and "
+                     "[string]::Equals($yStateRaw, 'quiet', [StringComparison]::Ordinal) -and $yCollectedRaw -is [bool] -and $yCollectedRaw)")
+        self.assertRegex(synthetic, self._SITE_LOCATOR_PATTERN)
+        self.assertRegex(synthetic, self.STRICT_PREDICATE_PATTERN)
 
     def test_a_comment_only_mention_is_not_located_as_a_site(self) -> None:
         # Mirrors the row census's comment-stripping guard: a mention of provisional/state/quiet
@@ -2701,6 +3061,8 @@ class CompareMachinePerfP3HostLoadRowTests(_ProbeCase):
             resolved_state = host_load_state if host_load_state is not None else (
                 "exceeded" if host_load_provisional else "quiet")
             extra += f"; hostLoadState = '{resolved_state}'"
+            # residue r1 (sol r6 B1): a P3 clip row carries hostLoadCollected (run-ultramagnus-p3-validation.ps1 writes it)
+            extra += "; hostLoadCollected = $true"
         return (
             "[pscustomobject]@{ "
             f"presentedFps = {presented_fps}; gpuTextureNoReadbackFrames = 10; "
@@ -2790,11 +3152,33 @@ class P3ValidationSmokeSummaryHostLoadFieldsTests(_ProbeCase):
         self.assertIn("PROVISIONAL=True", proc.stdout)
 
     def test_well_formed_quiet_hostload_reads_through_untouched(self) -> None:
+        # residue r1 (sol r6 B1): a well-formed quiet block carries its collected snapshots (the smoke always writes them)
         proc = self._fields(
-            "[pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null }"
+            "[pscustomobject]@{ provisional = $false; state = 'quiet'; reason = $null; " + SNAPS + " }"
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("PROVISIONAL=False STATE=quiet", proc.stdout)
+
+    def test_residue_b1_uncollected_coerced_and_case_folded_blocks_are_provisional(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1, sibling run-ultramagnus-p3-validation.ps1:237-249): the same strict predicate as the
+        # CUDA A/B reader. A singleton-array block is not an object and reads provisional too.
+        cases = {
+            "uncollected": "[pscustomobject]@{ provisional = $false; state = 'quiet'; before = [pscustomobject]@{ collected = $false }; after = [pscustomobject]@{ collected = $true } }",
+            "no-snapshots": "[pscustomobject]@{ provisional = $false; state = 'quiet' }",
+            "zero": "[pscustomobject]@{ provisional = 0; state = 'quiet'; " + SNAPS + " }",
+            "array": "[pscustomobject]@{ provisional = @($false); state = 'quiet'; " + SNAPS + " }",
+            "upper": "[pscustomobject]@{ provisional = $false; state = 'QUIET'; " + SNAPS + " }",
+            "singleton-block": ", @([pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + " })",
+            # adversary-ac6205bd.json A1 (sibling run-ultramagnus-p3-validation.ps1:252)
+            "during-uncollected": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = @([pscustomobject]@{ collected = $false }) }",
+            "during-null": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = $null }",
+            "during-object": "[pscustomobject]@{ provisional = $false; state = 'quiet'; " + SNAPS + "; during = [pscustomobject]@{ collected = $true } }",
+        }
+        for name, block in cases.items():
+            with self.subTest(case=name):
+                proc = self._fields(block)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn("PROVISIONAL=True", proc.stdout, (name, proc.stdout))
 
     def test_provisional_false_with_missing_state_reads_as_provisional_not_clean_unknown(self) -> None:
         # round 4 (sol major): an explicit provisional=false paired with a missing state used to
@@ -2840,7 +3224,8 @@ class P3ValidationSpeedValidatedWiringTests(unittest.TestCase):
             # executed by PowerShell as an attempt to invoke a command literally named "if"
             # (CommandNotFoundException) -- the fix wraps it as a subexpression, "$(if ...)". See
             # P3ValidationHostLoadFieldsAssignmentExecutesTests below for the executable regression.
-            "$(if ($result) { $result.hostLoad } else { $null })"
+            # residue r1 (sol r6 B1): ", $result.hostLoad" so a one-element hostLoad array is passed as it is (not unrolled into a clean object)
+            "$(if ($result) { , $result.hostLoad } else { $null })"
         )
         floor_check_index = source.index('was below hard floor {1:N3} fps."')
         self.assertLess(
@@ -2946,7 +3331,8 @@ class P3ValidationImportIndependentlyChecksHostLoadTests(unittest.TestCase):
         import_speed_start = source.index('if ($isSpeedProof) {\n                $minSpeedFps')
         # round 5: widened from 1800 to fit the state-check addition below the flag-only read.
         # round 8: widened again from 3200 to fit the item-3 canonical-predicate comment.
-        import_speed_block = source[import_speed_start:import_speed_start + 3600]
+        # residue r1: widened from 3600 to fit the strict-predicate lines (sol r6 B1)
+        import_speed_block = source[import_speed_start:import_speed_start + 5200]
         self.assertIn('$clip.PSObject.Properties["hostLoadProvisional"]', import_speed_block)
         self.assertIn("host load was PROVISIONAL or unrecorded", import_speed_block)
         # round 5 (sol BLOCKER): the flag alone is not enough -- hostLoadState must also gate.
@@ -3026,7 +3412,7 @@ class P3ValidationImportSpeedFloorGuardExecutesTests(_ProbeCase):
 
     def test_provisional_false_with_quiet_state_is_accepted(self) -> None:
         # Regression guard: the fix must not turn every clean clip provisional.
-        proc = self._run("[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }")
+        proc = self._run("[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REFUSED=False", proc.stdout)
 
@@ -3122,8 +3508,9 @@ class RequireCandidateImprovesPresentedFpsHostLoadGuardTests(unittest.TestCase):
         block = source[block_start:block_end]
         self.assertIn("hostLoadProvisional", block)
         self.assertIn("candidate-presented-fps-improvement-not-evaluated", block)
+        # residue r1 (sol r6 B1): the guard is the strict Get-HostLoadProofFailures refusal, not a truthy test of the flag
         guard_index = block.index(
-            "if ($baselineSummary.hostLoadProvisional -or $candidateForSpeed.hostLoadProvisional)"
+            "Get-HostLoadProofFailures -BaselineSummary $baselineSummary -CandidateSummary $candidateForSpeed"
         )
         comparison_index = block.index("$candidateFps -le $baselineFps")
         self.assertLess(
@@ -3140,7 +3527,8 @@ class LocalCudaProofSummarizerHostLoadGuardTests(unittest.TestCase):
 
     def test_summarizer_checks_host_load_provisional_independently_of_proof_failures(self) -> None:
         source = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('Get-Field $legEntry.Leg "hostLoadProvisional"', source)
+        # residue r1 (sol r6 B1): read with PSObject.Properties (Get-Field's return unrolled [false])
+        self.assertIn('$legEntry.Leg.PSObject.Properties["hostLoadProvisional"]', source)
         self.assertIn("PLAYBACK_AB_HOST_LOAD_PROVISIONAL", source)
         host_load_guard_index = source.index("$playbackAbHostLoadLegs = @(")
         # "PLAYBACK_PRESENTED_FPS_NOT_IMPROVED" also appears earlier in the file as a reason-code
@@ -3161,9 +3549,11 @@ class LocalCudaProofSummarizerHostLoadGuardTests(unittest.TestCase):
         # LocalCudaProofSummarizerGuardExecutesTests for the executable exceeded/false repro.
         source = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
         host_load_guard_index = source.index("$playbackAbHostLoadLegs = @(")
-        guard_block = source[host_load_guard_index:host_load_guard_index + 1900]
-        self.assertIn('Get-Field $legEntry.Leg "hostLoadState"', guard_block)
-        self.assertIn('$legState -ne "quiet"', guard_block)
+        guard_block = source[host_load_guard_index:host_load_guard_index + 3200]
+        # residue r1 (sol r6 B1): the strict predicate (ordinal 'quiet', real bools, collected)
+        self.assertIn('$legEntry.Leg.PSObject.Properties["hostLoadState"]', guard_block)
+        self.assertIn("[string]::Equals($legStateRaw, 'quiet', [StringComparison]::Ordinal)", guard_block)
+        self.assertIn('$legEntry.Leg.PSObject.Properties["hostLoadCollected"]', guard_block)
 
     def test_fps_not_improved_diagnostic_is_skipped_when_host_load_is_provisional(self) -> None:
         source = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
@@ -3185,7 +3575,7 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
     script = CUDA_PROOF_SUMMARIZER_SCRIPT
     functions = ["Get-Field", "New-Diagnostic", "Add-Diagnostic"]
 
-    START_MARKER = "$playbackAbCandidateLeg = if ($playbackAbComparisonBasis -eq \"candidateSpeed\")"
+    START_MARKER = "$playbackAbCandidateLeg = $playbackAb.candidate\n"
     END_MARKER = (
         "an fps number measured under provisional or unrecorded host load is not a property "
         "of the build."
@@ -3227,15 +3617,15 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
         # for as source text.
         proc = self._run(
             "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'unknown' }",
-            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }",
+            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }",
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REFUSED=True BLOCKERS=1", proc.stdout)
 
     def test_both_legs_quiet_and_non_provisional_are_accepted(self) -> None:
         proc = self._run(
-            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }",
-            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }",
+            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }",
+            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }",
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REFUSED=False BLOCKERS=0", proc.stdout)
@@ -3243,7 +3633,7 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
     def test_missing_state_property_on_either_leg_is_refused(self) -> None:
         proc = self._run(
             "[pscustomobject]@{ hostLoadProvisional = $false }",
-            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }",
+            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }",
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REFUSED=True BLOCKERS=1", proc.stdout)
@@ -3254,7 +3644,7 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
         # hostLoadState=="quiet" AND hostLoadProvisional==false.
         proc = self._run(
             "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'exceeded' }",
-            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet' }",
+            "[pscustomobject]@{ hostLoadProvisional = $false; hostLoadState = 'quiet'; hostLoadCollected = $true }",
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("REFUSED=True BLOCKERS=1", proc.stdout)
@@ -3364,6 +3754,504 @@ class ConsumerSweepUltraMagnusAndLocalGpuCapabilityRowsTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("host_load_provisional", proc.stdout)
         self.assertIn("fps", proc.stdout)
+
+
+def _one_pixel_png(rgb: tuple[int, int, int]) -> bytes:
+    import struct
+    import zlib
+
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(b"\x00" + bytes(rgb))) + chunk(b"IEND", b""))
+
+
+def _run_ps_file(script: Path, *args: str, timeout: int = 300) -> subprocess.CompletedProcess:
+    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(script), *args],
+                          capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=timeout)
+
+
+def _run_ps_command(command: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command],
+                          capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=timeout)
+
+
+def _flat_pwsh_text(text: str) -> str:
+    """A pwsh error as one line of plain text: no ANSI colour codes, and the ErrorView's own line wraps and `|` gutters joined back into single spaces.
+    On the hosted ubuntu profile pwsh colours and wraps an uncaught `throw` message at the console width ("is not strict\\n | JSON"); Windows pwsh did not."""
+    return re.sub(r"\s*\n[\s|]*", " ", re.sub(r"\x1b\[[0-9;]*m", "", text))
+
+
+QUIET_SMOKE = '{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+
+
+# R2-NARROW-1 r2: _extract_report_write_block and _report_write_probe are removed with the handle-held report write they extracted (reverted to master's plain write).
+
+
+@requires_pwsh
+class ResidueR2CudaAbReadSmokeSummaryTests(_ProbeCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2: adversary-07b6a932.json A8 and A9, each fed its own `input`, through the real Read-SmokeSummary."""
+
+    script = CUDA_AB_SCRIPT
+    functions = ["Convert-PlaybackLogLineToObject", "Get-ScopedPlaybackLogLines", "Add-NullableDouble", "Get-AverageOrNull", "Convert-ToNullableDouble",
+                 "Convert-ToNullableInt64", "Get-NestedValue", "Get-SmokeSummaryHostLoadFields", "Read-SmokeSummary"]
+    preamble = f"Import-Module '{VENUE_CHAIN_MODULE}' -Function ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember -DisableNameChecking\n"
+
+    def _summary(self, text: str) -> subprocess.CompletedProcess:
+        smoke = self.tmp / "smoke.json"
+        smoke.write_text(text, encoding="utf-8", newline="")
+        return self.run_snippet(
+            f"$s = Read-SmokeSummary -Path '{smoke}' -ExitCode 0\n"
+            "Write-Host \"PROVISIONAL=$($s.hostLoadProvisional) STATE=$($s.hostLoadState) COLLECTED=$($s.hostLoadCollected) VALID=$($s.validationOk)\"\n"
+            "Write-Host \"REASON=$($s.hostLoadReason)\"\n")
+
+    def test_a8_an_exceeded_fully_collected_run_keeps_collected_true(self) -> None:
+        # A8, its input: an exceeded (provisional) but fully collected host load. RED: collected was overwritten to false because the text was provisional.
+        proc = self._summary('{"hostLoad":{"state":"exceeded","provisional":true,"before":{"collected":true},"during":[],"after":{"collected":true}}}')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PROVISIONAL=True STATE=exceeded COLLECTED=True", proc.stdout, proc.stdout + proc.stderr)
+        # an uncollected snapshot still reads collected false, and the strict quiet block stays clean
+        proc = self._summary('{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":false},"after":{"collected":true}}}')
+        self.assertIn("PROVISIONAL=True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("COLLECTED=False", proc.stdout, proc.stdout + proc.stderr)
+        proc = self._summary(QUIET_SMOKE)
+        self.assertIn("PROVISIONAL=False STATE=quiet COLLECTED=True", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_a9_a_case_ambiguous_smoke_result_is_a_recorded_refusal_not_a_throw(self) -> None:
+        # A9, its input: hostLoad beside HostLoad. RED: ConvertFrom-Json threw KeysWithDifferentCasingInJsonString before the text reader's refusal was recorded.
+        proc = self._summary('{"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}},"HostLoad":{}}')
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("PROVISIONAL=True STATE=unknown COLLECTED=False VALID=False", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("could not be parsed", proc.stdout, proc.stdout + proc.stderr)
+
+
+@requires_pwsh
+class ResidueR2SiblingReaderTests(unittest.TestCase):
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2: adversary-07b6a932.json A2, A3, A4, A6, A7 and the P3 siblings of A8/A9, each fed its own `input`."""
+
+    def test_a2_a_comment_between_repeated_members_is_refused_by_machine_perf_and_the_summarizer(self) -> None:
+        # A2, its input: hostLoadCollected false, a comment, hostLoadCollected true. ConvertFrom-Json accepts it and keeps true; the strict scanner cannot
+        # read it, and that scanner error was swallowed. RED: machine-perf accepted the row, the summarizer summarized it.
+        baseline = '{"hostLoadState":"quiet","hostLoadProvisional":false,"hostLoadCollected":false,/* imported note */"hostLoadCollected":true}'
+        clean = '{"hostLoadState":"quiet","hostLoadProvisional":false,"hostLoadCollected":true}'
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a2-") as tmp:
+            record = Path(tmp) / "ab.json"
+            record.write_text('{"schema":"release-cuda-playback-ab.v1","baseline":' + baseline + ',"candidate":' + clean + '}', encoding="utf-8", newline="")
+            proc = _run_ps_file(COMPARE_MACHINE_PERF_SCRIPT, str(record))
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("is not strict JSON", _flat_pwsh_text(proc.stdout + proc.stderr), proc.stdout + proc.stderr)
+            summary = Path(tmp) / "summary.json"
+            summary.write_text('{"status":"PASS","proof":{"playbackAb":{"baseline":' + baseline + ',"candidate":' + clean + '}}}', encoding="utf-8", newline="")
+            proc = _run_ps_file(CUDA_PROOF_SUMMARIZER_SCRIPT, "-SummaryPath", str(summary))
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("is not strict JSON", _flat_pwsh_text(proc.stdout + proc.stderr), proc.stdout + proc.stderr)
+
+    @requires_windows_pwsh
+    def test_a3_the_planned_leg_type_comes_from_the_planner_never_a_second_read(self) -> None:
+        # A3: the matrix parent and the chain re-read each spec path for its type (a spec swapped between the plan and that read changed it), and the chain sent
+        # its LegSet child no -ExpectSpecSha256. The planner now records plannedLegType from the bytes it hashed; nobody re-reads the path.
+        runner = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
+        proc = _run_ps_command(f"Import-Module '{runner}' -Force -DisableNameChecking; "
+                               f"$p = Get-DvLegSetPlan -LegSetPath '{ROOT / 'tools' / 'profiling' / 'dual-venue' / 'legsets' / 'display-matrix.json'}' -Repeats 1 -Backend ''; "
+                               "foreach ($e in $p.plan) { Write-Output ('T=' + $e.plannedLegType + ' H=' + $e.specSha256.Length) }")
+        types = [l for l in proc.stdout.splitlines() if l.startswith("T=")]
+        self.assertTrue(types, proc.stdout + proc.stderr)
+        self.assertEqual(set(types), {"T=playback H=64"}, proc.stdout + proc.stderr)
+        leg = (ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        chain = (ROOT / "tools" / "profiling" / "dual-venue" / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        self.assertNotIn("Get-VenuePlannedLegType -SpecPath ([string]$pe.specPath)", leg)
+        self.assertNotIn("Get-VenuePlannedLegType -SpecPath ([string]$e.specPath)", chain)
+        self.assertIn("$lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256)", chain)
+
+    def test_a4_an_export_receipt_with_invented_tokens_or_playback_bindings_is_not_an_export_leg(self) -> None:
+        # A4, its inputs: outcome NONEXISTENT with export.verdict NONEXISTENT, visual {requested:true}, a smoke stderr binding; and outcome PASS with a null verdict.
+        # RED: both returned true. The writer's own shapes (a PASS verdict on a PASS receipt; a null verdict on a pre-export INVALID) still do.
+        base = ('"schema":"mlv-app/dual-venue-receipt/v1","scale":null,"display":null,"export":{"format":"prores","receiptSha256":"' + "0" * 64 + '","verdict":%s}')
+        cases = {
+            "invented": '{' + base % '"NONEXISTENT"' + ',"outcome":"NONEXISTENT","visual":{"requested":true},"evidence":{"smokeStderrSha256":"' + "1" * 64 + '"}}',
+            "invented-no-bindings": '{' + base % '"NONEXISTENT"' + ',"outcome":"NONEXISTENT","evidence":{}}',
+            "visual": '{' + base % '"PASS"' + ',"outcome":"PASS","visual":{"requested":true},"evidence":{}}',
+            "stderr": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"smokeStderrSha256":"' + "1" * 64 + '"}}',
+            "pass-null-verdict": '{' + base % 'null' + ',"outcome":"PASS","evidence":{}}',
+            "writer-pass": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{}}',
+            "writer-pre-export": '{' + base % 'null' + ',"outcome":"INVALID","evidence":{}}',
+            "writer-downgraded": '{' + base % '"PASS"' + ',"outcome":"INVALID","evidence":{}}',
+            # adversary-c2bbe5f8.json A7, its input: playback-branch-only bindings (evidenceManifestSha256, artifactIndexPath) on an otherwise export-shaped PASS
+            "manifest-binding": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"evidenceManifestSha256":"' + "b" * 64 + '","artifactIndexPath":"C:\\\\evidence\\\\artifact-index.json"}}',
+            "unknown-binding": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"someNewSha256":"' + "c" * 64 + '"}}',
+            "writer-export-evidence": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"umRunJsonSha256":"' + "d" * 64 + '","summaryJsonSha256":"' + "e" * 64 + '","localEvidenceDir":"C:\\\\ev","umRunOutcome":"PASS","resultJsonSha256":null}}',
+        }
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a4-") as tmp:
+            lines = []
+            for name, text in cases.items():
+                (Path(tmp) / f"{name}.json").write_text(text, encoding="utf-8", newline="")
+                lines.append(f"$rc = Get-Content -Raw -LiteralPath '{Path(tmp) / f'{name}.json'}' | ConvertFrom-Json; Write-Output ('{name}=' + (& $m {{ param($r) Test-VenueReceiptIsExportLeg $r }} $rc))")
+            proc = _run_ps_command(f"$m = Import-Module '{VENUE_CHAIN_MODULE}' -DisableNameChecking -PassThru; " + "; ".join(lines))
+        got = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+        self.assertEqual(got, {"invented": "False", "invented-no-bindings": "False", "visual": "False", "stderr": "False", "pass-null-verdict": "False",
+                               "writer-pass": "True", "writer-pre-export": "True", "writer-downgraded": "True",
+                               "manifest-binding": "False", "unknown-binding": "False", "writer-export-evidence": "True"}, proc.stdout + proc.stderr)
+
+    def test_r2_pass4_static_pins(self) -> None:
+        # adversary-c2bbe5f8.json: A1 (the failure text withholds the screenshot figures), A2 (the report is written through the identity-checked handle),
+        # A3 (a manifest with a null or no artifact is refused), A5 (an unreadable result or summary is a recorded refusal), A8 (identity from the open fd).
+        cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("'Screenshot delta exceeded threshold (figures withheld: the verdict is INCONCLUSIVE).'", cmp)
+        # R2-NARROW-1 r2: the report write is master's own again (Set-Content); the handle-held temporary file and its pins are reverted
+        self.assertNotIn("[IO.FileMode]::OpenOrCreate", cmp)
+        self.assertNotIn("MlvSmokeOwnedFsV1", cmp)
+        self.assertIn("Set-Content -LiteralPath $resolvedOutput", cmp)
+        self.assertIn('$fdPath = "/proc/$PID/fd/$fd"', cmp)
+        p3 = P3_VALIDATION_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('Add-Failure $importFailures "The manifest lists a null artifact entry."', p3)
+        self.assertIn('Add-Failure $importFailures "The manifest lists no artifact; a packet with no checked artifact is not proof."', p3)
+        self.assertIn("try { $summaryText = [string](Get-Content -LiteralPath $summaryPath -Raw) }", p3)
+        self.assertIn('catch { Add-Failure $clipFailures ("The smoke result JSON could not be read: "', p3)
+        cuda = _extract_functions(CUDA_AB_SCRIPT, ["Read-SmokeSummary"])
+        self.assertIn("try { $smokeBytes = [IO.File]::ReadAllBytes($Path) }", cuda)
+
+    @requires_windows_pwsh
+    def test_r2_pass4_a1_the_inconclusive_failure_text_carries_no_screenshot_figure(self) -> None:
+        # adversary-c2bbe5f8.json A1, its input: black and white PNGs, before hostLoad null, -FailOnScreenshotDelta. RED: failures kept meanAbsRgbDelta=255.
+        with tempfile.TemporaryDirectory(prefix="residue-r2-p4a1-") as tmp:
+            black, white = Path(tmp) / "black.png", Path(tmp) / "white.png"
+            black.write_bytes(_one_pixel_png((0, 0, 0)))
+            white.write_bytes(_one_pixel_png((255, 255, 255)))
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+            before.write_text(json.dumps({"hostLoad": None, "screenshot": {"path": str(black)}}), encoding="utf-8", newline="")
+            after.write_text(json.dumps({"hostLoad": json.loads(QUIET_SMOKE)["hostLoad"], "screenshot": {"path": str(white)}}), encoding="utf-8", newline="")
+            proc = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", str(out), "-FailOnScreenshotDelta")
+            report = json.loads(out.read_text(encoding="utf-8-sig")) if out.is_file() else None
+        self.assertIsNotNone(report, proc.stdout + proc.stderr)
+        self.assertEqual(report["verdict"], "INCONCLUSIVE")
+        self.assertFalse(any("meanAbsRgbDelta=" in f or "changedSampleRatio=" in f for f in report["failures"]), report["failures"])
+        self.assertIn("Screenshot delta exceeded threshold (figures withheld: the verdict is INCONCLUSIVE).", report["failures"])
+
+    def test_a4_the_outcome_list_is_the_writers(self) -> None:
+        runner = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
+        proc = _run_ps_command(f"Import-Module '{runner}' -Force -DisableNameChecking; $v = Import-Module '{VENUE_CHAIN_MODULE}' -DisableNameChecking -PassThru; "
+                               "Write-Output ('W=' + ((Get-DvOutcomeEnum) -join ',')); Write-Output ('V=' + ((& $v { $script:VenueReceiptOutcomeEnum }) -join ','))")
+        w = [l[2:] for l in proc.stdout.splitlines() if l.startswith("W=")]
+        v = [l[2:] for l in proc.stdout.splitlines() if l.startswith("V=")]
+        self.assertTrue(w and v, proc.stdout + proc.stderr)
+        self.assertEqual(v, w, "HostLoadReceiptOutcomeEnumParityTests: VenueChain.psm1's outcome list is DualVenueRunner.psm1's $script:OutcomeEnum")
+
+    def _compare(self, before: Path, after: Path, out: Path) -> tuple[subprocess.CompletedProcess, dict | None]:
+        proc = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", str(out))
+        return proc, (json.loads(out.read_text(encoding="utf-8-sig")) if out.is_file() else None)
+
+    def test_a6_a_hard_link_to_the_before_file_is_the_same_file(self) -> None:
+        # A6, its input: -After is a hard link to -Before. RED: the paths differ in spelling, so the one file was opened twice and no same-input refusal fired.
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a6-") as tmp:
+            before, alias, out = Path(tmp) / "before.json", Path(tmp) / "alias.json", Path(tmp) / "compare.json"
+            before.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            os.link(before, alias)
+            proc, report = self._compare(before, alias, out)
+            self.assertIsNotNone(report, proc.stdout + proc.stderr)
+            self.assertTrue(any("same smoke JSON file" in f for f in report["failures"]), report["failures"])
+            # a case variant of one file on a case-insensitive directory is that same file too (on a case-sensitive one, the ubuntu profile, BEFORE.JSON
+            # is no file at all, so there is no case variant to read)
+            if (Path(tmp) / "BEFORE.JSON").exists():
+                out2 = Path(tmp) / "compare2.json"
+                proc, report = self._compare(before, Path(tmp) / "BEFORE.JSON", out2)
+                self.assertTrue(any("same smoke JSON file" in f for f in report["failures"]), report["failures"])
+            # two distinct files are read independently: no same-input refusal and no "paths must be distinct"
+            other, out3 = Path(tmp) / "other.json", Path(tmp) / "compare3.json"
+            other.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            proc, report = self._compare(before, other, out3)
+            self.assertFalse(any("same smoke JSON file" in f or "paths must be distinct" in f for f in report["failures"]), report["failures"])
+        once = _extract_functions(COMPARE_SCRIPT, ["Read-SmokeSourceOnce"])
+        self.assertIn("Get-SmokeFileIdentity -Stream $stream", once)
+        self.assertNotIn("OrdinalIgnoreCase", once)
+
+    @unittest.skipIf(os.name != "nt", "the handle identity is GetFileInformationByHandle on Windows")
+    def test_r2_pass3_a1_the_identity_reads_the_native_volume_serial_and_file_index(self) -> None:
+        # adversary-88890049.json A1: the struct was declared with default alignment, so VolumeSerialNumber was read at offset 32 (SizeHigh: 0) and the index
+        # from the wrong words; two distinct files on two volumes with the same low index collided. RED: the volume part read 00000000, not the volume's serial.
+        with tempfile.TemporaryDirectory(prefix="residue-r2-id-") as tmp:
+            probe = Path(tmp) / "probe.ps1"
+            target = Path(tmp) / "f.json"
+            target.write_text("{}", encoding="utf-8")
+            probe.write_text(_extract_functions(COMPARE_SCRIPT, ["Get-SmokeFileIdentity"]) +
+                             f"$s = [IO.FileStream]::new('{target}', [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)\n"
+                             f"try {{ Write-Output ('ID=' + (Get-SmokeFileIdentity -Stream $s -ResolvedPath '{target}')) }} finally {{ $s.Dispose() }}\n"
+                             "Write-Output ('L=' + [MlvSmokeFileIdentityV2]::VolumeSerialOffset() + ',' + [MlvSmokeFileIdentityV2]::FileIndexHighOffset() + ',' + [MlvSmokeFileIdentityV2]::Size())\n",
+                             encoding="utf-8")
+            proc = _run_ps_file(probe)
+            vol = subprocess.run(["cmd", "/c", "vol", str(target)[:2]], capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=60)
+        ident = [l[3:] for l in proc.stdout.splitlines() if l.startswith("ID=")]
+        self.assertTrue(ident, proc.stdout + proc.stderr)
+        self.assertIn("L=28,44,52", proc.stdout, "the declared layout is the native BY_HANDLE_FILE_INFORMATION layout")
+        serial = re.search(r"([0-9A-F]{4})-([0-9A-F]{4})", vol.stdout)
+        self.assertIsNotNone(serial, vol.stdout + vol.stderr)
+        self.assertEqual(ident[0].split(":")[0], serial.group(1) + serial.group(2), (ident, vol.stdout))
+
+    @requires_windows_pwsh
+    def test_a7_an_inconclusive_comparison_publishes_no_screenshot_delta(self) -> None:
+        # A7, its input: 1x1 screenshots RGB (0,0,0) before and (255,255,255) after, the before host load uncollected, default SampleStep, no FailOnScreenshotDelta.
+        # RED: verdict INCONCLUSIVE but the report kept meanAbsRgbDelta=255 / changedSampleRatio=1 and the summary line printed them.
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a7-") as tmp:
+            black, white = Path(tmp) / "black.png", Path(tmp) / "white.png"
+            black.write_bytes(_one_pixel_png((0, 0, 0)))
+            white.write_bytes(_one_pixel_png((255, 255, 255)))
+            uncollected = '{"state":"quiet","provisional":false,"before":{"collected":false},"after":{"collected":true}}'
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+            before.write_text(json.dumps({"hostLoad": json.loads(uncollected), "screenshot": {"path": str(black)}}), encoding="utf-8", newline="")
+            after.write_text(json.dumps({"hostLoad": json.loads(QUIET_SMOKE)["hostLoad"], "screenshot": {"path": str(white)}}), encoding="utf-8", newline="")
+            proc, report = self._compare(before, after, out)
+        self.assertIsNotNone(report, proc.stdout + proc.stderr)
+        self.assertEqual(report["verdict"], "INCONCLUSIVE")
+        shot = report["screenshot"]
+        self.assertEqual(shot["status"], "withheld-inconclusive", shot)
+        for field in ("meanAbsRgbDelta", "maxAbsRgbDelta", "changedSampleRatio", "sameSha256", "sampledPixels"):
+            self.assertIsNone(shot[field], (field, shot))
+        line = [l for l in proc.stdout.splitlines() if l.startswith("GUI-SMOKE-AB verdict=")]
+        self.assertTrue(line, proc.stdout)
+        self.assertIn("screenshot_status=withheld-inconclusive mean_abs_rgb_delta= changed_sample_ratio= ", line[0])
+
+    def test_r2_a2_the_output_aliases_are_checked_against_the_paths_the_caller_gave(self) -> None:
+        # adversary-b3d61554.json A2, its input: -Before and -After are hard links of one file (read once, so the after SOURCE carries the before path); after the early
+        # check -After is swapped for a hard link to the report. RED: $afterJsonPath came from the source, so the write-time re-read opened before.json twice and the real
+        # -After path was never judged. The two paths now come from the parameters (each resolved on its own).
+        cmp = COMPARE_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("$afterJsonPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($After)", cmp)
+        self.assertIn("$beforeJsonPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Before)", cmp)
+        self.assertNotIn("$afterJsonPath = $afterSource.path", cmp)
+        self.assertNotIn("$beforeJsonPath = $beforeSource.path", cmp)
+        # and end to end: the same file given twice is still refused as same-input with nothing written for the report
+        with tempfile.TemporaryDirectory(prefix="residue-r2-a2-") as tmp:
+            before, after, report = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "report.json"
+            before.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            os.link(before, after)
+            proc = _run_ps_file(COMPARE_SCRIPT, "-Before", str(before), "-After", str(after), "-Output", str(report))
+            text = _flat_pwsh_text(proc.stdout + proc.stderr)
+            self.assertNotIn("Output must not overwrite", text, text)
+            self.assertTrue(report.exists(), text)
+            self.assertIn("same smoke JSON file", report.read_text(encoding="utf-8"))
+
+    @requires_pwsh
+    def test_r4n2_p2_a6_a_smoke_file_the_figure_parser_refused_leaves_no_clean_host_load_standing(self) -> None:
+        # adversary-ac722a96.json A6, its input: Before holds a quiet hostLoad and {"extra":{"x":1,"X":2}} (members differing only in case: the figure parser refuses the text), After a
+        # quiet hostLoad. RED on ac722a96: the strict host-load scan skips a non-hostLoad member, so the refused file still read quiet/collected and the comparison came out FAIL (a
+        # regression-shaped verdict) with no refusal. A source whose text the figure parser refused judges its host load as unknown: INCONCLUSIVE.
+        quiet = json.loads(QUIET_SMOKE)["hostLoad"]
+        with tempfile.TemporaryDirectory(prefix="r4n2-p2a6-") as tmp:
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+            before.write_text('{"hostLoad":' + json.dumps(quiet) + ',"extra":{"x":1,"X":2}}', encoding="utf-8", newline="")
+            after.write_text(json.dumps({"hostLoad": quiet}), encoding="utf-8", newline="")
+            proc, report = self._compare(before, after, out)
+            self.assertIsNotNone(report, proc.stdout + proc.stderr)
+            self.assertEqual(report["verdict"], "INCONCLUSIVE", (report["verdict"], report["failures"]))
+            self.assertEqual(report["hostLoadEvidence"]["before"]["state"], "unknown", report["hostLoadEvidence"])
+            self.assertTrue(report["hostLoadEvidence"]["before"]["provisional"])
+            self.assertFalse(report["hostLoadEvidence"]["after"]["provisional"], "the clean leg still reads clean")
+
+    @requires_pwsh
+    def test_r2n1_pass1_a2_a_smoke_file_the_figure_parser_refused_for_its_depth_leaves_no_clean_host_load_standing(self) -> None:
+        # adversary-baf2e69a.json A2, its input: Before holds a quiet hostLoad and an extra root member of exactly 100 nested arrays (depth 101: ConvertFrom-Json -Depth 100, the figure parser, refuses it), After a
+        # quiet hostLoad. RED on baf2e69a: the text judge (VenueChain's reader, default depth) read the same text quiet/collected, so the refused file kept a clean standing and the verdict was FAIL with no
+        # refusal. A source the figure parser refused never reads clean: its host load is unknown and the comparison INCONCLUSIVE.
+        quiet = json.loads(QUIET_SMOKE)["hostLoad"]
+        deep = 0
+        for _ in range(100):
+            deep = [deep]
+        with tempfile.TemporaryDirectory(prefix="r2n1-p1a2-") as tmp:
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+            before.write_text(json.dumps({"hostLoad": quiet, "extra": deep}), encoding="utf-8", newline="")
+            after.write_text(json.dumps({"hostLoad": quiet}), encoding="utf-8", newline="")
+            proc, report = self._compare(before, after, out)
+            self.assertIsNotNone(report, proc.stdout + proc.stderr)
+            self.assertEqual(report["verdict"], "INCONCLUSIVE", (report["verdict"], report["failures"]))
+            self.assertEqual(report["hostLoadEvidence"]["before"]["state"], "unknown", report["hostLoadEvidence"])
+            self.assertEqual(report["hostLoadEvidence"]["after"]["state"], "quiet", report["hostLoadEvidence"])
+
+    @requires_pwsh
+    def test_r4n2_a7_a_one_element_root_array_is_not_unwrapped_into_a_figure_object(self) -> None:
+        # adversary-6596e055.json A7, its input: Before is [{"playbackFps":{"smokePresentedFps":99},"hostLoad":{...quiet...}}] (a ONE-element root array), After is {}. RED on 077be843: ConvertFrom-Json
+        # unwrapped the singleton into its member, so no parse error was recorded and the report published the invalid root's raw before-FPS 99 beside an INCONCLUSIVE verdict. -NoEnumerate keeps
+        # the array, so the root is refused as "not one object", its figures read empty, and nothing of it is published. A plain object root still publishes its figure.
+        member = '{"playbackFps":{"smokePresentedFps":99},"hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+        for label, text, published in (("one-element-array", "[" + member + "]", None), ("object", member, 99)):
+            with self.subTest(label), tempfile.TemporaryDirectory(prefix="r4n2-a7-") as tmp:
+                before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "compare.json"
+                before.write_text(text, encoding="utf-8", newline="")
+                after.write_text("{}", encoding="utf-8", newline="")
+                proc, report = self._compare(before, after, out)
+                self.assertIsNotNone(report, proc.stdout + proc.stderr)
+                self.assertEqual(report["fps"]["smokePresentedFps"]["before"], published, report["fps"]["smokePresentedFps"])
+                if published is None:
+                    self.assertTrue(any("not one object" in str(f) for f in report["failures"]), report["failures"])
+                    self.assertEqual(report["verdict"], "INCONCLUSIVE")
+        source = _extract_functions(COMPARE_SCRIPT, ["Read-SmokeSourceOnce"])
+        self.assertIn("ConvertFrom-Json -InputObject $parseText -Depth 100 -NoEnumerate", source)
+
+    @requires_pwsh
+    def test_r4n2_a1_plain_paths_still_publish_the_report(self) -> None:
+        # the narrowing refuses only a link component: ordinary distinct paths, and a folder this call creates, still publish
+        with tempfile.TemporaryDirectory(prefix="r4n2-a1ok-") as tmp:
+            before, after, out = Path(tmp) / "before.json", Path(tmp) / "after.json", Path(tmp) / "new" / "deeper" / "report.json"
+            for p in (before, after):
+                p.write_text(QUIET_SMOKE, encoding="utf-8", newline="")
+            proc, report = self._compare(before, after, out)
+            self.assertIsNotNone(report, proc.stdout + proc.stderr)
+
+    def test_r3_a3_a_one_element_candidate_list_is_provisional_not_unrolled_into_its_clean_member(self) -> None:
+        # adversary-7efea617.json A3, its input: candidate = [one clean leg]. RED: `$x = if (...) { $Record.candidate }` unrolled the one-element list into its
+        # member before the list guard, so the member's own clean standing counted and a +50 percent delta was published. A plain assignment keeps the list.
+        functions = _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Get-PlaybackAbLegHostLoadProvisional", "Get-PlaybackAbHostLoadRefusal"])
+        clean = '{"hostLoadState":"quiet","hostLoadProvisional":false,"hostLoadCollected":true}'
+        with tempfile.TemporaryDirectory(prefix="residue-r3-a3-") as tmp:
+            script = Path(tmp) / "refusal.ps1"
+            script.write_text(
+                functions +
+                f"$listed = '{{\"baseline\":{clean},\"candidate\":[{clean}]}}' | ConvertFrom-Json\n"
+                f"$plain = '{{\"baseline\":{clean},\"candidate\":{clean}}}' | ConvertFrom-Json\n"
+                f"$speed = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"x\":1}},\"candidateSpeed\":[{clean}]}}' | ConvertFrom-Json\n"
+                "Write-Output ('LISTED=' + (Get-PlaybackAbHostLoadRefusal -Record $listed).provisional)\n"
+                "Write-Output ('PLAIN=' + (Get-PlaybackAbHostLoadRefusal -Record $plain).provisional)\n"
+                "Write-Output ('SPEED=' + (Get-PlaybackAbHostLoadRefusal -Record $speed).provisional)\n"
+                # adversary-b3d61554.json A6: speedCompare is the comparison basis whatever else is there; no candidateSpeed (absent, null or empty) is no leg: provisional
+                f"$noleg = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"presentedFps\":{{\"baseline\":20,\"candidate\":30}}}}}}' | ConvertFrom-Json\n"
+                f"$nullleg = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"x\":1}},\"candidateSpeed\":null}}' | ConvertFrom-Json\n"
+                f"$emptyleg = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"x\":1}},\"candidateSpeed\":[]}}' | ConvertFrom-Json\n"
+                f"$goodspeed = '{{\"baseline\":{clean},\"candidate\":{clean},\"speedCompare\":{{\"x\":1}},\"candidateSpeed\":{clean}}}' | ConvertFrom-Json\n"
+                "Write-Output ('NOLEG=' + (Get-PlaybackAbHostLoadRefusal -Record $noleg).provisional)\n"
+                "Write-Output ('NULLLEG=' + (Get-PlaybackAbHostLoadRefusal -Record $nullleg).provisional)\n"
+                "Write-Output ('EMPTYLEG=' + (Get-PlaybackAbHostLoadRefusal -Record $emptyleg).provisional)\n"
+                "Write-Output ('GOODSPEED=' + (Get-PlaybackAbHostLoadRefusal -Record $goodspeed).provisional)\n", encoding="utf-8")
+            proc = _run_ps_file(script)
+        self.assertIn("LISTED=True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("PLAIN=False", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("SPEED=True", proc.stdout, proc.stdout + proc.stderr)
+        for name in ("NOLEG", "NULLLEG", "EMPTYLEG"):
+            self.assertIn(f"{name}=True", proc.stdout, proc.stdout + proc.stderr)
+        self.assertIn("GOODSPEED=False", proc.stdout, proc.stdout + proc.stderr)
+        summarizer = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("$playbackAbCandidateLeg = if (", summarizer)
+        self.assertIn("$playbackAbCandidateLeg = $playbackAb.candidate\n", summarizer)
+
+    def test_r3_a2_the_baseline_compares_the_receipt_it_reads_with_the_sha_the_leg_published(self) -> None:
+        # adversary-7efea617.json A2 (the r2 A4 blocker), its input: a receipt and its result.json replaced together after the chain read them. RED: the chain row
+        # carried no receipt sha, so the baseline hashed the replacement and used that hash as its own expectation. The chain row now carries receiptSha256 (the
+        # sha the child published) and Get-RowFigures refuses bytes that are not those; an empty published sha is refused too.
+        dv = ROOT / "tools" / "profiling" / "dual-venue"
+        chain = (dv / "Invoke-VenueChain.ps1").read_text(encoding="utf-8")
+        self.assertIn("receipt = $receipt; receiptSha256 = $receiptSha }", chain)
+        baseline = (dv / "Invoke-VenueBaseline.ps1").read_text(encoding="utf-8")
+        # (r2 legacy-row tail: a chain row with no receiptSha256 member has NO expectation; the baseline's own read hash is never one)
+        self.assertIn("$hlExpectSha = $(if ($null -ne $publishedSha) { [string]$publishedSha } else { '' })", baseline)
+        self.assertNotIn("else { [string]$fig.receiptSha256 }", baseline)
+        # (Get-RowFigures declares its parameters inline, which _extract_functions' `function <name> {` pattern does not match)
+        figures_function = re.search(r"function Get-RowFigures\(.*?\n\}\r?\n", baseline, re.DOTALL).group(0)
+        with tempfile.TemporaryDirectory(prefix="residue-r3-a2b-") as tmp:
+            receipt = Path(tmp) / "r-1.json"
+            receipt.write_text('{"receiptId":"r-1","legId":"x"}', encoding="utf-8", newline="")
+            real = hashlib.sha256(receipt.read_bytes()).hexdigest()
+            script = Path(tmp) / "figures.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module '{dv / 'DualVenueRunner.psm1'}' -Force -DisableNameChecking\n" + figures_function +
+                f"foreach ($pub in @('{'0' * 64}', '', '{real}'.ToUpperInvariant())) {{\n"
+                f"  try {{ $f = Get-RowFigures '{receipt}' ([pscustomobject]@{{ legId = 'x' }}) 'cuda' $pub; Write-Output ('PUB=[' + $pub.Substring(0, [Math]::Min(4, $pub.Length)) + '] IDENT=' + [bool]$f.identity + ' SHA=' + $f.receiptSha256) }}\n"
+                "  catch { Write-Output ('PUB=[' + $pub.Substring(0, [Math]::Min(4, $pub.Length)) + '] THREW=' + $_.Exception.Message.Substring(0, 20)) } }\n", encoding="utf-8")
+            proc = _run_ps_file(script)
+        lines = [l for l in proc.stdout.splitlines() if l.startswith("PUB=")]
+        self.assertEqual(len(lines), 3, proc.stdout + proc.stderr)
+        self.assertIn("[0000] IDENT=True", lines[0], lines[0])
+        self.assertIn("[] IDENT=True", lines[1], lines[1])
+        self.assertNotIn("IDENT=True", lines[2], "the receipt bytes the leg published are accepted past the sha check: " + lines[2])
+
+    def test_r3_a2_a_soft_hyphen_in_an_outcome_token_or_an_evidence_name_is_not_the_writers(self) -> None:
+        # adversary-fd0141e8.json A2, its input: outcome and export.verdict 'PA<U+00AD>SS', and (sibling) ordinary PASS tokens with evidence member
+        # 'summaryJsonSha<U+00AD>256'. RED: -cin / -cnotin compare by culture and ignore U+00AD, so the receipt read as an export leg. The comparison is ordinal ASCII.
+        base = ('"schema":"mlv-app/dual-venue-receipt/v1","scale":null,"display":null,"export":{"format":"prores","receiptSha256":"' + "0" * 64 + '","verdict":%s}')
+        cases = {
+            "soft-token": '{' + base % '"PA\\u00adSS"' + ',"outcome":"PA\\u00adSS","evidence":{}}',
+            "soft-verdict-only": '{' + base % '"PA\\u00adSS"' + ',"outcome":"PASS","evidence":{}}',
+            "soft-outcome-only": '{' + base % '"PASS"' + ',"outcome":"PA\\u00adSS","evidence":{}}',
+            "soft-evidence-name": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"summaryJsonSha\\u00ad256":"b"}}',
+            "soft-pass-null-verdict": '{' + base % 'null' + ',"outcome":"INVALID","evidence":{"umRunOutcome\\u00ad":"x"}}',
+            "writer-pass": '{' + base % '"PASS"' + ',"outcome":"PASS","evidence":{"summaryJsonSha256":"' + "e" * 64 + '"}}',
+            "writer-downgraded": '{' + base % '"PASS"' + ',"outcome":"INVALID","evidence":{}}',
+        }
+        with tempfile.TemporaryDirectory(prefix="residue-r3-a2-") as tmp:
+            lines = []
+            for name, text in cases.items():
+                (Path(tmp) / f"{name}.json").write_text(text, encoding="ascii", newline="")
+                lines.append(f"$rc = Get-Content -Raw -LiteralPath '{Path(tmp) / f'{name}.json'}' | ConvertFrom-Json; Write-Output ('{name}=' + (& $m {{ param($r) Test-VenueReceiptIsExportLeg $r }} $rc))")
+            proc = _run_ps_command(f"$m = Import-Module '{VENUE_CHAIN_MODULE}' -DisableNameChecking -PassThru; " + "; ".join(lines))
+        got = dict(l.split("=", 1) for l in proc.stdout.splitlines() if "=" in l)
+        self.assertEqual(got, {"soft-token": "False", "soft-verdict-only": "False", "soft-outcome-only": "False", "soft-evidence-name": "False",
+                               "soft-pass-null-verdict": "False", "writer-pass": "True", "writer-downgraded": "True"}, proc.stdout + proc.stderr)
+
+    def test_r3_a2_the_runner_validator_and_writer_refuse_a_soft_hyphen_outcome(self) -> None:
+        # adversary-fd0141e8.json A2 siblings (DualVenueRunner.psm1 outcome checks): a receipt outcome 'PA<U+00AD>SS' is no typed outcome (Test-DvReceiptValid
+        # says OUTCOME_UNKNOWN, Write-DvReceipt throws DVE_RECEIPT_OUTCOME_INVALID), and the shared helper is ordinal ASCII for every token class.
+        runner = ROOT / "tools" / "profiling" / "dual-venue" / "DualVenueRunner.psm1"
+        with tempfile.TemporaryDirectory(prefix="residue-r3-a2r-") as tmp:
+            script = Path(tmp) / "probe.ps1"
+            script.write_text(
+                "$ErrorActionPreference = 'Stop'\n"
+                f"Import-Module '{runner}' -Force -DisableNameChecking\n"
+                "$soft = 'PA' + [char]0xAD + 'SS'\n"
+                "Write-Output ('H1=' + (Test-DvOrdinalIn $soft @('PASS', 'FAIL')))\n"
+                "Write-Output ('H2=' + (Test-DvOrdinalIn 'PASS' @('PASS', 'FAIL')))\n"
+                "Write-Output ('H3=' + (Test-DvOrdinalIn 'pass' @('PASS', 'FAIL')))\n"
+                "Write-Output ('H4=' + (Test-DvOrdinalIn $null @('PASS', 'FAIL')))\n"
+                "Write-Output ('H5=' + (Test-DvOrdinalIn ('PASS' + [char]0xE9) @('PASS' + [char]0xE9)))\n"
+                "$v = Test-DvReceiptValid -Receipt @{ outcome = $soft } -RepoRoot ''\n"
+                "Write-Output ('V=' + $v.status + ' ' + ($v.reasons -join '|'))\n"
+                f"try {{ Write-DvReceipt -Receipt @{{ outcome = $soft }} -ReceiptRoot '{tmp}' | Out-Null; Write-Output 'W=NOTHROW' }} catch {{ Write-Output ('W=' + $_.Exception.Message.Substring(0, 27)) }}\n",
+                encoding="utf-8")
+            proc = _run_ps_file(script)
+        out = proc.stdout
+        self.assertIn("H1=False", out, out + proc.stderr)
+        self.assertIn("H2=True", out, out + proc.stderr)
+        self.assertIn("H3=False", out, out + proc.stderr)
+        self.assertIn("H4=False", out, out + proc.stderr)
+        self.assertIn("H5=False", out, "a non-ASCII token is never a member, even of a set that names it")
+        self.assertIn("V=INVALID OUTCOME_UNKNOWN", out, out + proc.stderr)
+        self.assertIn("W=DVE_RECEIPT_OUTCOME_INVALID", out, out + proc.stderr)
+
+    def test_r3_a2_no_cited_site_compares_a_receipt_token_by_culture(self) -> None:
+        # adversary-fd0141e8.json A2 siblings, as a static pin on every cited site: none of them is a -cin / -cnotin / -notin on a receipt or result token.
+        dv = ROOT / "tools" / "profiling" / "dual-venue"
+        for name in ("VenueChain.psm1", "DualVenueRunner.psm1", "Invoke-VenueBaseline.ps1", "Invoke-VenueLeg.ps1"):
+            text = (dv / name).read_text(encoding="utf-8")
+            # (the plain `-in @('PASS', 'FAIL')` lines of Invoke-VenueLeg.ps1 test the leg's own derived local outcome, not a receipt or result token)
+            for pattern in (r"-c(not)?in @\('PASS', 'FAIL'\)", r"-cin \$script:VenueReceiptOutcomeEnum", r"-c?notin \$script:OutcomeEnum",
+                            r"-cnotin \$script:ExportFailResults", r"-cin \$script:ExportFailResults", r"-cnotin @\('summaryJsonSha256'"):
+                self.assertEqual([m.group(0) for m in re.finditer(pattern, text)], [], f"{name}: {pattern}")
+
+    def test_p3_siblings_of_a8_and_a9(self) -> None:
+        # A8 (P3 :1308): collected was replaced by false when the text was provisional. A9 (P3 :589, :1182): the object parse threw before the refusal was recorded.
+        p3 = P3_VALIDATION_SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("collected = $bothCollected; reason = \"smoke result text: $($resultTextStanding.reason)\"", p3)
+        self.assertNotIn("collected = $false; reason = \"smoke result text:", p3)
+        self.assertIn("try { $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate }", p3)
+        self.assertIn("try { $summary = $summaryText | ConvertFrom-Json }", p3)
+        # (A9 sibling: the packet manifest's parse is a recorded import failure too)
+        self.assertIn("try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }", p3)
+        self.assertNotIn("        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json\n", p3)
+        # adversary-88890049.json A2: a null manifest lists no artifact (@($null) is one null entry whose empty path named the extraction directory)
+        self.assertIn("foreach ($file in @(@($manifest.files) | Where-Object { $null -ne $_ })) {", p3)
+        self.assertIn("if (!(Test-Path -LiteralPath $artifactPath -PathType Leaf)) {", p3)
+        self.assertNotIn("foreach ($file in @($manifest.files)) {", p3)
+        # the reduced execution of that loop: a null manifest and an entry with no relativePath record failures and never throw
+        loop = _extract_block(p3, "        foreach ($file in @(@($manifest.files) | Where-Object { $null -ne $_ })) {", "Add-Failure $importFailures \"Artifact hash mismatch", trailing_lines=3)
+        with tempfile.TemporaryDirectory(prefix="residue-r2-p3m-") as tmp:
+            script = Path(tmp) / "loop.ps1"
+            script.write_text("$ErrorActionPreference = 'Stop'\n$importFailures = [System.Collections.Generic.List[string]]::new()\n"
+                              "function Add-Failure($List, [string]$Message) { $List.Add($Message) }\nfunction Get-FileSha256([string]$Path) { throw 'hash of a directory' }\n"
+                              f"$extractRoot = '{tmp}'\n"
+                              "foreach ($m in @($null, ('{\"files\":[{}]}' | ConvertFrom-Json))) { $manifest = $m\n" + loop + "}\n"
+                              "Write-Output ('F=' + ($importFailures -join '|'))\n", encoding="utf-8")
+            proc = _run_ps_file(script)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("F=The manifest lists an artifact with no relativePath.", proc.stdout, proc.stdout + proc.stderr)
+        self.assertLess(p3.index("$summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All }"), p3.index("try { $summary = $summaryText | ConvertFrom-Json }"))
+        self.assertLess(p3.index("$resultTextStanding = ConvertFrom-VenueSmokeResultText -Text $resultText"), p3.index("try { $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate }"))
 
 
 @requires_pwsh
