@@ -107,7 +107,7 @@
 #         because Invoke-VenueLeg would throw on it only after the lease is open.
 #         VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: a spec that is not COMMITTED under tools/profiling/dual-venue/legs/ at HEAD of this checkout (the leg's own
 #         Find-DvCommittedLegSpec, LEG_SPEC_NOT_COMMITTED) is refused here too (reason=LEG_SPEC_NOT_COMMITTED item=<n>, or BATCH_USAGE LEG_SPEC_NOT_COMMITTED for -LegSpec / -LegSet),
-#         when -LegScript is the real Invoke-VenueLeg.ps1; the leg would refuse it only after the lease is open (-CommittedSpecRepoRoot is the offline seam).
+#         when the real um-run.ps1 is used (or -LegScript is the real Invoke-VenueLeg.ps1's path); the leg would refuse it only after the lease is open (-CommittedSpecRepoRoot is the offline seam).
 #         The same content checks run again once the claim is held (inside -ClaimTtlSec less -ClaimRenewSec) and once the lease is open (inside the lease's room less
 #         -LeaseMarginSec and the leg budget, so a slow re-hash ends SHARE_UNREACHABLE before the lease is spent, never LEG_BUDGET_EXCEEDS_LEASE after it; a lease whose
 #         room cannot start the re-read is refused reason=LEG_BUDGET_EXCEEDS_LEASE at once, before any probe). r4: each check is ONE deadline over all of its reads (existence,
@@ -266,8 +266,8 @@ param(
     # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1: '<n>:<ms>[,<n>:<ms>...]' makes the n-th file-system key lookup of the run (Get-SpecDigestKey's LocateWithin; counted from 1, one per spelled
     # path, as the memo answers every later call) answer <ms> late, so a test can time out one lookup (its bound is 1 s) while the others answer. Offline only: refused with the real um-run.ps1.
     [string]$SpecDigestKeyDelay = '',
-    # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the committed-leg-spec preflight (Get-LegSpecCommittedRefusal) is on whenever -LegScript is the real Invoke-VenueLeg.ps1, against
-    # the HEAD of the checkout this script runs from (the repo the leg reads its own HEAD in). A non-empty value turns it on for a stand-in leg too, against that repo's HEAD. Offline only: refused with the real um-run.ps1.
+    # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the committed-leg-spec preflight (Get-LegSpecCommittedRefusal) is on whenever the real um-run.ps1 is used, or -LegScript is the real Invoke-VenueLeg.ps1's path,
+    # against the HEAD of the repo the selected leg resolves for itself (its own ..\..\..). A non-empty value turns it on for a stand-in leg too, against that repo's HEAD. Offline only: refused with the real um-run.ps1.
     [string]$CommittedSpecRepoRoot = '',
     # r2 (adversary A3): the bounded child the committed-spec preflight runs (default: Test-LegSpecCommitted.ps1 beside this script). Offline only: refused with the real um-run.ps1, so a test can time a lookup that overruns.
     [string]$CommittedSpecScript = ''
@@ -311,11 +311,11 @@ if ($umRunIsReal -and $CommittedSpecRepoRoot) { Stop-Usage '-CommittedSpecRepoRo
 if ($CommittedSpecRepoRoot -and -not (Test-Path -LiteralPath $CommittedSpecRepoRoot -PathType Container)) { Stop-Usage "-CommittedSpecRepoRoot '$CommittedSpecRepoRoot' is not a directory" }
 # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the repo whose HEAD the committed-leg-spec preflight reads ('' = the preflight is off). The real leg refuses an uncommitted spec (LEG_SPEC_NOT_COMMITTED,
 # Invoke-VenueLeg.ps1, outside -OfflineTestMode, which this script never forwards), so with the real leg the preflight is on, in the repo the leg resolves for itself ($here\..\..\.., its own -RepoRoot default).
-# r2 (adversary A1): "real" is by path OR by content, as $umRunIsReal is (a byte-identical copy of the leg elsewhere is the real leg), and the repo is the one THAT leg resolves for itself
-# (its own $PSScriptRoot\..\..\..), not this script's: the leg that runs is the one admitted at its own HEAD.
-$realLegPath = [IO.Path]::GetFullPath((Join-Path $here 'Invoke-VenueLeg.ps1'))
-$legScriptIsReal = ([IO.Path]::GetFullPath($LegScript) -ieq $realLegPath) -or ((Test-Path -LiteralPath $realLegPath -PathType Leaf) -and (Get-FileHash -LiteralPath $LegScript).Hash -ceq (Get-FileHash -LiteralPath $realLegPath).Hash)
-$script:CommittedSpecRepoRoot = $(if ($CommittedSpecRepoRoot) { (Resolve-Path -LiteralPath $CommittedSpecRepoRoot).Path } elseif ($legScriptIsReal) { (Resolve-Path -LiteralPath (Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($LegScript))) '..\..\..')).Path } else { '' })
+# r2 (adversary A1): the preflight is on in PRODUCTION, which is the real um-run.ps1 ($umRunIsReal, classified above by path or content; only it reaches a venue), whatever the leg script's own bytes are (a copy with other
+# line endings is still the leg that runs), and offline when -LegScript is the real leg's path or the seam names a repo. The repo is the one THE LEG THAT RUNS resolves for itself (its own $PSScriptRoot\..\..\..), not
+# this script's: that leg is admitted at its own HEAD. r3 (adversary pass 2 A1/A2): no classification by the leg script's CONTENT: it was a raw-bytes compare a line-ending change defeats, and an unbounded read before -DeadlineUtc.
+$legScriptIsReal = ([IO.Path]::GetFullPath($LegScript) -ieq [IO.Path]::GetFullPath((Join-Path $here 'Invoke-VenueLeg.ps1')))
+$script:CommittedSpecRepoRoot = $(if ($CommittedSpecRepoRoot) { (Resolve-Path -LiteralPath $CommittedSpecRepoRoot).Path } elseif ($umRunIsReal -or $legScriptIsReal) { (Resolve-Path -LiteralPath (Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($LegScript))) '..\..\..')).Path } else { '' })
 if ($umRunIsReal -and $CommittedSpecScript) { Stop-Usage '-CommittedSpecScript is an offline test seam: with the real um-run.ps1 the committed-spec preflight always runs Test-LegSpecCommitted.ps1' }
 $script:CommittedSpecScript = $(if ($CommittedSpecScript) { $CommittedSpecScript } else { Join-Path $here 'Test-LegSpecCommitted.ps1' })
 if (-not $ExportBudgetScript) { $ExportBudgetScript = Join-Path $here '..\bachelor\export-stage-job.ps1' }

@@ -5900,22 +5900,26 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertIn(f"{flag} is an offline test seam", r.stderr)
                 self.assertEqual(self.kinds(), [])
 
-    # r2 (adversary A1): "the real leg" is the real leg by CONTENT as well as by path (a byte-identical copy elsewhere is the real leg), and the repo is the one THAT leg resolves for itself
-    def test_legspec_committed_a_byte_identical_copy_of_the_real_leg_turns_the_preflight_on_in_its_own_repo(self) -> None:
+    # r2/r3 (adversary A1, pass 2 A1/A2): production is the real um-run.ps1, and the preflight is on there whatever the leg script's own bytes are (a copy with other line endings is still the leg that
+    # runs; the classification used to compare raw bytes, and to read the file unbounded before -DeadlineUtc), and the repo is the one THAT leg resolves for itself (its own ..\..\..)
+    def test_legspec_committed_the_real_um_run_turns_the_preflight_on_for_any_leg_script_in_that_legs_own_repo(self) -> None:
         leg_copy_root = self.case / "legcopy"
         leg_copy_dir = leg_copy_root / "tools" / "profiling" / "dual-venue"
         leg_copy_dir.mkdir(parents=True)
-        shutil.copyfile(LEG, leg_copy_dir / "Invoke-VenueLeg.ps1")
-        scratch = ROOT / ".claude-state" / f"zz-legspec-committed-{uuid.uuid4().hex[:8]}"
+        original = LEG.read_bytes()
+        lf = original.replace(b"\r\n", b"\n")
+        converted = lf.replace(b"\n", b"\r\n") if lf == original else lf   # the other line ending: never byte-identical to the shipped leg
+        self.assertNotEqual(converted, original)
+        (leg_copy_dir / "Invoke-VenueLeg.ps1").write_bytes(converted)
         self._reset_committed_case()
-        try:
-            args, e = self.batch_cmd([self._COMMITTED_SPEC], "-ReceiptRoot", str(scratch / "receipts"))
-            args[args.index("-LegScript") + 1] = str(leg_copy_dir / "Invoke-VenueLeg.ps1")
-            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
-        finally:
-            shutil.rmtree(scratch, ignore_errors=True)
-        # the spec IS committed in this repo, but the copy's own repo (its ..\..\.. : a plain directory, no HEAD) holds nothing: the leg that runs would refuse it, so the batch does first
-        self._assert_nothing_claimed_or_leased("copy of the real leg", r)
+        # the spec IS committed in this repo, but the copy's own repo (its ..\..\.. : a plain directory, no HEAD) holds nothing: the leg that runs would refuse it, so the batch does first.
+        # (the real um-run.ps1 is never reached: the refusal is before any claim; the short deadline bounds the run if a regression let it through)
+        # (OMIT_DEFAULTS: the real um-run.ps1 refuses the stub's -LeaseCooldownSec 0 as LEASE_CAP_RELAXED, which would end the run before the preflight is reached)
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=60)), OMIT_DEFAULTS="-LeaseCooldownSec")
+        args[args.index("-LegScript") + 1] = str(leg_copy_dir / "Invoke-VenueLeg.ps1")
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=e)
+        self._assert_nothing_claimed_or_leased("real um-run, converted copy of the leg", r)
         self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
         self.assertIn("legcopy", r.stderr)   # the message names the repo the check ran in: the copy's own tree, not this checkout
 
