@@ -1466,7 +1466,7 @@ inline int pacedMeasuredHoldTickMs( bool automationIsolated, bool unpacedRequest
                                     double tickStartPosition, int timeDiffMs, double requestFps )
 {
     if( !( automationIsolated && !unpacedRequested && armedForOpenSession && targetPresentedFrames <= 0 && requiredSourceFrames > 0 )
-     || consumedSourceFrames >= requiredSourceFrames || timeDiffMs <= 0 || !( requestFps > 0.0 ) || !std::isfinite( requestFps )
+     || consumedSourceFrames >= requiredSourceFrames || timeDiffMs < 1 || !( requestFps > 0.0 ) || !std::isfinite( requestFps )
      || !std::isfinite( tickStartPosition ) )
         return timeDiffMs;
     // the fraction of the current frame already travelled, on the counter's own rounding (in [0, 1))

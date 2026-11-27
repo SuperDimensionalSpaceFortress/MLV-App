@@ -5012,7 +5012,7 @@ TEST( PlaybackPacedMeasuredHold, R1A1ALongGapDropFrameTickNeverCarriesTheTimelin
     ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 1000, std::numeric_limits<double>::quiet_NaN() ) );
     ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, std::numeric_limits<double>::quiet_NaN(), 1000, 60.0 ) );
     ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, std::numeric_limits<double>::infinity(), 1000, 60.0 ) );
-    ASSERT_EQ( 0, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 0, 60.0 ) );
+    ASSERT_EQ( -5, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, -5, 60.0 ) );   // no forward span
     ASSERT_EQ( 17, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 1000, 60.0 ) );
     ASSERT_EQ( 1, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.99, 1000, 60.0 ) );   // 0.01 frame owed
     ASSERT_EQ( 9, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.5, 1000, 60.0 ) );    // 0.5 frame owed
