@@ -4347,10 +4347,12 @@ function Exit-HeavySlot {
             try { Add-LeaseSlotSnapshot -JobId 'jHtP4' -Phase 'grant' } finally { $script:LeaseProbeWatchdogScheduler = $null }
             $e4 = @($script:LeaseSlotSnapshots | Where-Object { $_.jobId -eq 'jHtP4' })
             Assert-True ($e4.Count -eq 1 -and $null -ne $script:DogFire -and $script:DogDueMs -eq 5000) "probe-watchdog A1(r5): the probe started with the scripted scheduler holding its 5 s bound (started=$($e4.Count) due=$($script:DogDueMs) ms)"
-            $null = Wait-Until { $script:Kc = @(Get-Calls | Where-Object { $_.cmd -eq 'status-orphan' }); $script:Kc.Count -ge 1 } 10
-            Assert-True ($script:Kc.Count -eq 1) "probe-watchdog A1(r5): the status root spawned its orphan child: $($script:Kc.Count)"
+            # r2 adversary-dba467c7 A1: the signal is logged BEFORE the root's sys.exit, so the case also waits for the root to exit (as the poll
+            # case below does) and fires only on a finished root whose pipes its live child still holds.
+            $null = Wait-Until { $script:Kc = @(Get-Calls | Where-Object { $_.cmd -eq 'status-orphan' }); $script:Kc.Count -ge 1 -and $e4[0].call.proc.HasExited } 10
+            Assert-True ($script:Kc.Count -eq 1 -and $e4[0].call.proc.HasExited) "probe-watchdog A1(r5): the status root spawned its orphan child and exited: $($script:Kc.Count) (exited=$($e4[0].call.proc.HasExited))"
             $kid4 = [int]$script:Kc[0].child; $script:OrphanKids.Add($kid4)
-            Assert-True ((Test-PidAlive $kid4) -and $e4[0].dog.KilledAtMs -lt 0) "probe-watchdog A1(r5): no real timer holds the scripted bound: the orphan child is alive and nothing was killed before the case fires (killedAtMs=$($e4[0].dog.KilledAtMs))"
+            Assert-True ((Test-PidAlive $kid4) -and -not ($e4[0].call.out.IsCompleted -and $e4[0].call.err.IsCompleted) -and $e4[0].dog.KilledAtMs -lt 0) "probe-watchdog A1(r5): no real timer holds the scripted bound: the orphan child is alive, still holds the finished root's pipes, and nothing was killed before the case fires (killedAtMs=$($e4[0].dog.KilledAtMs))"
             $script:DogFire.Invoke([long]5100)   # the bound fires, at a probe age of 5.1 s of the 5 s bound
             $kid4Gone = Wait-Until { -not (Test-PidAlive $kid4) } 10   # nothing polls meanwhile
             Update-LeaseSlotSnapshots
