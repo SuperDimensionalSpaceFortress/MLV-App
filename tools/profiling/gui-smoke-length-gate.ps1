@@ -590,6 +590,12 @@ function Convert-PlaybackLogLineToObject {
         elseif ([long]::TryParse($rawValue, [ref]$intValue)) {
             $result[$key] = $intValue
         }
+        elseif ([regex]::IsMatch($rawValue, '^[+-]?[0-9]+\.0+$') -and
+               [long]::TryParse($rawValue.Substring(0, $rawValue.IndexOf('.')), [ref]$intValue)) {
+            # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r7 (sol r1 B1): an integral counter printed in decimal form ("...1041.0") is
+            # an exact integer, not a double: a double rounds above 2^53 (the difference of two such counters read 48, not 49).
+            $result[$key] = $intValue
+        }
         elseif ([double]::TryParse(
             $rawValue,
             [System.Globalization.NumberStyles]::Float,
@@ -602,6 +608,42 @@ function Convert-PlaybackLogLineToObject {
         }
     }
     [pscustomobject]$result
+}
+
+function Get-GuiSmokeExactCounter {
+    <#
+    .SYNOPSIS
+    GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r7 (sol r1 B3): reads a Summary field that must be an EXACT INTEGER within [-Min, -Max]
+    (default: signed 64-bit) before any narrowing cast sees it. Returns [pscustomobject]@{ present; ok; value; reason }.
+    $null is present=false, ok=true (the caller's absent-field rule judges it). A value that is not an integer (1.5, NaN, text), is
+    a double past 2^53 (the parser rounded it, so its digits are unknown), or lies outside the range is ok=false with a typed
+    reason, so the caller returns a typed refusal instead of a cast that throws under $ErrorActionPreference = 'Stop'.
+    #>
+    param([AllowNull()]$Value, [int64]$Min = [int64]::MinValue, [int64]$Max = [int64]::MaxValue)
+    if ($null -eq $Value) { return [pscustomobject]@{ present = $false; ok = $true; value = $null; reason = '' } }
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $exact = $null
+    $reason = 'not_an_integer'
+    $d = 0.0
+    $m = [decimal]0
+    if ($Value -is [bool]) {
+        $reason = 'not_an_integer'
+    } elseif ($Value -is [double] -or $Value -is [single]) {
+        $d = [double]$Value
+        if ([double]::IsNaN($d) -or [double]::IsInfinity($d) -or [Math]::Floor($d) -ne $d) { $reason = 'not_an_integer' }
+        elseif ([Math]::Abs($d) -gt 9007199254740992.0) { $reason = 'inexact_double' }
+        else { $exact = [decimal]$d }
+    } elseif ([decimal]::TryParse([string]$Value, [Globalization.NumberStyles]::Float, $inv, [ref]$m)) {
+        if ([decimal]::Truncate($m) -eq $m) { $exact = $m }
+    } elseif ([double]::TryParse([string]$Value, [Globalization.NumberStyles]::Float, $inv, [ref]$d) -and
+              -not [double]::IsNaN($d) -and -not [double]::IsInfinity($d)) {
+        $reason = 'out_of_range'    # a finite number past the range of a decimal
+    }
+    if ($null -eq $exact) { return [pscustomobject]@{ present = $true; ok = $false; value = $null; reason = $reason } }
+    if ($exact -lt [decimal]$Min -or $exact -gt [decimal]$Max) {
+        return [pscustomobject]@{ present = $true; ok = $false; value = $null; reason = 'out_of_range' }
+    }
+    return [pscustomobject]@{ present = $true; ok = $true; value = [int64]$exact; reason = '' }
 }
 
 function Get-GuiSmokeAbsentReceiptFields {
@@ -834,6 +876,23 @@ function Get-GuiSmokeConformPaceProof {
 }
 
 function Get-GuiSmokeSourceFramesVerdict {
+    # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r7 (sol r1 B3): the typed-refusal safety net around the decision below. The counters are
+    # bounds-checked inside it; anything else a cast or an operator throws (a text where a rate belongs) is still a typed
+    # INVALID_SOURCE_FRAMES verdict, so the runner's $ErrorActionPreference = 'Stop' can never lose the verdict and exit 43.
+    param([AllowNull()]$Summary, [AllowNull()][string]$ExpectedRunNonce = '', [AllowNull()][AllowEmptyString()][string]$ConformLine = '')
+    try {
+        return Get-GuiSmokeSourceFramesVerdictCore -Summary $Summary -ExpectedRunNonce $ExpectedRunNonce -ConformLine $ConformLine
+    } catch {
+        return [pscustomobject]@{
+            invalid = $true
+            failures = @("INVALID_SOURCE_FRAMES: the playback_smoke.summary could not be judged ($($_.Exception.GetType().Name): $($_.Exception.Message)); a receipt the oracle cannot read is never playback evidence.")
+            sourceAdvanced = $null; requiredSourceFrames = $null
+            paceRule = 'native'; conformPlaybackFps = $null; conformClipFps = $null
+        }
+    }
+}
+
+function Get-GuiSmokeSourceFramesVerdictCore {
     <#
     .SYNOPSIS
     PLAYBACK-CLIP-LENGTH-ENFORCE-3 RECEIPT ORACLE. "20 s of real footage" is a SOURCE-FRAME quantity: the app
@@ -862,6 +921,12 @@ function Get-GuiSmokeSourceFramesVerdict {
     $nativeFps = & $prop 'native_fps'
     $paceFps = & $prop 'pace_fps'
     $fpsOverride = & $prop 'fps_override'
+    # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r7 (sol r1 B3): the counters are read EXACTLY before any narrowing cast sees them. A
+    # value that is not an integer in range is a typed refusal below, never a cast that throws (the runner runs under
+    # $ErrorActionPreference = 'Stop', where a throw loses this verdict and exit 43).
+    $advancedRead = Get-GuiSmokeExactCounter -Value $advanced
+    $requiredRead = Get-GuiSmokeExactCounter -Value $required
+    $overrideRead = Get-GuiSmokeExactCounter -Value $fpsOverride -Min ([int64][int]::MinValue) -Max ([int64][int]::MaxValue)
     # HFR-10S-1: the floor is the clip's own, Get-GuiSmokeMinPlaySeconds of native_fps (10 s at >= 50 fps, else 20 s).
     $floorSeconds = Get-GuiSmokeMinPlaySeconds -NativeFps $nativeFps
     if ($null -eq $Summary) {
@@ -869,6 +934,8 @@ function Get-GuiSmokeSourceFramesVerdict {
     } elseif ($null -eq $advanced -or $null -eq $required) {
         $missingCount = @(Get-GuiSmokeAbsentReceiptFields -Summary $Summary -Names @('source_advanced', 'required_source_frames'))
         $failures += "INVALID_SOURCE_FRAMES: RECEIPT_FIELD_ABSENT: playback_smoke.summary carries no $($missingCount -join ' / ') (a build that predates PLAYBACK-CLIP-LENGTH-ENFORCE-3 writes neither); the footage played cannot be proven."
+    } elseif (-not $advancedRead.ok -or -not $requiredRead.ok) {
+        $failures += "INVALID_SOURCE_FRAMES: source_advanced=$advanced required_source_frames=$required is not an exact integer within the signed 64-bit range ($($advancedRead.reason) / $($requiredRead.reason)); the footage played cannot be proven."
     } elseif ([int64]$required -le 0) {
         $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required; the admitted window is unknown."
     } elseif ([int64]$advanced -lt [int64]$required) {
@@ -881,8 +948,8 @@ function Get-GuiSmokeSourceFramesVerdict {
     $nonFinite = { param($v) [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v) }
     if ($null -ne $Summary -and $null -ne $nativeFps -and ((& $nonFinite $nativeFps) -or [double]$nativeFps -le 0)) {
         $failures += "INVALID_SOURCE_FRAMES: native_fps=$nativeFps; the clip's native frame rate is unknown, so 20 s of footage cannot be measured."
-    } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $required -and [int64]$required -gt 0 -and
-              [int64]$required -lt [int64][Math]::Ceiling($floorSeconds * [double]$nativeFps - 0.02)) {
+    } elseif ($null -ne $Summary -and $null -ne $nativeFps -and $null -ne $required -and $requiredRead.ok -and [int64]$required -gt 0 -and
+              [double]$required -lt [Math]::Ceiling($floorSeconds * [double]$nativeFps - 0.02)) {
         $failures += "INVALID_SOURCE_FRAMES: required_source_frames=$required is under ceil($floorSeconds s x native_fps=$nativeFps); the Play was admitted for less than $floorSeconds s of source footage."
     }
     # ENFORCE-4: the pace and override fields are REQUIRED, not optional extras of a source-frame count.
@@ -890,7 +957,9 @@ function Get-GuiSmokeSourceFramesVerdict {
     if ($null -ne $Summary -and $absent.Count -gt 0) {
         $failures += "INVALID_SOURCE_FRAMES: RECEIPT_FIELD_ABSENT: the receipt carries no $($absent -join ' / '); a run whose pace or override cannot be read is not proven to have played the footage at its native fps."
     }
-    if ($null -ne $Summary -and $null -ne $fpsOverride -and [int]$fpsOverride -ne 0) {
+    if ($null -ne $Summary -and $null -ne $fpsOverride -and -not $overrideRead.ok) {
+        $failures += "INVALID_SOURCE_FRAMES: fps_override=$fpsOverride is not an exact integer flag ($($overrideRead.reason)); a run whose pace override cannot be read is not proven to have played at the clip's native fps."
+    } elseif ($null -ne $Summary -and $null -ne $fpsOverride -and [int]$fpsOverride -ne 0) {
         $failures += "INVALID_SOURCE_FRAMES: the run was paced by a persisted fps override (fps_override=$fpsOverride); evidence is paced at the clip's native fps."
     }
     if ($null -ne $Summary -and $null -ne $paceFps -and ((& $nonFinite $paceFps) -or [double]$paceFps -le 0)) {
@@ -948,20 +1017,42 @@ function Get-GuiSmokeLoopVerdict {
     $failures = @()
     $paceRule = 'native'; $conformPlaybackFps = $null; $conformClipFps = $null
     $prop = { param($name) if ($null -ne $Summary -and $Summary.PSObject.Properties[$name]) { $Summary.$name } else { $null } }
-    $wrapped = & $prop 'wrapped'
-    $wrapCount = & $prop 'wrap_count'
+    # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r7 (sol r1 B3): every counter this verdict narrows to [int] / [int64] is read EXACTLY
+    # first. One that is not an integer in range is named in $unreadable and read as absent below (so no cast sees it), and the
+    # verdict then carries a typed failure for it: under the runner's $ErrorActionPreference = 'Stop' a throwing cast would lose
+    # the verdict and exit 43.
+    $unreadable = New-Object System.Collections.Generic.List[string]
+    $i32Lo = [int64][int]::MinValue; $i32Hi = [int64][int]::MaxValue
+    $i64Lo = [int64]::MinValue; $i64Hi = [int64]::MaxValue
+    $exactOrNull = { param($name, $value, $lo, $hi)
+        $read = Get-GuiSmokeExactCounter -Value $value -Min $lo -Max $hi
+        if ($read.ok) { $read.value } else { $unreadable.Add("$name=$value"); $null } }
+    $wrapped = & $exactOrNull 'wrapped' (& $prop 'wrapped') $i32Lo $i32Hi
+    $wrapCount = & $exactOrNull 'wrap_count' (& $prop 'wrap_count') $i64Lo $i64Hi
     $totalFrames = & $prop 'total_frames'
     $clipSeconds = & $prop 'clip_seconds'
-    $presented = & $prop 'presented_frames'
-    $firstPresented = & $prop 'first_presented_frame'
-    $lastPresented = & $prop 'last_presented_frame'
+    $clipSecondsNumber = 0.0
+    if ($null -ne $clipSeconds) {
+        if ([double]::TryParse([string]$clipSeconds, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$clipSecondsNumber)) {
+            $clipSeconds = $clipSecondsNumber
+        } else { $unreadable.Add("clip_seconds=$clipSeconds"); $clipSeconds = $null }
+    }
+    $presented = & $exactOrNull 'presented_frames' (& $prop 'presented_frames') $i64Lo $i64Hi
+    $firstPresented = & $exactOrNull 'first_presented_frame' (& $prop 'first_presented_frame') $i64Lo $i64Hi
+    $lastPresented = & $exactOrNull 'last_presented_frame' (& $prop 'last_presented_frame') $i64Lo $i64Hi
     if ($LaunchOnlyProbe) {
         if (($null -ne $presented -and [int64]$presented -gt 0) -or
             ($null -ne $wrapped -and [int]$wrapped -ne 0) -or
             ($null -ne $wrapCount -and [int64]$wrapCount -gt 0)) {
             $failures += "LAUNCH_ONLY_PROBE_PLAYED: a launch-only probe must present zero playback frames and never wrap (presented_frames=$presented wrapped=$wrapped wrap_count=$wrapCount)."
         }
+        if ($unreadable.Count -gt 0) {
+            $failures += "LAUNCH_ONLY_PROBE_PLAYED: $($unreadable -join ' ') is not an exact integer within range; a launch-only probe whose counters cannot be read is not proven to have presented nothing."
+        }
     } else {
+        if ($unreadable.Count -gt 0) {
+            $failures += "INVALID_LOOPED: $($unreadable -join ' ') is not an exact integer within range (a count that large is a wrap or a corrupt receipt); a run whose wrap and frame counters cannot be read is never playback evidence."
+        }
         # ENFORCE-4: the app's own wrap signal must be PRESENT. A build that predates the wrap fields cannot say it did
         # not wrap; "silent" is not "no wrap". (The header-based checks below remain as a second, independent signal.)
         $absent = @(Get-GuiSmokeAbsentReceiptFields -Summary $Summary -Names @('wrapped', 'wrap_count'))
@@ -979,7 +1070,8 @@ function Get-GuiSmokeLoopVerdict {
         $overranWindow = $false
         $frameNumber = { param($v) $m = [decimal]0; $d = 0.0
             if ($null -eq $v -or $v -is [bool]) { $null }
-            elseif ([decimal]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$m)) { $m }
+            elseif ([decimal]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$m) -and
+                    [Math]::Abs($m) -le [decimal]1e27) { $m }    # r7: past 1e27 the decimal difference / product could overflow, so a double
             elseif ([double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d) -and
                     -not [double]::IsNaN($d) -and -not [double]::IsInfinity($d)) { $d }
             else { $null } }
@@ -1116,9 +1208,18 @@ function Get-GuiSmokeProfileReceiptSummary {
     $override = & $get 'fps_override_active'
     if ($null -ne $override) { $summary['fps_override'] = [int][bool]$override }
     # the receipt has the engine's wrap COUNT only; "wrapped" is derived from it, and absent when the count is absent
-    if ($summary.Contains('wrap_count')) { $summary['wrapped'] = [int]([int64]$summary['wrap_count'] -gt 0) }
+    # r7 (sol r1 B3): a count that is not an exact integer in range is never cast here (a throw under the runner's
+    # $ErrorActionPreference = 'Stop' loses the verdict). It stays as the receipt wrote it, "wrapped" fails closed (1), and
+    # Get-GuiSmokeLoopVerdict names the unreadable count.
+    if ($summary.Contains('wrap_count')) {
+        $wrapRead = Get-GuiSmokeExactCounter -Value $summary['wrap_count']
+        $summary['wrapped'] = if ($wrapRead.ok) { [int]($wrapRead.value -gt 0) } else { 1 }
+    }
     $admitted = & $get 'programmatic_play_admitted'
-    if ($null -ne $admitted) { $summary['play_admitted'] = [int64]$admitted }
+    if ($null -ne $admitted) {
+        $admittedRead = Get-GuiSmokeExactCounter -Value $admitted
+        $summary['play_admitted'] = if ($admittedRead.ok) { $admittedRead.value } else { $admitted }
+    }
     return [pscustomobject]$summary
 }
 
@@ -1171,6 +1272,8 @@ function Get-GuiSmokeEvidencePlayVerdict {
             $failures += "RECEIPT_FIELD_ABSENT: no receipt, so no Play admission can be proven."
         } elseif ($absentAdmission.Count -gt 0) {
             $failures += "RECEIPT_FIELD_ABSENT: the receipt carries no programmatic_play_admitted; a build that does not write it cannot prove an evidence Play was admitted."
+        } elseif (-not (Get-GuiSmokeExactCounter -Value $Summary.play_admitted).ok) {
+            $failures += "PLAY_NOT_ADMITTED: programmatic_play_admitted=$($Summary.play_admitted) is not an exact integer within range; an admission that cannot be read is not proof a Play was admitted."
         } elseif ([int64]$Summary.play_admitted -le 0) {
             $failures += "PLAY_NOT_ADMITTED: programmatic_play_admitted=$($Summary.play_admitted) on a play-capable run; nothing was played, so there is no footage to prove."
         }

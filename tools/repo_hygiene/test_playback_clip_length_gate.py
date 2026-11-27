@@ -853,8 +853,10 @@ def _loop_verdict(line: str, window: float, launch_only: bool = False, gate: Pat
     """Runs the shared parser + Get-GuiSmokeLoopVerdict (the code the runner calls) on a summary line.
     -RequireWindowStop is passed only when the keyword is True, so every other row calls the base signature."""
     window_stop = " -RequireWindowStop $true" if require_window_stop else ""
+    # r6 (sol r1 B3): the runner runs under $ErrorActionPreference = 'Stop' (run-release-gui-smoke.ps1:149), where a cast that
+    # throws loses the verdict (no typed failure, no exit 43). Without it the exception is swallowed and the row looks fine.
     proc = _pwsh(
-        f". {_q(gate)}; $s = Convert-PlaybackLogLineToObject {_q(line)}; "
+        f"$ErrorActionPreference = 'Stop'; . {_q(gate)}; $s = Convert-PlaybackLogLineToObject {_q(line)}; "
         f"Get-GuiSmokeLoopVerdict -Summary $s -WindowSeconds {window} -ExpectedRunNonce {_q(nonce)} "
         f"-LaunchOnlyProbe ${'true' if launch_only else 'false'} -ClipFrames {clip_frames}{window_stop} "
         "| ConvertTo-Json -Compress -Depth 4")
@@ -983,6 +985,33 @@ OVERRUN_CASES = [
                                              required_source_frames=9007199254740992), 25, False, True, 1200, True, True, False),
     ("O11 the same at the tolerance", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9007199254741040,
                                             required_source_frames=9007199254740992), 25, False, True, 1200, False, False, False),
+    # r5 (sol r1 B1): the same exactness for a counter printed in DECIMAL form. The parser used to read "...1041.0" as a double
+    # (9007199254741040), so a 49-frame overrun read as 48 and passed.
+    ("O12 a decimal-form overrun past 2^53", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254741041.0",
+                                                   required_source_frames=9007199254740992), 25, False, True, 1200, True, True, False),
+    ("O12 the decimal form at the tolerance", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254741040.0",
+                                                    required_source_frames="9007199254740992.0"), 25, False, True, 1200, False, False, False),
+    # r5 (sol r1 B3): a counter outside the signed 64-bit range is a typed verdict, never an exception that loses it (exit 43).
+    ("O13 a counter past signed 64", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9223372036854775808),
+     25, False, True, 1200, True, True, False),
+    ("O14 a requirement past signed 64 is an unknown window",
+     dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9223372036854775810, required_source_frames=9223372036854775808),
+     25, False, True, 1200, True, False, False),
+    ("O15 a wrap count past signed 64 is a wrap", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+                                                       wrap_count=9223372036854775808), 25, False, True, 1200, True, False, True),
+    ("O16 an fps override past signed 64 is an override", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+                                                              fps_override=9223372036854775808), 25, False, True, 1200, True, False, False),
+    ("O16 an fps override past signed 32 is an override", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+                                                              fps_override=3000000000), 25, False, True, 1200, True, False, False),
+    # r7 class sweep (sol r1 B3): the other counters the loop verdict narrows are bounds-checked too -- a presented count past signed
+    # 64 is an unreadable (looped-class) receipt, and a native fps past the cast range is an unknown floor, never a throw.
+    ("O17 a presented count past signed 64", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+                                                  presented_frames=9223372036854775808), 25, False, True, 1200, True, False, True),
+    ("O18 a native fps past the cast range", dict(_OVERRUN_2397, native_fps="1e300", pace_fps=24, source_advanced=648),
+     25, False, True, 1200, True, False, False),
+    ("O19 an exact decimal counter inside the tolerance is still clean", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="648.0", required_source_frames="600.0", presented_frames=600),
+     25, False, True, 1200, False, False, False),
 ]
 
 
