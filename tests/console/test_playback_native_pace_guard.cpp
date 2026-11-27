@@ -1011,17 +1011,37 @@ TEST(PlaybackUnpacedWiring, APacedPlayHoldsAtItsRequiredFramesOnlyWhileTheMeasur
     ASSERT_TRUE(armedBefore >= 0);
     ASSERT_TRUE(pacedAt > armedBefore);
     ASSERT_TRUE(unpacedComment > pacedAt);
-    // r1 fix iteration 1 (adversary A1 on 57d1ab08): right after the hold, the tick's span is capped by the same armed paced hold,
-    // at the fps of the drop-frame request it feeds (timeDiff's only reader in playbackHandling)
-    const QString tickCap = QStringLiteral(
-        "        timeDiff = playback_frame_range::pacedMeasuredHoldTickMs( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(), pacedHoldArmed,\n"
-        "                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames, m_newPosDropMode, timeDiff,\n"
-        "                getPlaybackFramerate() );\n");
-    ASSERT_EQ(1, source.count(tickCap));
-    ASSERT_EQ(1, source.count(QStringLiteral("playback_frame_range::pacedMeasuredHoldTickMs(")));
-    const int capAt = handling.indexOf(tickCap);
+    // r2 (hub ruling; r1 adversary A1 / A2 on 21b6d81e): no millisecond cap -- timeDiff is not rewritten. Right after the hold the
+    // same armed scope is read once, outside the CUDA-HEADROOM-1 region...
+    ASSERT_EQ(0, source.count(QStringLiteral("pacedMeasuredHoldTickMs")));
+    ASSERT_EQ(0, handling.count(QRegularExpression(QStringLiteral("\\btimeDiff\\s*=(?!=)"))));
+    const QString clampScope = QStringLiteral(
+        "        const bool pacedHoldClampArmed = playback_frame_range::pacedMeasuredHoldApplies( m_automationPacingIsolated,\n"
+        "                mlvappPlaybackUnpacedRequested(), pacedHoldArmed, m_playbackSmokeTargetPresentedFrames, m_playRequiredSourceFrames );\n");
+    ASSERT_EQ(1, source.count(clampScope));
+    ASSERT_EQ(1, source.count(QStringLiteral("playback_frame_range::pacedMeasuredHoldApplies(")));
+    const int capAt = handling.indexOf(clampScope);
     ASSERT_TRUE(capAt > pacedAt);
     ASSERT_TRUE(unpacedComment > capAt);
+    // ...and inside it the drop-frame tick's advanced position is clamped in frames, guarded by that scope (a strict no-op when it
+    // does not apply), right after advanceDropFrameTick and before the position is stored or fed to the counter. The only other
+    // line touched in the region is the tick result losing its const.
+    const QString clamp = QStringLiteral(
+        "                if( pacedHoldClampArmed )\n"
+        "                    dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,\n"
+        "                                                                                            m_sourceAdvance.consumed(), m_playRequiredSourceFrames );\n");
+    ASSERT_EQ(1, source.count(clamp));
+    ASSERT_EQ(1, source.count(QStringLiteral("playback_frame_range::pacedMeasuredHoldLanding(")));
+    ASSERT_EQ(2, handling.count(QStringLiteral("pacedHoldClampArmed")));
+    ASSERT_EQ(1, handling.count(QStringLiteral("dropFrameTick.position =")));
+    const int clampAt = handling.indexOf(clamp);
+    const int advanceAt = handling.indexOf(QStringLiteral("playback_frame_range::advanceDropFrameTick("));
+    ASSERT_TRUE(advanceAt > unpacedComment);
+    ASSERT_TRUE(clampAt > advanceAt);
+    ASSERT_TRUE(clampAt < handling.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick")));
+    ASSERT_TRUE(clampAt < handling.indexOf(QStringLiteral("m_newPosDropMode = dropFrameTick.position;")));
+    ASSERT_TRUE(clampAt < handling.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );")));
+    ASSERT_EQ(0, handling.mid(clampAt, clamp.size()).count(QStringLiteral("m_playbackPaceGuard")));
     // the hold and its record touch no pace guard: no pace read, no grant
     const QString holdSpan = handling.mid(armedBefore, unpacedComment - armedBefore);
     ASSERT_EQ(0, holdSpan.count(QStringLiteral("playbackPaceGuardFps()")));

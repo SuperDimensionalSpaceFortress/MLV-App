@@ -13295,12 +13295,11 @@ void MainWindow::playbackHandling(int timeDiff)
             notePacedMeasuredHold();
             return;
         }
-        // r1 fix iteration 1 (adversary A1 on 57d1ab08): nor does one long-gap drop-frame tick carry it past the required frames
-        // (timeDiff feeds only that tick's request, fps x timeDiff / 1000, at the same fps). Iteration 2 (pass 2 A1 on 8bfb3448):
-        // the travel owed is measured from m_newPosDropMode, the position that tick advances from and feeds the counter.
-        timeDiff = playback_frame_range::pacedMeasuredHoldTickMs( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(), pacedHoldArmed,
-                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames, m_newPosDropMode, timeDiff,
-                getPlaybackFramerate() );
+        // r2 (hub ruling, r1 adversary A1 / A2): nor does the drop-frame tick that crosses the requirement land past it, or on its
+        // epsilon band (counted, not rendered): while this applies that tick's advanced position is clamped in frames, inside the
+        // completing frame (pacedMeasuredHoldLanding). Not applying, the tick below is bit for bit what it was.
+        const bool pacedHoldClampArmed = playback_frame_range::pacedMeasuredHoldApplies( m_automationPacingIsolated,
+                mlvappPlaybackUnpacedRequested(), pacedHoldArmed, m_playbackSmokeTargetPresentedFrames, m_playRequiredSourceFrames );
 
         // CUDA-HEADROOM-1: unpaced, present -> early advance -> render -> present never yields to the smoke's stop check
         // (r1 venue: Reached at 480 frames, seen at 615). Once the required source frames are consumed, hold.
@@ -13418,7 +13417,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 // (adversary A1 on d98be193): with no present outstanding (an invalidation, an idle renderer) nothing holds. r28
                 // (CoS B1 on c4efe7e3): the gate keys off the frame on SCREEN; an accepted frame whose present drawFrameReady has
                 // not dispatched, or that the non-inline prep still holds (pending, in flight, unconsumed), is still to come.
-                const playback_frame_range::DropFrameTickResult dropFrameTick =
+                playback_frame_range::DropFrameTickResult dropFrameTick =   // r2: not const, for the paced hold's landing clamp
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
                         playback_frame_range::conformDropFrameDelta(
@@ -13431,6 +13430,10 @@ void MainWindow::playbackHandling(int timeDiff)
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked(),
                         playbackConformActive() );   // r32 (adversary A1 on 2e0a3985): conform presents the cut's last frame before a Loop wrap
+                // GUI-SMOKE-PACED-STOP-STARVATION-1 r2: the armed paced hold's landing clamp (a strict no-op when it does not apply)
+                if( pacedHoldClampArmed )
+                    dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,
+                                                                                            m_sourceAdvance.consumed(), m_playRequiredSourceFrames );
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
                 // the clamp at the last frame without Loop reports what was actually advanced).
                 // r33 (adversary A1 on e0947e37): a tick can wrap more than one lap; each moved the position back by wrapWidth.

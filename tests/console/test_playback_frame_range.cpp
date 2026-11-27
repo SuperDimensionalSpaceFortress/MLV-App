@@ -4862,8 +4862,8 @@ namespace paced_starvation_model
 {
 // Receipt 8bcdb433 (Bachelor M16-1457 native fullscreen, paced): required 1499 of a 2859-frame clip, and the measured loop's
 // stop check starved -- its last check before the clip end came at frame ~1400, the next only at the clip end (2858). The model
-// runs the drop-frame engine's tick as playbackHandling does (engineTick: the paced hold, else the capped span's request at the
-// pace fps, fed to the real SourceFrameAdvanceCounter from the fractional position, never past the clip's last frame) and the
+// runs the drop-frame engine's tick as playbackHandling does (engineTick: the paced hold, else the request at the pace fps, its
+// landing clamped by the paced hold (r2), fed to the real SourceFrameAdvanceCounter, never past the clip's last frame) and the
 // measured loop's stop check only at the scheduled ticks; the check that sees Reached stops the loop, which disarms the hold,
 // and the tail ticks after it run disarmed. r1 fix iteration 2 (adversary pass 2 A1 on 8bfb3448): the model's ticks are real
 // requests (1.02 and 3 frames per tick at 60 fps), so a crossing tick is capped the way the engine's is.
@@ -4877,20 +4877,26 @@ struct Run
 static constexpr int64_t kRequired = 1499;
 static constexpr int64_t kClipFrames = 2859;
 static constexpr double kFps = 60.0;
-// false = held (no advance)
+// false = held (no advance). r2 (hub ruling): the tick is the engine's own drop-frame tick (advanceDropFrameTick, no Loop, the
+// request fps x timeDiff / 1000 from the fractional position, clamped at the clip's last frame), then, while the paced hold applies,
+// the landing clamp playbackHandling applies to it (pacedMeasuredHoldLanding), then the real counter fed from that position.
 inline bool engineTick( playback_frame_range::SourceFrameAdvanceCounter &counter, double &position, int timeDiffMs, double fps,
-                        bool unpaced, bool armed, int64_t target, int64_t required, int *tickMsOut = nullptr )
+                        bool unpaced, bool armed, int64_t target, int64_t required, int cutOutValue = static_cast<int>( kClipFrames ) )
 {
     if( playback_frame_range::pacedMeasuredHoldReached( true, unpaced, armed, target, counter.consumed(), required ) ) return false;
-    const int tickMs = playback_frame_range::pacedMeasuredHoldTickMs( true, unpaced, armed, target, counter.consumed(), required,
-                                                                      position, timeDiffMs, fps );
-    if( tickMsOut ) *tickMsOut = tickMs;
     const double before = position;
-    position += fps * static_cast<double>( tickMs ) / 1000.0;
-    if( position > static_cast<double>( kClipFrames - 1 ) ) position = static_cast<double>( kClipFrames - 1 );
-    counter.noteEngineTick( before, position, false );
+    playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick(
+        position, fps * static_cast<double>( timeDiffMs ) / 1000.0, 1, cutOutValue, false );
+    if( playback_frame_range::pacedMeasuredHoldApplies( true, unpaced, armed, target, required ) )
+        tick.position = playback_frame_range::pacedMeasuredHoldLanding( before, tick, counter.consumed(), required );
+    position = tick.position;
+    counter.noteEngineTick( before, position, tick.wrapped );
     return true;
 }
+// the frame the slider (and so the render) is on: setValue( int ) truncates the drop-frame position
+inline int64_t renderedFrame( double position ) { return static_cast<int64_t>( static_cast<int>( position ) ); }
+// the frame the counter credits for the same position (SourceFrameAdvanceCounter's rounding)
+inline int64_t countedFrame( double position ) { return static_cast<int64_t>( std::floor( position + 1e-9 ) ); }
 inline Run run( int timeDiffMs, bool unpaced, int64_t targetPresentedFrames, int64_t tailTicks )
 {
     static constexpr int64_t kChecks[] = { 50, 400, 900, 1400, 2858 };
@@ -4985,41 +4991,155 @@ TEST( PlaybackPacedMeasuredHold, R1A1ALongGapDropFrameTickNeverCarriesTheTimelin
                 for( int t = 0; t < 4000 && counter.consumed() < 1500; ++t )
                     engineTick( counter, position, gapMs, fps, false, true, 0, 1500 );
                 ASSERT_EQ( 1500, counter.consumed() );
+                ASSERT_EQ( 1499, paced_starvation_model::renderedFrame( position ) );   // r2: the hold freezes ON the frame it counted
                 ASSERT_TRUE( !engineTick( counter, position, gapMs, fps, false, true, 0, 1500 ) );
             }
-    // unchanged whenever the paced hold does not apply, and before the crossing: the span passes through untouched
-    for( const int gapMs : { 17, 1000 } )
+}
+
+// r2 (hub ruling HUB-TICK 20261127T0957Z; r1 adversary pass 3 on 21b6d81e). r1 capped the crossing tick's MILLISECOND span, which
+// cannot land exactly: A1, 25 fps from 498.79999999998023 (consumed 499, required 500) an 8 ms tick lands on 498.9999999999802,
+// which the counter credits as frame 499 (floor( p + 1e-9 )) while the slider truncates it to 498, so the hold froze one frame short
+// of what it counted; A2, at 3000 fps one ms is three frames (22 owed -> 8 ms -> 24 frames: consumed 75002 of 75000). The advanced
+// POSITION is clamped in frames instead, inside the completing frame, where both roundings agree.
+TEST( PlaybackPacedMeasuredHold, R2TheCrossingTickLandsInsideTheCompletingFrameAtAnyFps )
+{
+    using paced_starvation_model::engineTick;
+    using paced_starvation_model::renderedFrame;
+    using paced_starvation_model::countedFrame;
+    using playback_frame_range::SourceFrameAdvanceCounter;
+    const auto counterAt = []( double position )   // consumed counted from start frame 0 up to the playhead's position
     {
-        int tickMs = -1;
-        SourceFrameAdvanceCounter counter = counterAt( 1498.0 );
-        double position = 1498.0;
-        engineTick( counter, position, gapMs, 60.0, false, false, 0, 1500, &tickMs );   // not armed (the tail after the loop)
-        ASSERT_EQ( gapMs, tickMs );
-        counter = counterAt( 1498.0 );
-        position = 1498.0;
-        engineTick( counter, position, gapMs, 60.0, true, true, 0, 1500, &tickMs );     // unpaced: CUDA-HEADROOM-1's hold, unchanged
-        ASSERT_EQ( gapMs, tickMs );
-        counter = counterAt( 1498.0 );
-        position = 1498.0;
-        engineTick( counter, position, gapMs, 60.0, false, true, 480, 1500, &tickMs );  // pinned
-        ASSERT_EQ( gapMs, tickMs );
+        SourceFrameAdvanceCounter counter;
+        counter.begin( 0 );
+        counter.noteEngineTick( 0.0, position, false );
+        return counter;
+    };
+    // A1: 25 fps, 1000-frame clip, consumed 499, required 500, position 498.79999999998023, one 8 ms tick
+    {
+        SourceFrameAdvanceCounter counter = counterAt( 498.79999999998023 );
+        ASSERT_EQ( 499, counter.consumed() );
+        double position = 498.79999999998023;
+        ASSERT_TRUE( engineTick( counter, position, 8, 25.0, false, true, 0, 500, 1000 ) );
+        ASSERT_EQ( 500, counter.consumed() );
+        ASSERT_EQ( 499, countedFrame( position ) );
+        ASSERT_EQ( 499, renderedFrame( position ) );   // RED on 21b6d81e: 498 (the slider never requests frame 499)
+        const double heldAt = position;
+        ASSERT_TRUE( !engineTick( counter, position, 8, 25.0, false, true, 0, 500, 1000 ) );   // held, ON the rendered frame
+        ASSERT_TRUE( position == heldAt );
+        ASSERT_EQ( 499, renderedFrame( position ) );
     }
-    using playback_frame_range::pacedMeasuredHoldTickMs;
-    ASSERT_EQ( 17, pacedMeasuredHoldTickMs( true, false, true, 0, 100, 1500, 99.0, 17, 60.0 ) );   // far from it
-    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( false, false, true, 0, 1499, 1500, 1498.0, 1000, 60.0 ) );
-    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 0, 1498.0, 1000, 60.0 ) );
-    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 1000, 0.0 ) );
-    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 1000, std::numeric_limits<double>::quiet_NaN() ) );
-    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, std::numeric_limits<double>::quiet_NaN(), 1000, 60.0 ) );
-    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, std::numeric_limits<double>::infinity(), 1000, 60.0 ) );
-    ASSERT_EQ( -5, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, -5, 60.0 ) );   // no forward span
-    ASSERT_EQ( 17, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 1000, 60.0 ) );
-    ASSERT_EQ( 1, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.99, 1000, 60.0 ) );   // 0.01 frame owed
-    ASSERT_EQ( 9, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.5, 1000, 60.0 ) );    // 0.5 frame owed
-    // no overflow at the int64 extremes: the shortfall is formed exactly, and a span shorter than it passes through
-    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, std::numeric_limits<int64_t>::min(),
-                                              std::numeric_limits<int64_t>::max(), 0.0, 1000, 60.0 ) );
-    ASSERT_EQ( 1, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 1000, 1.0e9 ) );
+    // A2: 3000 fps, 90000-frame clip, consumed 74978, required 75000, position 74977 (22 owed), one 8 ms tick (24 frames)
+    {
+        SourceFrameAdvanceCounter counter = counterAt( 74977.0 );
+        ASSERT_EQ( 74978, counter.consumed() );
+        double position = 74977.0;
+        ASSERT_TRUE( engineTick( counter, position, 8, 3000.0, false, true, 0, 75000, 90000 ) );
+        ASSERT_EQ( 75000, counter.consumed() );   // RED on 21b6d81e: 75002
+        ASSERT_EQ( 74999, renderedFrame( position ) );
+        ASSERT_EQ( 74999, countedFrame( position ) );
+        ASSERT_TRUE( !engineTick( counter, position, 8, 3000.0, false, true, 0, 75000, 90000 ) );
+        ASSERT_EQ( 75000, counter.consumed() );
+    }
+    // the sweep: every venue fps and above 1000 fps, every gap, start offsets around each boundary (on it, inside, just under it,
+    // inside the counter's epsilon band, just past it), one and several frames owed: consumed lands on the requirement exactly,
+    // the counted and the rendered frame are the completing frame, and the next tick holds there
+    static constexpr int64_t kRequired = 75000;
+    static constexpr int kCutOut = 90000;
+    int64_t rows = 0;
+    int64_t alreadyMet = 0;   // one frame owed from inside the epsilon band: the counter already credits the completing frame
+    for( const double fps : { 23.976, 25.0, 29.97, 60.0, 120.0, 1000.0, 3000.0 } )
+        for( const int gapMs : { 1, 8, 17, 33, 100, 250, 1000 } )
+            for( const int64_t owedWhole : { int64_t( 1 ), int64_t( 2 ), int64_t( 22 ), int64_t( 500 ) } )
+                for( const double offset : { 0.0, 1.0e-12, 0.2, 0.5, 0.79999999998023, 0.99, 0.999999, 0.9999999995, 0.99999999999 } )
+                {
+                    const double start = static_cast<double>( kRequired - owedWhole - 1 ) + offset;
+                    SourceFrameAdvanceCounter counter = counterAt( start );
+                    if( counter.consumed() >= kRequired )
+                    {
+                        ASSERT_EQ( 1, owedWhole );
+                        ++alreadyMet;
+                        continue;
+                    }
+                    double position = start;
+                    for( int t = 0; t < 600000 && counter.consumed() < kRequired; ++t )
+                        ASSERT_TRUE( engineTick( counter, position, gapMs, fps, false, true, 0, kRequired, kCutOut ) );
+                    ASSERT_EQ( kRequired, counter.consumed() );
+                    ASSERT_EQ( kRequired - 1, countedFrame( position ) );
+                    ASSERT_EQ( kRequired - 1, renderedFrame( position ) );
+                    ASSERT_TRUE( !engineTick( counter, position, gapMs, fps, false, true, 0, kRequired, kCutOut ) );
+                    ++rows;
+                }
+    ASSERT_EQ( 7 * 7 * 2, alreadyMet );   // the two epsilon-band offsets with one frame owed
+    ASSERT_EQ( 7 * 7 * 4 * 9 - alreadyMet, rows );
+
+    // disarmed (and every other case the hold does not apply to): the tick is bit for bit the engine's own, with no clamp
+    for( const double fps : { 25.0, 60.0, 3000.0 } )
+        for( const int gapMs : { 8, 1000 } )
+            for( const double start : { 498.79999999998023, 74977.0, 74998.5 } )
+            {
+                const double request = fps * static_cast<double>( gapMs ) / 1000.0;
+                const playback_frame_range::DropFrameTickResult bare =
+                    playback_frame_range::advanceDropFrameTick( start, request, 1, kCutOut, false );
+                // disarmed (the tail after the loop), unpaced (CUDA-HEADROOM-1's hold), pinned, not isolated: none applies
+                ASSERT_TRUE( !playback_frame_range::pacedMeasuredHoldApplies( true, false, false, 0, kRequired ) );
+                ASSERT_TRUE( !playback_frame_range::pacedMeasuredHoldApplies( true, true, true, 0, kRequired ) );
+                ASSERT_TRUE( !playback_frame_range::pacedMeasuredHoldApplies( true, false, true, 480, kRequired ) );
+                ASSERT_TRUE( !playback_frame_range::pacedMeasuredHoldApplies( false, false, true, 0, kRequired ) );
+                ASSERT_TRUE( !playback_frame_range::pacedMeasuredHoldApplies( true, false, true, 0, 0 ) );
+                for( const bool unpaced : { false, true } )
+                    for( const bool armed : { false, true } )
+                        for( const int64_t target : { int64_t( 0 ), int64_t( 480 ) } )
+                        {
+                            if( !unpaced && armed && target == 0 ) continue;   // the one case the hold applies to
+                            SourceFrameAdvanceCounter counter = counterAt( start );
+                            double position = start;
+                            ASSERT_TRUE( engineTick( counter, position, gapMs, fps, unpaced, armed, target, kRequired, kCutOut ) );
+                            ASSERT_TRUE( std::memcmp( &position, &bare.position, sizeof( double ) ) == 0 );
+                        }
+            }
+
+    // pacedMeasuredHoldLanding's own truth table
+    using playback_frame_range::pacedMeasuredHoldLanding;
+    using playback_frame_range::DropFrameTickResult;
+    const auto tickTo = []( double position, bool wrapped = false )
+    {
+        DropFrameTickResult t;
+        t.position = position;
+        t.wrapped = wrapped;
+        return t;
+    };
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 1499, 1500 ) == 1499.5 );        // past: clamped inside
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1499.25 ), 1499, 1500 ) == 1499.25 );      // inside: unchanged
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1499.5 ), 1499, 1500 ) == 1499.5 );
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1499.0 - 5.0e-10 ), 1499, 1500 ) == 1499.0 );   // epsilon band: raised
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1498.9 ), 1499, 1500 ) == 1498.9 );        // short: unchanged
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0, true ), 1499, 1500 ) == 1558.0 );  // a wrap is never counted
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1400.0 ), 1499, 1500 ) == 1400.0 );        // backward
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 1500, 1500 ) == 1558.0 );        // already met
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 1498.0, tickTo( 1558.0 ), 1499, 0 ) == 1558.0 );           // no requirement
+    ASSERT_TRUE( std::isnan( pacedMeasuredHoldLanding( 1498.0, tickTo( std::numeric_limits<double>::quiet_NaN() ), 1499, 1500 ) ) );
+    ASSERT_TRUE( pacedMeasuredHoldLanding( std::numeric_limits<double>::quiet_NaN(), tickTo( 1558.0 ), 1499, 1500 ) == 1558.0 );
+    // a playhead above the counter's high-water mark (an external jump) is rebased to it by the counter: the start frame is the mark
+    {
+        SourceFrameAdvanceCounter counter = counterAt( 100.0 );   // consumed 101, high water 100
+        const DropFrameTickResult jumped = tickTo( 5000.0 );
+        const double landed = pacedMeasuredHoldLanding( 3000.0, jumped, counter.consumed(), 105 );
+        ASSERT_TRUE( landed == 3004.5 );
+        counter.noteEngineTick( 3000.0, landed, false );
+        ASSERT_EQ( 105, counter.consumed() );
+    }
+    // a playhead below the high-water mark (a backward seek) only lands short; the next ticks ask again and never pass it
+    {
+        SourceFrameAdvanceCounter counter = counterAt( 1498.0 );   // consumed 1499, high water 1498
+        double position = 1400.0;
+        for( int t = 0; t < 1000 && counter.consumed() < 1500; ++t )
+            ASSERT_TRUE( engineTick( counter, position, 1000, 60.0, false, true, 0, 1500 ) );
+        ASSERT_EQ( 1500, counter.consumed() );
+        ASSERT_EQ( 1499, renderedFrame( position ) );
+    }
+    // no overflow at the int64 extremes: the shortfall is formed exactly, and a landing short of it passes through
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 0.0, tickTo( 1000.0 ), std::numeric_limits<int64_t>::min(),
+                                           std::numeric_limits<int64_t>::max() ) == 1000.0 );
 }
 
 TEST( PlaybackPacedMeasuredHold, APinnedOrUnpacedRunIsNeverHeldByThePacedHold )

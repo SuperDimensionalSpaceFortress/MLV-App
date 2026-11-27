@@ -1443,42 +1443,49 @@ inline bool pinnedUnpacedHoldReached( int64_t targetPresentedFrames, int64_t con
 // GUI-SMOKE-PACED-STOP-STARVATION-1: a PACED automation measured Play holds its timeline once the required source frames are
 // consumed, only while the measured loop that checks the stop is running (armed for this open session), and never for a pinned
 // capture (its present path stops Play at exactly N) or an unpaced run (CUDA-HEADROOM-1's hold owns that).
+// The scope of that hold, without its reached test: an isolated paced unpinned Play with a requirement, while the loop is armed.
+inline bool pacedMeasuredHoldApplies( bool automationIsolated, bool unpacedRequested, bool armedForOpenSession,
+                                      int64_t targetPresentedFrames, int64_t requiredSourceFrames )
+{
+    return automationIsolated && !unpacedRequested && armedForOpenSession && targetPresentedFrames <= 0
+        && requiredSourceFrames > 0;
+}
 inline bool pacedMeasuredHoldReached( bool automationIsolated, bool unpacedRequested, bool armedForOpenSession,
                                       int64_t targetPresentedFrames, int64_t consumedSourceFrames, int64_t requiredSourceFrames )
 {
-    return automationIsolated && !unpacedRequested && armedForOpenSession && targetPresentedFrames <= 0
-        && requiredSourceFrames > 0 && consumedSourceFrames >= requiredSourceFrames;
+    return pacedMeasuredHoldApplies( automationIsolated, unpacedRequested, armedForOpenSession, targetPresentedFrames,
+                                     requiredSourceFrames )
+        && consumedSourceFrames >= requiredSourceFrames;
 }
-// r1 fix iteration 1 (adversary A1 on 57d1ab08): the hold above runs BEFORE a tick, so one drop-frame tick that asks for
-// fps x timeDiff / 1000 frames after a long GUI gap (1000 ms at 60 fps: 60 frames) carried the timeline from 1499 to 1559 consumed
-// before the hold saw it. While the same paced hold applies and is not yet reached, the tick's span (ms) is capped at the time the
-// TRAVEL still short of the requirement takes at the request's fps, rounded up. r1 fix iteration 2 (adversary pass 2 A1 on
-// 8bfb3448): that travel is measured from the tick's start position, the fractional drop-frame position the source-frame counter
-// is fed from (SourceFrameAdvanceCounter credits floor( position + 1e-9 )): (required - consumed) frames less the fraction already
-// travelled into the current frame. From 1498.99 a whole-frame shortfall asked for 1.02 frames and landed on 1500.01 (consumed
-// required + 1); now it asks for 0.06 and lands on 1499.05 (consumed == required). The tick then ends at most fps / 1000 frames
-// past the frame boundary that completes the requirement, never on the frame after it (fps below 1000); a playhead below the
-// counter's high-water mark (a backward seek) only lands short, and the next tick asks again. Anything else -- not armed,
-// pinned, unpaced, no requirement, an unknown fps or position, a span already short enough -- returns timeDiffMs unchanged, so
-// paced cadence before the crossing is untouched.
-inline int pacedMeasuredHoldTickMs( bool automationIsolated, bool unpacedRequested, bool armedForOpenSession,
-                                    int64_t targetPresentedFrames, int64_t consumedSourceFrames, int64_t requiredSourceFrames,
-                                    double tickStartPosition, int timeDiffMs, double requestFps )
+// r2 (hub ruling HUB-TICK 20261127T0957Z, closes r1 adversary A1 and A2 on 21b6d81e): the hold above runs BEFORE a tick, so one
+// drop-frame tick that crosses the requirement decides where the hold freezes. r1 capped that tick's millisecond span, which cannot
+// land exactly: the span is quantised to 1 ms (above 1000 fps one ms is more than a frame: 3000 fps, 22 owed, 8 ms -> 24 frames,
+// consumed 75002 of 75000), and the landing is read through two roundings, the counter's floor( position + 1e-9 ) and the render's
+// truncation (25 fps, 498.79999999998 + 0.2 = 498.9999999999802: the counter credits 499, the slider shows 498, the hold froze one
+// frame short of what it counted). This clamps the ADVANCED POSITION instead, in frames, so it holds at any fps and any span.
+//
+// The frame that completes the requirement is the tick's start frame (on the counter's rounding) plus the frames still owed: the
+// counter's high-water mark is the start frame on forward play, and a playhead above it is rebased to it (an external jump). When
+// the tick lands on or past that frame on the counter's rounding, the landing is clamped into [frame, frame + 0.5], where both
+// roundings agree on the frame: consumed reaches the requirement exactly and the hold freezes ON the rendered frame. A landing
+// already inside that span is returned unchanged (bit for bit). A playhead below the high-water mark (a backward seek) only lands
+// short of the real completing frame, and the next tick asks again; nothing is ever credited past the requirement.
+// Anything else -- a wrap (never counted as footage), a backward or non-finite tick, no requirement, the requirement already met, a
+// landing short of the completing frame -- returns tick.position unchanged. MainWindow calls it only while pacedMeasuredHoldApplies.
+inline double pacedMeasuredHoldLanding( double tickStartPosition, const DropFrameTickResult & tick,
+                                        int64_t consumedSourceFrames, int64_t requiredSourceFrames )
 {
-    if( !( automationIsolated && !unpacedRequested && armedForOpenSession && targetPresentedFrames <= 0 && requiredSourceFrames > 0 )
-     || consumedSourceFrames >= requiredSourceFrames || timeDiffMs < 1 || !( requestFps > 0.0 ) || !std::isfinite( requestFps )
-     || !std::isfinite( tickStartPosition ) )
-        return timeDiffMs;
-    // the fraction of the current frame already travelled, on the counter's own rounding (in [0, 1))
-    double travelled = tickStartPosition - std::floor( tickStartPosition + 1e-9 );
-    if( !( travelled > 0.0 ) ) travelled = 0.0;
-    if( travelled >= 1.0 ) travelled = 0.0;
-    // consumed < required here: the difference is formed in uint64_t, exact for every int64 pair (the signed form overflows);
-    // it is at least 1, so the travel still owed is positive
-    const double shortFrames = static_cast<double>( static_cast<uint64_t>( requiredSourceFrames )
-                                                    - static_cast<uint64_t>( consumedSourceFrames ) ) - travelled;
-    const double shortMs = std::ceil( shortFrames * 1000.0 / requestFps );
-    return shortMs < static_cast<double>( timeDiffMs ) ? static_cast<int>( shortMs < 1.0 ? 1.0 : shortMs ) : timeDiffMs;
+    if( tick.wrapped || requiredSourceFrames <= 0 || consumedSourceFrames >= requiredSourceFrames
+     || !std::isfinite( tickStartPosition ) || !std::isfinite( tick.position ) || !( tick.position >= tickStartPosition ) )
+        return tick.position;
+    // consumed < required here: the shortfall is formed in uint64_t, exact for every int64 pair (the signed form overflows), >= 1
+    const double owed = static_cast<double>( static_cast<uint64_t>( requiredSourceFrames )
+                                             - static_cast<uint64_t>( consumedSourceFrames ) );
+    const double completingFrame = std::floor( tickStartPosition + 1e-9 ) + owed;
+    if( !( std::floor( tick.position + 1e-9 ) >= completingFrame ) ) return tick.position;
+    const double insideFrame = completingFrame + 0.5;
+    if( tick.position < completingFrame ) return completingFrame;   // the epsilon band: counted as the frame, rendered as the one before
+    return tick.position > insideFrame ? insideFrame : tick.position;
 }
 // r8 fix 1 (adversary A2): a pinned capture is admitted only when its identity frame start + N exists and lies BEFORE the last frame
 // (lastFrameIndex, 0-based) -- the engine's end-of-clip stop can end Play before the last frame's present is credited. Refused
