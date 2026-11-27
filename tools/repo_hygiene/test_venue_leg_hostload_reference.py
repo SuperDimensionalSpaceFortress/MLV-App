@@ -1140,7 +1140,9 @@ class VenueChainImportResolvesTests(unittest.TestCase):
 
 @unittest.skipIf(PWSH is None, "pwsh is not on PATH")
 class R7ReceiptDigestGetterAndBaselineObservationGuardTests(unittest.TestCase):
-    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r7 (sol r7 B3 and A3, key3 fable r7 B3)."""
+    """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r7 (sol r7 B3 and A3, key3 fable r7 B3; adversary-aab90f89.json A1)."""
+
+    write_leg = PlannedLegTypeExemptionTests.write_leg   # the one fixture writer (a receipt, its summary and result.json under a receipts/evidence pair)
 
     def test_r7_b3_the_receipt_digest_getter_answers_empty_on_a_fresh_module_before_any_write(self) -> None:
         # sol r7 B3, its input: import the REAL DualVenueRunner.psm1 and call the exported Get-DvLastWrittenReceiptSha256 before any Write-DvReceipt. RED on 8bdb42a5: the module runs
@@ -1156,6 +1158,27 @@ class R7ReceiptDigestGetterAndBaselineObservationGuardTests(unittest.TestCase):
         text = module.read_text(encoding="utf-8")
         init = text.index("$script:DvLastWrittenReceiptSha256 = ''")
         self.assertLess(init, text.index("function Get-DvLastWrittenReceiptSha256"), "the variable is initialised at module scope, before the getter that reads it")
+
+    def test_r7_adv_a1_a_caller_descheduled_before_the_deadline_sample_keeps_its_remaining_budget(self) -> None:
+        # adversary-aab90f89.json A1 (introduced), its input: -ReadTimeoutSec 20, -CallDeadlineUtc 12 s away, the caller descheduled 7 s right after the read stopwatch started (the seam
+        # VenueTestPreDeadlineSampleDelayMs), a valid receipt and a quiet result.json both immediately readable. RED on aab90f89: the seconds LEFT (5) were taken as the endpoint on a stopwatch
+        # already at 7, so the first read was refused with 5 s still before the deadline (unknown, provisional). The endpoint is the stopwatch reading at the sample plus the seconds left (12): quiet.
+        # The control: a deadline already inside the descheduling (6 s away, 7 s asleep) still reads unknown, never quiet.
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            quiet = json.dumps({"hostLoad": QUIET})
+            sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            rid = "a1a1a1a1-a1a1-4a1a-8a1a-a1a1a1a1a1a1"
+            path = self.write_leg(Path(d), rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+            p = run_ps(
+                "$vc = Get-Module VenueChain; & $vc { $script:VenueTestPreDeadlineSampleDelayMs = 7000 }; "
+                f"$a = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(12)); Write-Output ('A=' + $a.state + '/' + $a.provisional); Write-Output ('AWHY=' + $a.reason); "
+                f"$b = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 20 -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(7.5)); Write-Output ('B=' + $b.state + '/' + $b.provisional); "
+                "& $vc { $script:VenueTestPreDeadlineSampleDelayMs = 0 }")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["A"], "quiet/False", "5 s are left before the deadline and the quiet standing is readable: " + p.stdout)
+        self.assertEqual(got["B"], "unknown/True", "a deadline that fell inside the descheduling is never a quiet read: " + p.stdout)
 
     def test_r7_a3_one_shared_guard_judges_a_standing_against_the_callers_absolute_end(self) -> None:
         # sol r7 A3, its input: the final row's reader passes quiet/nonprovisional/collected at elapsed 899.9 s and the baseline resumes at 901 s with MaxTotalSec=900. The standing

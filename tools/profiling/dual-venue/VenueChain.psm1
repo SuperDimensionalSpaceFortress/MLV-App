@@ -1239,6 +1239,8 @@ $script:VenueTestPostReadDelayMs = 0
 # between the read's own end check and the classification is. Production leaves it 0.
 $script:VenueTestPostBytesDelayMs = 0
 $script:VenueTestPostReceiptBytesDelayMs = 0   # the same stall after the RECEIPT read (the export-exemption return acts on that answer)
+# Test-only (R2-NARROW-1 r7, adversary-aab90f89.json A1): Get-VenueLegHostLoad sleeps this many ms after it starts its read stopwatch and before it samples the caller's deadline, as a caller descheduled there is. Production leaves it 0.
+$script:VenueTestPreDeadlineSampleDelayMs = 0
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the worker of Read-VenueFileBytesBounded. It is handed the ABSOLUTE UTC end of the caller's budget (endUtcTicks, 0 = none) and
 # checks it before the existence probe and again before ReadAllBytes, so a read that was started in time still performs no I/O once the end has passed. (No apostrophe in the messages: this is single-quoted text.)
 # Test-only (R2-NARROW-1 r2, adversary-baf2e69a.json A1): Read-VenueFileBytesBounded sleeps this many ms right after it samples the caller's stopwatch, as a caller descheduled there is, and with
@@ -2025,11 +2027,18 @@ function Get-VenueLegHostLoad {
         if (-not ($ReadTimeoutSec -ge 1.0)) { $unknown.reason = 'no time was left to read the leg''s receipt and smoke result'; return $unknown }
         # pass 2 (adversary-b3d61554.json A1): ONE budget for both reads (this Stopwatch and the same end), never a fresh bound per read, and an answer past the end is not acted on
         $readClock = [Diagnostics.Stopwatch]::StartNew()
+        if ($script:VenueTestPreDeadlineSampleDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreDeadlineSampleDelayMs) }
+        # $budgetSec is an ENDPOINT on $readClock (both reads pass it as -EndSec), never a duration: the earlier of -ReadTimeoutSec (measured from the stopwatch's start) and the stopwatch reading at
+        # which the absolute deadline falls
         $budgetSec = $ReadTimeoutSec
         if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) {
+            # R2-NARROW-1 r7 (adversary-aab90f89.json A1, introduced): the stopwatch is sampled BEFORE the wall clock, so the endpoint is that reading plus the seconds still left to the deadline. It used to
+            # take the seconds left as the endpoint itself, which charged the time already on the stopwatch twice: a caller descheduled 7 s after the stopwatch started, with 12 s to its deadline,
+            # got endpoint 5 on a stopwatch at 7 and refused a readable quiet standing with 5 s still left. Sampling the stopwatch first can only land the endpoint at or before the real end (the safe side).
+            $sampleSec = $readClock.Elapsed.TotalSeconds
             $toDeadline = ($CallDeadlineUtc.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds
             if (-not ($toDeadline -ge 1.0)) { $unknown.reason = 'no time was left before the caller''s deadline to read the leg''s receipt and smoke result'; return $unknown }
-            if ($toDeadline -lt $budgetSec) { $budgetSec = $toDeadline }
+            if (($sampleSec + $toDeadline) -lt $budgetSec) { $budgetSec = $sampleSec + $toDeadline }
         }
         $endArgs = @{}
         if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) { $endArgs['EndUtc'] = $CallDeadlineUtc.ToUniversalTime() }
