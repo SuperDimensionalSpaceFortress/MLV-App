@@ -1359,8 +1359,9 @@ function Invoke-VenueBoundedRead {
         if ($null -ne $Clock -and ($late = $Clock.Elapsed.TotalSeconds - $EndSec) -gt 0) {
             return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen $([Math]::Round($late, 2)) s after the call's end is never acted on" }
         }
-        # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1: and on the UTC end too, re-read on the wake that saw the answer
-        if ($hasUtc -and (Get-VenueUtcLeftSec -DeadlineUtc $EndUtc) -le 0) {
+        # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1: and on the UTC end too, re-read on the wake that saw the answer. adversary-9bc903a3.json A1: an end the wait already SAW passed ($utcCut)
+        # is final, so a later read that recovers (a clock stepped back, one read that threw or answered null) never turns an answer found by that last look into one acted on
+        if ($utcCut -or ($hasUtc -and (Get-VenueUtcLeftSec -DeadlineUtc $EndUtc) -le 0)) {
             return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen after the caller's absolute end is never acted on" }
         }
         [pscustomobject]@{ answered = $true; value = @($ps.EndInvoke($async)); error = $null }
