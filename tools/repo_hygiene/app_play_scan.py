@@ -1123,6 +1123,17 @@ COUNTER_MACRO_IDENTIFIERS = frozenset({
 _COUNTER_RESPELL_SPLICE = re.compile(r"\\[ \t\f\v]*\r?\n")
 _COUNTER_DEFINE_ANYWHERE = re.compile(r"(?<!\w)define\s+([A-Za-z_]\w*)")
 
+# r4 (adversary A1 on f7e81e1a, and advisory A3, its sibling at the reset): the pinned landing call and the pinned reset name
+# `playback_frame_range::`, and a namespace alias (`namespace playback_frame_range = ::hold_override;`) made that qualifier resolve to an
+# override -- one taking the high-water mark by reference and writing it, or returning an armed counter -- while the text still matched.
+# A qualified name resolves through the qualifier's own declaration only, so the qualifier is the thing to pin: outside the namespace's
+# own opening (`namespace playback_frame_range {`) in its defining header, every `playback_frame_range` token in a scanned source must be
+# followed by `::`. An alias, a reopened namespace, a type alias, a local type or a variable of that name fails.
+_QUALIFIER_DEFINING_SOURCE = "platform/qt/PlaybackFrameRange.h"
+_QUALIFIER_TOKEN = re.compile(r"(?<!\w)playback_frame_range(?!\w)")
+_QUALIFIER_QUALIFIES = re.compile(r"\s*::")
+_QUALIFIER_OPENING = re.compile(r"(?<!\w)namespace\s+(playback_frame_range)\s*\{")
+
 
 def _scan_counter_macros(sources: dict[str, str], main_blank: str) -> list[str]:
     problems: list[str] = []
@@ -1133,6 +1144,12 @@ def _scan_counter_macros(sources: dict[str, str], main_blank: str) -> list[str]:
             if match.group(1) in COUNTER_MACRO_IDENTIFIERS:
                 problems.append(f"{path}:{_line_of(blank, match.start())}: #define of {match.group(1)}, a token the source-frame "
                                 "counter's pinned reads and writes rely on")
+        openings = ({m.start(1) for m in _QUALIFIER_OPENING.finditer(blank)} if path == _QUALIFIER_DEFINING_SOURCE else set())
+        for match in _QUALIFIER_TOKEN.finditer(blank):
+            if _QUALIFIER_QUALIFIES.match(blank, match.end()) or match.start() in openings:
+                continue
+            problems.append(f"{path}:{_line_of(blank, match.start())}: rebinds playback_frame_range (not followed by ::), the qualifier the "
+                            f"source-frame counter's pinned calls resolve through: {_normalise(blank[match.start():match.start() + 60])}")
     return problems
 
 

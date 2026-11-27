@@ -884,6 +884,50 @@ class CounterWritePinTests(unittest.TestCase):
         self.assertTrue({"m_sourceAdvance", "highWater", "armed", "startFrame", "consumed", "pacedMeasuredHoldLanding"}
                         <= COUNTER_MACRO_IDENTIFIERS)
 
+    def test_r4_a_rebinding_of_the_pinned_qualifier_fails(self) -> None:
+        """GUI-SMOKE-PACED-STOP-STARVATION-1 r4 (adversary A1 on f7e81e1a, and advisory A3, its sibling at the reset): the pinned landing call
+        and reset name `playback_frame_range::`, and a NAMESPACE ALIAS made that qualifier resolve to an override that takes the high-water mark
+        by reference and writes it (A1, in playbackHandling) or returns an armed counter (A3, in programmaticPlay), while the text still matched.
+        Outside the namespace's own opening in PlaybackFrameRange.h, every `playback_frame_range` token in a scanned source must be followed by
+        `::`: an alias, a reopened namespace, a type alias, a local type or a variable of that name fails."""
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        needle = "rebinds playback_frame_range"
+        override = ("namespace hold_override { using namespace ::playback_frame_range; inline double pacedMeasuredHoldLanding(double, "
+                    "const ::playback_frame_range::DropFrameTickResult &tick, int64_t &mark, int64_t, int64_t) { mark=0; return tick.position; } }\n")
+        handling = "void MainWindow::playbackHandling(int timeDiff)\n{"
+        play = "bool MainWindow::programmaticPlay("
+        self.assertIn(play, self.sources[self.MAIN_WINDOW])
+        cases = (
+            ("A1: an alias as playbackHandling's first statement", handling,
+             override + handling + "\n    namespace playback_frame_range = ::hold_override;"),
+            ("A3: an alias before programmaticPlay", play,
+             "namespace counter_override { using namespace ::playback_frame_range; }\nnamespace playback_frame_range = ::counter_override;\n" + play),
+            ("the namespace reopened in MainWindow.cpp", handling,
+             "namespace playback_frame_range { inline double pacedMeasuredHoldLanding(double, const DropFrameTickResult &t, int64_t &m, int, int)"
+             " { m = 0; return t.position; } }\n" + handling),
+            ("a type alias", handling, "using playback_frame_range = ::hold_override_t;\n" + handling),
+            ("a local struct", handling, handling + "\n    struct playback_frame_range { static double pacedMeasuredHoldLanding(...) { return 0; } };"),
+            ("a spaced alias", handling, handling + "\n    namespace  playback_frame_range\n      =  ::hold_override ;"),
+        )
+        for name, anchor, replacement in cases:
+            with self.subTest(name):
+                self.assert_caught(self.mutated(anchor, replacement), needle)
+        for path in (self.MAIN_WINDOW, self.MAIN):
+            with self.subTest(f"an alias at the top of {path}"):
+                sources = dict(self.sources)
+                sources[path] = "namespace playback_frame_range = ::hold_override;\n" + sources[path]
+                self.assert_caught(sources, needle)
+        with self.subTest("an alias in the defining header itself"):
+            self.assert_caught({"platform/qt/PlaybackFrameRange.h": "namespace playback_frame_range {\n}\nnamespace playback_frame_range = ::x;\n"},
+                               needle)
+        with self.subTest("the defining header's own opening is not a rebinding"):
+            problems = scan_app_play_sources({"platform/qt/PlaybackFrameRange.h": "namespace playback_frame_range {\nint f();\n}\n"})
+            self.assertFalse(any(needle in p for p in problems), problems)
+        with self.subTest("a qualified use, comment or string is not a rebinding"):
+            problems = scan_app_play_sources({"platform/qt/main.cpp": "int a = ::playback_frame_range::f();\n// playback_frame_range alias\n"
+                                                                      "const char *s = \"playback_frame_range\";\n"})
+            self.assertFalse(any(needle in p for p in problems), problems)
+
     LANDING_CALL = ("dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,\n"
                     "                        m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );")
 
