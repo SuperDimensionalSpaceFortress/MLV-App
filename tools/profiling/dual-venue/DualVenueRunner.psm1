@@ -7280,7 +7280,8 @@ Remove-Item -LiteralPath `$scratch -Force
 `$probe.commitUsedGiB = [math]::Round((`$os.TotalVirtualMemorySize - `$os.FreeVirtualMemory) / 1MB, 1)
 `$probe.commitLimitGiB = [math]::Round(`$os.TotalVirtualMemorySize / 1MB, 1)
 `$probe.hostName = [string]`$env:COMPUTERNAME
-`$gpus = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue)
+`$gpuErr = `$null
+`$gpus = @(Get-CimInstance -ClassName Win32_VideoController -ErrorAction SilentlyContinue -ErrorVariable gpuErr)
 `$probe.gpuNames = @(`$gpus | ForEach-Object { [string]`$_.Name })
 `$probe.driverVersion = `$(if (`$gpus.Count -gt 0) { [string](`$gpus | Select-Object -First 1).DriverVersion } else { `$null })
 `$probe.displayDevice = `$null
@@ -7289,8 +7290,78 @@ try { Add-Type -AssemblyName System.Windows.Forms; `$probe.displayDevice = [stri
 `$probe.presentmonSha256 = `$(if (Test-Path -LiteralPath `$pm -PathType Leaf) { (Get-FileHash -LiteralPath `$pm -Algorithm SHA256).Hash.ToLowerInvariant() } else { `$null })
 "@
     # The embedded function is concatenated, never interpolated: its own `$` must reach the venue as written.
-    $body + "`r`n" + $sessionLockedSource + "`r`n" + '$probe.sessionLocked = Get-AttrCudaSessionLocked' + "`r`n" +
-        'Write-Output (''DVE_PROBE='' + ($probe | ConvertTo-Json -Compress -Depth 4))' + "`r`n"
+    # VENUE-LEG-DISPLAY-STATE-FIELDS-1: the display-state readings are one more fragment of this same job (no new job, process or call); -Depth 6 holds the nested readings.
+    $body + "`r`n" + (New-DvDisplayStateProbeText) + "`r`n" + $sessionLockedSource + "`r`n" + '$probe.sessionLocked = Get-AttrCudaSessionLocked' + "`r`n" +
+        'Write-Output (''DVE_PROBE='' + ($probe | ConvertTo-Json -Compress -Depth 6))' + "`r`n"
+}
+
+function New-DvDisplayStateProbeText {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-DISPLAY-STATE-FIELDS-1: the fragment of the health probe job that records `$probe.displayState`: eight readings, each { value; unknown }. It reads
+    NOTHING new except one bounded CIM class and one registry value: the display adapter, the displays and the driver come from the Win32_VideoController read
+    the probe already made (`$gpus`, `$gpuErr`), the Windows build and the last boot time from the Win32_OperatingSystem read it already made (`$os`), the
+    hotfix count from ONE Win32_QuickFixEngineering read with its own -OperationTimeoutSec, and the UBR from HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion
+    (Win32_OperatingSystem carries no UBR). No process, no write, no network, no elevation. Every read is inside the job's own deadline (Submit-VenueJob
+    -TimeoutSec 120) and the fragment adds its own 30 s budget on top: a read that has no budget left is `DEADLINE`, one that throws is `CIM_ERROR` (or
+    `CIM_TIMEOUT` for a timed-out operation), one that returns nothing is `CIM_EMPTY`, a registry read that fails is `REGISTRY_ERROR`, and a video controller
+    that reports no current mode is `NO_ACTIVE_OUTPUT`. The whole fragment is inside one try: a failure anywhere leaves `displayState` null (the writer types every
+    field NOT_REPORTED) and never fails the probe. A single-quoted here-string, so the fragment reaches the venue exactly as written. Expects `$probe`, `$os`,
+    `$gpus` and `$gpuErr` in scope.
+    #>
+    @'
+# VENUE-LEG-DISPLAY-STATE-FIELDS-1: display-state readings (read-only; see New-DvDisplayStateProbeText in DualVenueRunner.psm1)
+$probe.displayState = $null
+try {
+    $dsClock = [Diagnostics.Stopwatch]::StartNew()
+    if ($null -eq $dsBudgetSec) { $dsBudgetSec = 30 }   # a test may pre-set a smaller budget; the job never does
+    function Get-DsFailReason($ex) {
+        for ($x = $ex; $null -ne $x; $x = $x.InnerException) {
+            if ($x -is [System.TimeoutException]) { return 'CIM_TIMEOUT' }
+            $code = $null
+            try { $code = [string]$x.NativeErrorCode } catch { $code = $null }
+            if ($code -eq 'TimedOut') { return 'CIM_TIMEOUT' }
+        }
+        'CIM_ERROR'
+    }
+    function New-DsReading($value, $why) { [ordered]@{ value = $value; unknown = $why } }
+    $dsInvariant = [Globalization.CultureInfo]::InvariantCulture
+    $dsGpus = @($gpus)
+    $dsActive = @($dsGpus | Where-Object { [int]$_.CurrentHorizontalResolution -gt 0 -and [int]$_.CurrentVerticalResolution -gt 0 -and [int]$_.CurrentRefreshRate -gt 0 })
+    $dsAdapterWhy = $null
+    if ($dsGpus.Count -eq 0) { $dsAdapterWhy = $(if (@($gpuErr).Count -gt 0) { Get-DsFailReason (@($gpuErr)[0].Exception) } else { 'CIM_EMPTY' }) }
+    elseif ($dsActive.Count -eq 0) { $dsAdapterWhy = 'NO_ACTIVE_OUTPUT' }
+    $ds = [ordered]@{}
+    if ($null -ne $dsAdapterWhy) {
+        foreach ($f in @('displayAdapterName', 'displayAdapterDriverVersion', 'displayAdapterDriverDate', 'displays')) { $ds[$f] = New-DsReading $null $dsAdapterWhy }
+    } else {
+        $first = $dsActive[0]
+        $name = [string]$first.Name
+        $ds.displayAdapterName = $(if ($name.Length -gt 0) { New-DsReading $name $null } else { New-DsReading $null 'CIM_EMPTY' })
+        $ver = [string]$first.DriverVersion
+        $ds.displayAdapterDriverVersion = $(if ($ver.Length -gt 0) { New-DsReading $ver $null } else { New-DsReading $null 'CIM_EMPTY' })
+        $ds.displayAdapterDriverDate = $(if ($first.DriverDate -is [datetime]) { New-DsReading ($first.DriverDate.ToString('yyyy-MM-dd', $dsInvariant)) $null } else { New-DsReading $null 'CIM_EMPTY' })
+        $ds.displays = New-DsReading ([object[]]@($dsActive | Select-Object -First 64 | ForEach-Object {
+            [ordered]@{ adapter = [string]$_.Name; width = [int]$_.CurrentHorizontalResolution; height = [int]$_.CurrentVerticalResolution; refreshHz = [int]$_.CurrentRefreshRate } })) $null
+    }
+    $build = $(if ($null -ne $os) { [string]$os.BuildNumber } else { '' })
+    $ds.windowsBuild = $(if ($build.Length -gt 0) { New-DsReading $build $null } else { New-DsReading $null 'CIM_EMPTY' })
+    try {
+        $ubr = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name 'UBR' -ErrorAction Stop).UBR
+        $ds.windowsUbr = $(if ($ubr -is [int] -and $ubr -ge 0) { New-DsReading $ubr $null } else { New-DsReading $null 'REGISTRY_ERROR' })
+    } catch { $ds.windowsUbr = New-DsReading $null 'REGISTRY_ERROR' }
+    $ds.lastBootUtc = $(if ($null -ne $os -and $os.LastBootUpTime -is [datetime]) { New-DsReading ($os.LastBootUpTime.ToUniversalTime().ToString('yyyy-MM-dd\THH:mm:ss\Z', $dsInvariant)) $null } else { New-DsReading $null 'CIM_EMPTY' })
+    $dsLeft = $dsBudgetSec - $dsClock.Elapsed.TotalSeconds
+    if ($dsLeft -lt 1) { $ds.hotfixCount = New-DsReading $null 'DEADLINE' }
+    else {
+        try {
+            $fixes = @(Get-CimInstance -ClassName Win32_QuickFixEngineering -OperationTimeoutSec ([int][math]::Min(15, [math]::Floor($dsLeft))) -ErrorAction Stop)
+            $ds.hotfixCount = $(if ($fixes.Count -gt 0) { New-DsReading $fixes.Count $null } else { New-DsReading $null 'CIM_EMPTY' })
+        } catch { $ds.hotfixCount = New-DsReading $null (Get-DsFailReason $_.Exception) }
+    }
+    $probe.displayState = $ds
+} catch { $probe.displayState = $null }
+'@
 }
 
 function ConvertFrom-DvProbeStdout([string]$Stdout) {
@@ -7827,6 +7898,14 @@ $script:DisplayPathSchema = 'mlv-app/venue-display-path/v2'
 $script:DisplayPathSource = 'health-probe'
 $script:DisplayPathFields = @('schema', 'source', 'adapters', 'firstAdapterDriverVersion', 'primaryDisplayDevice')
 $script:DisplayPathMaxAdapters = 64
+# VENUE-LEG-DISPLAY-STATE-FIELDS-1: the v3 block is the v2 block plus ONE member, `displayState`: eight readings the health probe takes in the SAME job (see
+# New-DvDisplayStateProbeText). A v2 block still reads exactly as before (the schema picks the field set). Each reading is { value; unknown }: exactly one is
+# non-null, and `unknown` is one of the typed reasons below, never a guess and never a missing member.
+$script:DisplayPathSchemaV3 = 'mlv-app/venue-display-path/v3'
+$script:DisplayPathFieldsV3 = @('schema', 'source', 'adapters', 'firstAdapterDriverVersion', 'primaryDisplayDevice', 'displayState')
+$script:DisplayStateFields = @('displayAdapterName', 'displayAdapterDriverVersion', 'displayAdapterDriverDate', 'displays', 'windowsBuild', 'windowsUbr', 'lastBootUtc', 'hotfixCount')
+$script:DisplayStateUnknownReasons = @('CIM_ERROR', 'CIM_TIMEOUT', 'CIM_EMPTY', 'NO_ACTIVE_OUTPUT', 'REGISTRY_ERROR', 'DEADLINE', 'NOT_REPORTED', 'MALFORMED')
+$script:DisplayStateMaxDisplays = 64
 
 function Test-DvMemberNameIs {
     # r3 (sol r2 B1): THE case rule for finding a receipt member by name -- ordinal, ANY letter case (PowerShell reads member names case-insensitively, so a
@@ -7964,6 +8043,193 @@ function Test-DvReceiptCarriesDisplayPath {
     $false
 }
 
+function Test-DvTextHasRawControl {
+    # VENUE-LEG-DISPLAY-STATE-FIELDS-1: a C0 control, DEL, a C1 control (U+0085 NEL included), U+2028 or U+2029 in a name. Any of them splits a record line
+    # in a reader that breaks lines on it, so the v3 writer escapes them (ConvertTo-DvEscapedText) and the v3 reader refuses a text that still holds one.
+    param([AllowNull()][string]$Text)
+    if ($null -eq $Text) { return $false }
+    foreach ($ch in $Text.ToCharArray()) {
+        $c = [int]$ch
+        if ($c -lt 0x20 -or ($c -ge 0x7F -and $c -le 0x9F) -or $c -eq 0x2028 -or $c -eq 0x2029) { return $true }
+    }
+    $false
+}
+
+function ConvertTo-DvEscapedText {
+    # VENUE-LEG-DISPLAY-STATE-FIELDS-1: every character Test-DvTextHasRawControl names becomes the six characters \uXXXX (lower-case hex); nothing else changes.
+    param($Text)   # untyped on purpose: a [string] parameter turns $null into '' and a null driver or device must stay null
+    if ($null -eq $Text) { return $null }
+    $Text = [string]$Text
+    $sb = [System.Text.StringBuilder]::new()
+    foreach ($ch in $Text.ToCharArray()) {
+        if (Test-DvTextHasRawControl ([string]$ch)) { [void]$sb.Append('\u' + ([int]$ch).ToString('x4', [System.Globalization.CultureInfo]::InvariantCulture)) } else { [void]$sb.Append($ch) }
+    }
+    $sb.ToString()
+}
+
+function Read-DvDisplayReading {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-DISPLAY-STATE-FIELDS-1: the ONE rule for one `displayState` reading, shared by the strict reader (Read-DvDisplayState) and the lenient writer
+    (ConvertTo-DvDisplayStateFromProbe). A reading is an object with exactly the members `value` and `unknown` (any letter case, none doubled): `unknown` is
+    $null with a typed `value`, or one of $script:DisplayStateUnknownReasons with a null `value`. Value types by field: displayAdapterName / DriverVersion
+    non-empty text; displayAdapterDriverDate yyyy-MM-dd; windowsBuild digits; lastBootUtc yyyy-MM-ddTHH:mm:ssZ; windowsUbr / hotfixCount a non-negative
+    int32; displays a list of 1 to 64 objects { adapter; width; height; refreshHz } (positive ints). A text carrying U+FFFD or `?` is refused (the marks of a
+    text not carried as reported). A raw control or line-separator character is refused, or with -Escape (the writer) replaced by its \uXXXX escape.
+    Returns [pscustomobject]@{ ok; why; reading } where reading is [ordered]@{ value; unknown }. Never throws.
+    #>
+    param([System.Text.Json.JsonElement]$Element, [string]$Field, [switch]$Escape)
+    $bad = { param($why) [pscustomobject]@{ ok = $false; why = "$Field $why"; reading = $null } }
+    try {
+        $object = [System.Text.Json.JsonValueKind]::Object
+        $string = [System.Text.Json.JsonValueKind]::String
+        $null_ = [System.Text.Json.JsonValueKind]::Null
+        $number = [System.Text.Json.JsonValueKind]::Number
+        $lossy = [char[]]@([char]0xFFFD, [char]0x3F)
+        if ($Element.ValueKind -ne $object) { return (& $bad 'is not a reading object') }
+        $m = [System.Collections.Generic.Dictionary[string, System.Text.Json.JsonElement]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($p in $Element.EnumerateObject()) {
+            $n = $p.Name
+            if ($null -eq $n) { return (& $bad 'carries a member name that cannot be read back') }
+            if ($m.ContainsKey([string]$n)) { return (& $bad 'reading names a member more than once') }
+            if (-not ((Test-DvOrdinalEqual $n 'value') -or (Test-DvOrdinalEqual $n 'unknown'))) { return (& $bad 'reading carries an unknown member') }
+            $m[[string]$n] = $p.Value
+        }
+        if (-not ($m.ContainsKey('value') -and $m.ContainsKey('unknown'))) { return (& $bad 'reading needs both value and unknown') }
+        $u = $m['unknown']; $v = $m['value']
+        if ($u.ValueKind -eq $string) {
+            $why = [string]$u.GetString()
+            $typed = @($script:DisplayStateUnknownReasons | Where-Object { [string]::Equals($_, $why, [System.StringComparison]::Ordinal) })
+            if ($typed.Count -ne 1) { return (& $bad 'unknown is not a typed reason') }
+            if ($v.ValueKind -ne $null_) { return (& $bad 'carries a value beside an unknown reason') }
+            return [pscustomobject]@{ ok = $true; why = $null; reading = [ordered]@{ value = $null; unknown = $typed[0] } }
+        }
+        if ($u.ValueKind -ne $null_) { return (& $bad 'unknown is neither a reason nor null') }
+        if ($v.ValueKind -eq $null_) { return (& $bad 'has neither a value nor an unknown reason') }
+        $text = {
+            param($e)
+            if ($e.ValueKind -ne $string) { return $null }
+            $s = [string]$e.GetString()
+            if ($s.Length -eq 0 -or $s.IndexOfAny($lossy) -ge 0) { return $null }
+            if ($Escape) { return (ConvertTo-DvEscapedText $s) }
+            if (Test-DvTextHasRawControl $s) { return $null }
+            $s
+        }
+        $int = {
+            param($e, [bool]$positive)
+            $i = 0
+            if ($e.ValueKind -ne $number -or -not $e.TryGetInt32([ref]$i)) { return $null }
+            if ($i -lt 0 -or ($positive -and $i -eq 0)) { return $null }
+            [int]$i
+        }
+        $value = $null
+        switch ($Field) {
+            { $_ -in @('displayAdapterName', 'displayAdapterDriverVersion') } {
+                $value = & $text $v
+                if ($null -eq $value) { return (& $bad 'value is not a plain non-empty text') }
+            }
+            'displayAdapterDriverDate' {
+                $s = $(if ($v.ValueKind -eq $string) { [string]$v.GetString() } else { '' })
+                $d = [datetime]::MinValue
+                if ($s -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' -or -not [datetime]::TryParseExact($s, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return (& $bad 'value is not a yyyy-MM-dd date') }
+                $value = $s
+            }
+            'lastBootUtc' {
+                $s = $(if ($v.ValueKind -eq $string) { [string]$v.GetString() } else { '' })
+                $d = [datetime]::MinValue
+                if ($s -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' -or -not [datetime]::TryParseExact($s, "yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return (& $bad 'value is not a yyyy-MM-ddTHH:mm:ssZ time') }
+                $value = $s
+            }
+            'windowsBuild' {
+                $s = $(if ($v.ValueKind -eq $string) { [string]$v.GetString() } else { '' })
+                if ($s -notmatch '^[0-9]{1,10}$') { return (& $bad 'value is not a build number') }
+                $value = $s
+            }
+            { $_ -in @('windowsUbr', 'hotfixCount') } {
+                $value = & $int $v $false
+                if ($null -eq $value) { return (& $bad 'value is not a non-negative integer') }
+            }
+            'displays' {
+                if ($v.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { return (& $bad 'value is not a list') }
+                $n = $v.GetArrayLength()
+                if ($n -lt 1 -or $n -gt $script:DisplayStateMaxDisplays) { return (& $bad "value lists $n displays (1 to $($script:DisplayStateMaxDisplays) allowed)") }
+                $list = [System.Collections.Generic.List[object]]::new()
+                foreach ($e in $v.EnumerateArray()) {
+                    if ($e.ValueKind -ne $object) { return (& $bad 'lists a display that is not an object') }
+                    $dm = [System.Collections.Generic.Dictionary[string, System.Text.Json.JsonElement]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    foreach ($p in $e.EnumerateObject()) {
+                        $pn = $p.Name
+                        if ($null -eq $pn -or $dm.ContainsKey([string]$pn) -or -not (@('adapter', 'width', 'height', 'refreshHz') | Where-Object { Test-DvOrdinalEqual $_ $pn })) { return (& $bad 'lists a display with a doubled, unknown or unreadable member') }
+                        $dm[[string]$pn] = $p.Value
+                    }
+                    if ($dm.Count -ne 4) { return (& $bad 'lists a display that is not adapter, width, height and refreshHz') }
+                    $a = & $text $dm['adapter']; $w = & $int $dm['width'] $true; $h = & $int $dm['height'] $true; $r = & $int $dm['refreshHz'] $true
+                    if ($null -eq $a -or $null -eq $w -or $null -eq $h -or $null -eq $r) { return (& $bad 'lists a display with a bad adapter, width, height or refreshHz') }
+                    $list.Add([ordered]@{ adapter = $a; width = $w; height = $h; refreshHz = $r })
+                }
+                $value = [object[]]$list.ToArray()
+            }
+            default { return (& $bad 'is not a display-state field') }
+        }
+        [pscustomobject]@{ ok = $true; why = $null; reading = [ordered]@{ value = $value; unknown = $null } }
+    } catch { & $bad 'cannot be read back as written' }
+}
+
+function Read-DvDisplayState {
+    # VENUE-LEG-DISPLAY-STATE-FIELDS-1: the STRICT reading of a v3 block's `displayState`: an object holding each of $script:DisplayStateFields exactly once (any
+    # letter case, none doubled, no unknown member), each a reading Read-DvDisplayReading accepts. Returns [pscustomobject]@{ ok; why; state } (state is [ordered]).
+    param([System.Text.Json.JsonElement]$Element)
+    $bad = { param($why) [pscustomobject]@{ ok = $false; why = $why; state = $null } }
+    try {
+        if ($Element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $bad 'displayState is not an object') }
+        $m = [System.Collections.Generic.Dictionary[string, System.Text.Json.JsonElement]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($p in $Element.EnumerateObject()) {
+            $n = $p.Name
+            if ($null -eq $n) { return (& $bad 'displayState carries a member name that cannot be read back') }
+            if ($m.ContainsKey([string]$n)) { return (& $bad 'displayState names a field more than once') }
+            if (@($script:DisplayStateFields | Where-Object { Test-DvOrdinalEqual $_ $n }).Count -ne 1) { return (& $bad 'displayState carries an unknown field') }
+            $m[[string]$n] = $p.Value
+        }
+        $state = [ordered]@{}
+        foreach ($f in $script:DisplayStateFields) {
+            if (-not $m.ContainsKey($f)) { return (& $bad "displayState has no $f") }
+            $r = Read-DvDisplayReading -Element $m[$f] -Field $f
+            if (-not $r.ok) { return (& $bad ([string]$r.why)) }
+            $state[$f] = $r.reading
+        }
+        [pscustomobject]@{ ok = $true; why = $null; state = $state }
+    } catch { & $bad 'displayState cannot be read back as written' }
+}
+
+function ConvertTo-DvDisplayStateFromProbe {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-DISPLAY-STATE-FIELDS-1: the LENIENT side of the v3 block's displayState, for the writer. Reads the probe's own `displayState` member (the root of the
+    DVE_PROBE JSON, a System.Text.Json element) and returns [ordered]@{ <each of $script:DisplayStateFields> = [ordered]@{ value; unknown } }. A probe with no
+    `displayState` (an older probe, or the probe's own catch-all wrote null) types every field NOT_REPORTED; a doubled, misspelled-case or non-object member, and
+    any one reading Read-DvDisplayReading refuses, types MALFORMED. Names and texts are escaped (-Escape), never written raw. Never throws.
+    #>
+    param([System.Text.Json.JsonElement]$Root)
+    $all = { param($why) $s = [ordered]@{}; foreach ($f in $script:DisplayStateFields) { $s[$f] = [ordered]@{ value = $null; unknown = $why } }; $s }
+    try {
+        $hits = @(Get-DvJsonMembersNamed -Element $Root -Name 'displayState')
+        if ($hits.Count -eq 0) { return (& $all 'NOT_REPORTED') }
+        if ($hits.Count -ne 1 -or -not (Test-DvOrdinalEqual $hits[0].Name 'displayState')) { return (& $all 'MALFORMED') }
+        $element = $hits[0].Value
+        if ($element.ValueKind -eq [System.Text.Json.JsonValueKind]::Null) { return (& $all 'NOT_REPORTED') }
+        if ($element.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return (& $all 'MALFORMED') }
+        $state = [ordered]@{}
+        foreach ($f in $script:DisplayStateFields) {
+            $found = @(Get-DvJsonMembersNamed -Element $element -Name $f)
+            if ($found.Count -eq 0) { $state[$f] = [ordered]@{ value = $null; unknown = 'NOT_REPORTED' }; continue }
+            if ($found.Count -ne 1 -or -not (Test-DvOrdinalEqual $found[0].Name $f)) { $state[$f] = [ordered]@{ value = $null; unknown = 'MALFORMED' }; continue }
+            $r = Read-DvDisplayReading -Element $found[0].Value -Field $f -Escape
+            $state[$f] = $(if ($r.ok) { $r.reading } else { [ordered]@{ value = $null; unknown = 'MALFORMED' } })
+        }
+        $state
+    } catch { & $all 'MALFORMED' }
+}
+
 function Read-DvReceiptDisplayPath {
     <#
     .SYNOPSIS
@@ -8005,16 +8271,25 @@ function Read-DvReceiptDisplayPath {
                 elseif (-not (Test-DvOrdinalEqual $members[0].Name 'displayPath')) { $why = 'the block member is not spelled displayPath' }
                 elseif ($members[0].Value.ValueKind -ne $object) { $why = 'the block is not an object' }
                 else {
+                    # VENUE-LEG-DISPLAY-STATE-FIELDS-1: the block's own `schema` text picks the field set. Exactly the v3 schema reads the six-field v3 block; every
+                    # other block (v2 and anything else) goes through the five-field v2 rules below, unchanged, so a v2 receipt reads as it always did.
+                    $isV3 = $false
+                    foreach ($p in $members[0].Value.EnumerateObject()) {
+                        $pn = $p.Name
+                        if ($null -ne $pn -and (Test-DvOrdinalEqual $pn 'schema') -and $p.Value.ValueKind -eq [System.Text.Json.JsonValueKind]::String -and (Test-DvOrdinalEqual $p.Value.GetString() $script:DisplayPathSchemaV3)) { $isV3 = $true }
+                    }
+                    $allowedFields = $(if ($isV3) { $script:DisplayPathFieldsV3 } else { $script:DisplayPathFields })
+                    $wantSchema = $(if ($isV3) { $script:DisplayPathSchemaV3 } else { $script:DisplayPathSchema })
                     $fields = [System.Collections.Generic.Dictionary[string, System.Text.Json.JsonElement]]::new([System.StringComparer]::OrdinalIgnoreCase)
                     foreach ($p in $members[0].Value.EnumerateObject()) {
                         $n = $p.Name
                         if ($null -eq $n) { throw 'a block member name cannot be read back' }
                         if ($fields.ContainsKey([string]$n)) { $why = 'the block names a field more than once'; break }
-                        if (@($script:DisplayPathFields | Where-Object { Test-DvOrdinalEqual $_ $n }).Count -ne 1) { $why = 'the block carries an unknown field'; break }
+                        if (@($allowedFields | Where-Object { Test-DvOrdinalEqual $_ $n }).Count -ne 1) { $why = 'the block carries an unknown field'; break }
                         $fields[[string]$n] = $p.Value
                     }
                     if ($null -eq $why) {
-                        foreach ($f in $script:DisplayPathFields) { if (-not $fields.ContainsKey($f)) { $why = "the block has no $f"; break } }
+                        foreach ($f in $allowedFields) { if (-not $fields.ContainsKey($f)) { $why = "the block has no $f"; break } }
                     }
                     if ($null -eq $why) {
                         $string = [System.Text.Json.JsonValueKind]::String
@@ -8031,12 +8306,13 @@ function Read-DvReceiptDisplayPath {
                             elseif ($v.ValueKind -eq $string) {
                                 $s = [string]$v.GetString()
                                 if ($s.IndexOfAny($lossy) -ge 0) { $why = "$f carries U+FFFD or '?'"; break }
+                                if ($isV3 -and (Test-DvTextHasRawControl $s)) { $why = "$f carries a control or line-separator character"; break }
                                 $nullable[$f] = $s
                             }
                             else { $why = "$f is neither a string nor null"; break }
                         }
                         if ($null -ne $why) { }
-                        elseif ($fields['schema'].ValueKind -ne $string -or -not (Test-DvOrdinalEqual $fields['schema'].GetString() $script:DisplayPathSchema)) { $why = "schema is not $($script:DisplayPathSchema)" }
+                        elseif ($fields['schema'].ValueKind -ne $string -or -not (Test-DvOrdinalEqual $fields['schema'].GetString() $wantSchema)) { $why = "schema is not $wantSchema" }
                         elseif ($fields['source'].ValueKind -ne $string -or -not (Test-DvOrdinalEqual $fields['source'].GetString() $script:DisplayPathSource)) { $why = "source is not $($script:DisplayPathSource)" }
                         elseif ($adapters.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { $why = 'adapters is not a list' }
                         elseif ($adapters.GetArrayLength() -gt $script:DisplayPathMaxAdapters) { $why = "adapters lists more than $($script:DisplayPathMaxAdapters)" }
@@ -8049,16 +8325,24 @@ function Read-DvReceiptDisplayPath {
                                 if ($e.ValueKind -ne $string) { $why = 'an adapter is not a string'; break }
                                 $s = [string]$e.GetString()
                                 if ($s.IndexOfAny($lossy) -ge 0) { $why = "an adapter carries U+FFFD or '?'"; break }
+                                if ($isV3 -and (Test-DvTextHasRawControl $s)) { $why = 'an adapter carries a control or line-separator character'; break }
                                 $names.Add($s)
                             }
+                            $displayState = $null
+                            if ($null -eq $why -and $isV3) {
+                                $ds = Read-DvDisplayState -Element $fields['displayState']
+                                if ($ds.ok) { $displayState = $ds.state } else { $why = [string]$ds.why }
+                            }
                             if ($null -eq $why) {
-                                return [pscustomobject]@{ state = 'present'; reason = $null; block = [ordered]@{
-                                    schema = $script:DisplayPathSchema
+                                $block = [ordered]@{
+                                    schema = $wantSchema
                                     source = $script:DisplayPathSource
                                     adapters = [string[]]$names.ToArray()
                                     firstAdapterDriverVersion = $nullable['firstAdapterDriverVersion']
                                     primaryDisplayDevice = $nullable['primaryDisplayDevice']
-                                } }
+                                }
+                                if ($isV3) { $block['displayState'] = $displayState }
+                                return [pscustomobject]@{ state = 'present'; reason = $null; block = $block }
                             }
                         }
                     }
@@ -8117,16 +8401,20 @@ function New-DvDisplayPathBlock {
             }
             $driver = $text['driverVersion']
             $device = $text['displayDevice']
+            # VENUE-LEG-DISPLAY-STATE-FIELDS-1: the probe's eight display-state readings, typed (never a guess) and escaped; built here, while the element is live.
+            $displayState = ConvertTo-DvDisplayStateFromProbe -Root $root
         } finally { $doc.Dispose() }
+        # The v3 block: names are escaped (a control or line-separator character in a name becomes its \uXXXX text), so no record line can be split by one.
         $block = [ordered]@{
-            schema = $script:DisplayPathSchema
+            schema = $script:DisplayPathSchemaV3
             source = $script:DisplayPathSource
-            adapters = [string[]]$names
-            firstAdapterDriverVersion = $driver
-            primaryDisplayDevice = $device
+            adapters = [string[]]@($names | ForEach-Object { ConvertTo-DvEscapedText $_ })
+            firstAdapterDriverVersion = (ConvertTo-DvEscapedText $driver)
+            primaryDisplayDevice = (ConvertTo-DvEscapedText $device)
+            displayState = $displayState
         }
         # The writer never writes a block its reader does not type `present`: it hands back the reader's own typed block.
-        $read = Read-DvReceiptDisplayPath -ReceiptText (ConvertTo-DvReceiptJson ([ordered]@{ venue = [ordered]@{ displayPath = $block } }) 6)
+        $read = Read-DvReceiptDisplayPath -ReceiptText (ConvertTo-DvReceiptJson ([ordered]@{ venue = [ordered]@{ displayPath = $block } }) 12)
         if (-not (Test-DvOrdinalEqual $read.state 'present')) { return $null }
         return $read.block
     } catch { return $null }
@@ -8174,4 +8462,4 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict, Get-DvStoredPlaybackFieldProblems,
-    Read-DvReceiptDisplayPath, New-DvDisplayPathBlock
+    Read-DvReceiptDisplayPath, New-DvDisplayPathBlock, New-DvDisplayStateProbeText, ConvertTo-DvEscapedText

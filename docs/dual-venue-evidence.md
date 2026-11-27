@@ -725,7 +725,7 @@ adapters and display device the venue reported cannot show whether its display r
 BACHELOR-1457-NATIVE-GUI-LATE-ENV-DIFF-1, is the case that raised the question; that investigation left the cause open, recorded a cadence change on
 identical app inputs and a later display-route sample, and established no earlier adapter route, so this block does not say an adapter caused it).
 A receipt therefore carries ONE display-path block, written by ONE writer and read by ONE reader. It replaces the closed PR #904 (VENUE-LEG-DISPLAY-PATH-RECEIPT-1), whose wider collector and
-timing work were not carried over: this block adds no venue read, no CIM query, no clock and no wait.
+timing work were not carried over: the v2 block adds no venue read, no CIM query, no clock and no wait. (The v3 block below adds eight bounded readings to the same probe job.)
 
 **Writer.** `New-DvDisplayPathBlock -ProbeStdout <the health probe job's stdout>` (`DualVenueRunner.psm1`), called once by `Invoke-VenueLeg.ps1`
 right after the health probe job returns and BEFORE the probe's other fields are parsed and copied (so the block is attached even when
@@ -734,7 +734,7 @@ right after the health probe job returns and BEFORE the probe's other fields are
 
 | Field | Type | Value |
 |---|---|---|
-| `schema` | string | exactly `mlv-app/venue-display-path/v2` (`v1` was the closed #904 shape; it reads malformed) |
+| `schema` | string | exactly `mlv-app/venue-display-path/v2` (`v1` was the closed #904 shape; it reads malformed). The writer now writes `v3`, which adds `displayState` (see below); a `v2` block still reads as described here |
 | `source` | string | exactly `health-probe`: the probe's sample, taken before the measurement job is submitted, never re-read during the run |
 | `adapters` | list of strings | the probe's `gpuNames` (every `Win32_VideoController` name, in probe order), 1 to 64 of them |
 | `firstAdapterDriverVersion` | string or null | the probe's `driverVersion` (the first video controller's driver) |
@@ -790,6 +790,49 @@ no `ConvertFrom-Json` fallback and no recovery rewrite. It returns `{ state; blo
 trailing commas, reads a lone surrogate and turns `2026-11-24T00:00:00Z` into a `[datetime]`. That is why the block is read with one grammar
 only (pass-2 A3 of #904). `tools/repo_hygiene/test_venue_leg_display_path.py` pins the four rows: grammar parity, malformed, legacy `NO_SIGNAL`
 and the round trip through `Write-DvReceipt` and `Invoke-VenueLeg`.
+
+### The v3 block: `displayState` (VENUE-LEG-DISPLAY-STATE-FIELDS-1)
+
+The v2 block above names the adapters and the primary display device but not which adapter drives the panel, its driver date, the display mode, the
+Windows build or the boot, so a cadence change between two legs could not be attributed from the receipt alone. **#915's NARROW cut dropped these
+fields because the closed #904's collector read the registry and CIM without a bound (A1, a blocker) and NARROW-2 promised "no change to CIM
+sampling"; that reason does not cover a bounded read**, so this card adds them. The writer now writes `mlv-app/venue-display-path/v3`: the five v2 fields
+plus one member, `displayState`, of eight readings the health probe takes in the same job (`New-DvDisplayStateProbeText`, appended to the probe job: no
+new job, process, write, network call or elevation). A **v2 block (every receipt written before this card) reads exactly as before**: the block's own
+`schema` text picks the field set, and only the exact v3 schema reads the six-field set.
+
+Each reading is `{ "value": <typed>, "unknown": null }` or `{ "value": null, "unknown": "<reason>" }`: exactly one is non-null. A read that fails,
+times out or returns nothing is a typed unknown, never a guess and never a missing member.
+
+| `displayState` field | Value | Source |
+|---|---|---|
+| `displayAdapterName` | text | `Win32_VideoController.Name` of the first controller that reports a current mode (width, height and refresh all above 0): the adapter driving a display (a headless render adapter is skipped) |
+| `displayAdapterDriverVersion` | text | the same controller's `DriverVersion` |
+| `displayAdapterDriverDate` | `yyyy-MM-dd` | the same controller's `DriverDate` (the calendar date as reported) |
+| `displays` | 1 to 64 of `{ adapter; width; height; refreshHz }` | every controller with a current mode: `CurrentHorizontalResolution`, `CurrentVerticalResolution`, `CurrentRefreshRate` |
+| `windowsBuild` | digits | `Win32_OperatingSystem.BuildNumber` |
+| `windowsUbr` | int | the registry value `HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\UBR` (CIM carries no UBR; an in-process read-only registry read) |
+| `lastBootUtc` | `yyyy-MM-ddTHH:mm:ssZ` | `Win32_OperatingSystem.LastBootUpTime`, in UTC |
+| `hotfixCount` | int | the number of `Win32_QuickFixEngineering` records: the one new CIM read, with its own `-OperationTimeoutSec` (at most 15 s, inside a 30 s budget for the whole fragment, inside the probe job's own 120 s deadline) |
+
+The adapter, display, build and boot readings reuse the `Win32_VideoController` and `Win32_OperatingSystem` reads the probe already made. A video-controller
+read that errors keeps its error (`-ErrorVariable`), so a failed read is typed `CIM_ERROR` or `CIM_TIMEOUT` and not `CIM_EMPTY`.
+
+Typed unknown reasons: `CIM_ERROR` (the read threw), `CIM_TIMEOUT` (the operation timed out), `CIM_EMPTY` (it returned nothing, or a record without the
+property; an empty hotfix list is never read as "zero hotfixes"), `NO_ACTIVE_OUTPUT` (no controller reports a current mode), `REGISTRY_ERROR` (the UBR
+value is missing or not a number), `DEADLINE` (the fragment's budget was spent before the read started, so the read was never made), `NOT_REPORTED` (the probe
+carried no such reading: an older probe, or the fragment's own catch-all left `displayState` null) and `MALFORMED` (the probe reported the reading in a shape the
+reader's rule refuses). Any failure inside the fragment leaves `displayState` null and never fails the probe or the leg.
+
+**Escaping.** A control character (C0, DEL, C1 including U+0085) or U+2028 / U+2029 in a name (`adapters`, `firstAdapterDriverVersion`,
+`primaryDisplayDevice`, the adapter and display names of `displayState`) is written as the six characters `\uXXXX`, never raw, so no record line can be split
+by one. The v3 reader refuses a name that still holds one (`malformed`). A v2 block's names are read as they always were.
+
+**Reader (v3).** The same one reader, `Read-DvReceiptDisplayPath`, with the same grammar. A v3 block is `malformed` when `displayState` is missing,
+doubled or not an object, holds an unknown or missing field, or any reading is not exactly `{ value, unknown }` with one non-null, an `unknown` outside the
+typed reasons, a value of the wrong type (text not plain, a date or time that does not parse, a negative or fractional count, an empty or more than 64
+display list, a non-positive width, height or refresh), or carries U+FFFD or `?`. `NO_SIGNAL` and `DISPLAY_PATH_UNBOUND` semantics are unchanged, and the
+block stays a recorded, unbound claim: never a verdict input.
 
 ## How to read the evidence
 
