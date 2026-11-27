@@ -7951,6 +7951,21 @@ function Get-DvTailVisualEvidence {
         $frames = [System.Collections.Generic.List[object]]::new()
         $seenPlay = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
         $seenFile = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        # R6-BURST-CUTOFF-RESIDUE-1 r10 fix 1 (sol A2 on 4dcd3a13): the earliest tail time of ANY row that is not a play_first_unbound burst row (stop_unbound,
+        # paused, forced play, ...), read before the play-only filter below, so Get-DvTailInFlightCredit can require a credited burst row to precede them all;
+        # a non-burst row with no readable time leaves that order unproven (nonBurstUntimed)
+        $firstNonBurstMs = $null
+        $nonBurstUntimed = $false
+        foreach ($row in $rows) {
+            if ($null -eq $row -or $row -isnot [System.Management.Automation.PSCustomObject]) { continue }
+            $rowKind = Get-DvProp $row 'kind'
+            if ($rowKind -is [string] -and [string]::Equals($rowKind, 'play_first_unbound', [StringComparison]::Ordinal)) { continue }
+            $rowMs = Get-DvProp $row 'tail_elapsed_ms'
+            if (($rowMs -is [int] -or $rowMs -is [long] -or $rowMs -is [double]) -and -not [double]::IsNaN([double]$rowMs) -and -not [double]::IsInfinity([double]$rowMs) -and [double]$rowMs -ge 0) {
+                if ($null -eq $firstNonBurstMs -or [double]$rowMs -lt $firstNonBurstMs) { $firstNonBurstMs = [double]$rowMs }
+            }
+            else { $nonBurstUntimed = $true }
+        }
         foreach ($row in $rows) {
             if ($null -eq $row -or $row -isnot [System.Management.Automation.PSCustomObject]) { continue }
             $kind = Get-DvProp $row 'kind'
@@ -7987,7 +8002,7 @@ function Get-DvTailVisualEvidence {
             $basisRaw = Get-DvProp $row 'label_bound_basis'; $sourceRaw = Get-DvProp $row 'source_id'
             $mayCredit = (($forcedRaw -is [int]) -or ($forcedRaw -is [long])) -and [int64]$forcedRaw -eq 0 -and
                          ($boundRaw -is [bool]) -and $boundRaw -and ($validRaw -is [bool]) -and $validRaw -and
-                         (($serialRaw -is [int]) -or ($serialRaw -is [long])) -and (($paintedRaw -is [int]) -or ($paintedRaw -is [long])) -and ([int64]$serialRaw -eq [int64]$paintedRaw) -and
+                         (($serialRaw -is [int]) -or ($serialRaw -is [long])) -and (($paintedRaw -is [int]) -or ($paintedRaw -is [long])) -and ([int64]$serialRaw -eq [int64]$paintedRaw) -and [int64]$serialRaw -gt 0 -and
                          ($basisRaw -is [string]) -and (@($script:TailCreditPaintBases | Where-Object { [string]::Equals($basisRaw, $_, [StringComparison]::Ordinal) }).Count -eq 1) -and
                          ($sourceRaw -is [string]) -and ($sourceRaw -cmatch '^[0-9a-f]{16}\z') -and ($active -is [bool]) -and $active -and $null -ne $display -and $tailOk
             # r9 (sol A1 on 2cec2ecf): and only when the receipt recorded a hash for it: a row with no (or an ambiguous) recorded sha256 can never be credited,
@@ -8002,7 +8017,8 @@ function Get-DvTailVisualEvidence {
             }
             $bound = Get-DvProp $row 'label_bound'; $serialValid = Get-DvProp $row 'painted_serial_valid'
             $serial = Get-DvProp $row 'serial'; $paintedSerial = Get-DvProp $row 'painted_serial'
-            $serialsOk = (($serial -is [int]) -or ($serial -is [long])) -and (($paintedSerial -is [int]) -or ($paintedSerial -is [long])) -and ([int64]$serial -eq [int64]$paintedSerial)
+            # r10 fix 1 (sol A3 on 4dcd3a13, advisory): the app's request serials start at 1, so a serial of 0 or below names no request and binds no label
+            $serialsOk = (($serial -is [int]) -or ($serial -is [long])) -and (($paintedSerial -is [int]) -or ($paintedSerial -is [long])) -and ([int64]$serial -eq [int64]$paintedSerial) -and [int64]$serial -gt 0
             $labelBound = (($bound -is [bool]) -and $bound) -and (($serialValid -is [bool]) -and $serialValid) -and $serialsOk
             # r4 (adversary A1 on eabccd6c): forced_paints_before as a JSON integer, so the credit can admit only a capture taken BEFORE any forced repaint
             $forced = Get-DvProp $row 'forced_paints_before'
@@ -8019,7 +8035,8 @@ function Get-DvTailVisualEvidence {
         }
         return [pscustomobject]@{ refused = $null; unreadablePath = $null; measuredSession = [string]$sessionNumber
                                   tailBeginUtc = $(if ($tailBegin -is [string] -or $tailBegin -is [datetime]) { ConvertTo-DvVisualUtcText $tailBegin } else { $null })
-                                  runNonce = $(if ($runNonce -is [string]) { $runNonce } else { $null }); frames = @($frames) }
+                                  runNonce = $(if ($runNonce -is [string]) { $runNonce } else { $null }); frames = @($frames)
+                                  firstNonBurstMs = $firstNonBurstMs; nonBurstUntimed = $nonBurstUntimed }
     }
     catch { return $null }
 }
@@ -8152,17 +8169,16 @@ function Get-DvTailInFlightCredit {
     # capture needs no invalidation after burst_end at all (fail closed when either count is unreadable)
     $burstCaptures = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'visualBurstCaptures') } else { $null })
     $postBurstDrops = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'visualPostBurstPrepDrops') } else { $null })
-    $firstNonBurstMs = $null
-    foreach ($f in @($tailFrames)) {
-        if ($null -eq $f -or [string]::Equals([string](Get-DvProp $f 'kind'), 'play_first_unbound', [StringComparison]::Ordinal)) { continue }
-        $fMs = Get-DvProp $f 'tailElapsedMs'
-        if ($null -ne $fMs -and ($null -eq $firstNonBurstMs -or [double]$fMs -lt $firstNonBurstMs)) { $firstNonBurstMs = [double]$fMs }
-    }
+    # r10 fix 1 (sol A2 on 4dcd3a13): the bound comes from EVERY non-burst row of visual.json (stop_unbound, paused, forced play, ...), which
+    # Get-DvTailVisualEvidence reads before its play-only filter; a non-burst row with no readable time (or no such record at all) proves no order
+    $firstNonBurstRaw = Get-DvProp $Visual 'firstNonBurstMs'
+    $firstNonBurstMs = $(if ($firstNonBurstRaw -is [double] -or $firstNonBurstRaw -is [int] -or $firstNonBurstRaw -is [long]) { [double]$firstNonBurstRaw } else { $null })
+    $nonBurstTimed = (Get-DvProp $Visual 'nonBurstUntimed') -is [bool] -and -not (Get-DvProp $Visual 'nonBurstUntimed')
     foreach ($q in $ordered) {
         $qIndex = Get-DvProp $q 'index'; $qMs = [double](Get-DvProp $q 'tailElapsedMs')
         if ([string]::Equals([string](Get-DvProp $q 'kind'), 'play_first_unbound', [StringComparison]::Ordinal)) {
-            if ($null -eq $burstCaptures -or $burstCaptures -lt 0 -or $null -eq $qIndex -or [int64]$qIndex -ge $burstCaptures -or ($null -ne $firstNonBurstMs -and $qMs -ge $firstNonBurstMs)) {
-                return (& $no "TAIL_CREDIT_BURST_NOT_LOGGED: the play_first_unbound capture $qIndex at $qMs ms is not one the burst logged before its end (burst_end burst_captures=$burstCaptures; first non-burst capture at $firstNonBurstMs ms), so an invalidation after burst_end may have replaced what it shows and the tail is not credited")
+            if ($null -eq $burstCaptures -or $burstCaptures -lt 0 -or $null -eq $qIndex -or [int64]$qIndex -ge $burstCaptures -or -not $nonBurstTimed -or ($null -ne $firstNonBurstMs -and $qMs -ge $firstNonBurstMs)) {
+                return (& $no "TAIL_CREDIT_BURST_NOT_LOGGED: the play_first_unbound capture $qIndex at $qMs ms is not one the burst logged before its end (burst_end burst_captures=$burstCaptures; first non-burst capture at $firstNonBurstMs ms; every non-burst capture timed: $nonBurstTimed), so an invalidation after burst_end may have replaced what it shows and the tail is not credited")
             }
         }
         elseif ($null -eq $postBurstDrops -or $postBurstDrops -ne 0) {

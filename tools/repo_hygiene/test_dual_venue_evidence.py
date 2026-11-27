@@ -11820,6 +11820,28 @@ class VisualCaptureVenueHelperTests(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertIn("ATTRCUDA_SLOT_OCCUPIED", proc.stdout + proc.stderr)
 
+    def test_r6_r10_fix1_sol_a1_a_capture_slot_in_another_case_is_emptied_too(self) -> None:
+        # R6-BURST-CUTOFF-RESIDUE-1 r10 fix 1 (sol A1 on 4dcd3a13), its input: forwarded=false, SourceDir='', and an existing plain single-link
+        # visual\VISUAL.JSON holding {"old":true}. 4dcd3a13's case-sensitive `-ceq 'visual.json'` skipped it, so the old JSON stayed beside the fresh request
+        # record (and the downstream lowercase visual.json path resolves it on Windows). Sibling (:3006): a source VISUAL.JSON is published too.
+        with tempfile.TemporaryDirectory(prefix="vis-pub-r10f1-") as d:
+            Path(d, "pub", "visual").mkdir(parents=True)
+            Path(d, "pub", "visual", "VISUAL.JSON").write_bytes(b'{"old":true}')
+            Path(d, "pub", "visual", "Play-First-Unbound-0.PNG").write_bytes(b"old")
+            proc = self.run_module(f"$pub = Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $false }}) -SourceDir '' -PubRoot '{Path(d, 'pub')}'; "
+                                   "(Get-ChildItem -LiteralPath $pub -File | ForEach-Object Name | Sort-Object) -join ','")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines()[-1], "visual-capture-request.json")
+        with tempfile.TemporaryDirectory(prefix="vis-pub-r10f1b-") as d:
+            src = Path(d, "src")
+            src.mkdir()
+            Path(src, "VISUAL.JSON").write_bytes(b"new")
+            Path(d, "pub").mkdir()
+            proc = self.run_module(f"$pub = Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}'; "
+                                   "[IO.File]::ReadAllText((Join-Path $pub 'visual.json'))")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines()[-1], "new")
+
     def test_the_visual_tail_is_cut_off_the_presentmon_window_and_never_extends_it(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-pm-") as d:
             Path(d, "visual.json").write_text(json.dumps({"tail_begin_utc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
@@ -23109,6 +23131,23 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 out = self.metrics({**self.HELD, **pb}, app=self.app_json(*rows), criteria=crit)
                 self.assert_no_credit(out, 1)
                 self.assertIn(why, out["m"]["conformTailInFlightCreditNote"], out)
+        # r10 fix 1 (sol A2 on 4dcd3a13), its input: visualBurstCaptures=1, visualPostBurstPrepDrops=1, the burst row (index 0, 4 ms, frame 479, serial 484)
+        # and a stop_unbound row (index 0, file stop-unbound.png) at 2 ms with saved=false and play_active=false. The reader dropped every non-play row, so
+        # 4dcd3a13 never saw the earlier stop capture and credited. Every non-burst row of ANY kind now bounds the burst (and one with no readable time
+        # refuses it). (A3, advisory on 4dcd3a13): a burst row whose serial = painted_serial is 0 or negative names no request: never label-bound.
+        stop = {"kind": "stop_unbound", "index": 0, "file": "stop-unbound.png", "tail_elapsed_ms": 2, "saved": False, "play_active": False}
+        later = {"pb": {"visualBurstCaptures": 1, "visualPostBurstPrepDrops": 1}}
+        for name, rows, why in (("a stop_unbound row before the burst row", (stop, burst), "TAIL_CREDIT_BURST_NOT_LOGGED"),
+                                ("a paused row with no readable time", ({**stop, "kind": "paused", "file": "paused.png", "tail_elapsed_ms": None}, burst), "TAIL_CREDIT_BURST_NOT_LOGGED"),
+                                ("serial 0", ({**burst, "serial": 0, "painted_serial": 0},), "no play capture"),
+                                ("serial -1", ({**burst, "serial": -1, "painted_serial": -1},), "no play capture")):
+            with self.subTest(case=name):
+                out = self.metrics({**self.HELD, **later["pb"]}, app=self.app_json(*rows), criteria=crit)
+                self.assert_no_credit(out, 1)
+                self.assertIn(why, out["m"]["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="(control) the stop row after the burst row does not refuse it"):
+            out = self.metrics({**self.HELD, **later["pb"]}, app=self.app_json(burst, {**stop, "tail_elapsed_ms": 2900}), criteria=crit)
+            self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 1, out)
         with self.subTest(case="(control) the burst logged its capture; the play-stop invalidation after burst_end does not refuse it"):
             out = self.metrics({**self.HELD, "visualBurstCaptures": 1, "visualPostBurstPrepDrops": 1}, app=self.app_json(burst), criteria=crit)
             self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 1, out)

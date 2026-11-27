@@ -2999,11 +2999,13 @@ function Publish-AttrCudaVisualCaptures {
     # never visited its slot, and an older image there was published beside the fresh visual.json and bound to its labels. Every capture slot (the
     # names the loop publishes, and visual.json) is emptied first, forwarded or not, and only through Assert-AttrCudaWritableFileSlot: a plain one-name
     # file is removed, and a directory, reparse point or multi-link file throws its ATTRCUDA_SLOT_* refusal untouched
-    Get-ChildItem -LiteralPath $pubDir -Force | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
+    # r10 fix 1 (sol A1 on 4dcd3a13): Windows names are case-insensitive, so visual.json is matched case-insensitively (-eq), as the .png names are
+    # (-match): an older VISUAL.JSON is the same slot the downstream visual.json path resolves. The source selector below matches the same way.
+    Get-ChildItem -LiteralPath $pubDir -Force | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -eq 'visual.json' } | ForEach-Object {
         [void](Assert-AttrCudaWritableFileSlot -Path $_.FullName)
     }
     if ($Record['forwarded'] -and $SourceDir -and (Test-Path -LiteralPath $SourceDir -PathType Container)) {
-        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
+        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -eq 'visual.json' } | ForEach-Object {
             # R6-BURST-CUTOFF-RESIDUE-1 r6 (sol A2 on 806d496b): a play-first-unbound burst image is optional evidence; one the job cannot copy (held with
             # FileShare.None) is left out (the runner reads that row as not captured), never a throw that loses the measured job's RESULT line
             # r9 (sol A2 on 2cec2ecf): left out means ABSENT. An older image already in that slot would be published beside the fresh visual.json and bound to
