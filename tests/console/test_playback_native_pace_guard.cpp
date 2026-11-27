@@ -984,6 +984,109 @@ TEST(PlaybackUnpacedWiring, TheMeasuredLoopChecksItsStopInBoundedSlicesOnlyWhenU
     ASSERT_TRUE(holdAt < handling.indexOf(QStringLiteral("m_playbackPaceGuard.grantLoopWrap(")));
 }
 
+// GUI-SMOKE-PACED-STOP-STARVATION-1: on a paced run the measured loop's dispatch can starve its stop check across the required
+// frame (Bachelor receipts 8bcdb433 / c7948b18 played 2859 frames of a 1499-frame window), so the engine holds a paced unpinned
+// Play there -- only while the measured loop is armed for the open session, before every advance path, and through no pace-guard
+// call. The loop arms it once, before its for( ;; ), never on a stress run; it disarms after the loop and at the session's finish.
+TEST(PlaybackUnpacedWiring, APacedPlayHoldsAtItsRequiredFramesOnlyWhileTheMeasuredLoopIsArmed)
+{
+    const QString source = mainWindowSource();
+    const QString handling = bodyBetween(source, QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"),
+                                         QStringLiteral("void MainWindow::showPerformanceProfilingDialog"));
+    ASSERT_FALSE(handling.isEmpty());
+    const QString pacedHold = QStringLiteral(
+        "        if( playback_frame_range::pacedMeasuredHoldReached( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(),\n"
+        "                m_pacedMeasuredHoldSession != 0 && m_playbackSmokeActive && m_pacedMeasuredHoldSession == m_playbackSmokeSessionId,\n"
+        "                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames ) )\n"
+        "        {\n"
+        "            notePacedMeasuredHold();\n"
+        "            return;\n"
+        "        }\n");
+    ASSERT_EQ(1, source.count(pacedHold));
+    ASSERT_EQ(1, source.count(QStringLiteral("playback_frame_range::pacedMeasuredHoldReached(")));
+    const int pacedAt = handling.indexOf(pacedHold);
+    const int armedBefore = handling.indexOf(QStringLiteral("const bool paceGuardArmedBeforeTick = m_playbackPaceGuard.armed();"));
+    const int unpacedComment = handling.indexOf(QStringLiteral("// CUDA-HEADROOM-1: unpaced, present -> early advance"));
+    ASSERT_TRUE(armedBefore >= 0);
+    ASSERT_TRUE(pacedAt > armedBefore);
+    ASSERT_TRUE(unpacedComment > pacedAt);
+    // the hold and its record touch no pace guard: no pace read, no grant
+    const QString holdSpan = handling.mid(armedBefore, unpacedComment - armedBefore);
+    ASSERT_EQ(0, holdSpan.count(QStringLiteral("playbackPaceGuardFps()")));
+    ASSERT_EQ(0, holdSpan.count(QStringLiteral("m_playbackPaceGuard.grant")));
+    const QString note = bodyBetween(source, QStringLiteral("void MainWindow::notePacedMeasuredHold( void )"),
+                                     QStringLiteral("static double guiHopWaitClockNow( void )"));
+    ASSERT_FALSE(note.isEmpty());
+    ASSERT_EQ(0, note.count(QStringLiteral("m_playbackPaceGuard")));
+    ASSERT_EQ(0, note.count(QStringLiteral("playbackPaceGuardFps")));
+    ASSERT_TRUE(note.contains(QStringLiteral("const double now = mlv_stage_timing_now();")));
+
+    // the arm: assigned non-zero once in the whole source, in runGuiPlaybackSmoke, right before the measured loop
+    const QString smoke = bodyBetween(source, QStringLiteral("int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)"),
+                                      QStringLiteral("bool MainWindow::importNewMlv(QString fileName)"));
+    ASSERT_FALSE(smoke.isEmpty());
+    const QString arm = QStringLiteral(
+        "    m_pacedMeasuredHoldSession = ( options.exerciseClipLifecycleStress || !m_playbackSmokeActive ) ? 0 : m_playbackSmokeSessionId;\n"
+        "    playback_frame_range::PlayStopState measuredState = playback_frame_range::PlayStopState::Continue;\n"
+        "    for( ;; )\n");
+    ASSERT_EQ(1, source.count(arm));
+    ASSERT_EQ(1, smoke.count(arm));
+    ASSERT_EQ(1, source.count(QStringLiteral("m_pacedMeasuredHoldSession = ( options.exerciseClipLifecycleStress")));
+    // every other assignment clears it: right after the loop, and at the finish
+    ASSERT_EQ(3, source.count(QRegularExpression(QStringLiteral("m_pacedMeasuredHoldSession\\s*=(?!=)"))));
+    ASSERT_EQ(2, source.count(QStringLiteral("m_pacedMeasuredHoldSession = 0;")));
+    ASSERT_EQ(1, smoke.count(QStringLiteral("for( ;; )")));
+    const QString loopExit = QStringLiteral(
+        "        waitGuiThreadForSmokeEvents( 10 );\n"
+        "    }\n"
+        "    m_pacedMeasuredHoldSession = 0;\n"
+        "    endMeasuredDispatchLoop();\n"
+        "    const qint64 playedMs = playbackClock.elapsed();\n");
+    ASSERT_EQ(1, smoke.count(loopExit));
+    ASSERT_TRUE(smoke.indexOf(loopExit) > smoke.indexOf(arm));
+    const QString finish = bodyBetween(source, QStringLiteral("void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )"),
+                                       QStringLiteral("bool MainWindow::primePlaybackCacheOnPlayStart( void )"));
+    ASSERT_FALSE(finish.isEmpty());
+    const int finishClear = finish.indexOf(QStringLiteral("    m_pacedMeasuredHoldSession = 0;"));
+    const int inactive = finish.indexOf(QStringLiteral("    m_playbackSmokeActive = false;\n"));
+    ASSERT_TRUE(finishClear > 0);
+    ASSERT_TRUE(inactive > finishClear);
+    ASSERT_TRUE(inactive - finishClear < 500);
+
+    // the loop-top dispatch and the event wait are timed by site, one short call on each side, and the stop-check slice is unchanged
+    const QString sliced = QStringLiteral(
+        "        const MeasuredDispatchInFlight outer = measuredDispatchBegin( MeasuredDispatchLoopTop );   // STOP-STARVATION-1\n"
+        "        if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() )\n"
+        "            qApp->processEvents( QEventLoop::AllEvents, 5 );\n"
+        "        else\n"
+        "            qApp->processEvents( QEventLoop::AllEvents );\n"
+        "        measuredDispatchEnd( outer );\n");
+    ASSERT_EQ(1, smoke.count(sliced));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "    const MeasuredDispatchInFlight outerDispatch = measuredDispatchBegin( MeasuredDispatchEventWait );   // STOP-STARVATION-1\n"
+        "    qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );\n"
+        "    measuredDispatchEnd( outerDispatch );\n")));
+    ASSERT_EQ(2, source.count(QStringLiteral("measuredDispatchBegin( MeasuredDispatch")));
+
+    // one new line per session, after pace_unpaced and before pace_summary, printed whatever the pacing; the summary is untouched
+    const int unpacedLine = source.indexOf(QStringLiteral("\"playback_smoke.pace_unpaced session=%1"));
+    const int dispatchLine = source.indexOf(QStringLiteral(
+        "\"playback_smoke.measured_dispatch session=%1 loop_top_calls=%2 loop_top_max_ms=%3 event_wait_calls=%4 \"\n"
+        "                   \"event_wait_max_ms=%5 in_flight_site_at_finish=%6 in_flight_ms_at_finish=%7 paced_hold_armed=%8 \"\n"
+        "                   \"paced_hold_engaged=%9 hold_site_at_engage=%10 hold_in_flight_ms_at_engage=%11 hold_engaged_at_ms=%12 \"\n"
+        "                   \"held_ms=%13 held_ticks=%14 consumed_at_loop_exit=%15 required=%16\""));
+    const int paceLine = source.indexOf(QStringLiteral("\"playback_smoke.pace_summary session=%1"));
+    ASSERT_TRUE(unpacedLine > 0);
+    ASSERT_TRUE(dispatchLine > unpacedLine);
+    ASSERT_TRUE(paceLine > dispatchLine);
+    ASSERT_EQ(1, source.count(QStringLiteral("playback_smoke.measured_dispatch")));
+    // not inside the unpaced-only block: the brace that closes it comes before the line
+    const int unpacedGate = source.lastIndexOf(QStringLiteral("    if( mlvappPlaybackUnpacedRequested() )\n"), unpacedLine);
+    ASSERT_TRUE(unpacedGate > 0);
+    ASSERT_TRUE(source.indexOf(QStringLiteral("\n    }\n"), unpacedLine) < dispatchLine);
+    ASSERT_EQ(1, source.count(QStringLiteral(".arg( automationRunNonce() );")));
+}
+
 TEST(PlaybackUnpacedWiring, NoGuardCallIsStillPacedByGetFramerate)
 {
     const QString source = mainWindowSource();

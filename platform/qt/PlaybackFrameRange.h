@@ -1440,6 +1440,15 @@ inline bool pinnedUnpacedHoldReached( int64_t targetPresentedFrames, int64_t con
 {
     return targetPresentedFrames <= 0 || consumedSourceFrames > requiredSourceFrames;
 }
+// GUI-SMOKE-PACED-STOP-STARVATION-1: a PACED automation measured Play holds its timeline once the required source frames are
+// consumed, only while the measured loop that checks the stop is running (armed for this open session), and never for a pinned
+// capture (its present path stops Play at exactly N) or an unpaced run (CUDA-HEADROOM-1's hold owns that).
+inline bool pacedMeasuredHoldReached( bool automationIsolated, bool unpacedRequested, bool armedForOpenSession,
+                                      int64_t targetPresentedFrames, int64_t consumedSourceFrames, int64_t requiredSourceFrames )
+{
+    return automationIsolated && !unpacedRequested && armedForOpenSession && targetPresentedFrames <= 0
+        && requiredSourceFrames > 0 && consumedSourceFrames >= requiredSourceFrames;
+}
 // r8 fix 1 (adversary A2): a pinned capture is admitted only when its identity frame start + N exists and lies BEFORE the last frame
 // (lastFrameIndex, 0-based) -- the engine's end-of-clip stop can end Play before the last frame's present is credited. Refused
 // up front (exit 14) rather than played to a short count. An unpinned run (N <= 0) is never refused here.

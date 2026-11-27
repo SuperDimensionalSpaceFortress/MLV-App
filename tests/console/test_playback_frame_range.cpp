@@ -4835,6 +4835,116 @@ TEST( PlaybackMeasuredLoopExit, R8Fix1TheCaptureEndsOnItsIdentityFrameAndNeverWa
     ASSERT_EQ( 478, playback_frame_range::pinnedWindowObservedFrames( 480, seeked ) );
 }
 
+// GUI-SMOKE-PACED-STOP-STARVATION-1: the paced measured-loop hold. A paced automation Play holds its timeline at the required
+// source frames only while the measured loop is armed for the open session, and never for a pinned capture or an unpaced run.
+TEST( PlaybackPacedMeasuredHold, TheTruthTableHoldsOnlyAnArmedUnpinnedPacedIsolatedPlayAtOrPastItsRequiredFrames )
+{
+    using playback_frame_range::pacedMeasuredHoldReached;
+    static constexpr int64_t kRequired = 1499;
+    // held: consumed == required and consumed > required, unpinned (target 0 or negative)
+    ASSERT_TRUE( pacedMeasuredHoldReached( true, false, true, 0, kRequired, kRequired ) );
+    ASSERT_TRUE( pacedMeasuredHoldReached( true, false, true, 0, kRequired + 1, kRequired ) );
+    ASSERT_TRUE( pacedMeasuredHoldReached( true, false, true, 0, 2859, kRequired ) );
+    ASSERT_TRUE( pacedMeasuredHoldReached( true, false, true, -1, kRequired, kRequired ) );
+    // never held: not isolated (the interactive app), unpaced (CUDA-HEADROOM-1 owns it), not armed, pinned, no requirement, short
+    ASSERT_TRUE( !pacedMeasuredHoldReached( false, false, true, 0, kRequired, kRequired ) );
+    ASSERT_TRUE( !pacedMeasuredHoldReached( true, true, true, 0, kRequired, kRequired ) );
+    ASSERT_TRUE( !pacedMeasuredHoldReached( true, false, false, 0, kRequired, kRequired ) );
+    ASSERT_TRUE( !pacedMeasuredHoldReached( true, false, true, 1, kRequired + 1, kRequired ) );
+    ASSERT_TRUE( !pacedMeasuredHoldReached( true, false, true, 480, 2859, kRequired ) );
+    ASSERT_TRUE( !pacedMeasuredHoldReached( true, false, true, 0, kRequired, 0 ) );
+    ASSERT_TRUE( !pacedMeasuredHoldReached( true, false, true, 0, kRequired, -1 ) );
+    ASSERT_TRUE( !pacedMeasuredHoldReached( true, false, true, 0, kRequired - 1, kRequired ) );
+    ASSERT_TRUE( !pacedMeasuredHoldReached( true, false, true, 0, 0, kRequired ) );
+}
+
+namespace paced_starvation_model
+{
+// Receipt 8bcdb433 (Bachelor M16-1457 native fullscreen, paced): required 1499 of a 2859-frame clip, and the measured loop's
+// stop check starved -- its last check before the clip end came at frame ~1400, the next only at the clip end (2858). The model
+// runs one engine tick per step (advancing consumed by `step` unless the hold says no, never past the clip) and the measured
+// loop's stop check only at the scheduled ticks; the check that sees Reached stops the loop, which disarms the hold, and the
+// tail ticks after it run disarmed.
+struct Run
+{
+    int64_t consumedAtStop = -1;   // consumed at the check that stopped the loop (-1: never stopped)
+    bool loopStopped = false;
+    int64_t heldTicks = 0;
+    int64_t consumedAfterTail = -1;
+};
+static constexpr int64_t kRequired = 1499;
+static constexpr int64_t kClipFrames = 2859;
+inline Run run( int64_t step, bool unpaced, int64_t targetPresentedFrames, int64_t tailTicks )
+{
+    static constexpr int64_t kChecks[] = { 50, 400, 900, 1400, 2858 };
+    Run r;
+    int64_t consumed = 1;   // the counter counts the start frame
+    bool armed = true;
+    size_t nextCheck = 0;
+    for( int64_t tick = 0; tick <= 2858 && !r.loopStopped; ++tick )
+    {
+        if( playback_frame_range::pacedMeasuredHoldReached( true, unpaced, armed, targetPresentedFrames, consumed, kRequired ) )
+            ++r.heldTicks;
+        else
+            consumed = consumed + step < kClipFrames ? consumed + step : kClipFrames;
+        if( nextCheck < sizeof( kChecks ) / sizeof( kChecks[0] ) && tick == kChecks[nextCheck] )
+        {
+            ++nextCheck;
+            const playback_frame_range::PlayStopState state = consumed >= kRequired
+                ? playback_frame_range::PlayStopState::Reached : playback_frame_range::PlayStopState::Continue;
+            if( playback_frame_range::measuredPlayLoopShouldStop( state, false, targetPresentedFrames, 0, kRequired, true, consumed ) )
+            {
+                r.loopStopped = true;
+                r.consumedAtStop = consumed;
+            }
+        }
+    }
+    armed = false;   // the loop's exit disarms the hold
+    for( int64_t tick = 0; tick < tailTicks; ++tick )
+    {
+        if( !playback_frame_range::pacedMeasuredHoldReached( true, unpaced, armed, targetPresentedFrames, consumed, kRequired ) )
+            consumed = consumed + step < kClipFrames ? consumed + step : kClipFrames;
+    }
+    r.consumedAfterTail = consumed;
+    return r;
+}
+}
+
+TEST( PlaybackPacedMeasuredHold, AStarvedStopCheckSeesTheRequiredFrameAndTheTailPlaysOnOnceDisarmed )
+{
+    using namespace paced_starvation_model;
+    for( const int64_t step : { int64_t( 1 ), int64_t( 3 ) } )   // one frame per tick, and a drop-frame step of 3
+    {
+        const Run r = run( step, false, 0, 180 );
+        ASSERT_TRUE( r.loopStopped );
+        // RED on fbd46832 (no paced hold): the check at 2858 saw the clip end, consumed 2859
+        ASSERT_TRUE( r.consumedAtStop >= kRequired );
+        ASSERT_TRUE( r.consumedAtStop < kRequired + 3 );
+        ASSERT_TRUE( r.heldTicks > 0 );
+        ASSERT_TRUE( playback_frame_range::measuredPlayLoopShouldStop( playback_frame_range::PlayStopState::Reached, false, 0, 0,
+                                                                       kRequired, true, r.consumedAtStop ) );
+        // disarmed, the timeline advances again: the visual-capture tail plays
+        ASSERT_TRUE( r.consumedAfterTail > r.consumedAtStop );
+        ASSERT_EQ( r.consumedAtStop + 180 * step, r.consumedAfterTail );
+    }
+}
+
+TEST( PlaybackPacedMeasuredHold, APinnedOrUnpacedRunIsNeverHeldByThePacedHold )
+{
+    using namespace paced_starvation_model;
+    for( const int64_t step : { int64_t( 1 ), int64_t( 3 ) } )
+    {
+        const Run unpaced = run( step, true, 0, 0 );
+        ASSERT_EQ( 0, unpaced.heldTicks );
+        // the model has no unpaced hold (CUDA-HEADROOM-1's, unchanged), so the starved check sees the timeline far past the window
+        ASSERT_TRUE( unpaced.loopStopped );
+        ASSERT_TRUE( unpaced.consumedAtStop > kRequired + 1000 );
+        const Run pinned = run( step, false, 480, 0 );
+        ASSERT_EQ( 0, pinned.heldTicks );
+        ASSERT_TRUE( pinned.consumedAtStop < 0 || pinned.consumedAtStop > kRequired + 3 );
+    }
+}
+
 // r9 (adversary pass 9 on 35a85cdd, route b of the REFERENCE-FRAME-PIN-BY-SOURCE-INDEX-1 design review). Each block is RED on
 // eaa5c9e0's rules (the RED stub) and green on the fix.
 TEST( PlaybackMeasuredLoopExit, R9TheAdmissionJudgesThePlayedCutRangeAndTheStartFrameIsARepeatOnlyBeforeTheWindow )

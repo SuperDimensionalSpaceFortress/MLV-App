@@ -1540,6 +1540,29 @@ private:
         qint64 countedAtNs = 0;       // ... at this point on clock (the finish's, if the session ended inside it)
     };
     SmokeEventWaitInFlight *m_smokeEventWaitInFlight = nullptr;
+    // GUI-SMOKE-PACED-STOP-STARVATION-1: the session the measured loop armed the paced required-frame hold for (0 = disarmed),
+    // and the measured loop's dispatch calls by site (playback_smoke.measured_dispatch). The call in flight is a member so the
+    // hold and the finish, which can both run inside a dispatch, read which call it is and how long it has run.
+    uint64_t m_pacedMeasuredHoldSession = 0;
+    enum MeasuredDispatchSite { MeasuredDispatchNone = 0, MeasuredDispatchLoopTop = 1, MeasuredDispatchEventWait = 2 };
+    struct MeasuredDispatchInFlight
+    {
+        int site = MeasuredDispatchNone;   // None outside a dispatch, or outside the open session's measured loop
+        double startS = 0.0;               // mlv_stage_timing_now() at the call's start
+    };
+    MeasuredDispatchInFlight m_measuredDispatchInFlight;
+    uint64_t m_measuredDispatchLoopSession = 0;            // the session whose measured loop is running (0 = none)
+    double m_measuredDispatchLoopStartS = 0.0;
+    uint64_t m_measuredDispatchCalls[3] = { 0, 0, 0 };     // by MeasuredDispatchSite
+    double m_measuredDispatchMaxMs[3] = { 0.0, 0.0, 0.0 };
+    int64_t m_measuredDispatchConsumedAtLoopExit = -1;     // -1 = the session's measured loop has not exited
+    bool m_pacedHoldArmedSeen = false;
+    bool m_pacedHoldEngaged = false;
+    int m_pacedHoldSiteAtEngage = MeasuredDispatchNone;
+    double m_pacedHoldInFlightMsAtEngage = 0.0;
+    double m_pacedHoldEngagedS = 0.0;
+    double m_pacedHoldReleasedS = 0.0;                     // 0 = not released before the finish
+    uint64_t m_pacedHoldTicks = 0;
     double m_playbackSmokePresentDrawPresentSumMs = 0.0;
     double m_playbackSmokePresentOverlaysScopesSumMs = 0.0;
     double m_playbackSmokePresentRenderSlotReleaseSumMs = 0.0;
@@ -2170,6 +2193,12 @@ private:
     void sleepGuiThreadForSmokeRunner( unsigned long ms );
     void waitGuiThreadForSmokeEvents( int maxMs );
     void closeSmokeEventWait( SmokeEventWaitInFlight &wait );
+    bool measuredDispatchCounting( void ) const;
+    MeasuredDispatchInFlight measuredDispatchBegin( int site );
+    void measuredDispatchEnd( const MeasuredDispatchInFlight &outer );
+    void beginMeasuredDispatchLoop( void );
+    void endMeasuredDispatchLoop( void );
+    void notePacedMeasuredHold( void );
     void finishPresentedFrame( uint64_t displayFrame,
                                RenderFrameThread::ReadyFrame &readyFrame,
                                const PresentationRequestContext &requestContext,
