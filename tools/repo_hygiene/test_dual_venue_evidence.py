@@ -22177,13 +22177,13 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 2, 2, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
     def metrics(self, pb: dict | None = None, app="default", criteria=None, *, png: str = "all", sha: str = "good", leg: str | None = None,
-                recorded: str = "good", verbatim: dict | None = None):
+                recorded: str = "good", verbatim: dict | None = None, unrecorded: tuple = ()):
         """Get-DvCriteriaMetrics over a JSON playback block and the tail evidence Get-DvTailVisualEvidence reads from an evidence directory holding `app` as
         visual\\app-visual.json (`app` None: no file; `app` bytes: written verbatim) and the leg-named PNGs of its saved rows (`png` 'all' | 'none' |
         'first-missing' | 'stub' (the 5 bytes 89 50 4e 47 00) | 'empty'); `sha` is the digest the receipt stores ('good' | 'wrong' | 'absent').
         Test-DvCriteria over `criteria` if given. r2 (adversary A1 on 9f327333): `recorded` is the receipt's visual.frames the PNGs are bound to ('good': each
         written PNG's own sha256 | 'replaced': the sha256 of a different valid PNG, as if the file on disk was swapped after collection | 'none': no frames).
-        `verbatim` adds keys to the verbatim summary metrics (adversary A4)."""
+        `verbatim` adds keys to the verbatim summary metrics (adversary A4). r11: `unrecorded` names row indices the receipt records no sha256 for."""
         pb = {**self.PB, **(pb or {})}
         doc = self.app_json() if isinstance(app, str) else app
         rec: list[dict] = []
@@ -22209,7 +22209,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                         body = {"stub": b"\x89PNG\x00", "empty": b""}.get(png, self.png_bytes(row["index"]))
                         (vis / f"{leg or self.LEG}-{row['kind'].replace('_', '-')}-{row['index']}.png").write_bytes(body)
                         bound = body if recorded == "good" else self.png_bytes(200)
-                        if recorded != "none":
+                        if recorded != "none" and row["index"] not in unrecorded:
                             rec.append({"kind": row["kind"], "index": row["index"], "sha256": hashlib.sha256(bound).hexdigest()})
             stored = {"good": digest, "wrong": "f" * 64, "absent": ""}[sha]
             proc, out = run_pwsh_json(
@@ -23107,6 +23107,45 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         with self.subTest(case="(control) 478 at 34 ms then 479 at 64 ms"):
             out = self.metrics(None, app=self.app_json({**r478, "tail_elapsed_ms": 34}, r479), criteria=crit)
             self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+
+    def test_r6_r11_a1_a_paint_recording_row_that_cannot_credit_still_refuses(self) -> None:
+        """A1 (fable r2, key3 opus r2, sol r2 on 364df36b), key3's input: target 479, 2 unpainted (close 477), burst_captures=3, burst rows (index, ms, frame,
+        serial = painted_serial, saved) = (0, 8, 478, 484, true), (1, 38, 478, 485, false), (2, 68, 479, 486, true), the first forced play row at 125 ms, every
+        counter 0. 364df36b ran its equal-time, burst, behind-close, close-frame and order checks only over rows that already qualified for the credit, so the
+        unsaved row 1 (a second paint of 478: a repeat) was dropped first and 478 and 479 credited (jump 1, unpainted 0, repeats 0: PASS). Every refusal check
+        now runs over every bound, unforced paint-recording row; saved, a recorded sha256, a decodable PNG and a source_id only decide which rows may CREDIT."""
+        crit = self.BOTH + [{"metric": "conformRepeats", "op": "eq", "value": 0}]
+        pb = {"visualBurstCaptures": 3}
+        forced = self.play(0, kind="play", tail_elapsed_ms=125, display_frame=479, serial=487, painted_serial=487)
+
+        def burst(i: int, ms: int, frame: int, serial: int, **over) -> dict:
+            return self.play(i, kind="play_first_unbound", tail_elapsed_ms=ms, display_frame=frame, serial=serial, painted_serial=serial, **over)
+
+        no_source = {k: v for k, v in burst(1, 38, 478, 485).items() if k != "source_id"}
+        cases = (("key3 base: an unsaved repeat of 478", (burst(0, 8, 478, 484), burst(1, 38, 478, 485, saved=False), burst(2, 68, 479, 486)), (), "TAIL_CREDIT_PAINT_ORDER"),
+                 ("key3 variant: an unsaved capture of the close frame 477", (burst(0, 8, 477, 484, saved=False), burst(1, 38, 478, 485), burst(2, 68, 479, 486)), (),
+                  "TAIL_CREDIT_PAINT_ORDER"),
+                 ("key3 variant: an unsaved 479 before 478", (burst(0, 8, 479, 484, saved=False), burst(1, 38, 478, 485), burst(2, 68, 479, 486)), (), "TAIL_CREDIT_PAINT_ORDER"),
+                 ("a saved repeat with no recorded sha256", (burst(0, 8, 478, 484), burst(1, 38, 478, 485), burst(2, 68, 479, 486)), (1,), "TAIL_CREDIT_PAINT_ORDER"),
+                 ("a repeat with no source_id", (burst(0, 8, 478, 484), no_source, burst(2, 68, 479, 486)), (), "TAIL_CREDIT_PAINT_ORDER"),
+                 ("sol: an unsaved capture at the same tail time", (burst(0, 8, 478, 484), burst(1, 8, 478, 485, saved=False), burst(2, 68, 479, 486)), (),
+                  "TAIL_CREDIT_EQUAL_TIME"),
+                 ("an unsaved burst row the burst did not log", (burst(0, 8, 478, 484), burst(2, 68, 479, 486), burst(3, 98, 479, 488, saved=False)), (),
+                  "TAIL_CREDIT_BURST_NOT_LOGGED"))
+        for name, rows, unrecorded, why in cases:
+            with self.subTest(case=name):
+                out = self.metrics(pb, app=self.app_json(*rows, forced), criteria=crit, unrecorded=unrecorded)
+                self.assert_no_credit(out, 2)
+                self.assertIn(why, out["m"]["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="(control) 478 then 479, no third row"):
+            out = self.metrics(pb, app=self.app_json(burst(0, 8, 478, 484), burst(2, 68, 479, 486), forced), criteria=crit)
+            self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+            self.assertTrue(out["v"]["pass"], out)
+        with self.subTest(case="(control) an unsaved row that records no paint (unbound) does not refuse"):
+            unbound = burst(1, 38, 478, 485, saved=False, label_bound=False, painted_serial_valid=False)
+            out = self.metrics(pb, app=self.app_json(burst(0, 8, 478, 484), unbound, burst(2, 68, 479, 486), forced), criteria=crit)
+            self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+            self.assertTrue(out["v"]["pass"], out)
 
     def test_r6_r10_sol_a2_an_invalidation_after_burst_end_never_credits_a_capture_the_burst_did_not_take(self) -> None:
         """A2 (sol on a95fca2f), its input: the default PB (last 477, target 479, sourceAdvanced 480, nonce RUN_A) and a log whose burst_end says

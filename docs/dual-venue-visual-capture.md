@@ -245,7 +245,10 @@ forced repaint (`forced_paints_before` = JSON integer 0), saved, label-bound wit
 `gl_window_paint`, `gl_viewport_paint` or `pixmap_composed_paint`; a forced repaint's `pixmap_item_by_construction`, `none` or
 anything else never qualifies: R5-RESIDUE-1), carries a `source_id` (bound to the clip), names its own
 file (`play-unbound-<index>.png` / `play-first-unbound-<index>.png`), has its recorded, decodable PNG, and shows Play active. The
-qualifying captures must be in paint order (by `tail_elapsed_ms`, display frame and serial never decrease). The visual record is bound
+qualifying captures must be in paint order (by `tail_elapsed_ms`, display frame and serial never decrease). The order, equal-time,
+burst, behind-close and close-frame refusals run over EVERY unforced, label-bound row that records a paint (display frame, painted
+serial, tail time, Play active, paint-path basis, `forced_paints_before` 0), saved or not: being saved, a recorded sha256, a decodable
+PNG and a `source_id` decide only which of those rows may credit (R6-BURST-CUTOFF-RESIDUE-1 r11, A1). The visual record is bound
 to this run: visual.json's `run_nonce` must be 32 lowercase hex (`TAIL_VISUAL_NONCE_ABSENT` otherwise: absent, `none`, upper case,
 another length, a trailing newline, or not a JSON string) and ordinal-equal to BOTH the launcher's nonce (result.json, `expectedRunNonce`)
 and the nonce the app echoed on its summary line (`observedRunNonce`) (`TAIL_VISUAL_NONCE_MISMATCH` otherwise: two runs can share a

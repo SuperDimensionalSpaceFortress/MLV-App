@@ -8067,6 +8067,8 @@ function Get-DvTailInFlightCredit {
     R5-RESIDUE-1 (sol r1 B1): a qualifying capture's labelBoundBasis must also be a paint-path record, ordinally one of TailCreditPaintBases: gl_window_paint,
     gl_viewport_paint (the paintGL() that drew it recorded it) or pixmap_composed_paint (GraphicsZoomView's own record of its last composed paintEvent, the
     pixmap route's unforced capture). A forced repaint's by-construction basis (pixmap_item_by_construction), none, or anything else never qualifies.
+    R6-BURST-CUTOFF-RESIDUE-1 r11 (A1): the refusal checks (equal-time, burst, behind-close, close-frame, order/repeat) run over every such paint-recording
+    row; saved, the recorded sha256, a decodable PNG and source_id decide only which rows may credit.
     Pure: no I/O; a missing or malformed input is a reason, never a credit.
     #>
     param([Parameter(Mandatory)][int64]$Unpainted, [Parameter(Mandatory)][int64]$Target, $Playback, $Visual)
@@ -8145,13 +8147,19 @@ function Get-DvTailInFlightCredit {
         $fBasis = Get-DvProp $f 'labelBoundBasis'
         # r4 (sol A6 on 560c9642): ordinal membership; -cin is a culture compare, which ignores a NUL ("gl_window_paint\u0000" matched)
         $paintBasis = ($fBasis -is [string]) -and (@($script:TailCreditPaintBases | Where-Object { [string]::Equals($fBasis, $_, [StringComparison]::Ordinal) }).Count -eq 1)
-        if ((Get-DvProp $f 'saved') -eq $true -and (Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'labelBound') -eq $true -and $paintBasis -and
+        # R6-BURST-CUTOFF-RESIDUE-1 r11 (A1, fable r2 / key3 opus r2 / sol r2 on 364df36b): a bound, unforced row that RECORDS a paint (label-bound with a
+        # paint-path basis, a display frame, a painted serial, a tail time, Play active, no forced paint before it) enters every refusal check below
+        # (equal-time, burst, behind-close, close-frame, order/repeat) whether or not it can credit: 364df36b filtered on saved, the recorded sha256, a
+        # decodable PNG and source_id FIRST, so an unsaved second paint of 478 was never seen and 478 and 479 credited over a repeat. Those four decide only
+        # which rows may CREDIT (add to the shown set); a paint-recording row that cannot credit still refuses, or leaves its target uncredited
+        if ((Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'labelBound') -eq $true -and $paintBasis -and
             $unforcedKind -and $null -ne $forcedBefore -and [int64]$forcedBefore -eq 0 -and
-            -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'sourceId')) -and $null -ne (Get-DvProp $f 'serial') -and
-            -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'pngSha256')) -and $null -ne $tailMs -and $null -ne $display) {
+            $null -ne (Get-DvProp $f 'serial') -and $null -ne $tailMs -and $null -ne $display) {
             $ordered.Add($f)
+            $mayCreditRow = (Get-DvProp $f 'saved') -eq $true -and -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'sourceId')) -and
+                            -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'pngSha256'))
             $d = [int64]$display
-            if ($d -gt ($Target - $Unpainted) -and $d -le $Target) { [void]$shown.Add($d) }
+            if ($mayCreditRow -and $d -gt ($Target - $Unpainted) -and $d -le $Target) { [void]$shown.Add($d) }
         }
     }
     # R6-BURST-CUTOFF-RESIDUE-1 r10 (G3, Grok CoS on a95fca2f): two qualifying captures at the same tail_elapsed_ms cannot be ordered, so they are refused
