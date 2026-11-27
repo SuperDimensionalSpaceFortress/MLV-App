@@ -15,6 +15,8 @@
 # The floor is Get-GuiSmokeMinPlaySeconds of the clip's native fps: 20 s, 10 s for an HFR clip (HFR-10S-1).
 #   CLIP_LENGTH_UNKNOWN  (reason=<token>)       header unreadable / wrong magic / 0 frames / bad fps
 #                                               / spanned set incomplete -- FAIL CLOSED
+# RUNTIME receipt verdict (not a pre-launch gate): PLAY_OVERRAN_WINDOW, exit 43, under Get-GuiSmokeLoopVerdict -RequireWindowStop:
+#   source_advanced ran past required_source_frames by more than 2.0 s of source frames at native fps.
 #
 # Header: the 52-byte MLVI file header, mlv_file_hdr_t in src/mlv/mlv.h, little-endian:
 #   0  fileMagic[4]='MLVI'  4 blockSize u32 (52)   8 versionString[8]   16 fileGuid u64
@@ -179,6 +181,10 @@ function Get-GuiSmokeClipLength {
     Length of a clip (all spanned parts): the VIDF blocks the app will play (Get-GuiSmokePartFrames), with the MLVI headers
     for identity, fps and the spanned set. Returns
     [pscustomobject]@{ known; reason; frames; fps; seconds }. known=$false means FAIL CLOSED.
+    GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1: the parts are the ones the app OPENS. src/mlv/video_mlv.c load_all_chunks opens
+    the path, and only when its extension is the first-part extension (any case) probes <base>.M00, .M01 ... .M98 by NAME,
+    stopping at the first one missing; it reads no fileNum / fileCount. A first part whose header under-declares fileCount
+    (0 or 1) is still followed by every probed part (Bachelor M16-1457: 1671 frames counted where the app plays 2859).
     #>
     param([Parameter(Mandatory = $true)][string]$Path)
     $unknown = { param($why) [pscustomobject]@{ known = $false; reason = $why; frames = 0; fps = 0.0; seconds = 0.0 } }
@@ -187,36 +193,55 @@ function Get-GuiSmokeClipLength {
     # Header validity precedes the block walk (as before the walk existed): a zero-fps header reports bad_fps, not the walk's verdict.
     if ($first.fpsNom -le 0 -or $first.fpsDenom -le 0) { return (& $unknown 'bad_fps') }
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    $frames = [int64]0
-    if ($first.fileCount -le 1) {
-        # A spanned set walks every part (the first included) in the loop below, so the first part is walked once.
-        $partFrames = Get-GuiSmokePartFrames -Path $Path -HeaderFrames ([int64]$first.videoFrames) -Clock $clock
-        if (-not $partFrames.ok) { return (& $unknown $partFrames.reason) }
-        $frames = [int64]$partFrames.frames
+    # The probed parts, in the app's order: .M00 .. .M98 up to the first number missing. Any other extension is opened alone.
+    $probed = @()
+    if ([IO.Path]::GetExtension($Path) -ieq $script:GuiSmokeFirstPartExtension) {
+        $dir = Split-Path -Parent $Path
+        if ([string]::IsNullOrEmpty($dir)) { $dir = '.' }
+        $base = [IO.Path]::GetFileNameWithoutExtension($Path)
+        $byNumber = @{}
+        try {
+            $siblings = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction Stop | Where-Object {
+                $_.BaseName -ceq $base -and $_.Extension -match '^\.M[0-9][0-9]$'
+            })
+        } catch {
+            # A listing that fails would hide every probed part (the undercount this rule exists to stop): fail closed.
+            return (& $unknown 'spanned_set_unreadable')
+        }
+        foreach ($sibling in $siblings) {
+            $number = [int]$sibling.Extension.Substring(2)
+            if ($byNumber.ContainsKey($number)) { return (& $unknown 'spanned_set_mismatch') }   # .M00 and .m00 on a case-sensitive volume
+            $byNumber[$number] = $sibling
+        }
+        $number = 0
+        while ($number -lt 99 -and $byNumber.ContainsKey($number)) { $probed += $byNumber[$number]; $number++ }
     }
     if ($first.fileCount -gt 1) {
-        # Spanned: the per-file header counts only that file's frames, so the total is the sum over
-        # the WHOLE set, and the set must be complete (and one recording) or the length is unknown.
-        $dir = Split-Path -Parent $Path
-        $base = [IO.Path]::GetFileNameWithoutExtension($Path)
-        $firstExt = $script:GuiSmokeFirstPartExtension
-        $parts = @(Get-ChildItem -LiteralPath $dir -File | Where-Object {
-            $_.BaseName -ceq $base -and $_.Extension -match '^\.M(?:LV|\d\d)$'
-        } | Sort-Object @{ Expression = { if ($_.Extension -ieq $firstExt) { -1 } else { [int]$_.Extension.Substring(2) } } })
-        if ($parts.Count -ne $first.fileCount) { return (& $unknown 'spanned_set_incomplete') }
-        $frames = 0
-        $idx = 0
-        foreach ($part in $parts) {
-            $h = Read-GuiSmokeMlviHeader -Path $part.FullName
-            if (-not $h.ok) { return (& $unknown "part_$($h.reason)") }
-            if ($h.fileGuid -ne $first.fileGuid -or $h.fileNum -ne $idx -or $h.fileCount -ne $first.fileCount) {
-                return (& $unknown 'spanned_set_mismatch')
-            }
-            $pf = Get-GuiSmokePartFrames -Path $part.FullName -HeaderFrames ([int64]$h.videoFrames) -Clock $clock
-            if (-not $pf.ok) { return (& $unknown $pf.reason) }
-            $frames += [int64]$pf.frames
-            $idx++
+        # A header that declares the set: the per-file header counts only that file's frames, so the total is the sum over
+        # the WHOLE set, and the set must be complete (and one recording) or the length is unknown. A gap ends the set.
+        if ((1 + $probed.Count) -ne $first.fileCount) { return (& $unknown 'spanned_set_incomplete') }
+        if ($first.fileNum -ne 0) { return (& $unknown 'spanned_set_mismatch') }
+    }
+    $partHeaders = @()
+    $idx = 1
+    foreach ($part in $probed) {
+        $h = Read-GuiSmokeMlviHeader -Path $part.FullName
+        if (-not $h.ok) { return (& $unknown "part_$($h.reason)") }
+        if ($h.fileGuid -ne $first.fileGuid) { return (& $unknown 'spanned_set_mismatch') }
+        # An under-declaring first part (fileCount <= 1) shows the writer did not maintain fileNum / fileCount, and the app
+        # reads neither, so only one recording (the GUID) is required of its probed parts. A declared set keeps every check.
+        if ($first.fileCount -gt 1 -and ($h.fileNum -ne $idx -or $h.fileCount -ne $first.fileCount)) {
+            return (& $unknown 'spanned_set_mismatch')
         }
+        $partHeaders += , @($part.FullName, [int64]$h.videoFrames)
+        $idx++
+    }
+    # The first part is walked once, then every probed part, on one shared clock.
+    $frames = [int64]0
+    foreach ($walk in (, @($Path, [int64]$first.videoFrames)) + $partHeaders) {
+        $pf = Get-GuiSmokePartFrames -Path $walk[0] -HeaderFrames ([int64]$walk[1]) -Clock $clock
+        if (-not $pf.ok) { return (& $unknown $pf.reason) }
+        $frames += [int64]$pf.frames
     }
     if ($frames -le 0) { return (& $unknown 'zero_frames') }
     $fps = [double]$first.fpsNom / [double]$first.fpsDenom
@@ -506,11 +531,12 @@ function Get-GuiSmokeRefusalReason {
     .SYNOPSIS
     The typed reason token for a runner exit code (41 CLIP_TOO_SHORT or PLAY_WINDOW_TOO_SHORT, 42
     CLIP_LENGTH_UNKNOWN, 43 INVALID_LOOPED, 44 PASS_THROUGH_REFUSED, 14 the app's own gate), taking the
-    more specific token out of the message when one is given; 'NONE' for every other exit code.
+    more specific token out of the message when one is given; 'NONE' for every other exit code. Exit 43 also covers
+    PLAY_OVERRAN_WINDOW (a measured Play that ran past its window, Get-GuiSmokeLoopVerdict -RequireWindowStop).
     #>
     param([int]$ExitCode, [string]$Message = '')
     if (@(14, 41, 42, 43, 44) -notcontains $ExitCode) { return 'NONE' }
-    if ($Message -match '(PLAY_WINDOW_TOO_SHORT|PLAY_DURATION_TOO_SHORT|PLAY_PACE_TOO_SLOW|CLIP_TOO_SHORT|CLIP_LENGTH_UNKNOWN|INVALID_SOURCE_FRAMES|INVALID_LOOPED|SOURCE_FRAMES_SHORT|PLAY_SAFETY_TIMEOUT|REPLAY_REFUSED|PASS_THROUGH_REFUSED)') {
+    if ($Message -match '(PLAY_WINDOW_TOO_SHORT|PLAY_DURATION_TOO_SHORT|PLAY_PACE_TOO_SLOW|PLAY_OVERRAN_WINDOW|CLIP_TOO_SHORT|CLIP_LENGTH_UNKNOWN|INVALID_SOURCE_FRAMES|INVALID_LOOPED|SOURCE_FRAMES_SHORT|PLAY_SAFETY_TIMEOUT|REPLAY_REFUSED|PASS_THROUGH_REFUSED)') {
         return $Matches[1]
     }
     return "EXIT_$ExitCode"
@@ -874,6 +900,11 @@ function Get-GuiSmokeLoopVerdict {
     INVALID (RECEIPT_FIELD_ABSENT), not "no wrap". Two checks that need nothing from the app also apply, from the
     clip's header frame count (-ClipFrames, 0 = unknown): more frames presented than the clip holds, or a
     last presented frame BEFORE the first, can only mean the timeline went round again.
+    GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1: -RequireWindowStop (default off; the runner sets it for a measured Play, not for a
+    launch-only probe or a lifecycle-stress run) adds PLAY_OVERRAN_WINDOW: source_advanced past required_source_frames by more
+    than $script:GuiSmokePlayOverrunToleranceSeconds of source frames at native_fps means the Play ran past its window, so the
+    receipt does not measure the window requested. When it fires and the app reports wrapped=0 and wrap_count=0, more frames
+    presented than -ClipFrames is a clip-count disagreement, not a loop, and the overrun is the verdict.
     #>
     param(
         [AllowNull()]$Summary,
@@ -883,7 +914,9 @@ function Get-GuiSmokeLoopVerdict {
         # ENFORCE-4 r2: the per-run nonce THIS launch handed the app; the receipt must echo it (RECEIPT_NOT_THIS_RUN).
         [AllowNull()][string]$ExpectedRunNonce = '',
         # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the run's playback_smoke.conform line, handed on to the source-frame oracle.
-        [AllowNull()][AllowEmptyString()][string]$ConformLine = ''
+        [AllowNull()][AllowEmptyString()][string]$ConformLine = '',
+        # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1: opt in to PLAY_OVERRAN_WINDOW (off: Get-GuiSmokeEvidencePlayVerdict and its launchers).
+        [bool]$RequireWindowStop = $false
     )
     $failures = @()
     $paceRule = 'native'; $conformPlaybackFps = $null; $conformClipFps = $null
@@ -912,7 +945,35 @@ function Get-GuiSmokeLoopVerdict {
             ($null -ne $wrapCount -and [int64]$wrapCount -gt 0)) {
             $failures += "INVALID_LOOPED: the playback timeline wrapped (wrapped=$wrapped wrap_count=$wrapCount total_frames=$totalFrames clip_seconds=$clipSeconds); a looped short clip is never playback evidence."
         }
-        if ($ClipFrames -gt 0 -and $null -ne $presented -and [int64]$presented -gt $ClipFrames) {
+        # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1: the measured Play must stop at its window. An absent or unreadable field adds
+        # nothing here: the source-frame oracle below already fails it. A count outside +-9e15 is not a frame count (no [int64] overflow).
+        $overranWindow = $false
+        $frameNumber = { param($v) $d = 0.0
+            if ($null -ne $v -and $v -isnot [bool] -and
+                [double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d) -and
+                -not [double]::IsNaN($d) -and -not [double]::IsInfinity($d) -and [Math]::Abs($d) -lt 9.0e15) { $d } else { $null } }
+        $overrunAdvanced = & $frameNumber (& $prop 'source_advanced')
+        $overrunRequired = & $frameNumber (& $prop 'required_source_frames')
+        $overrunFps = & $frameNumber (& $prop 'native_fps')
+        if ($RequireWindowStop -and $null -ne $overrunAdvanced -and $null -ne $overrunRequired -and $null -ne $overrunFps -and
+            [int64]$overrunRequired -gt 0 -and $overrunFps -gt 0) {
+            $tolerance = [int64][Math]::Ceiling($script:GuiSmokePlayOverrunToleranceSeconds * $overrunFps)
+            $overrun = [int64]$overrunAdvanced - [int64]$overrunRequired
+            if ($overrun -gt $tolerance) {
+                $overranWindow = $true
+                $overrunReason = & $prop 'reason'
+                $overrunElapsed = & $prop 'elapsed_ms'
+                $overrunContext = @()
+                if ($null -ne $overrunReason) { $overrunContext += "reason=$overrunReason" }
+                if ($null -ne $overrunElapsed) { $overrunContext += "elapsed_ms=$overrunElapsed" }
+                $overrunTail = if ($overrunContext.Count -gt 0) { " ($($overrunContext -join ' '))" } else { '' }
+                $failures += "PLAY_OVERRAN_WINDOW: the measured Play ran past its window: source_advanced=$([int64]$overrunAdvanced) required_source_frames=$([int64]$overrunRequired) overrun=$overrun source frames, over tolerance=$tolerance frames ($($script:GuiSmokePlayOverrunToleranceSeconds) s at native_fps=$overrunFps)$overrunTail; the receipt does not measure the requested window."
+            }
+        }
+        # An overrun with the app's own wrap signals present and zero: more presented frames than -ClipFrames is a clip-count
+        # disagreement, not a loop, and the overrun above is the verdict (a real wrap is still INVALID_LOOPED, reported first).
+        $overranWithoutWrap = $overranWindow -and $null -ne $wrapped -and $null -ne $wrapCount -and [int]$wrapped -eq 0 -and [int64]$wrapCount -eq 0
+        if ($ClipFrames -gt 0 -and $null -ne $presented -and [int64]$presented -gt $ClipFrames -and -not $overranWithoutWrap) {
             $failures += "INVALID_LOOPED: $presented frames were presented from a clip of $ClipFrames frames; the timeline went round again."
         }
         if ($null -ne $firstPresented -and $null -ne $lastPresented -and [int64]$lastPresented -lt [int64]$firstPresented) {
@@ -950,6 +1011,12 @@ function Get-GuiSmokeLoopVerdict {
 # Mirrors platform/qt/PlaybackFrameRange.h (kMinSustainedPaceFraction, kPlaySafetyMarginMs); a parity test compares them.
 $script:GuiSmokeMinSustainedPaceFraction = 0.5
 $script:GuiSmokePlaySafetyMarginMs = 15000
+# GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1: how far past required_source_frames a measured Play may run, in seconds of source
+# frames at native_fps (ceil(2.0 x 59.94) = 120 frames), before Get-GuiSmokeLoopVerdict -RequireWindowStop calls it
+# PLAY_OVERRAN_WINDOW. The 8 valid M16-1457 legs overshot by 0-26 source frames at 59.94 fps; the two overrun legs by 1360. The
+# app's own pinned-window allowance is kMeasuredPlayMaxFramesInFlight = 16 (platform/qt/PlaybackFrameRange.h). Runner-only: no
+# app mirror and no parity test.
+$script:GuiSmokePlayOverrunToleranceSeconds = 2.0
 
 # CPU-LOOK-LEG-PACE-ABORT-1: mirrors platform/qt/PlaybackFrameRange.h kCpuInformationalMinPaceFraction (a parity test compares them).
 # A CPU-backend leg's pace is MEASURED and informational: the app's pace probe never ends it, and its wall budget is this CEILING
