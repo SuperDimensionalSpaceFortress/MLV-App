@@ -11,7 +11,8 @@
  *   (1) the truth table of playbackEveryFrameTickMayAdvance (platform/qt/PlaybackDueWake.h);
  *   (2) a deterministic event-sequence model of the venue's order of events (accept -> early advance -> lookahead slot
  *       Ready unaccepted -> poll tick -> accept ...), plus a seeded random mix: every frame presents once, in order;
- *   (3) the MainWindow.cpp wiring, read as text (MainWindow.cpp is not linked into console_tests).
+ *   (3) the MainWindow.cpp wiring, read as text (MainWindow.cpp is not linked into console_tests);
+ *   (4) self-tests of the source-text helpers the wiring pins rely on (stripComments: splicing, literals, raw strings).
  * Every test is named with the prefix EveryFrameTargetGate (minitest's filter takes ONE prefix).
  */
 
@@ -208,6 +209,47 @@ QString playbackHandlingBody( const QString & source )
 // left the substring and order assertions true. These helpers let a test pin the comment-free code exactly and pin the path of
 // blocks that encloses a statement, so a dead guard anywhere on that path changes a pinned value.
 // The code with its // and /* */ comments removed (string and char literals kept), so neither a guard nor a pin hides in a comment.
+// r7 (Grok CoS G7, adversary A3): the stripper follows the compiler's lexing, so a pin cannot be fooled by text the compiler reads
+// differently:
+//   - translation phase 2 line splicing: a backslash right before a newline (optionally with spaces or tabs between them, as GCC,
+//     Clang and C++23 accept; also before CR LF) joins the lines, so `// note \` + newline + `code();` is ONE comment, and a splice
+//     inside `/` `/`, `/` `*` or `*` `/` still opens or closes a comment;
+//   - string and char literals (any encoding prefix), with escaped quotes and escaped backslashes, so a `//` or `/*` inside a literal
+//     is literal text and the code after the literal on the same line survives;
+//   - raw string literals `R"delim(...)delim"` (prefixes R, LR, uR, UR, u8R): their body is copied verbatim and, as the standard
+//     says, splicing is undone inside them;
+//   - digit separators (`1'000'000`), which are not char literals.
+// Splices in code outside comments are copied unchanged, so the code text the exact pins compare is the source text.
+// Not handled: header-names (`#include <a//b.h>`), trigraphs (removed in C++17), and a macro that expands to a comment or to code
+// (the stripper does not preprocess). No pin depends on these: MainWindow.cpp has no splice, raw string, digit separator or
+// header-name with `//` or `/*` (the EveryFrameTargetGate.StripComments* tests below prove each handled case on fixtures).
+int skipLineSplices( const QString & s, int i )
+{
+    const int n = s.size();
+    while( i < n && s.at( i ) == QLatin1Char( '\\' ) )
+    {
+        int k = i + 1;
+        while( k < n && ( s.at( k ) == QLatin1Char( ' ' ) || s.at( k ) == QLatin1Char( '\t' ) ) ) ++k;
+        if( k < n && s.at( k ) == QLatin1Char( '\r' ) && k + 1 < n && s.at( k + 1 ) == QLatin1Char( '\n' ) ) ++k;
+        if( k >= n || s.at( k ) != QLatin1Char( '\n' ) ) break;
+        i = k + 1;
+    }
+    return i;
+}
+
+bool isIdentifierChar( QChar c )
+{
+    return c.isLetterOrNumber() || c == QLatin1Char( '_' );
+}
+
+// The identifier or pp-number that ends right before \a i (empty when \a i follows punctuation or whitespace).
+QString tokenBefore( const QString & s, int i )
+{
+    int start = i;
+    while( start > 0 && ( isIdentifierChar( s.at( start - 1 ) ) || s.at( start - 1 ) == QLatin1Char( '.' ) ) ) --start;
+    return s.mid( start, i - start );
+}
+
 QString stripComments( const QString & s )
 {
     QString out;
@@ -217,12 +259,63 @@ QString stripComments( const QString & s )
     while( i < n )
     {
         const QChar c = s.at( i );
+        if( c == QLatin1Char( '\\' ) && skipLineSplices( s, i ) > i )
+        {
+            const int end = skipLineSplices( s, i );   // a splice in code: copied unchanged
+            out.append( s.mid( i, end - i ) );
+            i = end;
+            continue;
+        }
+        if( c == QLatin1Char( '"' ) )
+        {
+            const QString prefix = tokenBefore( s, i );
+            const bool raw = prefix == QLatin1String( "R" ) || prefix == QLatin1String( "LR" ) || prefix == QLatin1String( "uR" )
+                             || prefix == QLatin1String( "UR" ) || prefix == QLatin1String( "u8R" );
+            if( raw )
+            {
+                const int open = s.indexOf( QLatin1Char( '(' ), i + 1 );
+                const QString delimiter = open > i ? s.mid( i + 1, open - i - 1 ) : QString();
+                bool delimiterValid = open > i && delimiter.size() <= 16;
+                for( const QChar d : delimiter )
+                    if( d.isSpace() || d == QLatin1Char( ')' ) || d == QLatin1Char( '\\' ) || d == QLatin1Char( '"' ) )
+                        delimiterValid = false;
+                if( delimiterValid )
+                {
+                    const QString closer = QLatin1Char( ')' ) + s.mid( i + 1, open - i - 1 ) + QLatin1Char( '"' );
+                    const int close = s.indexOf( closer, open + 1 );
+                    const int end = close < 0 ? n : close + closer.length();
+                    out.append( s.mid( i, end - i ) );
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        if( c == QLatin1Char( '\'' ) )
+        {
+            const QString token = tokenBefore( s, i );
+            const bool digitSeparator = !token.isEmpty()
+                                        && ( token.at( 0 ).isDigit()
+                                             || ( token.at( 0 ) == QLatin1Char( '.' ) && token.size() > 1 && token.at( 1 ).isDigit() ) );
+            if( digitSeparator )
+            {
+                out.append( c );
+                ++i;
+                continue;
+            }
+        }
         if( c == QLatin1Char( '"' ) || c == QLatin1Char( '\'' ) )
         {
             out.append( c );
             ++i;
             while( i < n && s.at( i ) != c && s.at( i ) != QLatin1Char( '\n' ) )
             {
+                if( s.at( i ) == QLatin1Char( '\\' ) && skipLineSplices( s, i ) > i )
+                {
+                    const int end = skipLineSplices( s, i );   // a splice continues the literal
+                    out.append( s.mid( i, end - i ) );
+                    i = end;
+                    continue;
+                }
                 if( s.at( i ) == QLatin1Char( '\\' ) && i + 1 < n )
                 {
                     out.append( s.at( i ) );
@@ -240,17 +333,48 @@ QString stripComments( const QString & s )
             }
             continue;
         }
-        if( c == QLatin1Char( '/' ) && i + 1 < n && s.at( i + 1 ) == QLatin1Char( '/' ) )
+        if( c == QLatin1Char( '/' ) )
         {
-            while( i < n && s.at( i ) != QLatin1Char( '\n' ) ) ++i;
-            continue;
-        }
-        if( c == QLatin1Char( '/' ) && i + 1 < n && s.at( i + 1 ) == QLatin1Char( '*' ) )
-        {
-            const int end = s.indexOf( QStringLiteral( "*/" ), i + 2 );
-            i = end < 0 ? n : end + 2;
-            out.append( QLatin1Char( ' ' ) );
-            continue;
+            const int second = skipLineSplices( s, i + 1 );
+            if( second < n && s.at( second ) == QLatin1Char( '/' ) )
+            {
+                // a // comment runs to the first newline that is not spliced away
+                int k = second + 1;
+                while( k < n )
+                {
+                    const int afterSplices = skipLineSplices( s, k );
+                    if( afterSplices > k )
+                    {
+                        k = afterSplices;
+                        continue;
+                    }
+                    if( s.at( k ) == QLatin1Char( '\n' ) ) break;
+                    ++k;
+                }
+                i = k;   // the newline itself is code (kept)
+                continue;
+            }
+            if( second < n && s.at( second ) == QLatin1Char( '*' ) )
+            {
+                int k = second + 1;
+                int end = n;
+                while( k < n )
+                {
+                    if( s.at( k ) == QLatin1Char( '*' ) )
+                    {
+                        const int slash = skipLineSplices( s, k + 1 );
+                        if( slash < n && s.at( slash ) == QLatin1Char( '/' ) )
+                        {
+                            end = slash + 1;
+                            break;
+                        }
+                    }
+                    ++k;
+                }
+                i = end;
+                out.append( QLatin1Char( ' ' ) );
+                continue;
+            }
         }
         out.append( c );
         ++i;
@@ -677,4 +801,138 @@ TEST( EveryFrameTargetGate, ConformStillReturnsFalseWithoutConformAndDelegatesTo
 
     const QString header = readRepoFile( QStringLiteral( "platform/qt/MainWindow.h" ) );
     ASSERT_EQ( 1, countOccurrences( header, QStringLiteral( "bool playbackTargetPresentOutstanding( int target );" ) ) );
+}
+
+// ---- (4) self-tests of the source-text helpers (r7, Grok CoS G6b/G6c/G7) --------------------------------------------------
+// The wiring pins above read MainWindow.cpp through functionBody + stripComments. These fixtures prove the pipeline on the cases a
+// pin relies on: a comment cannot fail a negative check, real code always fails it, and text the compiler reads as a comment (a
+// spliced // comment) is never counted as code, while code after a literal that holds "//" is never dropped.
+
+// G6b REGRESSION: a comment directly above the next signature names the forbidden token (the 5295d637 hosted red, in miniature).
+TEST( EveryFrameTargetGate, StripCommentsNegativeCheckPassesOnACommentAboveTheNextSignature )
+{
+    const QString fixture = QStringLiteral(
+        "bool A::neutral( int target )\n"
+        "{\n"
+        "    if( target < 0 ) return false;\n"
+        "    return check( target );\n"
+        "}\n"
+        "\n"
+        "// the conform check below takes the tick's start, not m_newPosDropMode\n"
+        "/* nor m_newPosDropMode in a block comment */\n"
+        "bool A::conform( double position )\n"
+        "{\n"
+        "    return neutral( static_cast<int>( position ) );\n"
+        "}\n" );
+    const QString raw = functionBody( fixture, QStringLiteral( "bool A::neutral( int target )" ),
+                                      QStringLiteral( "bool A::conform( double position )" ) );
+    ASSERT_FALSE( raw.isEmpty() );
+    ASSERT_TRUE( raw.contains( QStringLiteral( "m_newPosDropMode" ) ) );   // the fixture carries the trap the raw read fell into
+    const QString neutral = stripComments( raw );
+    ASSERT_FALSE( neutral.contains( QStringLiteral( "m_newPosDropMode" ) ) );
+    ASSERT_TRUE( neutral.contains( QStringLiteral( "return check( target );" ) ) );
+    ASSERT_TRUE( neutral.contains( QStringLiteral( "if( target < 0 ) return false;" ) ) );
+}
+
+// G6c ADVERSARIAL: the forbidden token in real code inside the body is still found after the strip, wherever it sits on its line.
+TEST( EveryFrameTargetGate, StripCommentsNegativeCheckFailsOnTheForbiddenTokenInRealCode )
+{
+    const QStringList bodies = {
+        QStringLiteral( "    if( m_newPosDropMode < 0 ) return false;\n" ),
+        QStringLiteral( "    /* a block comment first */ const double p = m_newPosDropMode;\n" ),
+        QStringLiteral( "    log( \"a // b\" ); use( m_newPosDropMode );\n" ),
+        QStringLiteral( "    log( \"q\\\" // still the string\" ); use( m_newPosDropMode );\n" ),
+        QStringLiteral( "    const char c = '\"'; use( m_newPosDropMode );\n" ),
+        QStringLiteral( "    const char c = '\\''; use( m_newPosDropMode );\n" ),
+        QStringLiteral( "    const int n = 1'000'000; use( m_newPosDropMode );\n" ),
+        QStringLiteral( "    const char * r = R\"x(a \" // )\" b)x\"; use( m_newPosDropMode );\n" ),
+        QStringLiteral( "    // a comment line\n    use( m_newPosDropMode );\n" ),
+        QStringLiteral( "    /* a block\n       comment */\n    use( m_newPosDropMode );\n" ),
+    };
+    for( const QString & body : bodies )
+    {
+        const QString fixture = QStringLiteral( "bool A::neutral( int target )\n{\n" ) + body
+                                + QStringLiteral( "    return true;\n}\n\nbool A::conform( double position )\n{\n}\n" );
+        const QString neutral = stripComments( functionBody( fixture, QStringLiteral( "bool A::neutral( int target )" ),
+                                                             QStringLiteral( "bool A::conform( double position )" ) ) );
+        ASSERT_FALSE( neutral.isEmpty() );
+        ASSERT_TRUE( neutral.contains( QStringLiteral( "m_newPosDropMode" ) ) );
+        ASSERT_TRUE( neutral.contains( QStringLiteral( "return true;" ) ) );
+    }
+}
+
+// G7 SPLICE: a backslash right before a newline continues a // comment (translation phase 2), so the next line is comment, not
+// code. The old stripper ended the comment at the first newline and kept `if( stop ) return;` as live code.
+TEST( EveryFrameTargetGate, StripCommentsTreatsASplicedLineCommentAsComment )
+{
+    const QStringList spliced = {
+        QStringLiteral( "void f()\n{\n    // disabled early-out \\\n    if( stop ) return;\n    run();\n}\n" ),
+        QStringLiteral( "void f()\n{\n    // trailing blanks after the backslash \\  \t\n    if( stop ) return;\n    run();\n}\n" ),
+        QStringLiteral( "void f()\n{\n    // CR LF line end \\\r\n    if( stop ) return;\n    run();\n}\n" ),
+        QStringLiteral( "void f()\n{\n    // an escaped-looking backslash pair still splices \\\\\n    if( stop ) return;\n    run();\n}\n" ),
+        QStringLiteral( "void f()\n{\n    // two splices \\\n    one(); \\\n    if( stop ) return;\n    run();\n}\n" ),
+        QStringLiteral( "void f()\n{\n    /\\\n/ the opener is spliced\n    /\\\n/ if( stop ) return;\n    run();\n}\n" ),
+        QStringLiteral( "void f()\n{\n    /* the closer *\\\n is not here, so if( stop ) return; is comment */\n    run();\n}\n" ),
+    };
+    for( const QString & fixture : spliced )
+    {
+        const QString code = stripComments( fixture );
+        ASSERT_FALSE( code.contains( QStringLiteral( "if( stop ) return;" ) ) );
+        ASSERT_FALSE( code.contains( QStringLiteral( "one();" ) ) );
+        ASSERT_TRUE( code.contains( QStringLiteral( "run();" ) ) );
+        ASSERT_TRUE( code.contains( QStringLiteral( "void f()" ) ) );
+    }
+    // a spliced block-comment closer does close the comment, so the code after it is live
+    const QString closed = stripComments( QStringLiteral( "/* comment *\\\n/ live();\n" ) );
+    ASSERT_TRUE( closed.contains( QStringLiteral( "live();" ) ) );
+    // a splice in code (a macro continuation) is copied unchanged, so the exact pins compare source text
+    const QString macro = QStringLiteral( "#define M( x ) \\\n    ( x )\nlive();\n" );
+    ASSERT_EQ( macro.toStdString(), stripComments( macro ).toStdString() );
+}
+
+// G7 LITERALS: "//" or "/*" inside a string, char or raw string literal is literal text; the code after it on the same line
+// survives the strip and a real comment after it is still removed.
+TEST( EveryFrameTargetGate, StripCommentsKeepsCodeAfterALiteralThatHoldsACommentOpener )
+{
+    struct Case
+    {
+        QString input;
+        QString expected;
+    };
+    const std::vector<Case> cases = {
+        { QStringLiteral( "log( \"a // b\" ); forbidden_code(); // gone\n" ),
+          QStringLiteral( "log( \"a // b\" ); forbidden_code(); \n" ) },
+        { QStringLiteral( "log( \"a /* b\" ); forbidden_code(); /* gone */\n" ),
+          QStringLiteral( "log( \"a /* b\" ); forbidden_code();  \n" ) },
+        { QStringLiteral( "log( \"q\\\" // still the string\" ); forbidden_code(); // gone\n" ),
+          QStringLiteral( "log( \"q\\\" // still the string\" ); forbidden_code(); \n" ) },
+        { QStringLiteral( "log( \"\\\\\" ); forbidden_code(); // gone\n" ),
+          QStringLiteral( "log( \"\\\\\" ); forbidden_code(); \n" ) },
+        { QStringLiteral( "c = '\"'; forbidden_code(); // gone\n" ),
+          QStringLiteral( "c = '\"'; forbidden_code(); \n" ) },
+        { QStringLiteral( "c = '\\''; forbidden_code(); // gone\n" ),
+          QStringLiteral( "c = '\\''; forbidden_code(); \n" ) },
+        { QStringLiteral( "s = u8\"// x\"; w = L'/'; forbidden_code(); // gone\n" ),
+          QStringLiteral( "s = u8\"// x\"; w = L'/'; forbidden_code(); \n" ) },
+        { QStringLiteral( "r = R\"x(a \" // )\" b)x\"; forbidden_code(); // gone\n" ),
+          QStringLiteral( "r = R\"x(a \" // )\" b)x\"; forbidden_code(); \n" ) },
+        { QStringLiteral( "r = u8R\"(/* \\\n */)\"; forbidden_code(); // gone\n" ),
+          QStringLiteral( "r = u8R\"(/* \\\n */)\"; forbidden_code(); \n" ) },
+        { QStringLiteral( "n = 1'000'000; forbidden_code(); // gone '\n" ),
+          QStringLiteral( "n = 1'000'000; forbidden_code(); \n" ) },
+        { QStringLiteral( "x = 0x1'F; forbidden_code(); // gone\n" ),
+          QStringLiteral( "x = 0x1'F; forbidden_code(); \n" ) },
+        { QStringLiteral( "a = b / c; forbidden_code(); // gone\n" ),
+          QStringLiteral( "a = b / c; forbidden_code(); \n" ) },
+    };
+    for( const Case & item : cases )
+    {
+        const QString code = stripComments( item.input );
+        ASSERT_EQ( item.expected.toStdString(), code.toStdString() );
+        ASSERT_TRUE( code.contains( QStringLiteral( "forbidden_code();" ) ) );
+        ASSERT_FALSE( code.contains( QStringLiteral( "gone" ) ) );
+    }
+    // text without comments is returned unchanged
+    const QString plain = QStringLiteral( "if( a ) { b(); }\nreturn c;\n" );
+    ASSERT_EQ( plain.toStdString(), stripComments( plain ).toStdString() );
 }
