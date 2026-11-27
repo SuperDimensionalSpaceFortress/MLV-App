@@ -863,12 +863,19 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         defaults = {"-LegBudgetSec": "60", "-LeaseMarginSec": "0", "-ClaimPollSec": "1", "-RecheckSec": "1",
                     "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
         for k in omit:
-            defaults.pop(k, None)   # (r2: an OMIT_DEFAULTS name that is not a valued default, as -SkipCommittedSpecPreflight, is read below)
+            defaults.pop(k, None)   # (r2: an OMIT_DEFAULTS name that is not a valued default, as -SkipCommittedSpecPreflight, is read by offline_switch_args)
         args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.runner), "-LegSpec", ",".join(str(s) for s in (specs or self.specs[:2])),
                 "-RunDir", str(self.run_dir), "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST, "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
-                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *extra]
+                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *self.offline_switch_args(extra, omit), *extra]
         return args, e
+
+    def offline_switch_args(self, extra: tuple, omit: list) -> list[str]:
+        """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r2: the committed-spec preflight is on in every mode and a stand-in leg lives in no repo, so every offline case turns it off with the
+        explicit switch -- unless the case passes the switch itself, names a repo for the preflight (-CommittedSpecRepoRoot), or asks for the default (OMIT_DEFAULTS=-SkipCommittedSpecPreflight)."""
+        if "-SkipCommittedSpecPreflight" in omit or "-SkipCommittedSpecPreflight" in extra or "-CommittedSpecRepoRoot" in extra:
+            return []
+        return ["-SkipCommittedSpecPreflight"]
 
     def kinds(self) -> list[str]:
         """The event order: OPEN / CLOSE (um-run), QUIET:<mode>, LEG:<leaf>:<leaseBatch>."""
@@ -3634,14 +3641,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         e = dict(os.environ)
         e.update({"FAKE_EVENTS": str(self.events), "FAKE_SHARE": str(self.share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case),
                   "FAKE_LEG_ARGS": str(self.leg_args)})
+        omit = [x for x in env.pop("OMIT_DEFAULTS", "").split(",") if x]
         e.update(env)
         defaults = {"-LegBudgetSec": "60", "-LeaseMarginSec": "0", "-ClaimPollSec": "1", "-RecheckSec": "1",
                     "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
+        for k in omit:
+            defaults.pop(k, None)
         # plan_runner: a case that runs a patched mirror of the runner (_mirror_with_bad_sidecar) names it here; unset, it is the runner under test
         args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(getattr(self, "plan_runner", RUNNER)), "-LegPlan", str(plan),
                 "-RunDir", str(self.run_dir), "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg-args.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
-                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *extra]
+                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *self.offline_switch_args(extra, omit), *extra]
         return args, e
 
     def run_plan(self, plan: Path, *extra: str, **env: str) -> subprocess.CompletedProcess:
@@ -5893,7 +5903,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # production: the batch runs the real Invoke-VenueLeg.ps1, whose own check refuses an uncommitted spec, so the preflight is on with no seam at all
         self._reset_committed_case()
         # (r2 hermetic: a regression here lets the real leg run, and it writes its refusal receipt under -ReceiptRoot; this case's own temp dir keeps that out of the canonical root)
-        args, e = self.batch_cmd([self._untracked_copy_of_a_committed_spec()], *self._hermetic_receipt_root())
+        args, e = self.batch_cmd([self._untracked_copy_of_a_committed_spec()], *self._hermetic_receipt_root(), OMIT_DEFAULTS="-SkipCommittedSpecPreflight")
         args[args.index("-LegScript") + 1] = str(LEG)
         r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
         self._assert_nothing_claimed_or_leased("real leg script", r)
@@ -5912,7 +5922,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     def test_legspec_committed_the_seams_are_refused_with_the_real_um_run(self) -> None:
         stand_in = self.case / "stand-in-committed.ps1"
-        stand_in.write_text("param([string]$RepoRoot, [string]$LegSpecSha256)\nWrite-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head='\nexit 0\n", encoding="utf-8")
+        stand_in.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\nWrite-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head= root=x'\nexit 0\n", encoding="utf-8")
         for flag, value in (("-CommittedSpecRepoRoot", str(ROOT)), ("-CommittedSpecScript", str(stand_in))):
             with self.subTest(seam=flag):
                 self._reset_committed_case()
@@ -5938,7 +5948,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # the spec IS committed in this repo, but the copy's own repo (its ..\..\.. : a plain directory, no HEAD) holds nothing: the leg that runs would refuse it, so the batch does first.
         # (the real um-run.ps1 is never reached: the refusal is before any claim; the short deadline bounds the run if a regression let it through)
         # (OMIT_DEFAULTS: the real um-run.ps1 refuses the stub's -LeaseCooldownSec 0 as LEASE_CAP_RELAXED, which would end the run before the preflight is reached)
-        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=60)), *self._hermetic_receipt_root(), OMIT_DEFAULTS="-LeaseCooldownSec")
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=60)), *self._hermetic_receipt_root(), OMIT_DEFAULTS="-LeaseCooldownSec," + self._SKIP)
         args[args.index("-LegScript") + 1] = str(leg_copy_dir / "Invoke-VenueLeg.ps1")
         args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
         r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=e)
@@ -5959,9 +5969,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     # r2 (adversary A3): the lookup is bounded by the room left before -DeadlineUtc, and a child that gives no answer is a typed refusal, never "no refusal"
     def test_legspec_committed_a_lookup_that_overruns_the_deadline_is_killed_and_refused_before_any_claim(self) -> None:
         slow = self.case / "slow-committed.ps1"
-        slow.write_text("param([string]$RepoRoot, [string]$LegSpecSha256)\nStart-Sleep -Seconds 120\nWrite-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head='\nexit 0\n", encoding="utf-8")
+        slow.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\nStart-Sleep -Seconds 120\nWrite-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head= root=x'\nexit 0\n", encoding="utf-8")
         silent = self.case / "silent-committed.ps1"
-        silent.write_text("param([string]$RepoRoot, [string]$LegSpecSha256)\nexit 0\n", encoding="utf-8")
+        silent.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\nexit 0\n", encoding="utf-8")
         for name, script, code, limit_s in (("slow", slow, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT", 40), ("silent", silent, "COMMITTED_SPEC_PREFLIGHT_FAILED", 40)):
             with self.subTest(child=name):
                 self._reset_committed_case()

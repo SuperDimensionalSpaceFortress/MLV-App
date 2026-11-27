@@ -1025,7 +1025,8 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
         args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(runner or LEASE_RUNNER), "-LegSpec", specs or str(self.spec), "-RunDir", str(run_dir), "-SourceCommit", "a" * 40,
                 "-BuildManifestSha256", "b" * 64, "-ClaimDir", str(self.claims), "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"),
                 "-UmRunScript", str(self.tmp / "fake-umrun.ps1"), "-AgentShare", str(share), "-LegBudgetSec", "60", "-LeaseMarginSec", "0", "-ClaimPollSec", str(claim_poll),
-                "-RecheckSec", "1", "-LeaseCooldownSec", cooldown, "-DeadlineUtc", utc_iso(deadline_utc or datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)), *extra]
+                "-RecheckSec", "1", "-LeaseCooldownSec", cooldown, "-DeadlineUtc", utc_iso(deadline_utc or datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)),
+                "-SkipCommittedSpecPreflight", *extra]   # (VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r2: the preflight is on by default; a stand-in leg lives in no repo)
         out_path = self.case / f"stdout-{name}.txt"
         with open(out_path, "w", encoding="utf-8") as out_file:
             p = subprocess.Popen(args, stdout=out_file, stderr=subprocess.STDOUT, text=True, env=e)

@@ -107,7 +107,8 @@
 #         because Invoke-VenueLeg would throw on it only after the lease is open.
 #         VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: a spec that is not COMMITTED under tools/profiling/dual-venue/legs/ at HEAD of this checkout (the leg's own
 #         Find-DvCommittedLegSpec, LEG_SPEC_NOT_COMMITTED) is refused here too (reason=LEG_SPEC_NOT_COMMITTED item=<n>, or BATCH_USAGE LEG_SPEC_NOT_COMMITTED for -LegSpec / -LegSet),
-#         when the real um-run.ps1 is used (or -LegScript is the real Invoke-VenueLeg.ps1's path); the leg would refuse it only after the lease is open (-CommittedSpecRepoRoot is the offline seam).
+#         ALWAYS (r2: on in every mode, decided by no classification of the scripts); the leg would refuse it only after the lease is open. Only the explicit offline switch
+#         -SkipCommittedSpecPreflight turns it off (refused with the real um-run.ps1); -CommittedSpecRepoRoot names the repo for a stand-in leg (the other offline seam).
 #         The same content checks run again once the claim is held (inside -ClaimTtlSec less -ClaimRenewSec) and once the lease is open (inside the lease's room less
 #         -LeaseMarginSec and the leg budget, so a slow re-hash ends SHARE_UNREACHABLE before the lease is spent, never LEG_BUDGET_EXCEEDS_LEASE after it; a lease whose
 #         room cannot start the re-read is refused reason=LEG_BUDGET_EXCEEDS_LEASE at once, before any probe). r4: each check is ONE deadline over all of its reads (existence,
@@ -266,9 +267,12 @@ param(
     # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1: '<n>:<ms>[,<n>:<ms>...]' makes the n-th file-system key lookup of the run (Get-SpecDigestKey's LocateWithin; counted from 1, one per spelled
     # path, as the memo answers every later call) answer <ms> late, so a test can time out one lookup (its bound is 1 s) while the others answer. Offline only: refused with the real um-run.ps1.
     [string]$SpecDigestKeyDelay = '',
-    # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the committed-leg-spec preflight (Get-LegSpecCommittedRefusal) is on whenever the real um-run.ps1 is used, or -LegScript is the real Invoke-VenueLeg.ps1's path,
-    # against the HEAD of the repo the selected leg resolves for itself (its own ..\..\..). A non-empty value turns it on for a stand-in leg too, against that repo's HEAD. Offline only: refused with the real um-run.ps1.
+    # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the committed-leg-spec preflight (Get-LegSpecCommittedRefusal) is ON in every mode, against the HEAD of the repo the selected leg script resolves
+    # for itself (its own ..\..\..; the bounded child resolves it). A non-empty value here names another repo (as spelled; the child resolves it). Offline only: refused with the real um-run.ps1.
     [string]$CommittedSpecRepoRoot = '',
+    # r2 (adversary A1): the ONE way to turn the preflight off, for an offline test with a stand-in leg that is not in a repo. It is a deliberate caller act, never inferred from the bytes or the
+    # path of any script (a line-ending change defeated every such inference). Refused with the real um-run.ps1, and with -CommittedSpecRepoRoot (which asks for the preflight).
+    [switch]$SkipCommittedSpecPreflight,
     # r2 (adversary A3): the bounded child the committed-spec preflight runs (default: Test-LegSpecCommitted.ps1 beside this script). Offline only: refused with the real um-run.ps1, so a test can time a lookup that overruns.
     [string]$CommittedSpecScript = ''
 )
@@ -308,14 +312,14 @@ if ($umRunIsReal -and $ExportBudgetScript) { Stop-Usage '-ExportBudgetScript is 
 if ($umRunIsReal -and $ExportBudgetSpecReadFault) { Stop-Usage '-ExportBudgetSpecReadFault is an offline test seam: with the real um-run.ps1 the export budget preflight reads the spec as it is' }
 if ($umRunIsReal -and $ExportBudgetSpecReadDelaySec -gt 0) { Stop-Usage '-ExportBudgetSpecReadDelaySec is an offline test seam: with the real um-run.ps1 the export budget preflight reads the spec as it is' }
 if ($umRunIsReal -and $CommittedSpecRepoRoot) { Stop-Usage '-CommittedSpecRepoRoot is an offline test seam: with the real um-run.ps1 the committed-spec preflight reads this checkout''s own HEAD' }
-if ($CommittedSpecRepoRoot -and -not (Test-Path -LiteralPath $CommittedSpecRepoRoot -PathType Container)) { Stop-Usage "-CommittedSpecRepoRoot '$CommittedSpecRepoRoot' is not a directory" }
-# VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the repo whose HEAD the committed-leg-spec preflight reads ('' = the preflight is off). The real leg refuses an uncommitted spec (LEG_SPEC_NOT_COMMITTED,
-# Invoke-VenueLeg.ps1, outside -OfflineTestMode, which this script never forwards), so with the real leg the preflight is on, in the repo the leg resolves for itself ($here\..\..\.., its own -RepoRoot default).
-# r2 (adversary A1): the preflight is on in PRODUCTION, which is the real um-run.ps1 ($umRunIsReal, classified above by path or content; only it reaches a venue), whatever the leg script's own bytes are (a copy with other
-# line endings is still the leg that runs), and offline when -LegScript is the real leg's path or the seam names a repo. The repo is the one THE LEG THAT RUNS resolves for itself (its own $PSScriptRoot\..\..\..), not
-# this script's: that leg is admitted at its own HEAD. r3 (adversary pass 2 A1/A2): no classification by the leg script's CONTENT: it was a raw-bytes compare a line-ending change defeats, and an unbounded read before -DeadlineUtc.
-$legScriptIsReal = ([IO.Path]::GetFullPath($LegScript) -ieq [IO.Path]::GetFullPath((Join-Path $here 'Invoke-VenueLeg.ps1')))
-$script:CommittedSpecRepoRoot = $(if ($CommittedSpecRepoRoot) { (Resolve-Path -LiteralPath $CommittedSpecRepoRoot).Path } elseif ($umRunIsReal -or $legScriptIsReal) { (Resolve-Path -LiteralPath (Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($LegScript))) '..\..\..')).Path } else { '' })
+if ($SkipCommittedSpecPreflight -and $CommittedSpecRepoRoot) { Stop-Usage '-SkipCommittedSpecPreflight contradicts -CommittedSpecRepoRoot: that seam asks for the committed-spec preflight' }
+# VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the real leg refuses an uncommitted spec (LEG_SPEC_NOT_COMMITTED, Invoke-VenueLeg.ps1, outside -OfflineTestMode, which this script never forwards) only
+# after the lease is open, so the preflight is ON in every mode. r2 (adversary A1, A2): it is turned off only by the explicit -SkipCommittedSpecPreflight; NOTHING is inferred from the bytes or the path of
+# the um-run or leg script (a complete second checkout whose scripts differ by line endings classified as a stand-in and silently ran with no gate). The repo whose HEAD it reads is the one THE LEG THAT RUNS
+# resolves for itself (its own ..\..\..), and the bounded child Test-LegSpecCommitted.ps1 resolves it from the leg script path, the seam value too: no file-system work on the root here, where no deadline holds yet.
+$script:CommittedSpecPreflightOn = -not $SkipCommittedSpecPreflight
+$script:CommittedSpecRepoRoot = $CommittedSpecRepoRoot   # as spelled; '' = the repo the leg script resolves for itself
+$script:CommittedSpecLegScript = [IO.Path]::GetFullPath($LegScript)   # a string operation only
 if ($umRunIsReal -and $CommittedSpecScript) { Stop-Usage '-CommittedSpecScript is an offline test seam: with the real um-run.ps1 the committed-spec preflight always runs Test-LegSpecCommitted.ps1' }
 $script:CommittedSpecScript = $(if ($CommittedSpecScript) { $CommittedSpecScript } else { Join-Path $here 'Test-LegSpecCommitted.ps1' })
 if (-not $ExportBudgetScript) { $ExportBudgetScript = Join-Path $here '..\bachelor\export-stage-job.ps1' }
@@ -347,6 +351,8 @@ foreach ($s in @($StagedBuildProbeScript, $ArtifactProbeScript) | Where-Object {
 $stagedBuildProbe = $(if ($StagedBuildProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($StagedBuildProbeScript)) } else { $null })
 $artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript)) } else { $null })
 if ($umRunIsReal -and $GuardReadDelay) { Stop-Usage '-GuardReadDelay is an offline test seam: with the real um-run.ps1 the guard reads are never delayed' }
+# r2 (adversary A1): the only way to turn the committed-spec preflight off is refused with the real um-run.ps1 (last, so every older seam keeps its own message)
+if ($umRunIsReal -and $SkipCommittedSpecPreflight) { Stop-Usage '-SkipCommittedSpecPreflight is an offline test seam: with the real um-run.ps1 the committed-spec preflight is always on' }
 $script:guardDelaySeam = $null; $script:lastGuardSeam = $null
 if ($GuardReadDelay) {
     # r4 adversary A3: [0-9], not \d, which also matches non-ASCII decimal digits that [int] then throws on. r5: rundir delays every read of -RunDir itself, in that guard and after it
@@ -1679,11 +1685,11 @@ function Get-LegSpecCommittedRefusal([string]$Path) {
     # AFTER the lease is open (2026-11-27T19:11:55Z: an untracked swap0 spec spent about 2 min of Bachelor lease and a quiet probe). Found here, before any claim, open or lease, by the SAME function
     # with the SAME line-ending-normalised hash (Get-DvLegSpecSha256: the CRLF/LF trap named at Invoke-VenueLeg.ps1:316): no second implementation of the comparison.
     # The commit is HEAD of $script:CommittedSpecRepoRoot at THIS preflight (the leg reads HEAD again when it is admitted, so a HEAD that moves between this check and a later leg is the one bound
-    # this check cannot close; it is read last-moment by the leg and never trusted here). '' = the preflight is off (a stand-in leg and no seam). Returns code, detail; '', '' when the spec is committed.
-    # The repo is the one the LEG THAT RUNS resolves for itself (its own ..\..\.., whichever tree it sits in), and the lookup is Test-LegSpecCommitted.ps1, a bounded child (see below).
+    # this check cannot close; it is read last-moment by the leg and never trusted here). Off only by -SkipCommittedSpecPreflight. Returns code, detail; '', '' when the spec is committed.
+    # The repo is the one the LEG THAT RUNS resolves for itself (its own ..\..\.., whichever tree it sits in), resolved by the bounded child Test-LegSpecCommitted.ps1 from the leg script's path (see below).
     # Called AFTER Get-ExportBudgetRefusal, whose read recorded the judged bytes' digest: these bytes must be those, or two checks judged two specs (SPEC_CHANGED_AFTER_PREFLIGHT).
     # A check that cannot run is a refusal, never "no refusal": the leg would refuse a spec it cannot find committed.
-    if (-not $script:CommittedSpecRepoRoot) { return '', '' }
+    if (-not $script:CommittedSpecPreflightOn) { return '', '' }
     try {
         $specRead = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec)
         if ($specRead.state -ceq 'TIMEOUT') { return 'SPEC_READ_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight's read of the leg spec did not answer in the time left before -DeadlineUtc; no claim or lease is taken on it" }
@@ -1703,13 +1709,16 @@ function Get-LegSpecCommittedRefusal([string]$Path) {
         if ($boundFloor -lt 1) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s); no claim or lease is taken on it" }
         $boundSec = [int]$boundFloor
         $pwshExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-        $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $script:CommittedSpecScript, '-RepoRoot', $script:CommittedSpecRepoRoot, '-LegSpecSha256', $normSha) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+        $childArgs = @('-NoProfile', '-File', $script:CommittedSpecScript, '-LegScript', $script:CommittedSpecLegScript, '-LegSpecSha256', $normSha)
+        if ($script:CommittedSpecRepoRoot) { $childArgs += @('-RepoRoot', $script:CommittedSpecRepoRoot) }
+        $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $childArgs -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
         if ($bp.timedOut) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' })); no claim or lease is taken on it" }
         $answer = [string]$bp.stdout
         if ($bp.exit -eq 0 -and $answer -match '(?m)^DV_LEGSPEC_COMMITTED FOUND ') { return '', '' }
-        if ($bp.exit -eq 3 -and $answer -match '(?m)^DV_LEGSPEC_COMMITTED NOT_FOUND head=(?<head>[0-9a-f]{0,40})\s*$') {
+        if ($bp.exit -eq 3 -and $answer -match '(?m)^DV_LEGSPEC_COMMITTED NOT_FOUND head=(?<head>[0-9a-f]{0,40}) root=(?<root>[^\r\n]*?)\s*$') {
             $headCommit = $Matches['head']
-            return 'LEG_SPEC_NOT_COMMITTED', "'$Path' cannot be run: its leg spec (line-ending-normalised sha256 $normSha) is not a spec committed under tools/profiling/dual-venue/legs/ at HEAD $(if ($headCommit.Length -ge 12) { $headCommit.Substring(0, 12) } else { "'$headCommit'" }) of $script:CommittedSpecRepoRoot, which Invoke-VenueLeg refuses (LEG_SPEC_NOT_COMMITTED) only after the lease is open; commit the spec first; no claim or lease is taken on it"
+            $resolvedRoot = $Matches['root']
+            return 'LEG_SPEC_NOT_COMMITTED', "'$Path' cannot be run: its leg spec (line-ending-normalised sha256 $normSha) is not a spec committed under tools/profiling/dual-venue/legs/ at HEAD $(if ($headCommit.Length -ge 12) { $headCommit.Substring(0, 12) } else { "'$headCommit'" }) of $resolvedRoot, which Invoke-VenueLeg refuses (LEG_SPEC_NOT_COMMITTED) only after the lease is open; commit the spec first; no claim or lease is taken on it"
         }
         $firstLine = @((@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n" -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -First 1)
         return 'COMMITTED_SPEC_PREFLIGHT_FAILED', "'$Path' cannot be run: the committed-spec preflight gave no answer (exit $($bp.exit)$(if ($firstLine.Count) { ': ' + ($firstLine[0] -replace '\s+', ' ') })), so whether its leg spec is committed is unchecked, and Invoke-VenueLeg refuses a spec it cannot find committed (LEG_SPEC_NOT_COMMITTED); no claim or lease is taken on it"

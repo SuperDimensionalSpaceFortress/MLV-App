@@ -9,22 +9,32 @@ Every git call here is the module's own hardened Invoke-DvGit, the one Invoke-Ve
 GIT_DIR / GIT_WORK_TREE / GIT_OBJECT_DIRECTORY / replace-ref override and every GIT_TRACE* target (so the commit asked about is the repo's own HEAD, and git writes nothing the caller names),
 is bounded per call, and passes --no-replace-objects. A raw `git rev-parse HEAD` in the batch was none of those.
 
-Prints ONE line and exits: `DV_LEGSPEC_COMMITTED FOUND path=<relative path> head=<sha>` (exit 0), or `DV_LEGSPEC_COMMITTED NOT_FOUND head=<sha or empty>` (exit 3: no spec under
-tools/profiling/dual-venue/legs/ at HEAD hashes to -LegSpecSha256, or HEAD cannot be read). Any other end (a throw, a kill) is NOT an answer: the caller refuses it as unchecked.
+THE ROOT IS RESOLVED HERE, not by the batch (r2, adversary A2): the batch hands over -LegScript (the leg script it will run) and, only for the offline seam, -RepoRoot as spelled. The repo is the one the
+leg that runs resolves for itself (its own <dir>\..\..\.., Invoke-VenueLeg.ps1's -RepoRoot default); a -RepoRoot, when given, replaces it. Resolving it touches the file system (a stalled share would
+stall the call), which is why it runs in this bounded child and never in the batch before -DeadlineUtc exists.
+
+Prints ONE line and exits: `DV_LEGSPEC_COMMITTED FOUND path=<relative path> head=<sha> root=<resolved root>` (exit 0), or `DV_LEGSPEC_COMMITTED NOT_FOUND head=<sha or empty> root=<resolved root>`
+(exit 3: no spec under tools/profiling/dual-venue/legs/ at HEAD hashes to -LegSpecSha256, or HEAD cannot be read), or `DV_LEGSPEC_COMMITTED NO_ROOT candidate=<what was tried>` (exit 4: the root does not
+resolve to a directory). Any other end (a throw, a kill) is NOT an answer: the caller refuses it as unchecked.
 -LegSpecSha256 is the line-ending-normalised hash (Get-DvLegSpecSha256), the one the leg computes from the spec it runs.
 #>
 param(
-    [Parameter(Mandatory)][string]$RepoRoot,
-    [Parameter(Mandatory)][string]$LegSpecSha256
+    [Parameter(Mandatory)][string]$LegSpecSha256,
+    [string]$LegScript = '',
+    [string]$RepoRoot = ''
 )
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'DualVenueRunner.psm1') -Force -DisableNameChecking
+$candidate = $(if ($RepoRoot) { $RepoRoot } elseif ($LegScript) { Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($LegScript))) '..\..\..' } else { '' })
+$root = ''
+try { if ($candidate) { $root = (Resolve-Path -LiteralPath $candidate -ErrorAction Stop).Path } } catch { $root = '' }
+if (-not $root -or -not (Test-Path -LiteralPath $root -PathType Container)) { Write-Output "DV_LEGSPEC_COMMITTED NO_ROOT candidate=$candidate"; exit 4 }
 $head = & (Get-Module DualVenueRunner) {
     param($root)
     $r = Invoke-DvGit -RepoRoot $root -GitArgs @('rev-parse', '--verify', 'HEAD')
     if ($r.exitCode -eq 0) { ([Text.Encoding]::ASCII.GetString($r.bytes)).Trim() } else { '' }
-} $RepoRoot
-$found = Find-DvCommittedLegSpec -RepoRoot $RepoRoot -Commit ([string]$head) -LegSpecSha256 $LegSpecSha256
-if ($found.ok) { Write-Output "DV_LEGSPEC_COMMITTED FOUND path=$($found.relativePath) head=$head"; exit 0 }
-Write-Output "DV_LEGSPEC_COMMITTED NOT_FOUND head=$head"
+} $root
+$found = Find-DvCommittedLegSpec -RepoRoot $root -Commit ([string]$head) -LegSpecSha256 $LegSpecSha256
+if ($found.ok) { Write-Output "DV_LEGSPEC_COMMITTED FOUND path=$($found.relativePath) head=$head root=$root"; exit 0 }
+Write-Output "DV_LEGSPEC_COMMITTED NOT_FOUND head=$head root=$root"
 exit 3
