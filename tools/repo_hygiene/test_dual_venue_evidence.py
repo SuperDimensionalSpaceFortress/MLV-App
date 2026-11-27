@@ -11268,6 +11268,17 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                   "-SourceDifference known-identical | ConvertTo-Json -Compress")
         self.assertEqual((out["verdict"], out["counted"]), ("OK", True), out["reason"])
         self.assertIsNone(out["reason"], "no static-clip waiver text beside a repeat count the judged frames cannot hold")
+        # adversary pass 2 A1 (its input verbatim): a NEGATIVE repeat count cannot be true either (the guard checked only the upper bound)
+        for repeats in ("-1", "-2147483648"):
+            with self.subTest(negative_repeats=repeats):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames {repeats} "
+                                          "-SourceDifference known-differ | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+                self.assertNotIn("known to differ", out["reason"])
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames {repeats} "
+                                          "-SourceDifference known-identical | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("OK", True), out["reason"])
+                self.assertIsNone(out["reason"])
         # a repeat count the frames can hold (5 of 6 over one picture) keeps both claims
         proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 "
                                   "-SourceDifference known-differ | ConvertTo-Json -Compress")

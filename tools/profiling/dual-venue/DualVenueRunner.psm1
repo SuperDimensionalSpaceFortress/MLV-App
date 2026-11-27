@@ -4396,7 +4396,8 @@ function Get-DvVisualVerdict {
     # repeat branch below) claim no source difference beside it either; the PARTIAL_FREEZE branch below keeps its own, stricter N - 2 bound for an out-of-range D
     $repeatHold = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { $PlayFrames - $DistinctContentHashes } else { $PlayFrames - 1 })
     if ($null -ne $labelledCount) { $repeatHold = [Math]::Min($repeatHold, [Math]::Max(0, $labelledCount - 1)) }
-    $repeatOverHold = ($RepeatedPlayFrames -gt $repeatHold)
+    # pass 2 A1: and a negative count is no count of repeats at all
+    $repeatOverHold = ($RepeatedPlayFrames -lt 0 -or $RepeatedPlayFrames -gt $repeatHold)
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
         # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (key3 r4 H1): and a source claim beside an app count this same reason calls impossible is not quoted either
         $differText = $(if ($sourceIncoherent) { "the source difference supplied disagrees with the $labelledCount labelled of the $PlayFrames judged frames and is not quoted" }
