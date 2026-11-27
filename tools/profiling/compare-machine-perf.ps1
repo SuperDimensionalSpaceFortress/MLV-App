@@ -517,21 +517,25 @@ function Get-PlaybackAbFpsArmRefusal {
     $verdict = Get-FpsPairVerdict `
         -Baseline (Get-FpsArmFromLegRecord $Record.baseline) `
         -Candidate (Get-FpsArmFromLegRecord $candidateLeg)
-    if ($verdict.allowed) {
-        # R2-RESIDUE-1 r1 (adversary 698fffb1 A7, sibling of summarize-local-cuda-proof.ps1): the compare this reader publishes must be measured on the very legs it just judged.
-        if ($Record.speedCompare) { $judgedCompare = $Record.speedCompare } else { $judgedCompare = $Record.compare }
-        # R2-RESIDUE-1 r3 (sol 5add23cf A10): every metric the compare publishes is bound to the judged legs, so a compare without presentedFps is asked too
-        if ($null -ne $judgedCompare) {
-            $bindingProblem = Get-FpsCompareBindingProblem -Compare $judgedCompare -Baseline $Record.baseline -Candidate $candidateLeg
-            if ($null -ne $bindingProblem) {
-                return [pscustomobject]@{ refused = $true; reason = "fps-verdict-refused:compare-not-judged-pair"; detail = [string]$bindingProblem }
-            }
-        }
+    # R2-RESIDUE-1 r1 (adversary 698fffb1 A7, sibling of summarize-local-cuda-proof.ps1): the compare this reader publishes must be measured on the very legs it just judged.
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A1): asked of EVERY published compare, not only one the arm gate allowed: a HEAVY pair beside a compare measured on other legs published that
+    # compare's per-leg fps and stage figures. A pair the arm gate refused keeps its ARM reason (the verdict the row publishes says why the pair was refused); `compareUnbound` is the separate fact
+    # that sends the per-leg figures back to the legs, whatever the reason.
+    if ($Record.speedCompare) { $judgedCompare = $Record.speedCompare } else { $judgedCompare = $Record.compare }
+    # R2-RESIDUE-1 r3 (sol 5add23cf A10): every metric the compare publishes is bound to the judged legs, so a compare without presentedFps is asked too
+    $bindingProblem = $null
+    if ($null -ne $judgedCompare) {
+        $bindingProblem = Get-FpsCompareBindingProblem -Compare $judgedCompare -Baseline $Record.baseline -Candidate $candidateLeg
+    }
+    if ($null -ne $bindingProblem -and $verdict.allowed) {
+        return [pscustomobject]@{ refused = $true; reason = "fps-verdict-refused:compare-not-judged-pair"; detail = [string]$bindingProblem; compareUnbound = $true; compareProblem = [string]$bindingProblem }
     }
     [pscustomobject]@{
         refused = (-not $verdict.allowed)
         reason = [string]$verdict.reason
         detail = [string]$verdict.detail
+        compareUnbound = ($null -ne $bindingProblem)
+        compareProblem = [string]$bindingProblem
     }
 }
 
@@ -1022,7 +1026,8 @@ function New-PlaybackAbSummaryRow {
     $fpsArmRefusal = Get-PlaybackAbFpsArmRefusal -Record $Record
     # R2-RESIDUE-1 r3 (sol 5add23cf A5): a compare that is not measured on the judged pair is not where the per-leg numbers come from either (20 and 60 published beside two legs that both measured 40): the
     # legs' own figures are read from the legs, and a leg that records none leaves the number empty
-    if ($fpsArmRefusal.refused -and ([string]$fpsArmRefusal.reason -ceq 'fps-verdict-refused:compare-not-judged-pair')) {
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A1): keyed on the fact (`compareUnbound`), not on the reason: a HEAVY pair keeps its arm reason and still reads its fps from its legs
+    if ($fpsArmRefusal.compareUnbound) {
         $judgedCandidateLeg = if ($Record.speedCompare) { $Record.candidateSpeed } else { $Record.candidate }
         $baselinePresented = Convert-ToNullableDouble $Record.baseline.presentedFps
         $candidatePresented = Convert-ToNullableDouble $judgedCandidateLeg.presentedFps

@@ -1441,6 +1441,26 @@ class LocalProofSummarizerFpsGateTests(unittest.TestCase):
         self.assertNotIn("compare-not-judged-pair", control)
         self.assertIn("GUI status FPS: CPU", control)
 
+    def test_r5_adversary_82d6f070_a1_a_heavy_pair_beside_an_unbound_compare_publishes_none_of_its_figures(self) -> None:
+        # adversary 82d6f070 A1 (input verbatim): HEAVY baseline and candidate each record presentedFps 40 and avgRenderTotalMs 10; the compare publishes presentedFps 20 -> 60 (+200 %) and avgRenderTotalMs
+        # 50 -> 25 (-50 %). The binding ran only for a pair the arm gate allowed, so the arm refusal kept the stage lines and the summarizer printed the false -50 % render change.
+        text = "\n".join(self.run_summarizer_block(
+            "HEAVY", "HEAVY", candidate_fps="40", baseline_fps="40", presented_compare="baseline = 20; candidate = 60; delta = 40; deltaPercent = 200",
+            leg_metrics="guiStatusFps = 40; avgPresentIntervalMs = 25; avgRenderTotalMs = 10; ",
+            compare_metrics=("guiStatusFps = [pscustomobject]@{ baseline = 40; candidate = 40; delta = 0; deltaPercent = 0 }; "
+                             "avgPresentIntervalMs = [pscustomobject]@{ baseline = 25; candidate = 25; delta = 0; deltaPercent = 0 }; "
+                             "avgRenderTotalMs = [pscustomobject]@{ baseline = 50; candidate = 25; delta = -25; deltaPercent = -50 }")))
+        self.assertIn(HEAVY_REASON, text, "the pair keeps its arm reason")
+        self.assertIn("speed compare: withheld", text)
+        self.assertIn("not measured on the judged pair either", text)
+        for figure in ("render total: CPU", "CPU 50 ms", "-50%", "presented FPS: CPU", "GUI status FPS: CPU", "avg present interval: CPU"):
+            self.assertNotIn(figure, text)
+        # control: the same HEAVY pair beside a compare measured on its own legs keeps the arm reason and its stage lines
+        control = "\n".join(self.run_summarizer_block("HEAVY", "HEAVY"))
+        self.assertNotIn("compare-not-judged-pair", control)
+        self.assertIn(HEAVY_REASON, control)
+        self.assertIn("render total: CPU", control)
+
     def test_heavy_ab_gets_a_refusal_diagnostic_and_no_fps_delta_lines(self) -> None:
         text = "\n".join(self.run_summarizer_block("HEAVY", "HEAVY"))
         self.assertIn("DIAG=PLAYBACK_AB_FPS_ARM_REFUSED", text)
@@ -3173,6 +3193,89 @@ class EnvelopePreemptR1ResidueTests(_Probe):
             "foreach ($k in $cases.Keys) { $r = [pscustomobject]@{ baseline = (& $leg); candidate = (& $leg); candidateSpeed = (& $leg); speedCompare = $cases[$k] }; $v = Get-PlaybackAbFpsArmRefusal -Record $r; Write-Host ($k + '=' + $v.refused + '|' + $v.reason) }\n")
         refused = "fps-verdict-refused:compare-not-judged-pair"
         self.assertEqual(self.ok(body).split(), [f"with-presented-unbound=True|{refused}", f"without-presented-unbound=True|{refused}", "with-presented-bound=False|", "without-presented-bound=False|"])
+
+    # ---- BENCH-LIGHT-ARM-GAIN-GATES-1-R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A1-A3) ----
+
+    def test_r5_adversary_82d6f070_a1_compare_machine_perf_binds_the_compare_of_a_pair_the_arm_gate_refused(self) -> None:
+        # A1 sibling (compare-machine-perf.ps1:520): HEAVY baseline and candidate both presentedFps 40 / avgRenderTotalMs 10, the compare publishes 20 -> 60 and 50 -> 25. The binding sat inside `if ($verdict.allowed)`,
+        # so the machine-perf row kept 20 and 60 as the legs' own fps. The typed compare refusal wins (its reason keys the per-leg re-read at New-PlaybackAbSummaryRow); the arm reason rides in the detail.
+        funcs = _extract_functions(COMPARE_MACHINE_PERF_SCRIPT, ["Convert-ToNullableDouble", "Get-PlaybackAbFpsArmRefusal"])
+        source = COMPARE_MACHINE_PERF_SCRIPT.read_text(encoding="utf-8")
+        start = source.index("    $fpsArmRefusal = Get-PlaybackAbFpsArmRefusal -Record $Record")
+        block = source[start:source.index("    $fpsDeltaRefused = ", start)]
+        body = funcs + (
+            "$leg = { param($arm) [pscustomobject]@{ telemetryArm = $arm; presentedFps = 40; avgRenderTotalMs = 10 } }\n"
+            "$unbound = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 20; candidate = 60; delta = 40; deltaPercent = 200 }; avgRenderTotalMs = [pscustomobject]@{ baseline = 50; candidate = 25; delta = -25; deltaPercent = -50 } }\n"
+            "$bound = [pscustomobject]@{ presentedFps = [pscustomobject]@{ baseline = 40; candidate = 40; delta = 0; deltaPercent = 0 }; avgRenderTotalMs = [pscustomobject]@{ baseline = 10; candidate = 10; delta = 0; deltaPercent = 0 } }\n"
+            "foreach ($k in 'unbound', 'bound') { $c = if ($k -eq 'unbound') { $unbound } else { $bound }; $Record = [pscustomobject]@{ baseline = (& $leg 'HEAVY'); candidate = (& $leg 'HEAVY'); candidateSpeed = $null; speedCompare = $null; compare = $c }\n"
+            "    $baselinePresented = $c.presentedFps.baseline; $candidatePresented = $c.presentedFps.candidate\n" + block +
+            "    Write-Host ($k + '=' + $fpsArmRefusal.refused + '|' + $fpsArmRefusal.reason + '|' + $fpsArmRefusal.compareUnbound + '|' + $baselinePresented + '|' + $candidatePresented) }\n")
+        # the arm reason is kept (the row's playback_fps_arm_verdict says why the pair was refused); the unbound compare sends the per-leg fps back to the legs (40 and 40, not 20 and 60)
+        self.assertEqual(self.ok(body).split(), [f"unbound=True|{HEAVY_REASON}|True|40|40", f"bound=True|{HEAVY_REASON}|False|40|40"])
+
+    @requires_windows_pwsh
+    def test_r5_adversary_82d6f070_a3_a_twin_with_other_bytes_is_a_second_file_not_the_same_name(self) -> None:
+        # A3 (input): a case-sensitive directory holds summary.JSON and a DISTINCT SUMMARY.json ({}). The flipped-case lookup found the twin and answered OrdinalIgnoreCase, so the packager refused the independent
+        # report destination SUMMARY.md as the input and the importer counted two report twins. A twin that exists proves nothing alone; only a twin with the same bytes can be the same file. This host's volume
+        # ignores case, so the twin's bytes are made to differ by replacing the module's byte comparison for the call.
+        probe = self.tmp / "summary.JSON"
+        probe.write_text('{"fps":40}', encoding="utf-8")
+        got = self.ok(
+            f"$m = Get-Module FpsArmGate\n"
+            f"Write-Host ('SAME-FILE=' + (Get-VolumeNameComparison -ExistingFile '{probe}'))\n"
+            "& $m { Set-Item -Path function:script:Test-FpsFilesHoldTheSameBytes -Value { $false } }\n"
+            f"Write-Host ('DISTINCT-TWIN=' + (Get-VolumeNameComparison -ExistingFile '{probe}'))\n")
+        self.assertEqual(dict(line.split("=", 1) for line in got.split()), {"SAME-FILE": "OrdinalIgnoreCase", "DISTINCT-TWIN": "Ordinal"})
+        # the byte comparison itself: the same file and a copy hold the same bytes; another length and another content do not; a file that cannot be read is answered "the same" (the refusing side)
+        other = self.tmp / "other.json"
+        other.write_text('{"fps":41}', encoding="utf-8")
+        longer = self.tmp / "longer.json"
+        longer.write_text('{"fps":40,"x":1}', encoding="utf-8")
+        copy = self.tmp / "copy.json"
+        copy.write_bytes(probe.read_bytes())
+        got = self.ok("".join(f"Write-Host ('{name}=' + (Test-FpsFilesHoldTheSameBytes '{a}' '{b}'))\n" for name, a, b in (
+            ("self", probe, probe), ("copy", probe, copy), ("content", probe, other), ("length", probe, longer), ("unreadable", probe, self.tmp / "nope.json"))))
+        self.assertEqual(dict(line.split("=", 1) for line in got.split()), {"self": "True", "copy": "True", "content": "False", "length": "False", "unreadable": "True"})
+
+    def test_r5_adversary_82d6f070_a2_output_paths_are_compared_by_the_volume_that_holds_them(self) -> None:
+        # A2 (input): the summary sits in a case-sensitive directory (so the packager's comparison was Ordinal) and the outputs in a case-insensitive one: -ReportPath out\Proof.md (its JSON twin Proof.json) and
+        # -PacketPath out\proof.json. On the output volume they are one name and the packet replaced the JSON report. Each pair is asked of the volume that holds the pair, not of the input's directory; when
+        # neither name exists nothing shows the directory case sensitive, so the pair is refused as one name.
+        funcs = _extract_functions(self.PACKAGER, ["ConvertTo-PlainFilePath", "Get-RealFilePath", "Get-BytesSha256", "Get-FileSha256", "Assert-OutputPathsAreSafe"])
+        src = self.tmp / "in"
+        src.mkdir()
+        (src / "summary.json").write_text("{}", encoding="utf-8")
+        out = self.tmp / "out"
+        out.mkdir()
+        body = funcs + (
+            f"$s = '{src / 'summary.json'}'; $b = [IO.File]::ReadAllBytes($s)\n"
+            "function T($o) { try { Assert-OutputPathsAreSafe -Summary $s -SummaryBytes $b -Outputs $o -Comparison ([StringComparison]::Ordinal); 'OK' } catch { 'REFUSED' } }\n"
+            f"Write-Host ('case-only-twins=' + (T ([ordered]@{{ 'JSON report' = '{out / 'Proof.json'}'; 'packet' = '{out / 'proof.json'}' }})))\n"
+            f"Write-Host ('distinct-names=' + (T ([ordered]@{{ 'JSON report' = '{out / 'Proof.json'}'; 'packet' = '{out / 'return.zip'}' }})))\n"
+            f"Write-Host ('same-name=' + (T ([ordered]@{{ 'JSON report' = '{out / 'proof.json'}'; 'packet' = '{out / 'proof.json'}' }})))\n")
+        self.assertEqual(dict(line.split("=", 1) for line in self.ok(body).split()), {"case-only-twins": "REFUSED", "distinct-names": "OK", "same-name": "REFUSED"})
+        # the disk-file exclusion and the manifest / packet exclusion of the same run use the same question
+        source = self.PACKAGER.read_text(encoding="utf-8")
+        self.assertEqual(source.count("[string]::Equals($path, $summaryFull, $Comparison)"), 0)
+        self.assertEqual(source.count("[string]::Equals($_.FullName, $manifestPath, $comparison)"), 0)
+        self.assertIn("Test-FpsPathAlias $diskPath $manifestPath", source)
+        self.assertIn("Test-FpsPathAlias $diskPath $packetFullPath", source)
+
+    @requires_windows_pwsh
+    def test_r5_adversary_82d6f070_a3_a_distinct_report_twin_is_not_refused_as_the_input_summary(self) -> None:
+        # A3 sibling (package-local-cuda-proof-result.ps1:372/182): summary.JSON and a distinct SUMMARY.json in one case-sensitive directory, -ReportPath SUMMARY.md. The comparison the packager takes from the
+        # volume was OrdinalIgnoreCase, so the independent report (its JSON twin SUMMARY.json) was refused as the input. The twin's bytes are made to differ (this host's volume ignores case) and the summary
+        # bytes passed are not the file's, so only the name question is asked.
+        funcs = _extract_functions(self.PACKAGER, ["ConvertTo-PlainFilePath", "Get-RealFilePath", "Get-BytesSha256", "Get-FileSha256", "Assert-OutputPathsAreSafe"])
+        summary = self.tmp / "summary.JSON"
+        summary.write_text('{"fps":40}', encoding="utf-8")
+        body = funcs + (
+            "$m = Get-Module FpsArmGate\n"
+            "& $m { Set-Item -Path function:script:Test-FpsFilesHoldTheSameBytes -Value { $false } }\n"
+            f"$s = '{summary}'; $b = [byte[]](1, 2, 3)\n"
+            f"$cmp = Get-VolumeNameComparison -ExistingFile $s\n"
+            f"try {{ Assert-OutputPathsAreSafe -Summary $s -SummaryBytes $b -Outputs ([ordered]@{{ 'Markdown report' = '{self.tmp / 'SUMMARY.md'}'; 'JSON report' = '{self.tmp / 'SUMMARY.json'}'; 'packet' = '{self.tmp / 'out' / 'return.zip'}' }}) -Comparison $cmp; Write-Host 'OUTCOME=OK' }} catch {{ Write-Host ('OUTCOME=REFUSED ' + $_.Exception.Message) }}\n")
+        self.assertEqual(self.ok(body).strip(), "OUTCOME=OK")
 
 
 if __name__ == "__main__":

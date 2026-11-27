@@ -833,8 +833,40 @@ function Get-VolumeNameComparison {
     if ([string]::IsNullOrEmpty($leaf) -or [string]::IsNullOrEmpty($directory) -or -not (Test-Path -LiteralPath $ExistingFile -PathType Leaf)) { return $platformDefault }
     $flipped = -join @($leaf.ToCharArray() | ForEach-Object { if ([char]::IsUpper($_)) { [char]::ToLowerInvariant($_) } elseif ([char]::IsLower($_)) { [char]::ToUpperInvariant($_) } else { $_ } })
     if ([string]::Equals($flipped, $leaf, [StringComparison]::Ordinal)) { return $platformDefault }
-    if (Test-Path -LiteralPath (Join-Path $directory $flipped) -PathType Leaf) { return [StringComparison]::OrdinalIgnoreCase }
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A3): a twin that EXISTS does not show the volume ignores case: a case-sensitive directory can hold two distinct files whose names differ only by case.
+    # Only a twin that holds the same bytes can be the same file (a distinct twin with other bytes proves the directory case sensitive). Equal bytes stay OrdinalIgnoreCase, the side that refuses.
+    $twin = Join-Path $directory $flipped
+    if (Test-Path -LiteralPath $twin -PathType Leaf) {
+        if (Test-FpsFilesHoldTheSameBytes $ExistingFile $twin) { return [StringComparison]::OrdinalIgnoreCase }
+    }
     [StringComparison]::Ordinal
+}
+
+function Test-FpsFilesHoldTheSameBytes {
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A3): true when both files read and hold the same bytes (the same file, or a copy of it); false when they differ in length or content. A file that cannot be read
+    # is answered true: the caller refuses on the side of "these are one file", never on a guess that they are two.
+    param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B)
+    try {
+        if ((Get-Item -LiteralPath $A -Force).Length -ne (Get-Item -LiteralPath $B -Force).Length) { return $false }
+        $left = [IO.File]::ReadAllBytes($A)
+        $right = [IO.File]::ReadAllBytes($B)
+        if ($left.Length -ne $right.Length) { return $false }
+        for ($i = 0; $i -lt $left.Length; $i++) { if ($left[$i] -ne $right[$i]) { return $false } }
+        $true
+    } catch { $true }
+}
+
+function Test-FpsPathAlias {
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A2): are two output paths the SAME name on the volume that holds them? The comparison asked of the INPUT's directory does not describe a directory elsewhere (a
+    # case-sensitive input directory, a case-insensitive output directory: Proof.json and proof.json are one file there). Equal ordinally: the same. Different ignoring case too: distinct. Different only
+    # by case: the volume of a name that EXISTS is asked (Get-VolumeNameComparison); when neither exists nothing can show the directory case sensitive, so they are refused as one name.
+    param([Parameter(Mandatory)][string]$A, [Parameter(Mandatory)][string]$B)
+    if ([string]::Equals($A, $B, [StringComparison]::Ordinal)) { return $true }
+    if (-not [string]::Equals($A, $B, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    foreach ($path in @($A, $B)) {
+        if (Test-Path -LiteralPath $path -PathType Leaf) { return ((Get-VolumeNameComparison -ExistingFile $path) -eq [StringComparison]::OrdinalIgnoreCase) }
+    }
+    $true
 }
 
 function Get-FpsJsonRepeatedKeyProblem {
@@ -987,4 +1019,4 @@ function Get-FpsLegPlanRefusal {
     @('', 0, '')
 }
 
-Export-ModuleMember -Function Get-VolumeNameComparison, Get-FpsCompareBindingProblem, Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Test-FpsProofReportSpeedQuotable, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal
+Export-ModuleMember -Function Get-VolumeNameComparison, Test-FpsFilesHoldTheSameBytes, Test-FpsPathAlias, Get-FpsCompareBindingProblem, Get-FpsObserverControls, Get-FpsLightShape, Get-FpsArmFromLegRecord, Get-FaProp, New-FpsArm, ConvertTo-FpsArmName, Get-FpsArmFromLegSpec, Get-FpsArmFromJobResult, Get-FpsArm, ConvertTo-FpsEnvMap, Get-FpsArmFromEnvironment, Get-FpsArmFromLaunch, Get-FpsArmFromSmokeRecord, Get-FpsJsonRepeatedKeyProblem, Assert-FpsJsonNoRepeatedKey, Test-FpsCachedAnalysisBound, Test-FpsProofReportSpeedQuotable, Get-FpsPairVerdict, Get-FpsArmsVerdict, Get-FpsLegPlanRefusal

@@ -759,13 +759,22 @@ else {
         refused = (-not $playbackAbFpsArmVerdict.allowed)
         reason = [string]$playbackAbFpsArmVerdict.reason
         detail = [string]$playbackAbFpsArmVerdict.detail
+        compareUnbound = $false
+        compareProblem = ""
     }
     # (adversary 698fffb1 A7: the arm gate judged these two legs; the compare that carries the fps must be measured on them, or the pair is refused like any other the gate refuses)
     # (R2-RESIDUE-1 r3, sol 5add23cf A10: EVERY metric the compare publishes is bound, so the check runs for any published compare, not only one that carries presentedFps)
-    if (-not $playbackAbFpsArmRefusal.refused -and $playbackAbSpeedCompare) {
+    # (R4-DEADLINE-RESIDUE-1 r5, adversary 82d6f070 A1: the binding is asked of EVERY published compare, whether or not the arm gate refused the pair. It ran only for a pair the arm gate allowed, so a HEAVY
+    # pair beside a compare that was measured on other legs still printed that compare's render total. A pair the arm gate refused keeps its ARM reason (every reader of it, and the verdict the row
+    # publishes, say why the pair was refused); `compareUnbound` is the separate fact that withholds the compare's figures, whatever the reason.)
+    if ($playbackAbSpeedCompare) {
         $playbackAbCompareProblem = Get-FpsCompareBindingProblem -Compare $playbackAbSpeedCompare -Baseline $playbackAb.baseline -Candidate $playbackAbCandidateLeg
         if ($null -ne $playbackAbCompareProblem) {
-            $playbackAbFpsArmRefusal = [pscustomobject]@{ refused = $true; reason = "fps-verdict-refused:compare-not-judged-pair"; detail = [string]$playbackAbCompareProblem }
+            if ($playbackAbFpsArmRefusal.refused) {
+                $playbackAbFpsArmRefusal = [pscustomobject]@{ refused = $true; reason = $playbackAbFpsArmRefusal.reason; detail = $playbackAbFpsArmRefusal.detail; compareUnbound = $true; compareProblem = [string]$playbackAbCompareProblem }
+            } else {
+                $playbackAbFpsArmRefusal = [pscustomobject]@{ refused = $true; reason = "fps-verdict-refused:compare-not-judged-pair"; detail = [string]$playbackAbCompareProblem; compareUnbound = $true; compareProblem = [string]$playbackAbCompareProblem }
+            }
         }
     }
     if ($playbackAbFpsArmRefusal.refused) {
@@ -821,10 +830,12 @@ if ($playbackAb -and $playbackAbSpeedCompare) {
     )
     # R2-RESIDUE-1 r3 (sol 5add23cf A5, A10): a compare that is not bound to the judged pair publishes NO figure of its own: the stage lines above read the same unbound compare (a render total of 50 -> 25 ms
     # beside two legs that both measured 10 ms), so all of them are replaced by the typed refusal. A pair refused for its ARM keeps its stage lines (the legs' own stage metrics are valid; only the fps is not).
-    if ($playbackAbFpsArmRefusal.refused -and ([string]$playbackAbFpsArmRefusal.reason -ceq 'fps-verdict-refused:compare-not-judged-pair')) {
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A1): keyed on the fact (`compareUnbound`), not on the reason: a HEAVY pair keeps its arm reason and still withholds an unbound compare's stage lines
+    if ($playbackAbFpsArmRefusal.refused -and $playbackAbFpsArmRefusal.compareUnbound) {
+        $playbackAbUnboundNote = if ([string]$playbackAbFpsArmRefusal.reason -ceq 'fps-verdict-refused:compare-not-judged-pair') { "" } else { "; the compare is not measured on the judged pair either: $($playbackAbFpsArmRefusal.compareProblem)" }
         $playbackSpeedEvidence = @(
             "comparison_basis=$playbackAbComparisonBasis",
-            "speed compare: withheld ($($playbackAbFpsArmRefusal.reason); $($playbackAbFpsArmRefusal.detail)); a compare that was not measured on the judged pair publishes no presented, GUI, interval or render figure"
+            "speed compare: withheld ($($playbackAbFpsArmRefusal.reason); $($playbackAbFpsArmRefusal.detail)$playbackAbUnboundNote); a compare that was not measured on the judged pair publishes no presented, GUI, interval or render figure"
         )
     }
     # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A9): the packet's cached suggestion is fps-delta-derived, so it is not repeated for a pair the arm gate refused.

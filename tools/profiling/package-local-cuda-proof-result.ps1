@@ -178,11 +178,13 @@ function Assert-OutputPathsAreSafe {
     for ($i = 0; $i -lt $names.Count; $i++) {
         $name = $names[$i]
         $path = $real[$name]
-        if ([string]::Equals($path, $summaryFull, $Comparison)) {
+        # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A2): every pair is asked of the volume that holds the pair (Test-FpsPathAlias), not by the comparison taken from the INPUT's directory: an output
+        # directory that ignores case beside an input directory that does not made Proof.json and proof.json two names, and the packet replaced the JSON report.
+        if (Test-FpsPathAlias $path $summaryFull) {
             throw "The $name path $path is the input summary; refusing before anything is written."
         }
         for ($j = $i + 1; $j -lt $names.Count; $j++) {
-            if ([string]::Equals($path, $real[$names[$j]], $Comparison)) {
+            if (Test-FpsPathAlias $path $real[$names[$j]]) {
                 throw "The $name and the $($names[$j]) share the path $path; refusing."
             }
         }
@@ -401,11 +403,15 @@ try {
         if ($relative -eq ".." -or $relative.StartsWith(".." + [IO.Path]::DirectorySeparatorChar, [StringComparison]::Ordinal) -or [IO.Path]::IsPathRooted($relative)) { continue }
         $heldBytes[($relative -replace '\\', '/')] = $held[1]
     }
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A2): a disk file is this run's own output, the manifest or the packet when the volume that holds it says it is the same name (Test-FpsPathAlias), not by the
+    # comparison taken from the input's directory
+    $heldFullPaths = @(@($summaryFullPath, $ReportPath, $jsonReportPath) | ForEach-Object { [IO.Path]::GetFullPath([string]$_) })
     $diskFiles = @(Get-ChildItem -LiteralPath $runRootResolved -Recurse -File | Sort-Object FullName | Where-Object {
-            $relative = Get-RelativeArtifactPath -Root $runRootResolved -Path $_.FullName
-            $isOwn = $heldBytes.Contains($relative)
+            $diskPath = $_.FullName
+            $relative = Get-RelativeArtifactPath -Root $runRootResolved -Path $diskPath
+            $isOwn = $heldBytes.Contains($relative) -or (@($heldFullPaths | Where-Object { Test-FpsPathAlias $_ $diskPath }).Count -gt 0)
             $isPrivate = @($relative.Split('/') | Where-Object { $_.StartsWith('.pkg-', [StringComparison]::Ordinal) }).Count -gt 0
-            -not $isOwn -and -not $isPrivate -and -not [string]::Equals($_.FullName, $manifestPath, $comparison) -and -not [string]::Equals($_.FullName, $packetFullPath, $comparison)
+            -not $isOwn -and -not $isPrivate -and -not (Test-FpsPathAlias $diskPath $manifestPath) -and -not (Test-FpsPathAlias $diskPath $packetFullPath)
         })
 
     $zip = $null
