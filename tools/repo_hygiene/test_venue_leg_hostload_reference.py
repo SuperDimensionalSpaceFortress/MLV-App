@@ -1214,5 +1214,122 @@ class R7ReceiptDigestGetterAndBaselineObservationGuardTests(unittest.TestCase):
         self.assertIn("Limit-VenueHostLoadToDeadline", exports)
 
 
+@unittest.skipIf(PWSH is None, "pwsh is not on PATH")
+class HostLoadWaitHonoursUtcDeadlineTests(unittest.TestCase):
+    """VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 (sol r7 A1 on #906, review-pr906-sol-r7-20261127T0904Z\\sol-001.last.txt): the host-load read's wait observed only the stopwatch end. A forward
+    UTC step inside the wait kept the caller blocked up to the stopwatch end after the absolute UTC deadline had passed. The wait now blocks for min(stopwatch left, UTC left), re-checks
+    both on every wake, and a UTC remaining that is not one finite number reads as expired. The answer stays the existing typed unknown; no new success path.
+
+    The forward step is injected MID-WAIT through the module's own seam (VenueTestUtcStepSec, the one every absolute-end check honours) by a second thread 1 s after the call
+    starts; the answer never arrives (VenueTestFileReadDelayMs holds the worker 30 s, past every bound here)."""
+
+    write_leg = PlannedLegTypeExemptionTests.write_leg
+
+    def run_wait(self, d: Path, step_sec: float, deadline_sec: float, read_timeout_sec: float, *, delay_ms: int = 30000, utc_reader: str = "") -> dict:
+        import hashlib
+        quiet = json.dumps({"hostLoad": QUIET})
+        sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+        rid = "c1c1c1c1-c1c1-4c1c-8c1c-c1c1c1c1c1c1"
+        path = self.write_leg(d, rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+        body = (
+            "$vc = Get-Module VenueChain; "
+            f"& $vc {{ $script:VenueTestFileReadDelayMs = {delay_ms} }}; "
+            "$v = & $vc { Get-Variable -Name VenueTestUtcStepSec -Scope Script }; "
+            # the injected clock: a second thread steps the module's UTC reading forward (or back) 1 s after the call starts; 0 = no step
+            "$stepper = [powershell]::Create(); "
+            f"[void]$stepper.AddScript('param($v, $s) if ($s -ne 0) {{ [Threading.Thread]::Sleep(1000); $v.Value = $s }}').AddArgument($v).AddArgument([double]{step_sec}); "
+            "$t = [Diagnostics.Stopwatch]::StartNew(); "
+            + (f"$rs = {utc_reader}; & $vc {{ param($s) $script:VenueTestUtcNowScript = $s }} $rs; " if utc_reader else "")
+            + "$h = $stepper.BeginInvoke(); "
+            f"$r = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec {read_timeout_sec} -CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds({deadline_sec})); "
+            "$ms = $t.ElapsedMilliseconds; "
+            "Write-Output ('STATE=' + $r.state + '/' + $r.provisional + '/' + $r.collected); Write-Output ('MS=' + $ms); Write-Output ('WHY=' + ($r.reason -replace '\\s+', ' ')); "
+            "Complete-VenueProcess -ExitCode 0")
+        p = run_ps(body)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+
+    def test_a_forward_utc_step_mid_wait_ends_the_wait_at_the_utc_deadline_not_the_stopwatch_end(self) -> None:
+        # sol r7 A1, its input: -CallDeadlineUtc U0+20 s, -ReadTimeoutSec 20 (the chain's and the batch's), the receipt read blocks and never answers, the wall clock steps 15 s forward at
+        # elapsed 1 s. The UTC deadline arrives at elapsed ~5 s. RED on c0237034: the single stopwatch-only WaitOne held the caller until elapsed ~20 s (MS ~20000).
+        with tempfile.TemporaryDirectory() as d:
+            got = self.run_wait(Path(d), 15, 20, 20)
+        self.assertEqual(got["STATE"], "unknown/True/False", got)
+        self.assertLess(int(got["MS"]), 7500, f"the wait outlived the UTC deadline (reached at ~5 s elapsed) by holding to the stopwatch end: {got}")
+        self.assertGreaterEqual(int(got["MS"]), 3500, f"the wait ended before the stepped UTC deadline: {got}")
+        self.assertIn("absolute end", got["WHY"], got)
+
+    def test_b_no_step_keeps_the_stopwatch_bound_and_timing(self) -> None:
+        # control: no step, a far deadline, a 2 s read budget: the wait still ends at the stopwatch bound (unknown, ~2 s), never earlier
+        with tempfile.TemporaryDirectory() as d:
+            got = self.run_wait(Path(d), 0, 60, 2)
+        self.assertEqual(got["STATE"], "unknown/True/False", got)
+        self.assertGreaterEqual(int(got["MS"]), 1700, got)
+        self.assertLess(int(got["MS"]), 4500, got)
+
+    def test_b_no_step_a_readable_standing_still_reads_quiet(self) -> None:
+        # control: no step, the answer arrives after 0.4 s per read, inside both ends: quiet, exactly as before
+        with tempfile.TemporaryDirectory() as d:
+            got = self.run_wait(Path(d), 0, 20, 20, delay_ms=400)
+        self.assertEqual(got["STATE"], "quiet/False/True", got)
+
+    def test_b_a_backward_step_never_lengthens_the_wait_past_the_stopwatch_end(self) -> None:
+        # control: the wall clock steps 15 s BACK at elapsed 1 s; the stopwatch end (3 s) still ends the wait
+        with tempfile.TemporaryDirectory() as d:
+            got = self.run_wait(Path(d), -15, 60, 3)
+        self.assertEqual(got["STATE"], "unknown/True/False", got)
+        self.assertLess(int(got["MS"]), 5500, got)
+
+    def test_c_a_utc_read_that_throws_mid_wait_reads_as_expired_typed_and_never_hangs(self) -> None:
+        # the injected UTC reader works for 1 s, then throws: the UTC remaining is no number, so the deadline reads as passed (fail closed). RED on c0237034: the wait ran to the 6 s bound.
+        reader = "{ if ($t.Elapsed.TotalSeconds -ge 1.0) { throw 'the wall clock could not be read' }; [DateTime]::UtcNow }.GetNewClosure()"
+        with tempfile.TemporaryDirectory() as d:
+            got = self.run_wait(Path(d), 0, 6, 6, utc_reader=reader)
+        self.assertEqual(got["STATE"], "unknown/True/False", got)
+        self.assertLess(int(got["MS"]), 3500, f"a UTC read that throws must end the wait as expired, not leave it to the stopwatch: {got}")
+        self.assertIn("absolute end", got["WHY"], got)
+
+    def test_c_a_utc_read_that_returns_null_mid_wait_reads_as_expired_typed_and_never_hangs(self) -> None:
+        reader = "{ if ($t.Elapsed.TotalSeconds -ge 1.0) { $null } else { [DateTime]::UtcNow } }.GetNewClosure()"
+        with tempfile.TemporaryDirectory() as d:
+            got = self.run_wait(Path(d), 0, 6, 6, utc_reader=reader)
+        self.assertEqual(got["STATE"], "unknown/True/False", got)
+        self.assertLess(int(got["MS"]), 3500, f"a UTC read that returns no instant must end the wait as expired: {got}")
+        self.assertIn("absolute end", got["WHY"], got)
+
+    def test_c_a_utc_read_that_throws_before_the_call_starts_no_read(self) -> None:
+        # the reader is broken from the start: the reader's entry check reads the deadline as passed and starts nothing (unknown, at once)
+        with tempfile.TemporaryDirectory() as d:
+            got = self.run_wait(Path(d), 0, 60, 20, utc_reader="{ throw 'no wall clock' }")
+        self.assertEqual(got["STATE"], "unknown/True/False", got)
+        self.assertLess(int(got["MS"]), 2000, got)
+
+    def test_d_the_shared_consumption_guard_reads_the_same_fail_closed_utc_clock(self) -> None:
+        # the chain, the lease batch and the baseline have no wait of their own on the host-load read (each calls Get-VenueLegHostLoad and then Limit-VenueHostLoadToDeadline); the guard
+        # they all consume the standing through must read the SAME UTC clock as the wait, fail closed: a reader that throws or answers null is past the end even for a far deadline, and a
+        # forward step past the deadline is past the end. RED on c0237034: the guard read [DateTime]::UtcNow directly and kept the quiet standing.
+        p = run_ps(
+            "$vc = Get-Module VenueChain; "
+            "$q = [pscustomobject]@{ state = 'quiet'; provisional = $false; collected = $true; reason = 'peak 18% <= 75%'; applies = $true }; "
+            "$far = [DateTime]::UtcNow.AddSeconds(60); "
+            "Write-Output ('CLEAN=' + (Limit-VenueHostLoadToDeadline -Standing $q -DeadlineUtc $far).state); "
+            "& $vc { $script:VenueTestUtcNowScript = { throw 'no wall clock' } }; Write-Output ('THROW=' + (Limit-VenueHostLoadToDeadline -Standing $q -DeadlineUtc $far).state); "
+            "& $vc { $script:VenueTestUtcNowScript = { $null } }; Write-Output ('NULL=' + (Limit-VenueHostLoadToDeadline -Standing $q -DeadlineUtc $far).state); "
+            "& $vc { $script:VenueTestUtcNowScript = $null; $script:VenueTestUtcStepSec = 90 }; Write-Output ('STEP=' + (Limit-VenueHostLoadToDeadline -Standing $q -DeadlineUtc $far).state); "
+            "& $vc { $script:VenueTestUtcStepSec = 0 }")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["CLEAN"], "quiet", p.stdout)
+        self.assertEqual((got["THROW"], got["NULL"], got["STEP"]), ("unknown", "unknown", "unknown"), p.stdout)
+
+    def test_d_the_bounded_read_is_handed_the_absolute_end(self) -> None:
+        # structural pin: Read-VenueFileBytesBounded forwards -EndUtc into Invoke-VenueBoundedRead's wait (the one wait both host-load reads, and so the chain, batch and baseline, use)
+        import re
+        text = MODULE.read_text(encoding="utf-8")
+        body = text[text.index("function Read-VenueFileBytesBounded"):text.index("function Get-VenueRemoteJobIds")]
+        self.assertRegex(body, r"Invoke-VenueBoundedRead [^\r\n]*-EndUtc", "the absolute end reaches the bounded read's wait")
+        self.assertEqual(len(re.findall(r"^function Get-VenueUtcLeftSec ", text, re.M)), 1, "one UTC clock read for the wait and the guard")
+
+
 if __name__ == "__main__":
     unittest.main()
