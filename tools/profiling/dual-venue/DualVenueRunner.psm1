@@ -1485,7 +1485,9 @@ function Get-DvVisualCaptureBeginRecord {
             }
             elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=playback_prep\.invalidate_generation(\s|$)'), $script:DvCi)) { }   # before the begin record: not tail evidence
             elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture(\s|$)'), $script:DvCi)) { }   # r12 (Grok CoS G4): the app's own summary record (MainWindow.cpp logInteractionEvent "gui_smoke.visual_capture"): not tail evidence, and its free-text error="..." may name any event, so the catch-all below must not read it
-            elseif ([string]$line -match '(?i)interaction_trace\b.*\bevent\s*=\s*["'']?\s*(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)') {
+            elseif ([string]$line -match '(?i)interaction_trace\b.*\bevent["'']?\s*[=\x1A]\s*["'']?\s*(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)') {
+                # r12 fix 1 (sol pass 16 A1 on dea8d70c): a fully quoted "event=<name>" token has its `=` masked (DvQuotedEqualsMask, U+001A) inside the quotes, so the
+                # event-position form accepts the mask for the `=` and a quote before the `=`
                 # r11 adversary A2 (sol on 6c0a9228): a record naming one of these events in any other form (a quoted event=, two spaces) was skipped
                 # silently, so a doubled or unreadable burst_end, begin, clip_changed or invalidation vanished; it now voids the whole tail binding
                 # r12 adversary A2 (sol on e8011af8): only in the EVENT position of an interaction_trace record: the r11 form matched the names anywhere in a line,
@@ -8038,6 +8040,9 @@ function Get-DvTailVisualEvidence {
             # r10 fix 1 (sol A3 on 4dcd3a13, advisory): the app's request serials start at 1, so a serial of 0 or below names no request and binds no label
             $serialsOk = (($serial -is [int]) -or ($serial -is [long])) -and (($paintedSerial -is [int]) -or ($paintedSerial -is [long])) -and ([int64]$serial -eq [int64]$paintedSerial) -and [int64]$serial -gt 0
             $labelBound = (($bound -is [bool]) -and $bound) -and (($serialValid -is [bool]) -and $serialValid) -and $serialsOk
+            # r12 fix 1 (sol pass 16 A2 on dea8d70c): the row ASSERTS a bound paint (label_bound and painted_serial_valid true) but its serials are unreadable (a string
+            # "485", unequal or non-positive): labelBound is then false and the credit skipped the row; the credit refuses it by name instead
+            $serialUnreadable = (($bound -is [bool]) -and $bound) -and (($serialValid -is [bool]) -and $serialValid) -and -not $serialsOk
             # r4 (adversary A1 on eabccd6c): forced_paints_before as a JSON integer, so the credit can admit only a capture taken BEFORE any forced repaint
             $forced = Get-DvProp $row 'forced_paints_before'
             # r4 (adversary A2): the app writes source_id only while the capture's clip is still the clip the capture run began on (MainWindow.cpp r7)
@@ -8045,7 +8050,7 @@ function Get-DvTailVisualEvidence {
             # R5-RESIDUE-1 (sol r1 B1): where the painted serial came from (MainWindow.cpp paintPresentedFrameForCapture); a JSON string only, judged by the credit
             $basis = Get-DvProp $row 'label_bound_basis'
             $frames.Add([pscustomobject]@{ kind = $kind; index = [int64]$index; saved = (($saved -is [bool]) -and $saved); playActive = (($active -is [bool]) -and $active)
-                                           displayFrame = $display; tailElapsedMs = $(if ($tailOk) { [double]$tail } else { $null }); pngSha256 = $pngSha; labelBound = $labelBound
+                                           displayFrame = $display; tailElapsedMs = $(if ($tailOk) { [double]$tail } else { $null }); pngSha256 = $pngSha; labelBound = $labelBound; serialUnreadable = $serialUnreadable
                                            labelBoundBasis = $(if ($basis -is [string]) { $basis } else { $null })
                                            serial = $(if ($serialsOk) { [int64]$serial } else { $null })
                                            forcedPaintsBefore = $(if (($forced -is [int]) -or ($forced -is [long])) { [int64]$forced } else { $null })
@@ -8170,6 +8175,11 @@ function Get-DvTailInFlightCredit {
         # (equal-time, burst, behind-close, close-frame, order/repeat) whether or not it can credit: 364df36b filtered on saved, the recorded sha256, a
         # decodable PNG and source_id FIRST, so an unsaved second paint of 478 was never seen and 478 and 479 credited over a repeat. Those four decide only
         # which rows may CREDIT (add to the shown set); a paint-recording row that cannot credit still refuses, or leaves its target uncredited
+        # r12 fix 1 (sol pass 16 A2 on dea8d70c): the same refusal for a row that asserts a bound paint with unreadable serials (the reader's serialUnreadable)
+        if ((Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'serialUnreadable') -eq $true -and $paintBasis -and
+            $unforcedKind -and $null -ne $forcedBefore -and [int64]$forcedBefore -eq 0) {
+            return (& $no "TAIL_CREDIT_PAINT_ORDER: the $fKind capture $(Get-DvProp $f 'index') asserts a bound paint (label_bound and painted_serial_valid true) but its serial or painted serial is unreadable, so its place in the paint order cannot be told and the tail is not credited")
+        }
         # r12 adversary A3 (sol on e8011af8): such a row whose display frame or tail time the reader could not read (a string "478", a string "38": normalised to null)
         # still records a paint, so it is refused here, never dropped from the checks below while the burst's index completeness still passes
         if ((Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'labelBound') -eq $true -and $paintBasis -and

@@ -23212,8 +23212,9 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         later = {"pb": {"visualBurstCaptures": 1, "visualPostBurstPrepDrops": 1}}
         for name, rows, why in (("a stop_unbound row before the burst row", (stop, burst), "TAIL_CREDIT_BURST_NOT_LOGGED"),
                                 ("a paused row with no readable time", ({**stop, "kind": "paused", "file": "paused.png", "tail_elapsed_ms": None}, burst), "TAIL_CREDIT_BURST_NOT_LOGGED"),
-                                ("serial 0", ({**burst, "serial": 0, "painted_serial": 0},), "no play capture"),
-                                ("serial -1", ({**burst, "serial": -1, "painted_serial": -1},), "no play capture")):
+                                # r12 fix 1 (sol pass 16 A2): a row that asserts a bound paint with a non-positive serial is refused by name, no longer skipped
+                                ("serial 0", ({**burst, "serial": 0, "painted_serial": 0},), "serial or painted serial is unreadable"),
+                                ("serial -1", ({**burst, "serial": -1, "painted_serial": -1},), "serial or painted serial is unreadable")):
             with self.subTest(case=name):
                 out = self.metrics({**self.HELD, **later["pb"]}, app=self.app_json(*rows), criteria=crit)
                 self.assert_no_credit(out, 1)
@@ -23288,7 +23289,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         "gui_smoke.visual_capture": {"measured_session": "3", "requested": "5", "written": "5", "stop_frame": "480", "paused_settled": "1",
                                      "tail_begin_utc": BEGIN_UTC, "tail_end_utc": "2026-11-25T18:00:03.100Z", "error": "", "source_difference": "omitted"},
     }
-    TAIL_CATCH_ALL = r"""'(?i)interaction_trace\b.*\bevent\s*=\s*["'']?\s*(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)'"""
+    TAIL_CATCH_ALL = r"""'(?i)interaction_trace\b.*\bevent["'']?\s*[=\x1A]\s*["'']?\s*(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)'"""
     R11_CATCH_ALL = r"'(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation'"
     TAIL_SUMMARY_EXEMPTION = (r"elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture(\s|$)'), "
                               r"$script:DvCi)) { }")
@@ -23475,6 +23476,46 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
                 self.assertNotIn("conformTailInFlightCreditedFrames", out["m"], out)
                 self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
                 self.assertIn(why, out["m"]["conformTailInFlightCreditNote"], out)
+
+    def test_r12_fix1_a1_a_fully_quoted_event_token_still_voids_the_binding(self) -> None:
+        """r12 fix 1, sol pass 16 A1 (on dea8d70c), its input: between a valid begin and a valid burst_end, `interaction_trace "event=playback_prep.invalidate_generation"
+        reason=resize`. The quotes mask the `=` (U+001A), so the narrowed event-position form missed the record and the binding survived with tailPrepDrops=0.
+        Siblings: the whole `event=` token quoted for begin, clip_changed and burst_end. (control) the same record unquoted is an invalidation that counts."""
+        base = self.every_emitter_log(error="")
+        pre = "[2026-11-25T18:00:00.000Z] [INFO] [0xa] interaction_trace "
+        at = next(i for i, line in enumerate(base) if "event=gui_smoke.visual_capture.burst_end" in line)
+        for name, body in (("a quoted invalidate_generation token", '"event=playback_prep.invalidate_generation" reason=resize new_generation=5'),
+                           ("a quoted begin token", '"event=gui_smoke.visual_capture.begin" measured_session=3 tail_ms=3000 play_frames=6 tail_begin_utc=' + self.BEGIN_UTC),
+                           ("a quoted clip_changed token", '"event=gui_smoke.visual_capture.clip_changed" refused_play_captures=1 capture_generation=7'),
+                           ("a quoted burst_end token", '"event=gui_smoke.visual_capture.burst_end" measured_session=3 burst_captures=2 generation_changes=1')):
+            with self.subTest(case=name):
+                derived = self.derive_tail_binding(base[:at] + [pre + body] + base[at:])
+                self.assertEqual({k: derived[k] for k in ("visualCaptureBeginSession", "visualCaptureBeginUtc", "visualTailPrepDrops")},
+                                 {"visualCaptureBeginSession": None, "visualCaptureBeginUtc": None, "visualTailPrepDrops": None}, derived)
+        plain = self.derive_tail_binding(base[:at] + [pre + "event=playback_prep.invalidate_generation reason=resize new_generation=5"] + base[at:])
+        self.assertEqual((plain["visualCaptureBeginSession"], plain["visualTailPrepDrops"]), ("3", 1), plain)
+
+    def test_r12_fix1_a2_a_bound_row_with_an_unreadable_serial_is_refused_not_skipped(self) -> None:
+        """r12 fix 1, sol pass 16 A2 (on dea8d70c), its input: burst_captures=3, burst rows (index, ms, frame, serial, painted_serial, saved) (0, 8, 478, 484, 484, true),
+        (1, 38, 478, "485", 485, false), (2, 68, 479, 486, 486, true) and a forced play boundary at 125 ms, label_bound and painted_serial_valid true on the middle
+        row. The string serial made labelBound false and the row left the ordered checks while burst completeness passed: 478 and 479 credited over a repeat of 478.
+        Siblings: a non-positive serial, and serial != painted_serial, on a row that still asserts label_bound. (control) a row that does NOT assert it is skipped."""
+        forced = self.play(0, kind="play", tail_elapsed_ms=125, display_frame=479, serial=487, painted_serial=487)
+
+        def burst(i: int, ms: int, frame: int, serial, painted=None, **over) -> dict:
+            return self.play(i, kind="play_first_unbound", tail_elapsed_ms=ms, display_frame=frame, serial=serial, painted_serial=serial if painted is None else painted, **over)
+
+        for name, middle, refused in (("a string serial", burst(1, 38, 478, "485", 485, saved=False), True),
+                                      ("serial 0", burst(1, 38, 478, 0, saved=False), True),
+                                      ("serial != painted_serial", burst(1, 38, 478, 485, 484, saved=False), True),
+                                      ("label_bound false (not asserted)", burst(1, 38, 478, "485", 485, saved=False, label_bound=False), False)):
+            with self.subTest(case=name):
+                out = self.metrics({"visualBurstCaptures": 3}, app=self.app_json(burst(0, 8, 478, 484), middle, burst(2, 68, 479, 486), forced), criteria=self.BOTH)
+                if refused:
+                    self.assertNotIn("conformTailInFlightCreditedFrames", out["m"], out)
+                    self.assertIn("serial or painted serial is unreadable", out["m"]["conformTailInFlightCreditNote"], out)
+                else:
+                    self.assertNotIn("serial or painted serial is unreadable", out["m"].get("conformTailInFlightCreditNote", ""), out)
 
     def tail_catch_all_count(self) -> int:
         return (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8").count(self.TAIL_CATCH_ALL)
