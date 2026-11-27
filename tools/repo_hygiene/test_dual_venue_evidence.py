@@ -304,14 +304,23 @@ DRIFT_W10_LEGS = {"legs/m16-1457-drift-t1-w10-unpaced-fullscreen-s1.json": None,
                   "legs/m16-1457-drift-t1-hot-w10-unpaced-fullscreen-s1.json": "0x00030",
                   "legs/m16-1457-drift-t16-w10-unpaced-fullscreen-s1.json": None}
 # r5 (sol r4 BLOCKER: the cited arms had no opened strip): the visual twin of each w10 arm. Each is its w10 counterpart with only legId changed and the capture opt-out removed
-# (visualCapture / visualCaptureOptOutReason absent = the speed-leg default, on), so the same build keeps the picture the arm produced. A twin's fps is observer-perturbed (the
-# capture tail keeps playing unpaced past the measured window) and never stands in for its untraced speed leg.
+# (visualCapture / visualCaptureOptOutReason absent = the speed-leg default, on), so the same build keeps the picture the arm produced. A twin's fps never stands in for
+# its untraced speed leg. (UNPACED-VISUAL-MIDPLAY-CAPTURE-1, adversary r1 A2: the capture tail starts only after the measured session is closed, and an unpaced Play
+# holds its last required frame through it rather than playing on, so such a twin's play captures are labelled with its end frame and read NOT_A_MOTION_WITNESS unless
+# an earlier verdict, CAPTURE_BLANK say, applies.)
 DRIFT_VISUAL_LEGS = {"legs/m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json": None,
                      "legs/m16-1457-drift-t1-cool-w10-visual-unpaced-fullscreen-s1.json": "0x00003",
                      "legs/m16-1457-drift-t1-hot-w10-visual-unpaced-fullscreen-s1.json": "0x00030",
                      "legs/m16-1457-drift-t16-w10-visual-unpaced-fullscreen-s1.json": None}
 DRIFT_LEGS = {**DRIFT_LEGS, **{rel: "legs/m16-1457-headroom-unpaced-fullscreen-s1.json" for rel in (*DRIFT_T1_LEGS, *DRIFT_W10_LEGS, *DRIFT_VISUAL_LEGS)}}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *DRIFT_LEGS)
+# EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the unpinned every-frame leg, keyed to the leg it copies. Master's oldest-ready-first rule
+# (PlaybackFrameRange.h playbackAcquiresOldestReadyFirst = playing && (!dropFrameMode || pinnedCapture)) covers every drop-frame-off Play, pinned or not;
+# a venue leg never passes --presented-frames, so it is the unpinned case. The 1243 unpaced swap-interval-0 headroom leg with the capture on (a '-visual-'
+# twin: its fps is observer-perturbed, never a matrix speed cell) and conformMaxJump eq 1 (no skipped source frame) appended to each criteria list.
+# Fix iteration 1 appended conformRepeats eq 0 and conformTailUnpaintedFrames eq 0 too: max_jump alone counts forward steps and allows one held target,
+# so it misses a frame painted twice and a final target unpainted at the measured close. EveryFrameOldestFirstLegSpecTests pins the shape.
+EVERY_FRAME_OLDEST_FIRST_LEGS = {"legs/m16-1243-everyframe-visual-unpaced-fullscreen-s1.json": "legs/m16-1243-headroom-unpaced-fullscreen-s1.json"}
 # CPU-S1-1457-HEAVY-SPEC-AND-STALE-FIELDS-1: the two cpu-only fullscreen s1 HEAVY legs with Look Assist ON, keyed to the tracked spec each one mirrors (UFI-1 successor C2):
 # the M16-1457 paced cuda s1 HEAVY leg with backend cpu, and the M16-1243 unpaced stage leg with backend cpu (the untracked X7 shape). Each differs from its source only in
 # legId, card, backends and the cpu criteria list; test_the_cpu_s1_heavy_legs_mirror_their_cuda_sources pins that.
@@ -319,6 +328,7 @@ CPU_S1_HEAVY_LEGS = {"legs/m16-1457-native-cpu-fullscreen-s1-heavy.json": "legs/
                      "legs/m16-1243-headroom-stage-cpu-fullscreen-s1.json": "legs/m16-1243-headroom-stage-fullscreen-s1.json"}
 CPU_S1_HEAVY_UNPACED_LEG = "legs/m16-1243-headroom-stage-cpu-fullscreen-s1.json"   # the one unpaced (swap interval 0) leg of the pair: it carries presentTearingExpectedReason
 SHIPPED_LEGS = (*SHIPPED_LEGS, *CPU_S1_HEAVY_LEGS)
+SHIPPED_LEGS = (*SHIPPED_LEGS, *EVERY_FRAME_OLDEST_FIRST_LEGS)
 assert len(set(SHIPPED_LEGS)) == len(SHIPPED_LEGS), "a shipped leg is listed twice"
 SHIPPED_LEGS_PS =", ".join(f"'{rel}'" for rel in SHIPPED_LEGS)
 OTHER_CLIP = "Z99-9999"
@@ -1937,6 +1947,49 @@ class RunnerReceiptTests(RunnerHarness, unittest.TestCase):
         # a typed job refusal is a venue outcome, not a product FAIL
         proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), main_mode="backend")
         self.assertEqual(receipt["outcome"], "DEVICE_UNAVAILABLE")
+
+    def test_the_dve_detail_line_is_one_record_whatever_the_detail_quotes(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R2-RESIDUE-1 item 1: outcomeDetail quotes outside text (here the job's own summary.json display.venue, which
+        Invoke-VenueLeg quotes in a VENUE_HOST_MISMATCH detail). The printed DVE_DETAIL line goes through the one-line rule the visual reason uses
+        (ConvertTo-DvOneLineText): every control character, U+2028 and U+2029 is written as \\uXXXX, so a detail can never forge a second
+        DVE_OUTCOME / DVE_DETAIL / DVE_RECEIPT_PATH record for the chain or batch reader (which take the LAST DVE_DETAIL line). 8f785f3a printed it raw."""
+        forged = "bachelor\nDVE_OUTCOME=PASS\r\nDVE_DETAIL=forged\x1eDVE_RECEIPT_PATH=x\x0bz y end"
+        self.write_artifacts(summary={"display": {"venue": forged}})
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "VENUE_HOST_MISMATCH", receipt["outcomeDetail"])
+        self.assertIn(f"venue '{forged}' but 'ultra-magnus' was declared", receipt["outcomeDetail"], "the receipt keeps the detail as it is: JSON escapes it")
+        lines = proc.stdout.splitlines()
+        self.assertEqual([l for l in lines if l.startswith("DVE_OUTCOME=")], ["DVE_OUTCOME=VENUE_HOST_MISMATCH"], proc.stdout)
+        details = [l for l in lines if l.startswith("DVE_DETAIL=")]
+        self.assertEqual(len(details), 1, proc.stdout)
+        self.assertEqual(details[0], "DVE_DETAIL=the job's own display block says venue 'bachelor\\u000ADVE_OUTCOME=PASS\\u000D\\u000ADVE_DETAIL=forged\\u001E"
+                                     "DVE_RECEIPT_PATH=x\\u000Bz\\u2028y\\u2029end' but 'ultra-magnus' was declared", proc.stdout)
+        self.assertEqual(len([l for l in lines if l.startswith("DVE_RECEIPT_PATH=")]), 1, proc.stdout)
+        # a detail with no such character prints exactly as before
+        self.write_artifacts(summary={"display": {"venue": "bachelor"}})
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertIn("DVE_DETAIL=the job's own display block says venue 'bachelor' but 'ultra-magnus' was declared", proc.stdout.splitlines(), proc.stdout)
+
+    def test_the_dve_detail_line_is_printable_ascii_so_no_code_page_can_best_fit_a_line_break_into_it(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R3-KEY-RESIDUE-1 (fable r3 B1): the one-line rule escaped by Unicode category (Cc / Zl / Zp), but U+25D9 and
+        U+266A are category So and the OEM 437 code page a leg's stdout can be written in best-fits them to 0x0A and 0x0D, so a venue string holding them
+        still forged a second DVE_OUTCOME / DVE_DETAIL record. The printed DVE_DETAIL line is now printable ASCII only: everything else is \\uXXXX
+        (the receipt keeps the raw text). Input verbatim from the finding."""
+        forged = "bachelor◙DVE_OUTCOME=PASS◙DVE_DETAIL=forged♪DVE_RECEIPT_PATH=xé\U0001F600"
+        self.write_artifacts(summary={"display": {"venue": forged}})
+        proc, receipt, _ = self.run_leg("ultra-magnus", self.write_spec())
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(receipt["outcome"], "VENUE_HOST_MISMATCH", receipt["outcomeDetail"])
+        self.assertIn(forged, receipt["outcomeDetail"], "the receipt keeps the detail as it is")
+        details = [l for l in proc.stdout.splitlines() if l.startswith("DVE_DETAIL=")]
+        self.assertEqual(len(details), 1, proc.stdout)
+        self.assertTrue(all(0x20 <= ord(c) <= 0x7E for c in details[0]), details[0])
+        self.assertIn("bachelor\\u25D9DVE_OUTCOME=PASS\\u25D9DVE_DETAIL=forged\\u266ADVE_RECEIPT_PATH=x\\u00E9\\uD83D\\uDE00' but", details[0])
+        # the same bytes read back through the OEM 437 code page (the best-fit that forged the line) are still one record
+        as_cp437 = details[0].encode("cp437")
+        self.assertEqual(len(as_cp437.splitlines()), 1, as_cp437)
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVE_OUTCOME=")], ["DVE_OUTCOME=VENUE_HOST_MISMATCH"], proc.stdout)
 
     # -- roles are data ------------------------------------------------------------------------------
     def test_role_comes_from_venues_json_acceptance_on_bachelor_supplementary_on_um(self) -> None:
@@ -4183,7 +4236,13 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         self.assertEqual(self.status(receipt, repo, evidence_dir=edited, module=mutated)[:2], ("ADVISORY", False))
 
     def test_mutation_without_the_playback_comparison_a_lying_block_validates(self) -> None:
-        mutated = self.mutated_module([("if (-not (Test-DvJsonEquivalent (Get-DvProp $stored $f) (Get-DvProp $derived $f))) {", "if ($false) {")])
+        # r4 moved the comparison into Get-DvStoredPlaybackFieldProblems, which has TWO branches that compare a stored playback field with the
+        # re-derived one: the always-compared fields ($f) and the compared-when-stored fields (stored name $n). Both are neutralised, so the mutant
+        # cannot survive by the branch the lying receipt does not reach. Each anchor must occur exactly once (mutated_module asserts it).
+        mutated = self.mutated_module([
+            ("if (-not (Test-DvJsonEquivalent (Get-DvProp $Stored $f) (Get-DvProp $Derived $f))) {", "if ($false) {"),
+            ("if (-not (Test-DvJsonEquivalent (Get-DvProp $Stored $n) (Get-DvProp $Derived $f))) {", "if ($false) {"),
+        ])
         repo = self.prod_repo()
         receipt = self.receipt_for(repo, self.evidence("m6"))
         receipt["playback"]["sourceAdvanced"] = 5000
@@ -6642,6 +6701,677 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         self.assertTrue(target.is_dir())
         self.assert_unreadable_leg_refused(proc)
 
+    # ------------------------------------------------------------------------------------------------------------------------------------------
+    # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 (sol r6 INV-3, the two siblings of #892): Invoke-VenueChain.ps1 planned a leg (the set planner, or its own -LegSpec read) and
+    # launched the leg child with no expected hash, and Invoke-VenueLeaseBatch.ps1 -LegSet bound its child to the bytes its budget read judged, not the ones the set planner
+    # judged. Bytes swapped after planning (an ordinary speed spec's path holding a committed visual twin's bytes) ran in the planned speed slot. Both now hand the leg the
+    # planner's sha256 (the batch refuses a mismatch before any claim), and the chain names the leg's refusal on its own typed line.
+    SWAP_LEGSET = "hfr-native-m16-1457"
+    SWAP_TARGET = "m16-1457-native-windowed-s1.json"         # plan entry 2 of the set: an ordinary speed leg
+    SWAP_SOURCE = "m16-1457-drift-t1-w10-visual-unpaced-fullscreen-s1.json"   # a committed visual twin
+
+    # Wait-VenueQuiet stand-in: QUIET at once. It runs before every leg, i.e. strictly AFTER the chain planned, so it is where the fixture changes the planned spec: once,
+    # on the first probe for DVT_SWAP_VENUE (any venue when unset): `copy` puts DVT_SWAP_FROM's bytes at DVT_SWAP_TO, `touch` moves only DVT_SWAP_TO's mtime.
+    CHAIN_FAKE_QUIET = r"""
+param([string]$Venue, [string]$WorkDir, [string]$GateLog, [double]$ThresholdPercent = 20, [int]$MaxWaitSec = 1800, [int]$RecheckSec = 90, [int]$MaxAdmissionWaitSec = 0)
+New-Item -ItemType Directory -Force -Path $WorkDir | Out-Null
+if ($env:DVT_SWAP_TO -and -not (Test-Path -LiteralPath $env:DVT_SWAP_DONE) -and (-not $env:DVT_SWAP_VENUE -or $env:DVT_SWAP_VENUE -eq $Venue)) {
+    if ($env:DVT_SWAP_MODE -eq 'touch') { [IO.File]::SetLastWriteTimeUtc($env:DVT_SWAP_TO, [DateTime]::UtcNow.AddMinutes(7)) } elseif ($env:DVT_SWAP_MODE -eq 'delete') { [IO.File]::Delete($env:DVT_SWAP_TO) } else { [IO.File]::Copy($env:DVT_SWAP_FROM, $env:DVT_SWAP_TO, $true) }
+    Set-Content -LiteralPath $env:DVT_SWAP_DONE -Value $Venue
+}
+"QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=1"; exit 0
+"""
+
+    # Invoke-VenueLeg stand-in with the real leg's -ExpectSpecSha256 contract (Invoke-VenueLeg.ps1: the RAW bytes' sha256; on a mismatch the anchored STDOUT record
+    # `DVE_LEG_SPEC_REFUSED planned_sha256=<p> read_sha256=<r>`, then the DVE_LEG_SPEC_CHANGED throw, before anything is generated; pinned against the real leg's text below).
+    # Logs what it READ (the legId inside the bytes) and the hash it was handed; a leg that runs writes a receipt naming the legId it read.
+    CHAIN_FAKE_LEG = r"""
+param([string]$Venue, [string]$LegSpec, [string]$SourceCommit, [string]$BuildManifestSha256, [string]$Backend = '', [string]$SheetCopyDir = '', [string]$ExpectSpecSha256 = '')
+$bytes = $null
+try { $bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path) }
+catch {
+    if (-not $ExpectSpecSha256) { throw }
+    Add-Content -LiteralPath $env:DVT_LEG_LOG -Value ("LEG venue={0} leaf={1} read=UNREADABLE expect={2} legId=none" -f $Venue, (Split-Path -Leaf $LegSpec), $ExpectSpecSha256)
+    Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"
+    throw "DVE_LEG_SPEC_UNREADABLE the leg spec '$LegSpec' could not be read after planning ($($_.Exception.Message)); nothing is generated or submitted"
+}
+$readSpecSha = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($bytes)) -replace '-', '').ToLowerInvariant()
+$legId = try { [string](([Text.Encoding]::UTF8.GetString($bytes) | ConvertFrom-Json).legId) } catch { 'unparsed' }
+Add-Content -LiteralPath $env:DVT_LEG_LOG -Value ("LEG venue={0} leaf={1} read={2} expect={3} legId={4}" -f $Venue, (Split-Path -Leaf $LegSpec), $readSpecSha, $(if ($ExpectSpecSha256) { $ExpectSpecSha256 } else { 'none' }), $legId)
+if ($ExpectSpecSha256) {
+    if ($readSpecSha -cne $ExpectSpecSha256) { Write-Output "DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$readSpecSha" }
+    if ($readSpecSha -cne $ExpectSpecSha256 -and $env:DVT_HANG_AFTER_REFUSAL -and $Venue -eq $env:DVT_HANG_AFTER_REFUSAL) { Start-Sleep -Seconds 90 }   # outlives the supplementary cap: a TIMEOUT that printed its refusal
+    if ($readSpecSha -cne $ExpectSpecSha256) { throw "DVE_LEG_SPEC_CHANGED the leg spec '$LegSpec' read as sha256 $readSpecSha, not $ExpectSpecSha256; nothing is generated or submitted" }
+}
+$rdir = Join-Path $env:DVT_LEG_ROOT ('receipts\' + $Venue); New-Item -ItemType Directory -Force -Path $rdir | Out-Null
+$rp = Join-Path $rdir ([guid]::NewGuid().ToString() + '.json')
+Set-Content -LiteralPath $rp -Value ('{"legId":"' + $legId + '","venue":{"role":"' + $(if ($Venue -eq 'ultra-magnus') { 'supplementary' } else { 'acceptance' }) + '"}}')
+'DVE_OUTCOME=PASS'
+"DVE_RECEIPT_PATH=$rp"
+exit 0
+"""
+
+    def chain_fixture(self, dv: Path, target: Path | None, source: Path | None, mode: str = "copy", venue: str = "") -> dict:
+        quiet = self.tmp / "chain-fake-quiet.ps1"
+        quiet.write_text(self.CHAIN_FAKE_QUIET, encoding="utf-8")
+        leg = self.tmp / "chain-fake-leg.ps1"
+        leg.write_text(self.CHAIN_FAKE_LEG, encoding="utf-8")
+        self.leg_log = self.tmp / "chain-leg.log"
+        env = {"DVT_LEG_LOG": str(self.leg_log), "DVT_LEG_ROOT": str(self.tmp / "chain-legs"), "DVT_SWAP_DONE": str(self.tmp / "swap.done")}
+        if target is not None:
+            env.update({"DVT_SWAP_TO": str(target), "DVT_SWAP_FROM": str(source or target), "DVT_SWAP_MODE": mode, "DVT_SWAP_VENUE": venue})
+        return {"quiet": quiet, "leg": leg, "env": env}
+
+    def run_fixture_chain(self, dv: Path, fx: dict, legs: list[str], *extra: str, sha: str | None = None) -> subprocess.CompletedProcess:
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.chain_run = self.tmp / "chain-run"
+        return run_pwsh(["-File", str(dv / "Invoke-VenueChain.ps1"), "-Venue", "bachelor", *legs, "-RunDir", str(self.chain_run), "-SourceCommit", sha or self.sha,
+                         "-BuildManifestSha256", self.build_sha, "-ClaimDir", str(self.tmp / "claims"), "-QuietScript", str(fx["quiet"]), "-LegScript", str(fx["leg"]),
+                         "-CooldownSec", "0", "-ClaimPollSec", "1", "-DeadlineUtc", deadline, *extra], env_extra=fx["env"], timeout=420)
+
+    def fixture_legs(self) -> list[dict]:
+        rows = []
+        for l in (self.leg_log.read_text(encoding="utf-8").splitlines() if self.leg_log.exists() else []):
+            rows.append(dict(kv.split("=", 1) for kv in l.split()[1:]))
+        return rows
+
+    def chain_set_run(self, mode: str | None):
+        """A -LegSet chain over hfr-native-m16-1457 (two ordinary speed legs) in a COPY of the runner tree. `mode`: None (nothing changes), 'copy' (plan entry 2's path gets
+        the committed visual twin's bytes after planning) or 'touch' (only its mtime moves). Returns (proc, target, planned sha256 of the target, twin's sha256)."""
+        dv = self.mutated_runner([])
+        target = dv / "legs" / self.SWAP_TARGET
+        source = dv / "legs" / self.SWAP_SOURCE
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, None if mode is None else target, source, mode or "copy")
+        proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+        if mode == "copy":
+            self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really swapped the planned spec's bytes")
+        return proc, target, planned, hashlib.sha256(source.read_bytes()).hexdigest()
+
+    def test_planned_hash_bind_chain_a_legset_leg_whose_bytes_become_a_visual_twin_after_planning_is_refused(self) -> None:
+        proc, target, planned, twin = self.chain_set_run("copy")
+        legs = self.fixture_legs()
+        self.assertEqual(len(legs), 2, proc.stdout + proc.stderr)
+        swapped = next(l for l in legs if l["leaf"] == self.SWAP_TARGET)
+        self.assertEqual(swapped["expect"], planned, "the leg child must be handed the planner's sha256 (-ExpectSpecSha256)\n" + proc.stdout)
+        self.assertEqual(swapped["read"], twin)
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in (self.tmp / "chain-legs").rglob("*.json")]
+        self.assertEqual([r["legId"] for r in receipts if "-visual-" in r["legId"]], [], "a visual twin ran in a speed slot")
+        self.assertEqual(len(receipts), 1, "the unchanged leg still ran")
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row["outcome"], row.get("specRefusal")), ("LEG_FAILED", "INVALID", "DVE_CHAIN_SPEC_CHANGED"), row)
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        typed = [l for l in proc.stdout.splitlines() if " DVE_CHAIN_SPEC_CHANGED " in l]
+        self.assertEqual(len(typed), 1, proc.stdout)
+        self.assertIn(f"planned_sha256={planned} read_sha256={twin}", typed[0])
+
+    def test_planned_hash_bind_chain_control_an_unchanged_legset_spec_still_runs(self) -> None:
+        proc, target, planned, twin = self.chain_set_run(None)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        legs = self.fixture_legs()
+        self.assertEqual(len(legs), 2)
+        self.assertTrue(all(l["expect"] == l["read"] for l in legs), legs)
+        self.assertFalse([l for l in proc.stdout.splitlines() if "DVE_CHAIN_SPEC_" in l], proc.stdout)
+
+    def test_planned_hash_bind_chain_control_an_mtime_only_change_still_runs(self) -> None:
+        proc, target, planned, twin = self.chain_set_run("touch")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue((self.tmp / "swap.done").exists(), "the fixture really moved the mtime after planning")
+        legs = self.fixture_legs()
+        self.assertEqual([l["read"] == l["expect"] for l in legs], [True, True], legs)
+        self.assertFalse([l for l in proc.stdout.splitlines() if "DVE_CHAIN_SPEC_" in l], proc.stdout)
+
+    def test_planned_hash_bind_chain_a_legspec_leg_is_bound_to_the_bytes_it_was_named_from(self) -> None:
+        """The chain's -LegSpec form reads each spec once to name the leg; the child is bound to THOSE bytes, so a swap after the read is refused, not run under the old name."""
+        dv = self.mutated_runner([])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, target, source)
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(target), "-Backend", "cuda", "-NoSupplementary"])
+        legs = self.fixture_legs()
+        self.assertEqual(len(legs), 1, proc.stdout + proc.stderr)
+        self.assertEqual(legs[0]["expect"], planned, "the -LegSpec leg's child must be handed the sha256 of the bytes it was planned from\n" + proc.stdout)
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        self.assertTrue(any(" DVE_CHAIN_SPEC_CHANGED leg=01-m16-1457-native-windowed-s1-cuda " in l for l in proc.stdout.splitlines()), proc.stdout)
+
+    def test_planned_hash_bind_chain_a_supplementary_leg_is_bound_to_the_planned_bytes(self) -> None:
+        """The chain's ultra-magnus supplementary child re-read the leg spec after planning with no expected hash: the fixture swaps the bytes at the first ultra-magnus probe,
+        after the Bachelor leg ran on the planned bytes."""
+        dv = self.mutated_runner([])
+        spec = self.tmp / "supp-leg.json"
+        spec.write_text(json.dumps({"legId": "supp-leg", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        twin = self.tmp / "supp-leg-visual-twin.json"
+        twin.write_text(json.dumps({"legId": "supp-leg-visual-twin", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        planned = hashlib.sha256(spec.read_bytes()).hexdigest()
+        um_share = self.tmp / "um-share"
+        (um_share / "cache").mkdir(parents=True)
+        (um_share / "cache" / f"playback-attr-3-cuda-{self.sha[:12]}-build.json").write_text('{"fixture":"staged-on-ultra-magnus"}', encoding="utf-8")
+        fx = self.chain_fixture(dv, spec, twin, venue="ultra-magnus")
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(spec), "-SupplementaryAgentShare", str(um_share)])
+        legs = self.fixture_legs()
+        supp = [l for l in legs if l["venue"] == "ultra-magnus"]
+        self.assertEqual(len(supp), 1, proc.stdout + proc.stderr)
+        self.assertEqual(supp[0]["expect"], planned, "the supplementary child must be handed the planner's sha256\n" + proc.stdout)
+        self.assertEqual([l["expect"] == l["read"] for l in legs if l["venue"] == "bachelor"], [True])
+        self.assertTrue(any(" DVE_CHAIN_SPEC_CHANGED " in l and "role=supplementary" in l for l in proc.stdout.splitlines()), proc.stdout)
+        receipts = [json.loads(p.read_text(encoding="utf-8")) for p in (self.tmp / "chain-legs").rglob("*.json")]
+        self.assertEqual([r["legId"] for r in receipts], ["supp-leg"], "the swapped bytes never ran on ultra-magnus")
+
+    def test_planned_hash_bind_the_fixture_leg_mirrors_the_real_legs_refusal_record(self) -> None:
+        """The stand-in's refusal is the real leg's: the same anchored stdout record and the same throw token, so the parents' classification is tested against the real text."""
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn('Write-Output "DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=$readSpecSha"', leg)
+        self.assertIn("throw \"DVE_LEG_SPEC_CHANGED the leg spec '$LegSpec' read as sha256 $readSpecSha", leg)
+        self.assertIn('Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"', leg)
+        self.assertIn("[ValidatePattern('^[0-9a-f]{64}\\z')][string]$ExpectSpecSha256", leg, "the real leg takes the planned hash on every leg, not only a lease batch's")
+
+    # The lease batch, -LegSet: a COPY of the batch whose planner call is followed by the fixture's swap (the race the preflight must survive), and whose plan stage ends
+    # the run by printing the hash each leg child would be bound to (the leg's -ExpectSpecSha256: SpecBudgetSha256), so no claim, lease or venue is involved.
+    BATCH_PLAN_ANCHOR = '    $sp = try { Get-DvLegSetPlan -LegSetPath (Join-Path $here "legsets\\$LegSet.json") -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { \'\' }) } catch { Stop-Usage $_.Exception.Message }\n'
+    BATCH_SWAP = ("    if ($env:DVT_SWAP_TO) { if ($env:DVT_SWAP_MODE -eq 'touch') { [IO.File]::SetLastWriteTimeUtc($env:DVT_SWAP_TO, [DateTime]::UtcNow.AddMinutes(7)) } "
+                  "else { [IO.File]::Copy($env:DVT_SWAP_FROM, $env:DVT_SWAP_TO, $true) } }   # TEST FIXTURE: the bytes change after the planner read them\n")
+    BATCH_STOP_ANCHOR = "# r11 (sol r10 blocker 2): every generated output name is checked HERE"
+    BATCH_STOP = ("foreach ($pl in $plan) { \"DVT_PLANNED spec=$([IO.Path]::GetFileName([string]$pl.spec)) bound=$([string]$script:SpecBudgetSha256[(Get-SpecDigestKey ([string]$pl.spec))])\" }; exit 0   # TEST FIXTURE\n"
+                  + BATCH_STOP_ANCHOR)
+
+    def batch_set_run(self, mode: str | None):
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_PLAN_ANCHOR, self.BATCH_PLAN_ANCHOR + self.BATCH_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        env = {} if mode is None else {"DVT_SWAP_TO": str(target), "DVT_SWAP_FROM": str(source), "DVT_SWAP_MODE": mode}
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra=env, timeout=420)
+        if mode == "copy":
+            self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really swapped the planned spec's bytes")
+        return proc, planned, hashlib.sha256(source.read_bytes()).hexdigest()
+
+    def test_planned_hash_bind_batch_a_legset_leg_whose_bytes_become_a_visual_twin_after_planning_is_refused_before_any_claim(self) -> None:
+        proc, planned, twin = self.batch_set_run("copy")
+        bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ") and self.SWAP_TARGET in l]
+        self.assertEqual(bound, [], "the leg would have been bound to the swapped bytes' hash (old: bound=<twin sha>)\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertIn(f"read as sha256 {twin} after the leg-set planner judged sha256 {planned} (planned_sha256={planned})", refusal[0])
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    def test_planned_hash_bind_batch_control_an_unchanged_or_touched_legset_spec_still_plans_bound_to_the_planner(self) -> None:
+        for mode in (None, "touch"):
+            with self.subTest(mode=mode):
+                if mode == "touch":
+                    self.make_harness()   # a fresh tree: mutated_runner's copy is named by its mutations
+                proc, planned, twin = self.batch_set_run(mode)
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ") and self.SWAP_TARGET in l]
+                self.assertEqual(bound, [f"DVT_PLANNED spec={self.SWAP_TARGET} bound={planned}"], proc.stdout + proc.stderr)
+
+    # r2 (adversary pass 1 on 071c4ea6, A1): the batch bound every child through the PATH-keyed SpecBudgetSha256, i.e. the LAST preflight read of a path. A set naming one
+    # path twice, planned and judged as bytes A for entry 1 and B for entry 2 (the bytes changed between the two preflights), bound BOTH children to B.
+    BATCH_DUP_PLAN = ("    if ($env:DVT_DUP_TWIN) { $w = @($sp.plan | Where-Object { [IO.Path]::GetFileName([string]$_.specPath) -ceq 'm16-1457-native-windowed-s1.json' })[0]; "
+                      "$e1 = $w.PSObject.Copy(); $e1.seq = 1; $e2 = $w.PSObject.Copy(); $e2.seq = 2; "
+                      "$e2.specSha256 = (Get-FileHash -LiteralPath $env:DVT_DUP_TWIN -Algorithm SHA256).Hash.ToLowerInvariant(); $sp = [pscustomobject]@{ plan = @($e1, $e2) } }   # TEST FIXTURE\n")
+    BATCH_LOOP_ANCHOR = "    foreach ($e in $sp.plan) {\n        $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath)"
+    BATCH_LOOP_SWAP = ("    foreach ($e in $sp.plan) {\n        if ($env:DVT_DUP_TWIN -and $e.seq -eq 2) { [IO.File]::Copy($env:DVT_DUP_TWIN, [string]$e.specPath, $true) }   # TEST FIXTURE\n"
+                       "        $shapeRefusal = Get-ScalarLegShapeRefusal ([string]$e.specPath)")
+
+    def test_planned_hash_bind_r2_a1_batch_a_path_named_twice_whose_bytes_change_between_its_preflights_is_refused_before_any_claim(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_PLAN_ANCHOR, self.BATCH_PLAN_ANCHOR + self.BATCH_DUP_PLAN),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_LOOP_ANCHOR, self.BATCH_LOOP_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        planned, twin = hashlib.sha256(target.read_bytes()).hexdigest(), hashlib.sha256(source.read_bytes()).hexdigest()
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra={"DVT_DUP_TWIN": str(source)}, timeout=420)
+        self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really changed the path's bytes between its two preflights")
+        bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
+        self.assertEqual(bound, [], f"entry 1 (planned and judged as {planned}) would have been bound to the twin's {twin}\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertIn(f"was judged as sha256 {planned} but a later preflight read of the same path judged sha256 {twin} (planned_sha256={planned})", refusal[0])
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    # DV-PLANNED-SPEC-HASH-BIND-R9-R2-RESIDUE-1 (adversary pass 2 on 946fe141, A3): the digest maps were ORDINAL-keyed by the path as spelled, so ONE file named under two case
+    # spellings, its bytes changed between the two preflights, had two keys and each entry was bound to its own read: no refusal here, the claim was taken, and only the content
+    # guard refused after it. The key is the file's canonical name now: the second read overwrites the first's digest and entry 1 is refused before any claim.
+    BATCH_DUP_PLAN_CASE = BATCH_DUP_PLAN.replace("$e2.specSha256 =", "$e2.specPath = ([IO.Path]::Combine([IO.Path]::GetDirectoryName([string]$w.specPath), "
+                                                 "[IO.Path]::GetFileNameWithoutExtension([string]$w.specPath).ToUpperInvariant() + [IO.Path]::GetExtension([string]$w.specPath))); $e2.specSha256 =", 1)
+    # (no map lookup: the line reads the same on the old code, whose maps are keyed by the path as spelled)
+    BATCH_STOP_NOMAP = ("foreach ($pl in $plan) { \"DVT_PLANNED spec=$([IO.Path]::GetFileName([string]$pl.spec)) own=$([string]$pl.specSha256)\" }; exit 0   # TEST FIXTURE\n"
+                        + BATCH_STOP_ANCHOR)
+
+    def test_planned_hash_bind_r9_r2_a3_batch_one_file_named_under_two_case_spellings_whose_bytes_change_between_its_preflights_is_refused_before_any_claim(self) -> None:
+        self.assertIn("ToUpperInvariant", self.BATCH_DUP_PLAN_CASE)
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_PLAN_ANCHOR, self.BATCH_PLAN_ANCHOR + self.BATCH_DUP_PLAN_CASE),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_LOOP_ANCHOR, self.BATCH_LOOP_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP_NOMAP)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        planned, twin = hashlib.sha256(target.read_bytes()).hexdigest(), hashlib.sha256(source.read_bytes()).hexdigest()
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra={"DVT_DUP_TWIN": str(source)}, timeout=420)
+        self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really changed the file's bytes between its two preflights")
+        planned_lines = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
+        self.assertEqual(planned_lines, [], f"old: both entries plan, entry 1 (judged as {planned}) bound to its own read and the claim is next\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertIn(f"was judged as sha256 {planned} but a later preflight read of the same path judged sha256 {twin} (planned_sha256={planned})", refusal[0])
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    # DV-PLANNED-SPEC-HASH-BIND-R10-DIGEST-KEY-RESIDUE-1 (key r10 B1, fable + opus on ca27678b): Get-SpecDigestKey chose the file's final path or the spelled full path PER CALL. A -LegSet entry
+    # whose spec is spelled off its on-disk name (the fixture upper-cases each leaf) and whose budget-store lookup got no answer in 1 s stored the judged digest under the spelled path and read
+    # it back under the final one: the per-entry check then read an empty sha256 and refused a spec nobody changed ("read as sha256  after the leg-set planner judged ..."). -SpecDigestKeyDelay
+    # '<n>:<ms>' makes the n-th lookup answer late: 1 and 4 split the key on the old code (4 = the budget store of entry 1), and the memo makes every call of one spelling agree.
+    BATCH_UPPER_PLAN = ("    if ($env:DVT_UPPER_SPEC) { foreach ($q in $sp.plan) { $q.specPath = ([IO.Path]::Combine([IO.Path]::GetDirectoryName([string]$q.specPath), "
+                        "[IO.Path]::GetFileNameWithoutExtension([string]$q.specPath).ToUpperInvariant() + [IO.Path]::GetExtension([string]$q.specPath))) } }   # TEST FIXTURE: each spec spelled off its on-disk name\n")
+
+    def test_planned_hash_bind_r10_batch_legset_a_spec_spelled_off_its_name_whose_key_lookup_times_out_is_not_refused_as_changed_with_an_empty_hash(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_PLAN_ANCHOR, self.BATCH_PLAN_ANCHOR + self.BATCH_UPPER_PLAN),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP_OWN)])
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline, "-SpecDigestKeyDelay", "1:1500,4:1500"],
+                        env_extra={"DVT_UPPER_SPEC": "1"}, timeout=420)
+        self.assertNotIn("SPEC_CHANGED_AFTER_PREFLIGHT", proc.stderr, "old: a false refusal naming an empty sha256 on a spec nobody changed\n" + proc.stdout + proc.stderr)
+        # (adversary pass 1 A1: a key that fell back to the spelled path is the typed SPEC_KEY_UNRESOLVED before any claim, never a changed spec and never a run on an unbound key)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE SPEC_KEY_UNRESOLVED ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertEqual([l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")], [], "nothing is planned past the refusal")
+        self.assertNotRegex(proc.stderr, r"sha256 +after", "no empty sha256 is ever named")
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+        # control: the same spelled specs with every lookup answering run, each entry bound to its own judged bytes
+        ok = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run-control"),
+                       "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                       "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra={"DVT_UPPER_SPEC": "1"}, timeout=420)
+        self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+        rows = [l for l in ok.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
+        self.assertGreaterEqual(len(rows), 2, ok.stdout + ok.stderr)
+        for row in rows:
+            m = re.fullmatch(r"DVT_PLANNED spec=(\S+) bound=([0-9a-f]{64}) own=([0-9a-f]{64})", row)
+            self.assertIsNotNone(m, row)
+            self.assertEqual(m.group(2), m.group(3), f"the entry is bound to its own judged bytes: {row}")
+            self.assertEqual(m.group(1), m.group(1).upper().replace(".JSON", ".json"), "the spec stayed spelled off its on-disk name, so the test is the key split's input")
+
+    def test_planned_hash_bind_r2_a2_chain_a_zero_byte_legspec_is_planned_with_the_empty_bytes_hash(self) -> None:
+        """A2: `$x = try { <empty byte array> }` enumerated to $null and the hash threw outside the usage catch; an empty file is bytes like any other."""
+        dv = self.mutated_runner([])
+        empty = self.tmp / "empty-leg.json"
+        empty.write_bytes(b"")
+        fx = self.chain_fixture(dv, None, None)
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(empty), "-Backend", "cuda", "-NoSupplementary"])
+        self.assertNotIn("HashData", proc.stderr, proc.stdout + proc.stderr)
+        legs = self.fixture_legs()
+        self.assertEqual([l["expect"] for l in legs], [hashlib.sha256(b"").hexdigest()], proc.stdout + proc.stderr)
+
+    def test_planned_hash_bind_r2_a3_chain_called_with_native_error_preference_still_types_the_refusal_and_runs_the_next_leg(self) -> None:
+        """A3: a caller's $PSNativeCommandUseErrorActionPreference = $true reached the raw leg launch and turned the refusal's exit 1 into a terminating error."""
+        dv = self.mutated_runner([])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, target, source)
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=300)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        args = ["-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary", "-RunDir", str(self.tmp / "chain-run"), "-SourceCommit", self.sha,
+                "-BuildManifestSha256", self.build_sha, "-ClaimDir", str(self.tmp / "claims"), "-QuietScript", str(fx["quiet"]), "-LegScript", str(fx["leg"]),
+                "-CooldownSec", "0", "-ClaimPollSec", "1", "-DeadlineUtc", deadline]
+        quoted = " ".join(a if a.startswith("-") and " " not in a else "'" + a.replace("'", "''") + "'" for a in args)
+        proc = run_pwsh(["-Command", f"$PSNativeCommandUseErrorActionPreference = $true; & '{dv / 'Invoke-VenueChain.ps1'}' {quoted}; exit $LASTEXITCODE"], env_extra=fx["env"], timeout=420)
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row.get("specRefusal")), ("LEG_FAILED", "DVE_CHAIN_SPEC_CHANGED"), row)
+        self.assertEqual(len(self.fixture_legs()), 2, "the next leg still ran")
+        self.assertTrue(any(f"planned_sha256={planned}" in l and " DVE_CHAIN_SPEC_CHANGED " in l for l in proc.stdout.splitlines()), proc.stdout)
+
+    def test_planned_hash_bind_r2_a5_chain_a_failing_label_log_write_keeps_the_result_the_exit_code_and_the_next_leg(self) -> None:
+        """A5: the new label's log write could throw (a locked ChainLog) after LEG_FAILED was appended and skip exit 7, CHAIN_RESULT and the rest of the walk."""
+        lock = ("function L([string]$Message) {\n    if ($Message -clike 'DVE_CHAIN_SPEC_*') { throw 'TEST FIXTURE: the chain log is locked' }\n")
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", "function L([string]$Message) {\n", lock)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        fx = self.chain_fixture(dv, target, source)
+        proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row["outcome"], row.get("specRefusal")), ("LEG_FAILED", "INVALID", "DVE_CHAIN_SPEC_CHANGED"), row)
+        self.assertEqual(len(self.fixture_legs()), 2, "the next leg still ran")
+        self.assertIn("DVE_CHAIN_SPEC_CHANGED", proc.stderr, "the label still reaches the operator when the log write fails")
+
+    # r3 (adversary pass 2 on 5ef85bc6, A2): SpecBudgetSha256 / SpecShapeSha256 were @{} (case-insensitive keys). On a case-sensitive directory A.json and a.json are two
+    # files; the second read overwrote the first's digest and the per-entry check refused a spec nobody changed. The simulated form maps each EXACT path string to its own file
+    # at the batch's one spec-read seam (Read-SpecBytesWithin), as a case-sensitive directory would; the real form makes one, where the host lets it.
+    SWAP_FIRST = "m16-1457-native-fullscreen-s1.json"        # plan entry 1 of the set
+    BATCH_CASE_READ_ANCHOR = "    $ms = [int][Math]::Floor([Math]::Max(0.0, [Math]::Min(3600.0, $BoundSec)) * 1000.0)\n"
+    BATCH_CASE_READ = ("    if ($env:DVT_CASE_LEAF -and [string]::Equals([IO.Path]::GetFileName($Path), $env:DVT_CASE_LEAF, [StringComparison]::Ordinal)) { $Path = $env:DVT_CASE_BYTES }   # TEST FIXTURE: a case-sensitive directory\n"
+                       + BATCH_CASE_READ_ANCHOR)
+    BATCH_STOP_OWN = ("foreach ($pl in $plan) { \"DVT_PLANNED spec=$([IO.Path]::GetFileName([string]$pl.spec)) bound=$([string]$script:SpecBudgetSha256[(Get-SpecDigestKey ([string]$pl.spec))]) own=$([string]$pl.specSha256)\" }; exit 0   # TEST FIXTURE\n"
+                      + BATCH_STOP_ANCHOR)
+    # (R9-R2 A3: the maps are keyed by the file's canonical name; the simulated case-sensitive directory keeps each EXACT name its own key, as the real one does)
+    BATCH_CASE_KEY_ANCHOR = "    $digestFull = try { [IO.Path]::GetFullPath($Path) } catch { return $Path }\n"
+    BATCH_CASE_KEY = (BATCH_CASE_KEY_ANCHOR
+                      + "    if ($env:DVT_CASE_LEAF -and [string]::Equals([IO.Path]::GetFileName($Path), $env:DVT_CASE_LEAF, [StringComparison]::Ordinal)) { return $digestFull }   # TEST FIXTURE: a case-sensitive directory\n")
+
+    def run_case_batch(self, dv: Path, specs: list[Path], env: dict) -> subprocess.CompletedProcess:
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        legspec = ",".join("'" + str(s).replace("'", "''") + "'" for s in specs)
+        cmd = (f"& '{dv / 'Invoke-VenueLeaseBatch.ps1'}' -Venue bachelor -LegSpec {legspec} -Backend cuda -RunDir '{self.tmp / 'batch-run'}' -SourceCommit {self.sha} "
+               f"-BuildManifestSha256 {self.build_sha} -UmRunScript '{self.um}' -QuietScript '{fake}' -LegScript '{fake}' -ClaimDir '{self.tmp / 'claims'}' "
+               f"-AgentShare '{self.share}' -DeadlineUtc {deadline}; exit $LASTEXITCODE")
+        return run_pwsh(["-Command", cmd], env_extra=env, timeout=420)
+
+    def test_planned_hash_bind_r3_a2_batch_two_specs_whose_paths_differ_only_in_case_are_two_entries_each_bound_to_its_own_bytes(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_CASE_READ_ANCHOR, self.BATCH_CASE_READ),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_CASE_KEY_ANCHOR, self.BATCH_CASE_KEY),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP_OWN)])
+        case_dir = self.tmp / "case"
+        case_dir.mkdir()
+        upper = case_dir / "A.json"   # the one file on this (case-insensitive) volume; the map serves a.json's own bytes, as a case-sensitive directory holds them
+        shutil.copyfile(dv / "legs" / self.SWAP_FIRST, upper)
+        lower_bytes = case_dir.parent / "lower-bytes.json"
+        shutil.copyfile(dv / "legs" / self.SWAP_TARGET, lower_bytes)
+        lower = case_dir / "a.json"
+        fsha, wsha = hashlib.sha256(upper.read_bytes()).hexdigest(), hashlib.sha256(lower_bytes.read_bytes()).hexdigest()
+        proc = self.run_case_batch(dv, [upper, lower], {"DVT_CASE_LEAF": "a.json", "DVT_CASE_BYTES": str(lower_bytes)})
+        self.assertEqual(proc.returncode, 0, "two distinct files were refused as one changed spec (old: SPEC_CHANGED_AFTER_PREFLIGHT)\n" + proc.stdout + proc.stderr)
+        bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
+        self.assertEqual(bound, [f"DVT_PLANNED spec=A.json bound={fsha} own={fsha}", f"DVT_PLANNED spec=a.json bound={wsha} own={wsha}"], proc.stdout + proc.stderr)
+
+    def test_planned_hash_bind_r3_a2_batch_real_case_sensitive_directory(self) -> None:
+        """The adversary's literal input on a real case-sensitive directory (fsutil setCaseSensitiveInfo needs admin or developer mode: skipped where the host refuses it)."""
+        case_dir = self.tmp / "case-real"
+        case_dir.mkdir()
+        fs = subprocess.run(["fsutil", "file", "setCaseSensitiveInfo", str(case_dir), "enable"], capture_output=True, text=True)
+        probe = case_dir / "x.txt"
+        probe.write_text("1", encoding="utf-8")
+        if fs.returncode != 0 or (case_dir / "X.txt").exists():
+            self.skipTest(f"this host cannot make a case-sensitive directory: {(fs.stdout + fs.stderr).strip()}")
+        probe.unlink()
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP_OWN)])
+        upper, lower = case_dir / "A.json", case_dir / "a.json"
+        shutil.copyfile(dv / "legs" / self.SWAP_FIRST, upper)
+        shutil.copyfile(dv / "legs" / self.SWAP_TARGET, lower)
+        fsha, wsha = hashlib.sha256(upper.read_bytes()).hexdigest(), hashlib.sha256(lower.read_bytes()).hexdigest()
+        self.assertNotEqual(fsha, wsha)
+        proc = self.run_case_batch(dv, [upper, lower], {})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
+        self.assertEqual(bound, [f"DVT_PLANNED spec=A.json bound={fsha} own={fsha}", f"DVT_PLANNED spec=a.json bound={wsha} own={wsha}"], proc.stdout + proc.stderr)
+
+    # BATCH-3 r9 (adversary pass 11 on f42e44a8, A2): the batch's -LegSet loop parsed the shape check's bytes BEFORE comparing them with the planner's sha256, so bytes that
+    # changed after planning into something that is not JSON were refused as LEG_SPEC_INVALID and never named as SPEC_CHANGED_AFTER_PREFLIGHT with the planned hash.
+    def test_planned_hash_bind_b3_r9_a2_batch_legset_bytes_cut_to_one_brace_after_planning_are_spec_changed_not_spec_invalid(self) -> None:
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_PLAN_ANCHOR, self.BATCH_PLAN_ANCHOR + self.BATCH_SWAP),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP)])
+        target = dv / "legs" / self.SWAP_TARGET
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        brace = self.tmp / "one-brace.json"
+        brace.write_bytes(b"{")
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline],
+                        env_extra={"DVT_SWAP_TO": str(target), "DVT_SWAP_FROM": str(brace), "DVT_SWAP_MODE": "copy"}, timeout=420)
+        self.assertEqual(target.read_bytes(), b"{", "the fixture really cut the planned spec to one brace")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ")]
+        self.assertEqual(len(refusal), 1, "old: BATCH_USAGE LEG_SPEC_INVALID (the shape check parsed the new bytes first)\n" + proc.stderr)
+        self.assertIn(f"read as sha256 {hashlib.sha256(b'{').hexdigest()} after the leg-set planner judged sha256 {planned} (planned_sha256={planned})", refusal[0])
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    # BATCH-3 r9 (adversary pass 11 on f42e44a8, A4): the supplementary child's refusal was logged but its result row carried no specRefusal, and a supplementary child that
+    # printed its refusal and was then cut at the cap (TIMEOUT) was never read for one at all.
+    # DV-PLANNED-SPEC-HASH-BIND-R9-R2-RESIDUE-1 (adversary pass 2 A1): a directory squatting on the supplementary transcript's path makes the copy's WriteAllText throw. Injected right
+    # after the child returns, so it is the same on the old and the new line that writes the copy.
+    SUPP_RUN_ANCHOR = "        $sr = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $sArgs -TimeoutSec $capSec\n"
+    SUPP_SQUAT = SUPP_RUN_ANCHOR + "        if ($env:DVT_SUPP_SQUAT) { $null = New-Item -ItemType Directory -Path $sOut -Force }   # TEST FIXTURE: the transcript path cannot be written\n"
+
+    def supp_swap_run(self, *extra: str, hang: bool = False, squat: bool = False):
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", self.SUPP_RUN_ANCHOR, self.SUPP_SQUAT)] if squat else [])
+        spec = self.tmp / "supp-leg.json"
+        spec.write_text(json.dumps({"legId": "supp-leg", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        twin = self.tmp / "supp-leg-visual-twin.json"
+        twin.write_text(json.dumps({"legId": "supp-leg-visual-twin", "backends": ["cpu"], "criteria": {"acceptance": {"cpu": []}, "supplementary": {"cpu": []}}}), encoding="utf-8")
+        um_share = self.tmp / "um-share"
+        (um_share / "cache").mkdir(parents=True)
+        (um_share / "cache" / f"playback-attr-3-cuda-{self.sha[:12]}-build.json").write_text('{"fixture":"staged-on-ultra-magnus"}', encoding="utf-8")
+        fx = self.chain_fixture(dv, spec, twin, venue="ultra-magnus")
+        if hang:
+            fx["env"]["DVT_HANG_AFTER_REFUSAL"] = "ultra-magnus"
+        if squat:
+            fx["env"]["DVT_SUPP_SQUAT"] = "1"
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(spec), "-SupplementaryAgentShare", str(um_share), *extra])
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        return proc, result
+
+    def test_planned_hash_bind_b3_r9_a4_a_failed_supplementary_refusal_is_on_its_result_row(self) -> None:
+        proc, result = self.supp_swap_run()
+        rows = [r for r in result["supplementary"] if r.get("status") in ("FAILED", "TIMEOUT", "RAN")]
+        self.assertEqual([(r["status"], r.get("specRefusal")) for r in rows], [("FAILED", "DVE_CHAIN_SPEC_CHANGED")], "old: the FAILED row had no specRefusal\n" + proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, "a supplementary result never moves the chain's exit\n" + proc.stdout + proc.stderr)
+
+    def test_planned_hash_bind_b3_r9_a4_a_timed_out_supplementary_child_that_printed_its_refusal_keeps_it(self) -> None:
+        proc, result = self.supp_swap_run("-TestSupplementaryCapSec", "8", hang=True)
+        rows = [r for r in result["supplementary"] if r.get("status") in ("FAILED", "TIMEOUT", "RAN")]
+        self.assertEqual([(r["status"], r.get("specRefusal")) for r in rows], [("TIMEOUT", "DVE_CHAIN_SPEC_CHANGED")], "old: a TIMEOUT was never read for its refusal\n" + proc.stdout + proc.stderr)
+        self.assertTrue(any(" DVE_CHAIN_SPEC_CHANGED " in l and "role=supplementary" in l for l in proc.stdout.splitlines()), proc.stdout)
+
+    # DV-PLANNED-SPEC-HASH-BIND-R9-R2-RESIDUE-1 (adversary pass 2 on 946fe141, A1): the supplementary transcript write ran before the refusal was read, so a write that threw ended the
+    # row SKIPPED/SUPPLEMENTARY_ERROR with no specRefusal. The copy is best-effort now (as the primary leg's): the child's stdout is still classified.
+    def test_planned_hash_bind_r9_r2_a1_a_supplementary_transcript_that_cannot_be_written_keeps_the_childs_refusal_on_its_row(self) -> None:
+        proc, result = self.supp_swap_run(squat=True)
+        self.assertEqual([r.get("reason") for r in result["supplementary"] if r.get("status") == "SKIPPED"], [], "old: SKIPPED/SUPPLEMENTARY_ERROR\n" + proc.stdout + proc.stderr)
+        rows = [r for r in result["supplementary"] if r.get("status") in ("FAILED", "TIMEOUT", "RAN")]
+        self.assertEqual([(r["status"], r.get("specRefusal")) for r in rows], [("FAILED", "DVE_CHAIN_SPEC_CHANGED")], proc.stdout + proc.stderr)
+        self.assertEqual(proc.returncode, 0, "a supplementary result never moves the chain's exit\n" + proc.stdout + proc.stderr)
+        self.assertIn("supplementary transcript write failed", proc.stderr, "the failed copy is said on the diagnostic stream, not hidden")
+
+    # BATCH-3 r9 (adversary pass 11 on f42e44a8, A10): the stand-in leg had no DVE_LEG_SPEC_UNREADABLE path, so the chain's SPEC_UNREADABLE label was never exercised end to end.
+    def test_planned_hash_bind_b3_r9_a10_a_planned_spec_deleted_before_its_leg_is_spec_unreadable(self) -> None:
+        dv = self.mutated_runner([])
+        target = dv / "legs" / self.SWAP_TARGET
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, target, None, mode="delete")
+        proc = self.run_fixture_chain(dv, fx, ["-LegSpec", str(target), "-Backend", "cuda", "-NoSupplementary"])
+        self.assertFalse(target.exists(), "the fixture really deleted the planned spec")
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        self.assertEqual([(r["status"], r.get("specRefusal")) for r in result["legs"]], [("LEG_FAILED", "DVE_CHAIN_SPEC_UNREADABLE")], proc.stdout + proc.stderr)
+        self.assertTrue(any(f" DVE_CHAIN_SPEC_UNREADABLE leg=01-m16-1457-native-windowed-s1-cuda planned_sha256={planned}" in l for l in proc.stdout.splitlines()), proc.stdout)
+
+    def test_planned_hash_bind_b3_r9_a10_the_fixture_leg_mirrors_the_real_legs_unreadable_record(self) -> None:
+        leg = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        self.assertIn("try { $specBytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path) }", leg)
+        self.assertIn('Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"', leg)
+        self.assertIn("try { $bytes = [IO.File]::ReadAllBytes((Resolve-Path -LiteralPath $LegSpec).Path) }", self.CHAIN_FAKE_LEG)
+        self.assertIn('Write-Output "DVE_LEG_SPEC_UNREADABLE planned_sha256=$ExpectSpecSha256"', self.CHAIN_FAKE_LEG)
+
+    # DV-PLANNED-SPEC-HASH-BIND-R9-RESIDUE-1 r1 (sol r9, finding 1): the primary chain classified the leg child's refusal from <RunDir>\leg-<name>.out.txt read back from disk, a
+    # transcript a second run sharing the RunDir (same leg name) may have written, and from both streams merged. A refusal record from another child with the same planned
+    # hash was published as THIS child's observed digest. The primary now classifies the child's own captured STDOUT, as the supplementary route does.
+    FOREIGN_DIGEST = "f" * 64
+    # (r2, adversary pass 1 A7: injected AFTER the operator's copy is written, so a primary that re-read the transcript for its refusal would publish the foreign digest)
+    CHAIN_FOREIGN_ANCHOR = "            try { $legLines | Out-File -LiteralPath $out } catch { Write-ChainDiag \"leg transcript write failed for $($leg.name): $($_.Exception.Message -replace '\\s+', ' ')\" }\n"
+    CHAIN_FOREIGN_INJECT = ("            if ($env:DVT_FOREIGN_TRANSCRIPT -and $legCode -ne 0) { [IO.File]::WriteAllText($out, $env:DVT_FOREIGN_TRANSCRIPT + [Environment]::NewLine + "
+                            "$(if (Test-Path -LiteralPath $out) { [IO.File]::ReadAllText($out) } else { '' })) }   # TEST FIXTURE: another run sharing the RunDir wrote the leg's transcript first\n")
+
+    def foreign_transcript_run(self, leg_text: str | None = None):
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", self.CHAIN_FOREIGN_ANCHOR, self.CHAIN_FOREIGN_ANCHOR + self.CHAIN_FOREIGN_INJECT)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        fx = self.chain_fixture(dv, target, source)
+        if leg_text is not None:
+            fx["leg"].write_text(leg_text, encoding="utf-8")
+        fx["env"]["DVT_FOREIGN_TRANSCRIPT"] = f"DVE_LEG_SPEC_REFUSED planned_sha256={planned} read_sha256={self.FOREIGN_DIGEST}"
+        proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+        return proc, planned, hashlib.sha256(source.read_bytes()).hexdigest()
+
+    def test_planned_hash_bind_r9_residue_a1_primary_refusal_names_its_own_childs_observed_digest_not_a_shared_transcripts(self) -> None:
+        proc, planned, twin = self.foreign_transcript_run()
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        typed = [l for l in proc.stdout.splitlines() if " DVE_CHAIN_SPEC_CHANGED " in l]
+        self.assertEqual(len(typed), 1, proc.stdout)
+        self.assertIn(f"planned_sha256={planned} read_sha256={twin}", typed[0], "old: the shared transcript's record (another child's digest) was published as this child's\n" + proc.stdout)
+        self.assertNotIn(self.FOREIGN_DIGEST, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row["outcome"], row.get("specRefusal")), ("LEG_FAILED", "INVALID", "DVE_CHAIN_SPEC_CHANGED"), row)
+
+    def test_planned_hash_bind_r9_residue_a1_a_record_on_the_childs_stderr_is_not_its_refusal(self) -> None:
+        """The merged stream carried no provenance: a whole-line record on STDERR (a child that merely quotes one) was read as the refusal. Only stdout is."""
+        stderr_line = '    [Console]::Error.WriteLine("DVE_LEG_SPEC_REFUSED planned_sha256=$ExpectSpecSha256 read_sha256=' + self.FOREIGN_DIGEST + '")\n'
+        anchor = '    if ($readSpecSha -cne $ExpectSpecSha256) { Write-Output "DVE_LEG_SPEC_REFUSED'
+        self.assertEqual(self.CHAIN_FAKE_LEG.count(anchor), 1)
+        proc, planned, twin = self.foreign_transcript_run(self.CHAIN_FAKE_LEG.replace(anchor, stderr_line + anchor, 1))
+        typed = [l for l in proc.stdout.splitlines() if " DVE_CHAIN_SPEC_CHANGED " in l]
+        self.assertEqual(len(typed), 1, proc.stdout + proc.stderr)
+        self.assertIn(f"planned_sha256={planned} read_sha256={twin}", typed[0], "old: a stderr record and the shared transcript's record both stood in for the child's stdout\n" + proc.stdout)
+        self.assertNotIn(self.FOREIGN_DIGEST, "\n".join(typed))
+
+    # r2 (adversary pass 1 on 6de082e2, A1): the receipt/outcome/detail were still read from the merged capture, so a DVE_RECEIPT_PATH= line on the child's STDERR was taken as a
+    # receipt and suppressed the real stdout refusal. Every parse now reads the child's stdout only.
+    def test_planned_hash_bind_r9_residue_r2_a1_a_receipt_line_on_the_childs_stderr_does_not_suppress_its_stdout_refusal(self) -> None:
+        stderr_line = '    [Console]::Error.WriteLine("DVE_RECEIPT_PATH=C:\\scratch\\phantom.json")\n'
+        anchor = '    if ($readSpecSha -cne $ExpectSpecSha256) { Write-Output "DVE_LEG_SPEC_REFUSED'
+        self.assertEqual(self.CHAIN_FAKE_LEG.count(anchor), 1)
+        proc, planned, twin = self.foreign_transcript_run(self.CHAIN_FAKE_LEG.replace(anchor, stderr_line + anchor, 1))
+        self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row["outcome"], row.get("specRefusal")), ("LEG_FAILED", "INVALID", "DVE_CHAIN_SPEC_CHANGED"), "old: the stderr receipt line suppressed the refusal\n" + proc.stdout + proc.stderr)
+
+    # r2 (adversary pass 1, A2): the operator's transcript copy is written before the child's result is classified; a write failure (the leaf is a directory) must not cost the
+    # typed refusal, exit 7, CHAIN_RESULT or the next leg.
+    def test_planned_hash_bind_r9_residue_r2_a2_an_unwritable_transcript_leaf_costs_neither_the_refusal_nor_the_chain_result(self) -> None:
+        anchor = "            $legCode = $LASTEXITCODE\n"
+        obstruct = "            if ($env:DVT_OBSTRUCT_TRANSCRIPT) { New-Item -ItemType Directory -Force -Path $out | Out-Null }   # TEST FIXTURE: the transcript leaf cannot be written\n"
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", anchor, anchor + obstruct)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        fx = self.chain_fixture(dv, target, source)
+        fx["env"]["DVT_OBSTRUCT_TRANSCRIPT"] = "1"
+        proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+        self.assertEqual(proc.returncode, 7, "old: Out-File threw and the chain died before classifying\n" + proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row.get("specRefusal")), ("LEG_FAILED", "DVE_CHAIN_SPEC_CHANGED"), proc.stdout + proc.stderr)
+
+    # r2 (adversary pass 2, A2): the diagnostic written from that catch must itself be best-effort (a caller that closed or disposed the process's stderr writer).
+    def test_planned_hash_bind_r9_residue_r2_a2b_a_stderr_the_caller_disposed_does_not_cost_the_chain_result_either(self) -> None:
+        anchor = "            $legCode = $LASTEXITCODE\n"
+        inject = ("            if ($env:DVT_OBSTRUCT_TRANSCRIPT) { New-Item -ItemType Directory -Force -Path $out | Out-Null; $dw = [IO.StreamWriter]::new([IO.MemoryStream]::new()); [Console]::SetError($dw); $dw.Dispose() }"
+                  "   # TEST FIXTURE: the transcript leaf cannot be written and the caller's stderr writer is disposed\n")
+        dv = self.mutated_runner([("Invoke-VenueChain.ps1", anchor, anchor + inject)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        fx = self.chain_fixture(dv, target, source)
+        fx["env"]["DVT_OBSTRUCT_TRANSCRIPT"] = "1"
+        proc = self.run_fixture_chain(dv, fx, ["-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-NoSupplementary"])
+        self.assertEqual(proc.returncode, 7, "old: the catch's own stderr write threw and the chain died\n" + proc.stdout + proc.stderr)
+        result = json.loads([l for l in proc.stdout.splitlines() if l.startswith("CHAIN_RESULT=")][-1][len("CHAIN_RESULT="):])
+        row = next(r for r in result["legs"] if r["spec"].endswith(self.SWAP_TARGET))
+        self.assertEqual((row["status"], row.get("specRefusal")), ("LEG_FAILED", "DVE_CHAIN_SPEC_CHANGED"), proc.stdout + proc.stderr)
+
+    def test_planned_hash_bind_r9_residue_a1_control_an_unshared_transcript_still_types_the_refusal(self) -> None:
+        proc = self.chain_set_run("copy")[0]
+        typed = [l for l in proc.stdout.splitlines() if " DVE_CHAIN_SPEC_CHANGED " in l]
+        self.assertEqual(len(typed), 1, proc.stdout + proc.stderr)
+        transcripts = [p for p in self.chain_run.glob("leg-*.out.txt") if "DVE_LEG_SPEC_REFUSED planned_sha256=" in p.read_text(encoding="utf-8")]
+        self.assertEqual(len(transcripts), 1, "the per-leg transcript is still written for the operator")
+
+    # DV-PLANNED-SPEC-HASH-BIND-R9-RESIDUE-1 r1 (sol r9, finding 2): a -LegSet replacement landing AFTER the shape read and BEFORE the export budget read was refused by the
+    # budget read's own message, which has no planned_sha256=. The -LegSet loop names the planner's hash on that path too.
+    BATCH_BUDGET_ANCHOR = "        $budgetRefusal = Get-ExportBudgetRefusal ([string]$e.specPath)   # r8 (adversary r7 A3): before the lease, as -LegPlan does\n"
+    BATCH_BUDGET_SWAP = ("        if ($env:DVT_BUDGET_SWAP_TO -and [IO.Path]::GetFileName([string]$e.specPath) -ceq [IO.Path]::GetFileName($env:DVT_BUDGET_SWAP_TO)) { "
+                         "[IO.File]::Copy($env:DVT_BUDGET_SWAP_FROM, $env:DVT_BUDGET_SWAP_TO, $true) }   # TEST FIXTURE: the bytes change after the shape read, before the budget read\n")
+
+    def budget_swap_run(self, source_bytes: bytes | None = None):
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_BUDGET_ANCHOR, self.BATCH_BUDGET_SWAP + self.BATCH_BUDGET_ANCHOR),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP)])
+        target, source = dv / "legs" / self.SWAP_TARGET, dv / "legs" / self.SWAP_SOURCE
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        if source_bytes is not None:
+            source = self.tmp / "budget-swap-source.json"
+            source.write_bytes(source_bytes)
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline],
+                        env_extra={"DVT_BUDGET_SWAP_TO": str(target), "DVT_BUDGET_SWAP_FROM": str(source)}, timeout=420)
+        self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really replaced the planned spec between the shape read and the budget read")
+        return proc, planned, hashlib.sha256(source.read_bytes()).hexdigest()
+
+    def test_planned_hash_bind_r9_residue_b_a_legset_spec_replaced_between_the_shape_read_and_the_budget_read_is_refused_with_the_planned_hash(self) -> None:
+        proc, planned, twin = self.budget_swap_run()
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertIn(f"planned_sha256={planned}", refusal[0], "old: the budget read's refusal named no planned hash\n" + proc.stderr)
+        self.assertIn(f"sha256 {twin}", refusal[0])
+        self.assertFalse([l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ") and self.SWAP_TARGET in l], proc.stdout)
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    # r2 (adversary pass 1, A4): the budget read's OTHER refusals (SPEC_READ_FAILED for a spec that vanished after the shape read) named no planned hash either.
+    def test_planned_hash_bind_r9_residue_r2_a4_a_legset_spec_deleted_before_the_budget_read_names_the_planned_hash(self) -> None:
+        delete = ("        if ($env:DVT_BUDGET_DELETE -and [IO.Path]::GetFileName([string]$e.specPath) -ceq $env:DVT_BUDGET_DELETE) { Remove-Item -LiteralPath ([string]$e.specPath) -Force }"
+                  "   # TEST FIXTURE: the spec vanishes after the shape read\n")
+        dv = self.mutated_runner([("Invoke-VenueLeaseBatch.ps1", self.BATCH_BUDGET_ANCHOR, delete + self.BATCH_BUDGET_ANCHOR),
+                                  ("Invoke-VenueLeaseBatch.ps1", self.BATCH_STOP_ANCHOR, self.BATCH_STOP)])
+        target = dv / "legs" / self.SWAP_TARGET
+        planned = hashlib.sha256(target.read_bytes()).hexdigest()
+        from datetime import datetime, timedelta, timezone
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fake = self.tmp / "batch-fake-script.ps1"
+        fake.write_text("exit 0\n", encoding="utf-8")
+        proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline],
+                        env_extra={"DVT_BUDGET_DELETE": self.SWAP_TARGET}, timeout=420)
+        self.assertFalse(target.exists(), "the fixture really deleted the planned spec")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertTrue(refusal[0].startswith("BATCH_USAGE SPEC_READ_FAILED "), refusal[0])
+        self.assertIn(f"planned_sha256={planned}", refusal[0], "old: the budget read's SPEC_READ_FAILED named no planned hash\n" + proc.stderr)
+        self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
+
+    def test_planned_hash_bind_r9_residue_b_a_legset_spec_cut_to_one_brace_before_the_budget_read_is_refused_with_the_planned_hash(self) -> None:
+        proc, planned, twin = self.budget_swap_run(b"{")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        refusal = [l for l in proc.stderr.splitlines() if l.startswith("BATCH_USAGE ")]
+        self.assertEqual(len(refusal), 1, proc.stderr)
+        self.assertTrue(refusal[0].startswith("BATCH_USAGE SPEC_CHANGED_AFTER_PREFLIGHT "), refusal[0])
+        self.assertIn(f"planned_sha256={planned}", refusal[0], proc.stderr)
+
 
 # ---------------------------------------------------------------------------------------------------
 # VENUE-QUIET-UNKNOWN-PROBE-FAILS-1: Wait-VenueQuiet.ps1 used to print `COOLDOWN_UNMET mean=UNKNOWN` and exit 0 when the venue probe was unavailable or failed, and
@@ -8326,12 +9056,14 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        for rel in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS, CPU_S1_HEAVY_UNPACED_LEG):
+        tearing = (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS,
+                   CPU_S1_HEAVY_UNPACED_LEG, *EVERY_FRAME_OLDEST_FIRST_LEGS)
+        for rel in tearing:
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.jsonschema.validate(spec, self.schema)
             self.assertGreaterEqual(len(spec.get("presentTearingExpectedReason", "")), 12, rel)
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name not in (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS, CPU_S1_HEAVY_UNPACED_LEG):
+            if "legs/" + path.name not in tearing:
                 self.assertNotIn("presentTearingExpectedReason", json.loads(path.read_text(encoding="utf-8")), path.name)
         leg = json.loads((DV / HEADROOM_LEGS[0]).read_text(encoding="utf-8"))
         paced = {k: v for k, v in leg["generatorArgs"].items() if k != "unpaced"}
@@ -8436,6 +9168,12 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertIn("legs/" + path.name, DRIFT_LEGS, path.name)
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1457-drift-(t(1|4|8|12|16)|t1-cool|t1-hot|pcore12|(t1|t1-cool|t1-hot|t16)-w10(-visual)?)-unpaced-fullscreen-s1$", path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
+                self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
+            elif spec["card"] == "EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1":   # the unpinned every-frame visual twin of the 1243 unpaced headroom leg
+                self.assertIn("legs/" + path.name, EVERY_FRAME_OLDEST_FIRST_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-everyframe-visual-unpaced-fullscreen-s1$", path.name)
                 self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
                 self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, path.name)
             elif spec["card"] == "CUDA-HEADROOM-UTIL-SAMPLER-1":   # the unpaced Cinematic utilisation-sampler leg (Look Assist forced on, the owner shape), named by cell
@@ -9565,15 +10303,19 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
     frozen-source-partial-unsaved (frames 0-4 over source A; frame 5 over source B was never saved; the app's record "differ"),
     frozen-source-partial-noviewport (the same, but frame 5 was saved without a viewport rectangle), frozen-source-partial-differ (frames 0-4 over
     five different sources; frame 5 never saved; "differ"), frozen-source-ids-only (frames 0-4 over five different sources; frame 5 never saved and
-    has no source id, so the app records nothing), frozen-upper-source-id (every source id in upper-case hex, which is not the app's form; "differ")."""
+    has no source id, so the app records nothing), frozen-upper-source-id (every source id in upper-case hex, which is not the app's form; "differ").
+    UNPACED-VISUAL-MIDPLAY-CAPTURE-1 mode held-end-frame, shaped like the saved L3 app-visual.json (every-frame unpaced CUDA leg a0fc462a): six forced play
+    captures (forced_paints_before 0..5) then six unforced (forced_paints_before 6), every play entry play_active with display_frame 479 and ONE source_id
+    (an unpaced Play held its last required frame through the tail), no source_difference record, and two distinct pictures among the unforced."""
     if dest.exists():
         shutil.rmtree(dest)
     dest.mkdir(parents=True)
     calls = []
+    held = mode == "held-end-frame"
     frozen = mode in ("frozen", "frozen-unknown", "frozen-identical", "frozen-partial", "frozen-upper-differ", "frozen-upper-identical", "noviewport",
                       "frozen-source-partial-unsaved", "frozen-source-partial-noviewport", "frozen-source-partial-differ", "frozen-source-ids-only",
-                      "frozen-upper-source-id")
-    paired = mode in ("paired-ok", "masked", "partial-freeze")
+                      "frozen-upper-source-id", "held-end-frame")
+    paired = mode in ("paired-ok", "masked", "partial-freeze", "held-end-frame")
     bound = mode in ("bound", "bound-paused-unbound", "bound-paused-missing")
     viewport = None if mode == "noviewport" else VIEWPORT
     source_difference = {"frozen": "differ", "frozen-partial": "differ", "frozen-identical": "identical",
@@ -9605,7 +10347,7 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
         calls.append(f"New-VisPng '{dest / f'play-{k}.png'}' {seed} {60 + k * 10} 0 ${'true' if mode == 'blank' else 'false'}")
         if paired:
             # (seed, bias): bias 30 marks a frame of the unforced half (later than every forced capture's frame); masked repeats forced play 5's paint
-            unforced_seed, unforced_bias = {"masked": (5, 0), "partial-freeze": (min(k, 2), 30)}.get(mode, (k, 30))
+            unforced_seed, unforced_bias = {"masked": (5, 0), "partial-freeze": (min(k, 2), 30), "held-end-frame": (1 if k < 3 else 2, 0)}.get(mode, (k, 30))
             calls.append(f"New-VisPng '{dest / f'play-unbound-{k}.png'}' {unforced_seed} {60 + k * 10} {unforced_bias} $false")
     if bound:
         calls.append(f"New-VisPng '{dest / 'stop-unbound.png'}' 5 120 40 $false")
@@ -9633,17 +10375,22 @@ def write_visual_captures(dest: Path, mode: str = "ok") -> None:
             for f in frames:
                 if f["kind"] in ("play", "play_unbound"):
                     f["source_id"] = f"{f['display_frame']:016x}"
+        if held:
+            # L3: the held end frame -- one display frame and one source id on every play capture, forced and unforced
+            for f in frames:
+                if f["kind"] in ("play", "play_unbound"):
+                    f.update({"display_frame": 479, "source_id": "da6d7160d64f797a"})
     if bound:
         frames.append({"kind": "stop_unbound", "index": 0, "file": "stop-unbound.png", "display_frame": 612, "serial": 912, "painted_serial": 911,
                        "painted_serial_valid": True, "label_bound": False, "label_bound_basis": "gl_viewport_paint", "play_active": False, "viewport": viewport,
                        "saved": True, "reason": ""})
-    stop = {"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""}
+    stop = {"kind": "stop", "index": 0, "file": "stop.png", "display_frame": 479 if held else 612, "play_active": False, "viewport": viewport, "saved": True, "reason": ""}
     if mode == "lagged" or bound:
         stop.update({"serial": 912, "painted_serial": 911 if mode == "lagged" else 912, "painted_serial_valid": True, "label_bound": bound})
     if bound:
         stop["label_bound_basis"] = "pixmap_item_by_construction"
     frames.append(stop)
-    paused = {"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 612, "settled": True, "settled_frame": 612, "play_active": False,
+    paused = {"kind": "paused", "index": 0, "file": "paused.png", "display_frame": 479 if held else 612, "settled": True, "settled_frame": 479 if held else 612, "play_active": False,
               "viewport": viewport, "saved": True, "reason": ""}
     if mode in ("bound", "bound-paused-unbound"):
         paused.update({"serial": 913, "painted_serial": 913 if mode == "bound" else 912, "painted_serial_valid": True, "label_bound": mode == "bound",
@@ -10541,8 +11288,25 @@ class VisualExposureFloorTests(unittest.TestCase):
         self.assertEqual(len(calls), 2, "the measured run's read and the self-heal pre-launch read")
         for call in calls:
             self.assertIn("-ClipId ([string]$spec.clipId)", call)
-        self.assertIn("'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE')) {", runner, "counted for speed and surfaced in the detail, like a divergence")
+        # (UNPACED-VISUAL-MIDPLAY-CAPTURE-1 appended NOT_A_MOTION_WITNESS to the same list: the pinned tail now ends with it)
+        self.assertIn("'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE', 'NOT_A_MOTION_WITNESS')) {", runner, "counted for speed and surfaced in the detail, like a divergence")
         self.assertNotIn("EXPOSURE_OUT_OF_RANGE", runner.split("elseif ($receipt.visual.verdict -cin")[0], "never an exclusion: the FROZEN_DISPLAY branch does not name it")
+
+    def test_the_visual_leg_runner_counts_and_surfaces_a_strip_that_is_no_motion_witness(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1: NOT_A_MOTION_WITNESS (every judged play frame carries one display frame: an unpaced Play held its last
+        required frame through the capture tail) is in the measured run's counted-and-surfaced list, never the FROZEN_DISPLAY exclusion, and the
+        self-heal pre-launch rule (anything but OK / EXPOSURE_OUT_OF_RANGE is INVALID) refuses it without naming it (fail closed)."""
+        runner = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        gate = re.search(r"\} elseif \(\$receipt\.visual\.verdict -cin @\(([^)]*)\)\) \{", runner)
+        self.assertIsNotNone(gate, "the counted-and-surfaced -cin list of the measured run's visual gate")
+        self.assertIn("'NOT_A_MOTION_WITNESS'", re.findall(r"'[A-Z_]+'", gate.group(1)))
+        self.assertNotIn("NOT_A_MOTION_WITNESS", runner.split("elseif ($receipt.visual.verdict -cin")[0], "counted: the FROZEN_DISPLAY exclusion does not name it")
+        self.assertIn("$detail += \"; $($receipt.visual.verdict) (counted for speed, surfaced for review): $($receipt.visual.reason)\"", runner)
+        self.assertIn("elseif ([string]$entry.verdict -cne 'OK' -and [string]$entry.verdict -cne 'EXPOSURE_OUT_OF_RANGE') {", runner,
+                      "a self-heal pre-launch held on one frame is INVALID through the generic rule")
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        self.assertIn("| `NOT_A_MOTION_WITNESS` |", doc)
+        self.assertIn("UNPACED-VISUAL-TAIL-HOLD-RELEASE-1", doc)
 
     DARK_PNG_PS = r"""
 Add-Type -AssemblyName System.Drawing
@@ -10911,7 +11675,9 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
     def test_the_visual_gate_freezes_diverges_and_blanks_only_on_its_own_evidence(self) -> None:
         rows = [  # requested, captured, play, distinct, appDistinct, flat, mad, samePosition -> verdict, counted
             ("$true", "$true", 6, 6, 6, 0, "2.0", "$true", "OK", True),
-            ("$true", "$true", 6, 1, 1, 0, "2.0", "$true", "OK", True),            # the app itself presented one frame: a stall, not a frozen display
+            # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: this row read OK, which encoded the defect: one display frame across the play frames is no motion witness
+            # (an unpaced Play holds its last required frame through the capture tail: every L3/L4/L5 play capture carried display frame 479)
+            ("$true", "$true", 6, 1, 1, 0, "2.0", "$true", "NOT_A_MOTION_WITNESS", True),
             ("$true", "$true", 6, 1, 6, 6, "$null", "$false", "CAPTURE_BLANK", True),
             ("$true", "$true", 6, 6, 6, 0, "30.0", "$true", "VISUAL_DIVERGENCE", True),
             ("$true", "$true", 6, 6, 6, 0, "30.0", "$false", "OK", True),           # not the same timeline position: the difference judges nothing
@@ -10953,12 +11719,367 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
                                   "-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true | ConvertTo-Json -Compress")
         self.assertEqual((proc.returncode, out["verdict"]), (0, "FROZEN_DISPLAY_SUSPECTED"), "ViewportUnavailablePlayFrames defaults to 0")
 
-    def visual_verdict(self, src, play, unavailable, distinct, repeats=None, extra=""):
+    def test_the_visual_gate_says_not_a_motion_witness_when_the_play_frames_carry_one_display_frame(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1: an unpaced Play holds its last required frame through the capture tail (MainWindow.cpp playbackHandling,
+        pinnedUnpacedHoldReached), so all 12 play captures of the every-frame CUDA legs carried display_frame 479 and the gate fell through to OK. Fewer than
+        two distinct display frames across the judged play frames is NOT_A_MOTION_WITNESS (counted, surfaced), whatever the source difference and the
+        number of pictures; two display frames judge as before."""
+        rows = [  # source difference, distinct pictures, app distinct display frames -> verdict
+            ("known-differ", 1, 1, "NOT_A_MOTION_WITNESS"), ("known-differ", 2, 1, "NOT_A_MOTION_WITNESS"),
+            ("unknown", 1, 1, "NOT_A_MOTION_WITNESS"), ("unknown", 2, 1, "NOT_A_MOTION_WITNESS"),
+            ("known-identical", 1, 1, "NOT_A_MOTION_WITNESS"), ("known-identical", 2, 1, "NOT_A_MOTION_WITNESS"),
+            (None, 2, 1, "NOT_A_MOTION_WITNESS"),
+            ("known-differ", 1, 0, "NOT_A_MOTION_WITNESS"), ("unknown", 2, 0, "NOT_A_MOTION_WITNESS"), ("known-identical", 6, 0, "NOT_A_MOTION_WITNESS"),
+            # two display frames: unchanged
+            ("known-differ", 1, 2, "FROZEN_DISPLAY"), ("unknown", 1, 2, "FROZEN_DISPLAY_SUSPECTED"), ("known-identical", 1, 2, "OK"),
+            ("known-differ", 2, 2, "OK"), ("unknown", 2, 2, "OK"),
+        ]
+        for src, distinct, app, verdict in rows:
+            with self.subTest(source=src, distinct=distinct, app=app):
+                out = self.visual_verdict(src, 6, 0, distinct, app=app)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, verdict != "FROZEN_DISPLAY"), out["reason"])
+                if verdict == "NOT_A_MOTION_WITNESS":
+                    self.assertIn(f"({distinct} distinct picture(s) among them), so they cannot witness motion during playback", out["reason"])
+                    if src in ("known-differ", "known-identical"):
+                        # R1C-REASON-RESIDUE-1 (sol r1c A2): a known source difference needs two distinct display frame numbers, so beside fewer than two the
+                        # tuple disagrees and the reason claims neither "none" nor "all one number"
+                        self.assertTrue(out["reason"].startswith("the 6 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                                 "on how many carry a valid one)"), out["reason"])
+                        self.assertNotIn("none of the", out["reason"])
+                        self.assertNotIn("are all", out["reason"])
+                    else:
+                        self.assertIn("none of the 6 judged play frames carries a valid display frame number" if app == 0
+                                      else "the valid display frame numbers among the 6 judged play frames are all one display frame number: one display frame number "
+                                           "across them at most", out["reason"])
+                    self.assertNotIn("the strip shows", out["reason"], "r1 adversary A1: the reason speaks of the judged frames, never of the whole strip")
+                    self.assertNotIn("they show", out["reason"], "r1 adversary pass 2 A1: the labels carry a number; the pictures are not claimed to show one")
+                    self.assertNotIn("timeline position", out["reason"], "r1 adversary pass 3 A2: one number is not one timeline position (no clip token)")
+        # the reason quotes the one frame when the caller names it (the reader does); a value that is not a frame number is not quoted
+        out = self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 479 ")
+        self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS")
+        self.assertIn("the valid display frame numbers among the 6 judged play frames are all display frame number 479: one display frame number across them at most "
+                      "(2 distinct picture(s) among them)", out["reason"])
+        self.assertIn("are all one display frame number", self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 1.5 ")["reason"])
+        out = self.visual_verdict("unknown", 6, 0, 2, app=1, extra="-SoleDisplayFrame 479 -LabelledPlayFrames 6 ")
+        self.assertIn("all 6 judged play frames carry display frame number 479: one display frame number across them (2 distinct", out["reason"])
+        # r1 adversary A1: when only some judged frames carry a frame number, the reason says how many, never "all"
+        out = self.visual_verdict("unknown", 2, 0, 2, app=1, extra="-SoleDisplayFrame 479 -LabelledPlayFrames 1 ")
+        self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS")
+        self.assertIn("1 of the 2 judged play frames carry display frame number 479 and the other 1 carry no valid display frame number: one display frame number "
+                      "across them at most", out["reason"])
+        self.assertNotIn("all 2", out["reason"])
+        # r1 adversary pass 2 A2: a count that is not a whole number in 1..PlayFrames is not known, never "all", never "-1 of", never a throw.
+        # r1 adversary pass 3 A3 (its input verbatim): -LabelledPlayFrames 0 beside one declared display frame contradicts it, so it is not known either:
+        # on 59b7ceee the reason said "0 of the 2 judged play frames are labelled display frame 479 and the other 2 carry no valid display frame label".
+        # (the "0" case moved to the r2 test below: sol r1c pass A1 says a VALID zero beside one declared display frame is a disagreement, not "not known")
+        for bad in ("$null", "-1", "1.5", "2147483648", "3", "'1'"):
+            with self.subTest(labelled=bad):
+                out = self.visual_verdict("unknown", 2, 0, 2, app=1, extra=f"-SoleDisplayFrame 479 -LabelledPlayFrames {bad} ")
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                self.assertTrue(out["reason"].startswith("the valid display frame numbers among the 2 judged play frames are all display frame number 479: one display "
+                                                         "frame number across them at most"), out["reason"])
+                self.assertNotIn(" of the 2", out["reason"])
+
+    IMPOSSIBLE_REPEAT_LEAD = "the repeat count supplied for the 6 judged play frames cannot be true for them and is not quoted: it establishes no repeat and no cause"
+
+    def test_the_visual_gate_never_quotes_a_count_that_cannot_be_true_as_observed_evidence(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R3-KEY-RESIDUE-1 (sol r3 blocker; opus VISUAL-GATE-DISTINCT-HASHES-RANGE-1): Get-DvVisualVerdict is exported, so a
+        caller can hand it a tuple no judged set produces. The CONTRACT is "omit": the verdict is what it was, and a count outside what the judged set allows
+        (distinct pictures outside 1..PlayFrames, distinct display frames over PlayFrames or negative, repeats over PlayFrames, a negative play-frame count) is
+        left out of the reason, never quoted as observed. On 57023f59 the sol repro read '(3 distinct picture(s) among them)' beside 2 judged frames and
+        the -1 one quoted '-1'. Production derives every count from the judged set (Read-DvVisualCaptures), so none of these is reachable there."""
+        # sol's repro (verbatim) and the opus one: 3 and -1 distinct pictures over 2 judged frames
+        for bad in ("3", "-1", "0", "7"):
+            with self.subTest(distinct=bad):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 2 -DistinctContentHashes {bad} -AppDistinctDisplayFrames 1 "
+                                          "-FlatPlayFrames 0 | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True), "the verdict is unchanged")
+                self.assertNotIn("distinct picture", out["reason"], out["reason"])
+                self.assertNotIn(bad, out["reason"].replace("2 judged", "").replace("the 2", ""), out["reason"])
+                self.assertIn("so they cannot witness motion during playback", out["reason"])
+        # a count the judged set can produce is still quoted (1..PlayFrames)
+        for good in ("1", "2"):
+            out = self.visual_verdict("unknown", 2, 0, int(good), app=1)
+            self.assertIn(f"({good} distinct picture(s) among them), so they cannot witness", out["reason"])
+        # a negative distinct-display-frame count is not "none carry a number": it establishes nothing, and is never quoted
+        for app in ("-1", "-7"):
+            with self.subTest(app=app):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames {app} "
+                                          "-FlatPlayFrames 0 | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                self.assertNotIn(app, out["reason"])
+                self.assertNotIn("none of the", out["reason"])
+                self.assertIn("the 4 judged play frames do not establish two distinct display frame numbers (2 distinct picture(s) among them)", out["reason"])
+        # the frozen verdicts quote the app's distinct-frame count only when it fits the judged frames
+        for src, verdict in (("known-differ", "FROZEN_DISPLAY"), ("unknown", "FROZEN_DISPLAY_SUSPECTED")):
+            out = self.visual_verdict(src, 2, 0, 1, app=9)
+            self.assertEqual(out["verdict"], verdict, out["reason"])
+            self.assertIn("the app presented a distinct-frame count that cannot be true for them and is not quoted across them", out["reason"])
+            self.assertNotIn("9", out["reason"])
+            out = self.visual_verdict(src, 6, 0, 1, app=2)
+            self.assertIn("the app presented 2 distinct frames across them", out["reason"])
+        # a repeat count over the judged frames is not quoted
+        out = self.visual_verdict("known-differ", 6, 0, 3, repeats=9)
+        self.assertEqual(out["verdict"], "PARTIAL_FREEZE", out["reason"])
+        self.assertTrue(out["reason"].startswith(self.IMPOSSIBLE_REPEAT_LEAD), out["reason"])
+        out = self.visual_verdict("known-differ", 6, 0, 3, repeats=3)
+        self.assertTrue(out["reason"].startswith("3 of the 6 judged play frames repeat"), out["reason"])
+        # adversary pass 1 A1 (its input verbatim): N frames over D distinct pictures hold at most N - D adjacent repeats, so 4 repeats over 6 frames and 3
+        # pictures (and 6 repeats over 6 frames) cannot be true; on 7f07a3e7 the reason read '4 of the 6 judged play frames repeat'. The verdict is unchanged.
+        for distinct, repeats in ((3, 4), (3, 6), (6, 2), (2, 5), (9, 6), (0, 6)):
+            with self.subTest(distinct=distinct, repeats=repeats):
+                out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertTrue(out["reason"].startswith(self.IMPOSSIBLE_REPEAT_LEAD), out["reason"])
+        # adversary pass 2 A1 (its input verbatim): 2 frames over 2 pictures hold no repeat at all, so "two or more of them repeat" is the same impossible claim in
+        # words; the reason says the supplied count cannot be true and speaks of what was SUPPLIED
+        out = self.visual_verdict("known-differ", 2, 0, 2, app=2, repeats=2)
+        self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+        self.assertTrue(out["reason"].startswith("the repeat count supplied for the 2 judged play frames cannot be true for them and is not quoted: it establishes no repeat"), out["reason"])
+        self.assertNotIn("two or more", out["reason"])
+        # R1C-REASON-RESIDUE-1 (sol r1c A1, its input verbatim): the impossible count supports neither an observed repeat nor the freeze diagnosis; the verdict
+        # and counted stay. Red on cda3ba8d: "as supplied, they repeat the picture before them ... the display's own paint stopped landing for part of the tail"
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 2 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -FlatPlayFrames 0 "
+                                  "-SourceDifference known-differ -RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+        self.assertIn("cannot be true for them", out["reason"])
+        for claim in ("as supplied", "they repeat", "stopped landing", "label advanced", "paint"):
+            self.assertNotIn(claim, out["reason"], out["reason"])
+        # every impossible repeat count says nothing about repeats or a cause; a possible one still does
+        for distinct, repeats in ((3, 4), (3, 6), (6, 2), (2, 5), (9, 6), (0, 6)):
+            out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+            self.assertNotIn("stopped landing", out["reason"], out["reason"])
+            self.assertNotIn("as supplied", out["reason"], out["reason"])
+            self.assertNotIn("repeat the picture", out["reason"], out["reason"])
+        self.assertIn("the display's own paint stopped landing for part of the tail", self.visual_verdict("known-differ", 6, 0, 3, repeats=3)["reason"])
+        # R1C-REASON-RESIDUE-1 (sol r1c A2, its inputs verbatim): AppDistinctDisplayFrames 0 (or omitted) beside a known source difference (either value) or a
+        # repeat count disagrees with itself: the verdict stays, the reason never says "none of the 2 judged play frames carries a valid display frame number"
+        for label, args in (("known-differ", "-AppDistinctDisplayFrames 0 -SourceDifference known-differ"),
+                            ("known-identical", "-AppDistinctDisplayFrames 0 -SourceDifference known-identical"),
+                            ("omitted app", "-SourceDifference known-differ"),
+                            ("unknown+repeat", "-AppDistinctDisplayFrames 0 -SourceDifference unknown -RepeatedPlayFrames 1"),
+                            ("app 1 known-differ", "-AppDistinctDisplayFrames 1 -SourceDifference known-differ"),
+                            ("app 1 repeat", "-AppDistinctDisplayFrames 1 -RepeatedPlayFrames 1")):
+            with self.subTest(a2=label):
+                proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 2 -DistinctContentHashes 1 -FlatPlayFrames 0 "
+                                          f"{args} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                for claim in ("none of the", "carries a valid display frame number", "are all"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+                self.assertTrue(out["reason"].startswith("the 2 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                         "on how many carry a valid one) (1 distinct picture(s) among them)"), out["reason"])
+        # the consistent unknown-source zero still says none
+        # adversary pass 2 A2 (its input verbatim): -AppDistinctDisplayFrames omitted (it binds to 0) or 0 beside a sole frame number / a labelled count: the
+        # tuple disagrees with itself, so the reason never says "none of the 6 ... carries a valid display frame number"
+        for app_arg in ("", "-AppDistinctDisplayFrames 0 "):
+            for extra in ("-SoleDisplayFrame 479 -LabelledPlayFrames 6 ", "-SoleDisplayFrame 479 ", "-LabelledPlayFrames 3 "):
+                with self.subTest(app=app_arg, extra=extra):
+                    proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -FlatPlayFrames 0 "
+                                              f"{app_arg}{extra}| ConvertTo-Json -Compress")
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                    self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                    self.assertNotIn("none of the", out["reason"])
+                    self.assertTrue(out["reason"].startswith("the 6 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                             "on how many carry a valid one) (1 distinct picture(s) among them)"), out["reason"])
+        # the consistent zero still says none (no sole frame, no labelled count)
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -FlatPlayFrames 0 | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("none of the 6 judged play frames carries a valid display frame number"), out["reason"])
+        for distinct, repeats in ((2, 4), (6, 0), (9, 4), (0, 4)):
+            if repeats >= 2:
+                with self.subTest(distinct=distinct, repeats=repeats, quoted=True):
+                    out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+                    self.assertTrue(out["reason"].startswith(f"{repeats} of the 6 judged play frames repeat"), out["reason"])
+        # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (sol r4 B1 = key3 r4 B1): this branch is reached only with a known source difference, two or more app frames and a picture
+        # count other than 1 (1 would be FROZEN_DISPLAY), so a real judged set holds at least two pictures and at most PlayFrames - 2 repeats. With the picture count
+        # out of range the bound is therefore 4 here, and 5 repeats (the old PlayFrames - 1 fallback) is withheld like any other impossible count.
+        for distinct, repeats in ((9, 5), (0, 5)):
+            with self.subTest(distinct=distinct, repeats=repeats, quoted=False):
+                out = self.visual_verdict("known-differ", 6, 0, distinct, repeats=repeats)
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertTrue(out["reason"].startswith(self.IMPOSSIBLE_REPEAT_LEAD), out["reason"])
+        # a negative judged-frame count is worded as unknown (the early verdicts are unchanged)
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames -1 -DistinctContentHashes 0 -AppDistinctDisplayFrames 0 -FlatPlayFrames 0 "
+                                  "| ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["reason"]), ("NOT_CAPTURED", "only an unknown number of play frame(s) were captured"))
+        proc, out = run_pwsh_json("Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames -1 -DistinctContentHashes 0 -AppDistinctDisplayFrames 0 -FlatPlayFrames 0 "
+                                  "-ViewportUnavailablePlayFrames 3 | ConvertTo-Json -Compress")
+        self.assertEqual(out["verdict"], "VISUAL_ASSESSMENT_UNAVAILABLE")
+        self.assertNotIn("-1", out["reason"])
+
+    def test_the_visual_gate_never_reads_an_impossible_tuple_as_an_observed_repeat_or_source_claim(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (sol r4 B1 = key3 opus r4 B1, their inputs verbatim; key3 r4 H1). DEFECT_CLASS: an
+        impossible count quoted as observed evidence or cause. The verdict and counted stay; the reason withholds the repeat observation, the cause and the source claim.
+        Red on ba4f45d4: (a)/(b) read '5 of the 6 judged play frames repeat ... the display's own paint stopped landing for part of the tail' beside 0 or 9 distinct
+        pictures, (c) read '2 of the 4 ... repeat' beside an app count of 5 over 4 judged frames, H1 read '... and the source frames are known to differ' beside an app
+        count the same reason had just called impossible."""
+        base = "Get-DvVisualVerdict -Requested $true -Captured $true -FlatPlayFrames 0 "
+        cases = [
+            ("a", "-PlayFrames 6 -DistinctContentHashes 0 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 -SourceDifference known-differ"),
+            ("b", "-PlayFrames 6 -DistinctContentHashes 9 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 -SourceDifference known-differ"),
+            ("c", "-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 5 -LabelledPlayFrames 4 -RepeatedPlayFrames 2 -SourceDifference known-differ"),
+            ("c-no-labelled", "-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 5 -RepeatedPlayFrames 2 -SourceDifference known-differ"),
+        ]
+        for name, args in cases:
+            with self.subTest(case=name):
+                proc, out = run_pwsh_json(f"{base}{args} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertIn("cannot be true for them", out["reason"])
+                for claim in ("of the 6 judged play frames repeat", "of the 4 judged play frames repeat", "as supplied", "they repeat", "stopped landing", "label advanced",
+                              "paint", "known to differ"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+        # the bound is PlayFrames - 2 when the picture count cannot be true (two or more pictures are there): 4 of 6 is still quoted, 5 of 6 is not
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 0 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 4 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("4 of the 6 judged play frames repeat"), out["reason"])
+        # a tuple that fits (two pictures over four labelled frames, an app count of four) is quoted as before
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 4 -LabelledPlayFrames 4 -RepeatedPlayFrames 2 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("2 of the 4 judged play frames repeat"), out["reason"])
+        # key3 r4 H1 (its input verbatim): FROZEN_DISPLAY must not say the source frames are known to differ beside an app count it has just called impossible
+        for labelled in ("-LabelledPlayFrames 2 ", ""):
+            with self.subTest(h1_labelled=labelled):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 2 -DistinctContentHashes 1 -AppDistinctDisplayFrames 3 {labelled}-SourceDifference known-differ | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+                self.assertIn("a distinct-frame count that cannot be true for them and is not quoted", out["reason"])
+                self.assertNotIn("known to differ", out["reason"])
+                self.assertNotIn("3 distinct", out["reason"])
+        # ... and a count that fits still says it
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 2 -DistinctContentHashes 1 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 2 -SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertIn("the app presented 2 distinct frames across them and the source frames are known to differ", out["reason"])
+        # adversary pass 1 A1 (its input verbatim): the same class on the whole-freeze and waiver branches, which return before the repeat count is looked at. 6 repeats
+        # over 6 judged frames cannot be true (an adjacent repeat needs a predecessor: at most 5), so a source claim beside it is not quoted either; the verdict stays.
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 6 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+        self.assertNotIn("known to differ", out["reason"])
+        self.assertIn("the source difference supplied beside a repeat count they cannot hold is not quoted", out["reason"])
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 6 "
+                                  "-SourceDifference known-identical | ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["counted"]), ("OK", True), out["reason"])
+        self.assertIsNone(out["reason"], "no static-clip waiver text beside a repeat count the judged frames cannot hold")
+        # adversary pass 2 A1 (its input verbatim): a NEGATIVE repeat count cannot be true either (the guard checked only the upper bound)
+        for repeats in ("-1", "-2147483648"):
+            with self.subTest(negative_repeats=repeats):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames {repeats} "
+                                          "-SourceDifference known-differ | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+                self.assertNotIn("known to differ", out["reason"])
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames {repeats} "
+                                          "-SourceDifference known-identical | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("OK", True), out["reason"])
+                self.assertIsNone(out["reason"])
+        # a repeat count the frames can hold (5 of 6 over one picture) keeps both claims
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertIn("the source frames are known to differ", out["reason"])
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 "
+                                  "-SourceDifference known-identical | ConvertTo-Json -Compress")
+        self.assertIn("the app records the source frames as identical", out["reason"])
+
+    def test_the_visual_gate_reason_never_outruns_the_labelled_frame_count(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R1C-REASON-RESIDUE-1 r2 (sol r1c pass A1-A3, their inputs verbatim): -LabelledPlayFrames is how many judged frames carry
+        a valid label. A valid zero beside one declared display frame disagrees (A1); L labelled frames hold at most L - 1 repeats (A2); L labelled frames hold at
+        most L distinct labels, so a larger distinct-label count is not quoted (A3). The verdict and counted never change; only the reason abstains."""
+        base = "Get-DvVisualVerdict -Requested $true -Captured $true -FlatPlayFrames 0 "
+        # A1 (and -SoleDisplayFrame absent): "all valid labels are frame 479" over no valid label
+        for extra in ("-SoleDisplayFrame 479 ", ""):
+            with self.subTest(a1=extra):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 1 {extra}-LabelledPlayFrames 0 | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True))
+                self.assertTrue(out["reason"].startswith("the 4 judged play frames do not establish two distinct display frame numbers (the counts supplied disagree "
+                                                         "on how many carry a valid one)"), out["reason"])
+                for claim in ("are all", "479", "none of the", "carry display frame number"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+        # A2: two labelled frames hold one adjacent pair at most, so two repeats cannot be true; the verdict stays PARTIAL_FREEZE
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 2 -SourceDifference known-differ "
+                                  "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+        self.assertIn("cannot be true for them", out["reason"])
+        for claim in ("as supplied", "they repeat", "stopped landing", "label advanced", "paint"):
+            self.assertNotIn(claim, out["reason"], out["reason"])
+        for labelled in (0, 1):
+            proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames {labelled} -SourceDifference known-differ "
+                                      "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+            self.assertTrue(out["reason"].startswith("the repeat count supplied"), out["reason"])
+        # ... while a repeat count the labelled frames can hold still speaks (all 4 labelled hold 3 repeats; a known source difference needs every frame labelled)
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 4 -SourceDifference known-differ "
+                                  "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+        self.assertTrue(out["reason"].startswith("2 of the 4 judged play frames repeat"), out["reason"])
+        # A3: one labelled frame cannot show two distinct labels; every source value and the known-identical waiver
+        for src, verdict, counted in (("unknown", "FROZEN_DISPLAY_SUSPECTED", True), ("known-differ", "FROZEN_DISPLAY", False), ("known-identical", "OK", True)):
+            with self.subTest(a3=src):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 1 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 1 -SourceDifference {src} | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, counted), out["reason"])
+                reason = out["reason"] or ""
+                self.assertNotIn("2 distinct frames", reason)
+                self.assertNotIn("the app records the source frames as identical", reason)   # the waiver's own words ("a static clip" is also the SUSPECTED boilerplate)
+                if verdict != "OK":
+                    self.assertIn("a distinct-frame count that cannot be true for them and is not quoted", reason)
+        # a tuple that fits is still quoted
+        out = self.visual_verdict("unknown", 4, 0, 1, app=2, extra="-LabelledPlayFrames 4 ")
+        self.assertIn("the app presented 2 distinct frames across them", out["reason"])
+        # sol r1c pass 2 A1 (its input verbatim, and the app 2 variant it names): a known source difference needs a label on EVERY judged frame, so beside 3 labelled
+        # of 4 the reason claims no repeat, no known source difference and no cause (verdict and counted unchanged)
+        for app in (4, 2):
+            with self.subTest(pass2_a1=app):
+                proc, out = run_pwsh_json(f"{base}-PlayFrames 4 -DistinctContentHashes 2 -AppDistinctDisplayFrames {app} -LabelledPlayFrames 3 -SourceDifference known-differ "
+                                          "-RepeatedPlayFrames 2 | ConvertTo-Json -Compress")
+                self.assertEqual((out["verdict"], out["counted"]), ("PARTIAL_FREEZE", True), out["reason"])
+                self.assertTrue(out["reason"].startswith("the repeat count and source difference supplied for the 4 judged play frames disagree with the 3 labelled"), out["reason"])
+                for claim in ("2 of the 4", "repeat the picture", "known to differ", "stopped landing", "label advanced"):
+                    self.assertNotIn(claim, out["reason"], out["reason"])
+        out = self.visual_verdict("known-differ", 4, 0, 1, app=2, extra="-LabelledPlayFrames 3 ")
+        self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+        self.assertNotIn("are known to differ", out["reason"])
+        self.assertIn("disagrees with the 3 labelled of the 4 judged frames", out["reason"])
+        # every judged frame labelled: the source difference is quoted as before
+        out = self.visual_verdict("known-differ", 4, 0, 1, app=2, extra="-LabelledPlayFrames 4 ")
+        self.assertIn("the source frames are known to differ", out["reason"])
+
+    def test_the_visual_gate_ranks_not_a_motion_witness_after_blank_and_before_the_paused_and_exposure_verdicts(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 precedence: NOT_REQUESTED, VISUAL_ASSESSMENT_UNAVAILABLE, NOT_CAPTURED and CAPTURE_BLANK outrank it; it outranks
+        CAPTURE_UNBOUND, VISUAL_DIVERGENCE, EXPOSURE_OUT_OF_RANGE and PARTIAL_FREEZE (each shown winning with two display frames)."""
+        band = "-ExposureBand ([pscustomobject]@{ minMedianLuma = 20; maxMedianLuma = 220; maxNearBlackFraction = 0.5; maxClippedFraction = 0.01 }) "
+        dark = "-ExposureMedianLuma 3.0 -ExposureMedianNearBlackFraction 0.9 -ExposureMedianClippedFraction 0.0 " + band
+        cases = [  # (description, command tail, app distinct display frames, expected)
+            ("blank outranks", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 1 -FlatPlayFrames 6", 1, "CAPTURE_BLANK"),
+            ("not captured outranks", "-Requested $true -Captured $true -PlayFrames 1 -DistinctContentHashes 1 -FlatPlayFrames 0", 1, "NOT_CAPTURED"),
+            ("not captured, nothing saved", "-Requested $true -Captured $false -PlayFrames 0 -DistinctContentHashes 0 -FlatPlayFrames 0", 0, "NOT_CAPTURED"),
+            ("unavailable outranks", "-Requested $true -Captured $true -PlayFrames 1 -DistinctContentHashes 1 -FlatPlayFrames 0 -ViewportUnavailablePlayFrames 5", 1,
+             "VISUAL_ASSESSMENT_UNAVAILABLE"),
+            ("not requested outranks", "-Requested $false -Captured $false -PlayFrames 0 -DistinctContentHashes 0 -FlatPlayFrames 0", 0, "NOT_REQUESTED"),
+            ("outranks unbound", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -LabelBound $false -PausedLabelBound $true", 1,
+             "NOT_A_MOTION_WITNESS"),
+            ("unbound with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -LabelBound $false -PausedLabelBound $true", 2,
+             "CAPTURE_UNBOUND"),
+            ("outranks divergence", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 30 -SamePosition $true -Threshold 6", 1,
+             "NOT_A_MOTION_WITNESS"),
+            ("divergence with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 30 -SamePosition $true -Threshold 6", 2,
+             "VISUAL_DIVERGENCE"),
+            ("outranks exposure", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 " + dark, 1, "NOT_A_MOTION_WITNESS"),
+            ("exposure with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 2 -FlatPlayFrames 0 " + dark, 2, "EXPOSURE_OUT_OF_RANGE"),
+            ("outranks partial freeze", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 3 -FlatPlayFrames 0 -SourceDifference known-differ -RepeatedPlayFrames 3", 1,
+             "NOT_A_MOTION_WITNESS"),
+            ("partial freeze with two frames", "-Requested $true -Captured $true -PlayFrames 6 -DistinctContentHashes 3 -FlatPlayFrames 0 -SourceDifference known-differ -RepeatedPlayFrames 3", 2,
+             "PARTIAL_FREEZE"),
+        ]
+        for name, tail, app, verdict in cases:
+            with self.subTest(name):
+                proc, out = run_pwsh_json(f"Get-DvVisualVerdict {tail} -AppDistinctDisplayFrames {app} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertEqual((out["verdict"], out["counted"]), (verdict, True), out["reason"])
+
+    def visual_verdict(self, src, play, unavailable, distinct, repeats=None, extra="", app=6):
         """One Get-DvVisualVerdict call over `play` judged (viewport) play frames; src None omits -SourceDifference (the default); repeats None omits
-        -RepeatedPlayFrames (the default, 0)."""
+        -RepeatedPlayFrames (the default, 0); app is -AppDistinctDisplayFrames (6 unless a row says otherwise)."""
         src_arg = f"-SourceDifference {src} " if src else ""
         repeats_arg = f"-RepeatedPlayFrames {repeats} " if repeats is not None else ""
-        proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames 6 "
+        proc, out = run_pwsh_json(f"Get-DvVisualVerdict -Requested $true -Captured $true -PlayFrames {play} -DistinctContentHashes {distinct} -AppDistinctDisplayFrames {app} "
                                   f"-FlatPlayFrames 0 -PlayVsPausedMeanAbsDiff 2.0 -SamePosition $true {src_arg}{repeats_arg}{extra}-ViewportUnavailablePlayFrames {unavailable} | ConvertTo-Json -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return out
@@ -10983,6 +12104,10 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         # more repeats is the partial one
         ("PARTIAL_FREEZE", "FROZEN_DISPLAY"): [("known-differ", 6, 0, 1, 5, "FROZEN_DISPLAY"), ("known-differ", 6, 0, 3, 3, "PARTIAL_FREEZE"),
                                                ("known-differ", 5, 1, 2, 2, "PARTIAL_FREEZE")],
+        # UNPACED-VISUAL-MIDPLAY-CAPTURE-1 (rows add repeats, extra, app distinct display frames): one picture over a known-differ source is FROZEN_DISPLAY
+        # only while the app presented two or more frames; on one display frame it is no motion witness (disjoint, so the display-frame count decides)
+        ("NOT_A_MOTION_WITNESS", "FROZEN_DISPLAY"): [("known-differ", 6, 0, 1, None, "", 1, "NOT_A_MOTION_WITNESS"), ("known-differ", 6, 0, 1, None, "", 2, "FROZEN_DISPLAY"),
+                                                     ("known-differ", 6, 0, 1, None, "", 0, "NOT_A_MOTION_WITNESS")],
     }
 
     def test_every_new_visual_verdict_is_paired_with_every_excluding_verdict(self) -> None:
@@ -10990,7 +12115,7 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         body = text[text.index("function Get-DvVisualVerdict {"):text.index("function New-DvVisualStrip {")]
         excluding = set(re.findall(r"verdict = '([A-Z_]+)'; counted = \$false", body))
         self.assertTrue(excluding, "the verdict function names no counted = $false verdict (the pairing check lost its subject)")
-        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE", "PARTIAL_FREEZE"):
+        for new in ("FROZEN_DISPLAY_SUSPECTED", "VISUAL_ASSESSMENT_UNAVAILABLE", "PARTIAL_FREEZE", "NOT_A_MOTION_WITNESS"):
             for ex in sorted(excluding):
                 with self.subTest(new=new, excluding=ex):
                     rows = self.NEW_VISUAL_VERDICT_PAIRINGS.get((new, ex))
@@ -11181,6 +12306,252 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
             self.assertEqual((out["frozenJudgedOn"], out["forcedPlayDistinctContentHashes"]), ("play", None),
                              "a build without unforced play captures is judged on its play captures, as before")
             self.assertNotIn("playForcedUnforcedDifferFrames", out)
+
+    @requires_windows_imaging
+    def test_the_visual_reader_says_not_a_motion_witness_for_a_held_end_frame(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1: the saved L3 shape (every play capture at display_frame 479 over one source id, two pictures among the six
+        judged unforced ones) read OK on c6ec83ae; it is NOT_A_MOTION_WITNESS, counted, and the reason names the six judged frames and frame 479. The
+        moving fixtures stay OK."""
+        with tempfile.TemporaryDirectory(prefix="vis-held-") as d:
+            _, out = self.read_visual_mode("held-end-frame", d)
+        self.assertEqual((out["verdict"], out["counted"]), ("NOT_A_MOTION_WITNESS", True), out["reason"])
+        self.assertEqual((out["frozenJudgedOn"], out["playFrames"], out["appDistinctDisplayFrames"], out["distinctContentHashes"]), ("play_unbound", 6, 1, 2))
+        self.assertEqual(out["observerPaintedPlayFrames"], 0)
+        self.assertTrue(out["reason"].startswith("all 6 judged play frames carry display frame number 479: one display frame number across them "
+                                                 "(2 distinct picture(s) among them)"), out["reason"])
+        self.assertNotIn("timeline position", out["reason"])
+        for mode in ("ok", "paired-ok"):
+            with self.subTest(mode), tempfile.TemporaryDirectory(prefix=f"vis-{mode}-") as d:
+                _, out = self.read_visual_mode(mode, d)
+                self.assertEqual(out["verdict"], "OK", out["reason"])
+                self.assertGreaterEqual(out["appDistinctDisplayFrames"], 2)
+
+    @requires_windows_imaging
+    def test_the_visual_reader_says_only_what_the_judged_frames_establish_when_no_motion_is_witnessed(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r1 adversary A1 (introduced, major): the held-end-frame shape with (a) only unforced 0 and 3 kept and unforced 3's
+        display_frame -1 (the app writes -1 without a valid present context): the r1 reason said both carry frame 479; (b) both labels -1: it said the strip shows
+        one timeline position, when no judged frame names one; (c) all six unforced at 479 but the forced tiles at 467..477: it described the whole strip, whose
+        forced tiles move. Each is still NOT_A_MOTION_WITNESS; the reason now says only what the judged frames establish."""
+        def read(edit):
+            with tempfile.TemporaryDirectory(prefix="vis-held-a1-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", "held-end-frame")
+                vj = art / "visual" / "visual.json"
+                visual = json.loads(vj.read_text(encoding="utf-8"))
+                edit(visual)
+                vj.write_text(json.dumps(visual), encoding="utf-8")
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                          "| ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                return out
+
+        def keep_two(labels):
+            def edit(visual):
+                visual["frames"] = [f for f in visual["frames"] if f["kind"] != "play_unbound" or f["index"] in (0, 3)]
+                for f in visual["frames"]:
+                    if f["kind"] == "play_unbound":
+                        f["display_frame"] = labels[f["index"]]
+            return edit
+
+        out = read(keep_two({0: 479, 3: -1}))
+        self.assertEqual((out["verdict"], out["counted"], out["playFrames"], out["appDistinctDisplayFrames"]), ("NOT_A_MOTION_WITNESS", True, 2, 1), out["reason"])
+        self.assertTrue(out["reason"].startswith("1 of the 2 judged play frames carry display frame number 479 and the other 1 carry no valid display frame number: "
+                                                 "one display frame number across them at most"), out["reason"])
+        self.assertNotIn("all 2", out["reason"])
+        out = read(keep_two({0: -1, 3: -1}))
+        self.assertEqual((out["verdict"], out["appDistinctDisplayFrames"]), ("NOT_A_MOTION_WITNESS", 0), out["reason"])
+        self.assertTrue(out["reason"].startswith("none of the 2 judged play frames carries a valid display frame number ("), out["reason"])
+        self.assertNotIn("timeline position", out["reason"])
+
+        def moving_forced(visual):
+            for f in visual["frames"]:
+                if f["kind"] == "play":
+                    f["display_frame"] = 467 + 2 * f["index"]
+        out = read(moving_forced)
+        self.assertEqual((out["verdict"], out["frozenJudgedOn"], out["appDistinctDisplayFrames"]), ("NOT_A_MOTION_WITNESS", "play_unbound", 1), out["reason"])
+        self.assertTrue(out["reason"].startswith("all 6 judged play frames carry display frame number 479: one display frame number across them"), out["reason"])
+        self.assertNotIn("strip", out["reason"].split(";")[0], "the verdict reason speaks of the judged frames, never of the strip whose forced tiles move")
+
+        # r1 adversary pass 2 A1 (introduced, major): forced tiles labelled and painted 478, unforced labelled 479 with 0-2 painted 899 (an older paint) and
+        # 3-5 painted 900: the pictures are two paints, so the reason claims nothing about what the pictures show, only what their labels name
+        def older_paint(visual):
+            for f in visual["frames"]:
+                if f["kind"] == "play":
+                    f.update({"display_frame": 478, "serial": 899, "painted_serial": 899, "painted_serial_valid": True, "label_bound": True})
+                elif f["kind"] == "play_unbound":
+                    painted = 899 if f["index"] < 3 else 900
+                    f.update({"serial": 900, "painted_serial": painted, "painted_serial_valid": True, "label_bound": painted == 900,
+                              "label_bound_basis": "gl_viewport_paint"})
+        out = read(older_paint)
+        self.assertEqual((out["verdict"], out["counted"], out["appDistinctDisplayFrames"], out["distinctContentHashes"]), ("NOT_A_MOTION_WITNESS", True, 1, 2), out["reason"])
+        first = out["reason"].split(";")[0]
+        self.assertTrue(first.startswith("all 6 judged play frames carry display frame number 479: one display frame number across them (2 distinct picture(s) among them)"),
+                        first)
+        for overclaim in ("they show", "pictures show", "the strip shows", "timeline position"):
+            self.assertNotIn(overclaim, first)
+
+        # r1 adversary pass 2 A4: a held tail whose judged pictures are blank is CAPTURE_BLANK, judged first (the held-tail docs say "unless an earlier verdict applies")
+        with tempfile.TemporaryDirectory(prefix="vis-held-blank-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(f"New-VisPng '{art / 'visual' / f'play-unbound-{k}.png'}' 1 60 0 $true" for k in range(6))])
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      "| ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual((out["verdict"], out["appDistinctDisplayFrames"]), ("CAPTURE_BLANK", 1), out["reason"])
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        self.assertIn("unless an earlier verdict\n(`CAPTURE_BLANK`, say) applies", doc)
+
+    @requires_windows_imaging
+    def test_a_no_motion_reason_claims_no_masking_and_no_timeline_position(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1 r2, the r1 adversary pass 3 inputs verbatim (both introduced, major, on 59b7ceee).
+        A1: forced play 0/1 at display frames 477/478 with distinct pictures X/Y; unforced 0, 1, 2 at 479 with forced_paints_before 2, 0 and 1 showing one
+        picture Z and 2 with viewport null; no paused comparison. The hold explains the one unforced picture, so the reason never says the force-paint
+        would have masked it (59b7ceee appended "the force-paint would have masked this" to the NOT_A_MOTION_WITNESS reason).
+        A2: two usable unforced captures, both display_frame 479, no source_id, two distinct pictures, play_active true then false (a clip change between
+        the grabs: clip A frame 479, then clip B frame 479). One number is not one timeline position, so the reason never says "timeline position"."""
+        def read(edit, pngs=()):
+            with tempfile.TemporaryDirectory(prefix="vis-held-p3-") as d:
+                art = Path(d) / "artifacts"
+                write_visual_captures(art / "visual", "held-end-frame")
+                if pngs:
+                    proc = run_pwsh(["-Command", VISUAL_PNG_PS + "\n".join(f"New-VisPng '{art / 'visual' / name}' {seed} 60 0 $false" for name, seed in pngs)])
+                    self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                vj = art / "visual" / "visual.json"
+                visual = json.loads(vj.read_text(encoding="utf-8"))
+                edit(visual)
+                vj.write_text(json.dumps(visual), encoding="utf-8")
+                proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                          "| ConvertTo-Json -Depth 8 -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                return out
+
+        def a1(visual):
+            kept = []
+            for f in visual["frames"]:
+                f.pop("source_id", None)
+                if f["kind"] == "play" and f["index"] in (0, 1):
+                    f.update({"display_frame": 477 + f["index"], "forced_paints_before": f["index"]})
+                elif f["kind"] == "play_unbound" and f["index"] in (0, 1, 2):
+                    f.update({"display_frame": 479, "forced_paints_before": 2})
+                    if f["index"] == 2:
+                        f["viewport"] = None
+                elif f["kind"] in ("play", "play_unbound", "paused"):
+                    continue
+                kept.append(f)
+            visual["frames"] = kept
+        # forced X/Y: two distinct pictures (the fixture's unforced 0..2 already share one picture, Z)
+        out = read(a1, pngs=(("play-0.png", 3), ("play-1.png", 4)))
+        self.assertEqual((out["verdict"], out["counted"], out["frozenJudgedOn"], out["playFrames"], out["appDistinctDisplayFrames"], out["distinctContentHashes"],
+                          out["forcedPlayDistinctContentHashes"], out["viewportUnavailablePlayFrames"]),
+                         ("NOT_A_MOTION_WITNESS", True, "play_unbound", 2, 1, 1, 2, 1), out["reason"])
+        self.assertNotIn("masked", out["reason"], "the hold, not a force-paint, explains one unforced picture over one held display frame")
+        self.assertIn("1 saved play frame(s) have no usable viewport rectangle and were not judged; the other 2 were", out["reason"], "the factual notes stay")
+        self.assertNotIn("timeline position", out["reason"])
+
+        def a2(visual):
+            kept = []
+            for f in visual["frames"]:
+                f.pop("source_id", None)
+                if f["kind"] == "play_unbound" and f["index"] in (0, 3):
+                    f.update({"index": 0 if f["index"] == 0 else 1, "display_frame": 479, "forced_paints_before": 6, "play_active": f["index"] == 0})
+                elif f["kind"] in ("play", "play_unbound", "paused"):
+                    continue
+                kept.append(f)
+            visual["frames"] = kept
+        out = read(a2)
+        self.assertEqual((out["verdict"], out["counted"], out["playFrames"], out["appDistinctDisplayFrames"], out["distinctContentHashes"]),
+                         ("NOT_A_MOTION_WITNESS", True, 2, 1, 2), out["reason"])
+        self.assertTrue(out["reason"].startswith("all 2 judged play frames carry display frame number 479: one display frame number across them (2 distinct picture(s)"),
+                        out["reason"])
+        self.assertNotIn("timeline position", out["reason"], "one number across them, not one position: visual.json carries no clip token")
+        doc = (ROOT / "docs" / "dual-venue-visual-capture.md").read_text(encoding="utf-8")
+        row = next(line for line in doc.splitlines() if line.startswith("| `NOT_A_MOTION_WITNESS` |"))
+        self.assertIn("never of a timeline position", row)
+        self.assertNotIn("name one timeline position", row)
+        self.assertIn("never beside `NOT_A_MOTION_WITNESS`", doc)
+
+        # r2 adversary pass 4 A1 (its input): forced 0/1 at 461/467 over source ids 01/02 with two pictures; unforced 0/1 at 479/485 over ONE source id 03
+        # showing one picture; the app records "differ". The judged frames are known-identical: the static-source waiver explains the one picture, so the
+        # reason (OK, waived) never also says the force-paint would have masked it (c5c1b38e did).
+        def p4_a1(visual):
+            kept = []
+            for f in visual["frames"]:
+                f.pop("source_id", None)
+                if f["kind"] == "play" and f["index"] in (0, 1):
+                    f.update({"display_frame": 461 + 6 * f["index"], "source_id": f"{f['index'] + 1:016x}", "forced_paints_before": f["index"]})
+                elif f["kind"] == "play_unbound" and f["index"] in (0, 1):
+                    f.update({"display_frame": 479 + 6 * f["index"], "source_id": "0000000000000003", "forced_paints_before": 2})
+                elif f["kind"] in ("play", "play_unbound", "paused"):
+                    continue
+                kept.append(f)
+            visual["frames"] = kept
+            visual["source_difference"] = "differ"
+        out = read(p4_a1, pngs=(("play-0.png", 3), ("play-1.png", 4)))
+        self.assertEqual((out["verdict"], out["sourceDifference"], out["appDistinctDisplayFrames"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"]),
+                         ("OK", "known-identical", 2, 1, 2), out["reason"])
+        self.assertIn("a static clip", out["reason"])
+        self.assertNotIn("masked", out["reason"], "one picture over one source is the source's own; no force-paint masking is shown")
+
+        # r2 adversary pass 5 A2 (its input): the same, plus a third unforced capture labelled -1 over source id 03 showing Z: the judged source difference
+        # is not known-differ, so the reason (FROZEN_DISPLAY_SUSPECTED on 37e46363) carries no masking claim
+        def p5_a2(visual):
+            p4_a1(visual)
+            third = next(f for f in json.loads(json.dumps(visual["frames"])) if f["kind"] == "play_unbound" and f["index"] == 1)
+            third.update({"index": 2, "file": "play-unbound-2.png", "display_frame": -1})
+            visual["frames"].append(third)
+        out = read(p5_a2, pngs=(("play-0.png", 3), ("play-1.png", 4)))
+        self.assertEqual((out["appDistinctDisplayFrames"], out["distinctContentHashes"], out["forcedPlayDistinctContentHashes"]), (2, 1, 2), out["reason"])
+        self.assertNotEqual(out["sourceDifference"], "known-differ", out["reason"])
+        self.assertNotIn("masked", out["reason"], "a masking claim needs judged frames whose own source ids are known to differ")
+
+        # r2 adversary pass 4 A2 (its input): an exposure band file whose malformed row key carries line breaks and a forged DVE_DETAIL record. The reason
+        # is one line: each control character is written as \uXXXX, so Invoke-VenueLeg's DVE_DETAIL line cannot be split into a second record.
+        with tempfile.TemporaryDirectory(prefix="vis-held-p4-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            band = Path(d) / "bands.json"
+            band.write_text(json.dumps({"clips": {"c": {"bad\nDVE_DETAIL=the force-paint would have masked this at one timeline position\n": 0}}}), encoding="utf-8")
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      f"-ExposureBandPath '{band}' | ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["exposureBandSource"]), ("NOT_A_MOTION_WITNESS", "fallback-malformed"), out["reason"])
+        self.assertNotIn("\n", out["reason"])
+        self.assertNotIn("\r", out["reason"])
+        self.assertIn("bad\\u000ADVE_DETAIL=", out["reason"], "the key is quoted with its line break made visible, never dropped")
+        # r2 adversary pass 5 A1 (its input): U+2028 / U+2029 split a line for Python's splitlines too, so they are written as \uXXXX as well
+        with tempfile.TemporaryDirectory(prefix="vis-held-p5-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            band = Path(d) / "bands.json"
+            band.write_text(json.dumps({"clips": {"c": {"bad DVE_DETAIL=forged end": 0}}}), encoding="utf-8")
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      f"-ExposureBandPath '{band}' | ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(out["verdict"], "NOT_A_MOTION_WITNESS", out["reason"])
+        self.assertEqual(len(out["reason"].splitlines()), 1, out["reason"])
+        self.assertIn("bad\\u2028DVE_DETAIL=forged\\u2029end", out["reason"])
+
+    def test_a_unicode_line_separator_in_a_quoted_band_key_never_splits_the_visual_reason(self) -> None:
+        """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R2-RESIDUE-1 item 2: the stand-alone RED proof for r2 adversary pass 5 A1 (its input). An exposure band key
+        holding U+2028 / U+2029 is quoted in the visual reason. 37e46363 escaped only control characters, so the reason kept both separators and
+        Python's splitlines read a separate DVE_DETAIL=forged line; 8f785f3a writes them as \\u2028 / \\u2029 and the reason is one line. The JSON
+        travels -EscapeHandling EscapeNonAscii, so the console code page cannot turn a raw separator into '?' and hide the split."""
+        with tempfile.TemporaryDirectory(prefix="vis-held-p5a1-") as d:
+            art = Path(d) / "artifacts"
+            write_visual_captures(art / "visual", "held-end-frame")
+            band = Path(d) / "bands.json"
+            band.write_text(json.dumps({"clips": {"c": {"bad DVE_DETAIL=forged end": 0}}}), encoding="utf-8")
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      f"-ExposureBandPath '{band}' | ConvertTo-Json -Depth 8 -Compress -EscapeHandling EscapeNonAscii")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual((out["verdict"], out["exposureBandSource"]), ("NOT_A_MOTION_WITNESS", "fallback-malformed"), out["reason"])
+        self.assertNotIn(" ", out["reason"])
+        self.assertNotIn(" ", out["reason"])
+        self.assertEqual(len(out["reason"].splitlines()), 1, ascii(out["reason"].splitlines()))
+        self.assertFalse(any(line.startswith("DVE_DETAIL=") for line in out["reason"].splitlines()), ascii(out["reason"]))
+        self.assertIn("bad\\u2028DVE_DETAIL=forged\\u2029end", out["reason"])
 
     def test_the_visual_reader_takes_the_source_difference_from_the_apps_record_and_never_guesses(self) -> None:
         """PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: visual.json's source_difference (differ | identical) is the only record of whether the source frames differ;
@@ -19513,7 +20884,13 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
     CLIP = "M16-1457"
     SPECS = tuple(f"legs/m16-{clip}-conform-{mode}-s1.json" for clip in ("1456", "1457") for mode in ("windowed", "fullscreen"))
 
-    def chain(self, measured: str, coverage: str | None = "1498", ends: bool = True) -> list[dict]:
+    def chain(self, measured: str, coverage: str | None = "1498", ends: bool = True, *, specs: tuple[str, ...] | None = None, clip: str | None = None,
+              backends: tuple[str, ...] = ("cuda",), head: tuple[str, str] | None = None, summary: str | None = None,
+              engine_frames: int = 1499) -> list[dict]:
+        # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the same chain judges any committed spec (`specs`, `clip`) on each of its `backends`; `head`
+        # (the pacing-isolation line, the conform line's head) and `summary` replace the conformed 59.94 -> 24 run's lines for a run of another shape.
+        specs = self.SPECS if specs is None else specs
+        clip = self.CLIP if clip is None else clip
         # r28 fix iteration 2 (adversary A4 on 4201a437): the app prints source_advanced (the presented coverage) on every conform line, and a line
         # without it now fails closed; a measured line that does not name it carries the in-step coverage unless `coverage` is None.
         if measured and coverage is not None and "source_advanced=" not in measured:
@@ -19528,15 +20905,26 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         # fails closed; a measured line that does not name it carries backward=0 (no seek) unless `ends` is False.
         if measured and ends and "backward=" not in measured:
             measured += " backward=0"
-        log = "\n".join([
+        # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 (adversary A1 on b56cc731): the app prints repeats on every conform line; a measured line that
+        # does not name it carries repeats=0 (no frame painted twice) unless `ends` is False. `engine_frames` is the job summary's own source count.
+        if measured and ends and "repeats=" not in measured:
+            measured += " repeats=0"
+        # r2 adversary fix 2 (A1 on 7c84e75a): the app prints presented on every conform line, and a line that carries repeats without it now fails
+        # closed; a measured line that does not name it carries one paint per covered frame plus the first (source_advanced + 1) unless `ends` is False.
+        if measured and ends and "presented=" not in measured:
+            m = re.search(r"source_advanced=(\d+)", measured)
+            if m:
+                measured += f" presented={int(m.group(1)) + 1}"
+        pacing, conform_head = head if head is not None else (
             "interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=24.000 drop_frame=1 settings_store=run_scoped",
-            "playback_smoke.measured_session id=3",
-            "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=1 conform_enabled=1 conform_env_override=1" + measured,
-            conformed_summary_line()]) + "\n"
+            "playback_smoke.conform session=3 clip_fps=59.940 playback_fps=24.000 conform_active=1 conform_enabled=1 conform_env_override=1")
+        log = "\n".join([pacing, "playback_smoke.measured_session id=3", conform_head + measured,
+                         conformed_summary_line() if summary is None else summary]) + "\n"
         sha = hashlib.sha256(log.encode("utf-8")).hexdigest()
         script = (
-            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 1499; requiredSourceFrames = 1499; failures = @() }; fixtureRehearsal = $false;"
-            " clipId = $env:DVE_CLIP; lookAssistForced = $true; gpuFramesTotal = 1499; lookFlavorReported = 'cinematic' }\n"
+            "$frames = [int64]$env:DVE_FRAMES\n"
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = $frames; requiredSourceFrames = $frames; failures = @() }; fixtureRehearsal = $false;"
+            " clipId = $env:DVE_CLIP; lookAssistForced = $true; gpuFramesTotal = $frames; lookFlavorReported = 'cinematic' }\n"
             "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = $env:DVE_SHA } }\n"
             "$result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $env:DVE_SHA } } }\n"
             "$out = foreach ($rel in ($env:DVE_SPECS -split ';')) {\n"
@@ -19545,16 +20933,17 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
             " -ExpectedClipId $env:DVE_CLIP -RequestedConform ([string]$spec.generatorArgs.playbackConform)\n"
             "  $arm = Get-DvConformArmVerdict -Spec $spec -Playback $pb\n"
             "  $m = Get-DvCriteriaMetrics -Metrics (Get-DvVerbatimMetrics -Summary $summary -EvidenceManifest $manifest) -Playback $pb\n"
-            "  foreach ($role in 'acceptance', 'supplementary') {\n"
-            "    $v = Test-DvCriteria -Criteria $spec.criteria.$role.cuda -Metrics $m\n"
-            "    [ordered]@{ spec = $rel; role = $role; valid = $pb.valid; honoured = $arm.honoured; blocks = $arm.blocks; pass = $v.pass; failures = @($v.failures);"
-            " sourceFps = $pb.conformSourceFps; maxJump = $pb.conformMaxJump; audioSync = $pb.conformAudioSyncRequests }\n"
-            "  }\n"
+            "  foreach ($role in 'acceptance', 'supplementary') { foreach ($backend in ($env:DVE_BACKENDS -split ';')) {\n"
+            "    $v = Test-DvCriteria -Criteria $spec.criteria.$role.$backend -Metrics $m\n"
+            "    [ordered]@{ spec = $rel; role = $role; backend = $backend; valid = $pb.valid; honoured = $arm.honoured; blocks = $arm.blocks; pass = $v.pass;"
+            " failures = @($v.failures); sourceFps = $pb.conformSourceFps; maxJump = $pb.conformMaxJump; audioSync = $pb.conformAudioSyncRequests }\n"
+            "  } }\n"
             "}\n"
             "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
-        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=self.CLIP, DVE_DV=str(DV), DVE_SPECS=";".join(self.SPECS))
+        proc, out = run_pwsh_json(script, DVE_LOG=log, DVE_SHA=sha, DVE_NONCE=NONCE, DVE_CLIP=clip, DVE_DV=str(DV), DVE_SPECS=";".join(specs),
+                                  DVE_BACKENDS=";".join(backends), DVE_FRAMES=str(engine_frames))
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
-        self.assertEqual(len(out), 2 * len(self.SPECS), out)
+        self.assertEqual(len(out), 2 * len(specs) * len(backends), out)
         for row in out:
             # the run itself is sound and honoured: only the criteria decide
             self.assertEqual((row["valid"], row["honoured"], row["blocks"]), (True, True, False), row)
@@ -19605,8 +20994,11 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
         count) with the exact allowance the conform line's ends give: in step and one held target pass, one frame further short fails. Fix iteration 2
         (adversary A4 on 4201a437): a line without source_advanced, or with an unreadable one, fails closed."""
         cases = {"in step": ("1498", True), "one target held": ("1497", True), "one past it": ("1496", False), "r28's tolerance": ("1489", False)}
+        # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r4 (sol r3 finding 1): presented is coverage + 1 (one forward step per frame, the start frame
+        # painted), the only count PlaybackSourceAdvanceTracker can print with no repeat; a fixed presented=1499 over 1497 frames made 1498 forward
+        # steps over 1497 frames, a line the tracker cannot emit and the paint-step bound now refuses. The tail allowance under test is unchanged.
         for name, (coverage, passes) in cases.items():
-            for row in self.chain(f" audio_sync_requests=0 presented=1499 source_advanced={coverage} source_fps=24.000 max_jump=1"):
+            for row in self.chain(f" audio_sync_requests=0 presented={int(coverage) + 1} source_advanced={coverage} source_fps=24.000 max_jump=1"):
                 with self.subTest(case=name, spec=row["spec"], role=row["role"]):
                     self.assertEqual(row["pass"], passes, row)
         for case, measured in (("no source_advanced", " audio_sync_requests=0 source_fps=24.000 max_jump=1"),
@@ -19761,6 +21153,531 @@ class ConformMeasuredFieldsAreJudgedTests(unittest.TestCase):
                                  "(Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived)"], calls)
 
 
+class EveryFrameOldestFirstLegSpecTests(unittest.TestCase):
+    """EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1: the unpinned every-frame leg. Master acquires the oldest ready frame first on every drop-frame-off Play,
+    pinned or not (PlaybackFrameRange.h playbackAcquiresOldestReadyFirst; the call site's pinned flag is m_playbackSmokeTargetPresentedFrames > 0, which no venue
+    leg sets). The leg is the 1243 unpaced (drop-frame off, fail closed UNPACED_NOT_HONOURED) swap-interval-0 fullscreen s1 headroom leg, the most frames ready at
+    once, with the visual capture on and the app's own conform line judged: conformMaxJump eq 1 (no skipped source frame), conformRepeats eq 0 (none painted
+    twice) and conformTailUnpaintedFrames eq 0 (no engine target unpainted at the measured close) together mean every source frame was shown, once, in order."""
+
+    CARD = "EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1"
+    MAX_JUMP = {"metric": "conformMaxJump", "op": "eq", "value": 1}
+    # Fix iteration 1 (adversary on b56cc731): max_jump counts forward steps and allows one held target, so a frame painted twice (A1) and an engine target
+    # never painted at the tail (A2) both read max_jump=1. The leg judges them directly: no repeat, and the last engine target painted.
+    APPENDED = [MAX_JUMP, {"metric": "conformRepeats", "op": "eq", "value": 0}, {"metric": "conformTailUnpaintedFrames", "op": "eq", "value": 0}]
+    OPT_OUT = ("visualCapture", "visualCaptureOptOutReason")
+    # A native-pace (unconformed) 23.976 fps run: the pacing line with drop-frame off, the conform line the app prints on every session (conform_active=0),
+    # and a summary paced at the native rate. The source counts stay the chain's (1499 from frame 0), so its coverage and ends defaults hold.
+    HEAD = ("interaction_trace event=automation.pacing_isolated site=gui-smoke-entry persisted_fps_override=0 persisted_frame_rate=23.976 drop_frame=0 settings_store=run_scoped",
+            "playback_smoke.conform session=3 clip_fps=23.976 playback_fps=23.976 conform_active=0 conform_enabled=1 conform_env_override=0 audio_sync_requests=0")
+
+    def setUp(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        self.jsonschema = jsonschema
+        self.schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+
+    def load(self, rel: str) -> dict:
+        return json.loads((DV / rel).read_text(encoding="utf-8"))
+
+    def test_the_leg_is_its_source_except_the_leg_id_the_card_the_capture_and_the_appended_max_jump(self) -> None:
+        for rel, source_rel in EVERY_FRAME_OLDEST_FIRST_LEGS.items():
+            with self.subTest(leg=rel):
+                text = (DV / rel).read_text(encoding="utf-8")
+                spec, source = json.loads(text), self.load(source_rel)
+                self.assertIs(source["visualCapture"], False, "the source keeps its opt-out: its fps must not be perturbed by the capture tail")
+                self.assertEqual(sorted(source["criteria"]), ["acceptance", "supplementary"])
+                for role, per in source["criteria"].items():
+                    self.assertEqual(sorted(per), ["cpu", "cuda"], role)
+                    for item in self.APPENDED:
+                        self.assertNotIn(item, [*per["cuda"], *per["cpu"]], "the source does not judge the every-frame criteria")
+                expected = {k: v for k, v in source.items() if k not in self.OPT_OUT}
+                expected.update(legId=Path(rel).stem, card=self.CARD,
+                                criteria={role: {b: [*items, *self.APPENDED] for b, items in per.items()} for role, per in source["criteria"].items()})
+                self.assertEqual(spec, expected, "only legId, card, the removed opt-out and the appended every-frame criteria differ")
+                self.assertEqual(list(spec), [k for k in source if k not in self.OPT_OUT], "the source's keys in the source's order")
+                for role in ("acceptance", "supplementary"):
+                    for backend in ("cuda", "cpu"):
+                        self.assertEqual(spec["criteria"][role][backend][-len(self.APPENDED):], self.APPENDED, (role, backend))
+                        for item in self.APPENDED:
+                            self.assertEqual(spec["criteria"][role][backend].count(item), 1, (role, backend, item))
+                self.assertEqual(text, json.dumps(spec, indent=2, ensure_ascii=False) + "\n", "the source's formatting")
+                self.assertEqual((DV / source_rel).read_text(encoding="utf-8"), json.dumps(source, indent=2, ensure_ascii=False) + "\n")
+
+    def test_the_leg_validates_and_is_an_unpaced_unpinned_visual_twin(self) -> None:
+        for rel in EVERY_FRAME_OLDEST_FIRST_LEGS:
+            with self.subTest(leg=rel):
+                spec = self.load(rel)
+                self.jsonschema.validate(spec, self.schema)
+                self.assertEqual(spec["legId"], Path(rel).stem)
+                self.assertIn("-visual-", spec["legId"], "a twin's fps is observer-perturbed: the name keeps it out of a matrix speed cell")
+                self.assertEqual(spec["legType"], "speed", "the capture only exists on a speed leg")
+                self.assertNotIn("visualCapture", spec, "absent means on")
+                self.assertNotIn("visualCaptureOptOutReason", spec)
+                ga = spec["generatorArgs"]
+                for key in ("unpaced", "forceLookAssist", "presentTrace"):
+                    self.assertIs(ga[key], True, key)
+                self.assertEqual(ga["swapInterval"], 0, "the most frames ready at once: the worst case for oldest-ready-first")
+                self.assertNotIn("playbackConform", ga, "a native-pace Play, not a conform arm")
+                self.assertEqual((spec["clipId"], spec["playSeconds"], spec["backends"], spec["scaleFactor"], spec["displayMode"]),
+                                 ("M16-1243", 20, ["cuda", "cpu"], 1, "fullscreen"))
+
+    def test_the_card_takes_its_sources_role_on_each_venue(self) -> None:
+        """Bachelor is acceptance for the source's card (CUDA-HEADROOM-1); an unlisted card would take defaultRole (supplementary) there."""
+        table = json.loads((DV / "venues.json").read_text(encoding="utf-8"))
+        self.assertEqual(table["roles"].get(self.CARD), {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+        for rel, source_rel in EVERY_FRAME_OLDEST_FIRST_LEGS.items():
+            with self.subTest(leg=rel):
+                self.assertEqual(table["roles"][self.load(rel)["card"]], table["roles"][self.load(source_rel)["card"]])
+
+    @requires_windows_pwsh
+    def test_the_runner_reads_the_leg_as_a_visual_twin(self) -> None:
+        names = [self.load(rel)["legId"] for rel in EVERY_FRAME_OLDEST_FIRST_LEGS]
+        proc = run_pwsh(["-Command", f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n$m = Get-Module DualVenueRunner\n"
+                         f"@({', '.join(repr(n) for n in names)}) | ForEach-Object {{ [string](& $m {{ param($n) Test-DvVisualTwinName $n }} $_) }}"])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["True"] * len(names))
+
+    def chain(self, measured: str, ends: bool = True, frames: int = 1499) -> list[dict]:
+        """The shipped criteria chain (ConformMeasuredFieldsAreJudgedTests.chain: Get-DvPlaybackEvidence -> Get-DvConformArmVerdict -> Get-DvCriteriaMetrics ->
+        Test-DvCriteria) on THIS spec, cuda and cpu, both roles, over a native-pace run's log whose engine advanced `frames` source frames from frame 0."""
+        return ConformMeasuredFieldsAreJudgedTests.chain(
+            self, measured, ends=ends, specs=tuple(EVERY_FRAME_OLDEST_FIRST_LEGS), clip="M16-1243", backends=("cuda", "cpu"), head=self.HEAD, engine_frames=frames,
+            summary=conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                           source_advanced=str(frames), required_source_frames=str(frames)))
+
+    @staticmethod
+    def failed_metrics(row: dict) -> list[str]:
+        return [f.split(" ")[0].rstrip(":") for f in row["failures"]]
+
+    @requires_windows_pwsh
+    def test_the_criteria_pass_only_a_run_that_showed_every_source_frame(self) -> None:
+        cases = {
+            "sound": (" max_jump=1", []),
+            "a skipped source frame": (" max_jump=2", ["conformMaxJump"]),
+            "no frame advanced": (" max_jump=0", ["conformMaxJump"]),
+            "a frozen presentation tail": (" presented=1401 source_advanced=1400 max_jump=1", ["conformMaxJump", "conformTailUnpaintedFrames"]),
+        }
+        for name, (measured, failing) in cases.items():
+            for row in self.chain(measured):
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertEqual(row["pass"], not failing, row)
+                    self.assertEqual(self.failed_metrics(row), failing, row)
+        seen = {(row["role"], row["backend"]) for row in self.chain(" max_jump=1")}
+        self.assertEqual(seen, {(r, b) for r in ("acceptance", "supplementary") for b in ("cuda", "cpu")})
+
+    @requires_windows_pwsh
+    def test_adversary_b56cc731_a1_a_repeated_frame_fails(self) -> None:
+        """Fix iteration 1 (adversary A1 on b56cc731), its literal input: engine source_advanced=480, painted 1..240,240,241..479. max_jump counts forward
+        steps, so the repeat read max_jump=1 and every criteria list passed; the line's repeats=1 now fails conformRepeats alone."""
+        line = " presented=480 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=1 first_frame=1 last_frame=479 engine_target=479"
+        for row in self.chain(line, ends=False, frames=480):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformRepeats"], row)
+
+    @requires_windows_pwsh
+    def test_adversary_b56cc731_a2_an_unpainted_final_target_fails(self) -> None:
+        """Fix iteration 1 (adversary A2 on b56cc731), its literal input: the engine reached target 479 and the last painted frame is 478 (never submitted).
+        conformMaxJump's one held-target allowance absorbs it, so every list passed; conformTailUnpaintedFrames = 479 - 478 = 1 now fails alone."""
+        line = (" presented=478 source_advanced=477 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=478 engine_target=479 paint_submitted=478"
+                " paint_superseded=0 paint_unverified=0 paint_waiting=0")
+        for row in self.chain(line, ends=False, frames=480):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformTailUnpaintedFrames"], row)
+
+    @requires_windows_pwsh
+    def test_a_run_painted_through_its_last_target_once_each_passes(self) -> None:
+        """The control, in the shape the venue logs show for a sound unpaced 20 s run (the start frame on screen before Play, so first_frame=1): every
+        target 1..479 painted once, in order, through engine_target. It passes every list."""
+        line = " presented=479 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479"
+        for row in self.chain(line, ends=False, frames=480):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertTrue(row["pass"], row)
+
+    @requires_windows_pwsh
+    def test_a_seek_back_or_an_absent_field_is_could_not_check_never_a_pass(self) -> None:
+        """backward > 0 is not judged (engine_target is the engine's high-water), and a line without max_jump or repeats is a missing number: each FAILS."""
+        seek = " presented=1550 source_advanced=1548 max_jump=1 wraps=0 backward=1 repeats=0 first_frame=0 last_frame=1448 engine_target=1498"
+        for row in self.chain(seek, ends=False):
+            with self.subTest(case="backward=1", role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformMaxJump", "conformTailUnpaintedFrames"], row)
+                self.assertIn("a seek back", row["failures"][0], row)
+                self.assertIn("a seek back", row["failures"][1], row)
+        for case, line, metric in (("no max_jump", " presented=1499", "conformMaxJump"),
+                                   ("no repeats", " presented=1499 source_advanced=1498 max_jump=1 wraps=0 backward=0 first_frame=0 last_frame=1498 engine_target=1498",
+                                    "conformRepeats")):
+            for row in self.chain(line, ends=(case != "no repeats")):
+                with self.subTest(case=case, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), [metric], row)
+                    self.assertIn("does not carry the field", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_the_every_frame_metrics_never_trust_a_summary_key_of_the_same_name(self) -> None:
+        """A summary.json that says conformRepeats=0 / conformTailUnpaintedFrames=0 cannot stand in for the run log's own line (absent here)."""
+        proc, out = run_pwsh_json(
+            "$m = [pscustomobject]@{ conformRepeats = 0; conformTailUnpaintedFrames = 0; rows = 5 }\n"
+            "Get-DvCriteriaMetrics -Metrics $m -Playback ([ordered]@{ conformLinePresent = $false }) | ConvertTo-Json -Compress -Depth 4")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        for metric in ("conformRepeats", "conformTailUnpaintedFrames"):
+            self.assertIsNone(out[metric], out)
+            self.assertIn("no playback_smoke.conform line", out[metric + "CouldNotCheck"], out)
+
+
+class EveryFrameConformConflictAndAcceptanceTests(unittest.TestCase):
+    """EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 on f774d3a3).
+    B2: the conform-line reader kept the LAST occurrence of a key, so `repeats=1 repeats=0`, `last_frame=478 last_frame=479` and `backward=1 backward=0`
+    each passed all four criteria lists of the every-frame leg. A key carried twice with DIFFERENT values is now left out (ConvertFrom-DvRecordKeyValues),
+    so every criterion that reads it is CouldNotCheck and FAILS, through the public reader and the criteria path the live runner (Invoke-VenueLeg) and
+    receipt revalidation (Test-DvReceiptValid) share; the summary line's reader (the same parse) refuses a conflicting key too. An identical repeat is
+    the same reading and is kept.
+    B1: the PR #910 readout reported two ADVISORY (VENUE_ANCHOR_ABSENT) Bachelor receipts as acceptance FAILs. Get-DvAcceptanceVerdict is the acceptance
+    step: a raw PASS/FAIL is an acceptance verdict only when the validator says VERIFIED; anything else is NOT_MEASURED, the raw outcome a diagnostic."""
+
+    HEAD = EveryFrameOldestFirstLegSpecTests.HEAD
+    # the control: every target 1..479 painted once, in order, through engine_target (EveryFrameOldestFirstLegSpecTests passes it on every list)
+    SOUND = " presented=479 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479"
+    CONFLICT = "more than once with different values"
+
+    def chain(self, measured: str) -> list[dict]:
+        return EveryFrameOldestFirstLegSpecTests.chain(self, measured, ends=False, frames=480)
+
+    @staticmethod
+    def failed_metrics(row: dict) -> list[str]:
+        return EveryFrameOldestFirstLegSpecTests.failed_metrics(row)
+
+    @requires_windows_pwsh
+    def test_sol_r1_b2_a_conflicting_conform_field_fails_every_list(self) -> None:
+        """sol r1 B2, its literal inputs, each on the sound control: the repeat, the painted end and the seek-back count each carried twice."""
+        cases = {
+            "repeats=1 repeats=0": (self.SOUND.replace("repeats=0", "repeats=1 repeats=0"), ["conformRepeats"]),
+            "last_frame=478 last_frame=479": (self.SOUND.replace("last_frame=479", "last_frame=478 last_frame=479"),
+                                              ["conformMaxJump", "conformTailUnpaintedFrames"]),
+            "backward=1 backward=0": (self.SOUND.replace("backward=0", "backward=1 backward=0"), ["conformMaxJump", "conformTailUnpaintedFrames"]),
+        }
+        for name, (line, failing) in cases.items():
+            self.assertEqual(line.count(name.split("=")[0] + "="), 2, line)
+            rows = self.chain(line)
+            self.assertEqual({(r["role"], r["backend"]) for r in rows}, {(r, b) for r in ("acceptance", "supplementary") for b in ("cuda", "cpu")})
+            for row in rows:
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), failing, row)
+                    for failure in row["failures"]:
+                        self.assertIn(self.CONFLICT, failure, row)
+                        self.assertIn(name.split("=")[0], failure, row)
+
+    @requires_windows_pwsh
+    def test_an_identical_repeat_is_the_same_reading_and_the_control_passes(self) -> None:
+        for name, line in (("control", self.SOUND), ("repeats=0 repeats=0", self.SOUND.replace("repeats=0", "repeats=0 repeats=0"))):
+            for row in self.chain(line):
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertTrue(row["pass"], row)
+
+    @requires_windows_pwsh
+    def test_fable_r1_h4_ends_that_contradict_each_other_are_could_not_check(self) -> None:
+        """fable r1 H4 (the B2 class: an ambiguous reading that read clean): last_frame=480 past engine_target=479 was clamped to a tail of 0 and passed."""
+        line = self.SOUND.replace("last_frame=479", "last_frame=480")
+        for row in self.chain(line):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertIn("conformTailUnpaintedFrames", self.failed_metrics(row), row)
+                self.assertTrue(any("contradict each other" in f for f in row["failures"]), row)
+
+    @requires_windows_pwsh
+    def test_the_public_reader_leaves_a_conflicting_key_out_and_refuses_a_conflicting_summary(self) -> None:
+        """Get-DvPlaybackEvidence (the reader Invoke-VenueLeg and Test-DvReceiptValid both call): a conflicting conform key reads absent and is named; a
+        summary line that carries source_advanced twice (the last value would satisfy the floor) is SUMMARY_FIELD_CONFLICT, never valid."""
+        summary = conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                         source_advanced="480", required_source_frames="480")
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 480; requiredSourceFrames = 480; failures = @() }; fixtureRehearsal = $false; clipId = 'M16-1243' }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = '' } }\n"
+            "$out = foreach ($log in ($env:DVE_LOGS -split '\\|\\|')) {\n"
+            "  $sha = Get-DvSha256OfText $log\n"
+            "  $result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $sha } } }\n"
+            "  $pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $log -LogSha256 $sha -ExpectedClipId 'M16-1243'\n"
+            "  [ordered]@{ valid = $pb.valid; reasons = @($pb.invalidReasons); repeats = $pb.conformRepeats; lastFrame = $pb.conformLastFrame; backward = $pb.conformBackward;"
+            " conformConflicts = @($pb.conformConflictingFields); summaryConflicts = @($pb.summaryConflictingFields); sourceAdvanced = $pb.sourceAdvanced }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
+        conform = self.HEAD[1] + self.SOUND.replace("repeats=0", "repeats=1 repeats=0").replace("last_frame=479", "last_frame=478 last_frame=479")
+        logs = ["\n".join([self.HEAD[0], "playback_smoke.measured_session id=3", conform, summary]) + "\n",
+                "\n".join([self.HEAD[0], "playback_smoke.measured_session id=3", self.HEAD[1] + self.SOUND, summary + " source_advanced=9999"]) + "\n"]
+        proc, out = run_pwsh_json(script, DVE_LOGS="||".join(logs), DVE_NONCE=NONCE)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), 2, out)
+        conflicting_conform, conflicting_summary = out
+        self.assertEqual((conflicting_conform["repeats"], conflicting_conform["lastFrame"], conflicting_conform["backward"]), (None, None, 0), conflicting_conform)
+        self.assertEqual(conflicting_conform["conformConflicts"], ["last_frame", "repeats"], conflicting_conform)
+        self.assertEqual(conflicting_conform["summaryConflicts"], [], conflicting_conform)
+        self.assertTrue(conflicting_conform["valid"], conflicting_conform)
+        self.assertFalse(conflicting_summary["valid"], conflicting_summary)
+        self.assertIsNone(conflicting_summary["sourceAdvanced"], conflicting_summary)
+        self.assertEqual(conflicting_summary["summaryConflicts"], ["source_advanced"], conflicting_summary)
+        self.assertTrue(any(r.startswith("SUMMARY_FIELD_CONFLICT:") and "source_advanced" in r for r in conflicting_summary["reasons"]), conflicting_summary)
+
+    @requires_windows_pwsh
+    def test_sol_r1_b1_an_advisory_receipt_is_not_measured_never_fail_or_pass(self) -> None:
+        """sol r1 B1 and its INV-3 rows: the two Bachelor receipts (raw FAIL, verification ADVISORY, VENUE_ANCHOR_ABSENT) and a raw PASS with an advisory
+        verification are NOT_MEASURED; only a VERIFIED PASS/FAIL is an acceptance verdict. The raw outcome and its detail stay as diagnostics."""
+        detail = ("ADVISORY (VENUE_ANCHOR_ABSENT; never a usable FAIL): CAPTURED; criteria failed: conformMaxJump eq 1 failed (actual 2); "
+                  "conformTailUnpaintedFrames eq 0 failed (actual 2)")
+        cases = [("a877bb17 cuda", "FAIL", "ADVISORY", "NOT_MEASURED"), ("231ea06e cpu", "FAIL", "ADVISORY", "NOT_MEASURED"),
+                 ("raw PASS advisory", "PASS", "ADVISORY", "NOT_MEASURED"), ("offline stub", "PASS", "VERIFIED_OFFLINE_TEST", "NOT_MEASURED"),
+                 ("invalid", "FAIL", "INVALID", "NOT_MEASURED"), ("incomplete", "PASS", "INCOMPLETE", "NOT_MEASURED"), ("no verification", "FAIL", "", "NOT_MEASURED"),
+                 ("not a measurement", "UNRESOLVED", "VERIFIED", "NOT_MEASURED"), ("lowercase status", "PASS", "verified", "NOT_MEASURED"),
+                 ("verified PASS", "PASS", "VERIFIED", "PASS"), ("verified FAIL", "FAIL", "VERIFIED", "FAIL")]
+        script = (
+            "$cases = $env:DVE_CASES | ConvertFrom-Json\n"
+            "$out = foreach ($c in $cases) { $r = [ordered]@{ outcome = $c.outcome; outcomeDetail = $env:DVE_DETAIL; verification = [ordered]@{ status = $c.status } }\n"
+            "  $v = Get-DvAcceptanceVerdict -Receipt $r -VerificationStatus $c.status\n"
+            "  [ordered]@{ verdict = $v.verdict; raw = $v.rawOutcome; status = $v.verificationStatus; reason = $v.reason; detail = $v.outcomeDetail } }\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 4")
+        proc, out = run_pwsh_json(script, DVE_CASES=json.dumps([{"outcome": o, "status": s} for _, o, s, _ in cases]), DVE_DETAIL=detail)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(cases), out)
+        for (name, outcome, status, expected), row in zip(cases, out):
+            with self.subTest(case=name):
+                self.assertEqual(row["verdict"], expected, row)
+                self.assertEqual(row["raw"], outcome, "the raw outcome is kept as a diagnostic")
+                self.assertEqual(row["detail"], detail, "the criteria failures are kept as diagnostics")
+                if expected == "NOT_MEASURED":
+                    self.assertTrue(row["reason"], row)
+                else:
+                    self.assertIsNone(row["reason"], row)
+
+    def reader(self, logs: list[str]) -> list[dict]:
+        """Get-DvPlaybackEvidence over each log (a 23.976 fps native-pace run, 480 source frames), as Invoke-VenueLeg and Test-DvReceiptValid call it."""
+        script = (
+            "$summary = [pscustomobject]@{ sourceFrames = [pscustomobject]@{ sourceAdvanced = 480; requiredSourceFrames = 480; failures = @() }; fixtureRehearsal = $false; clipId = 'M16-1243' }\n"
+            "$manifest = [pscustomobject]@{ smokeRunLog = [pscustomobject]@{ runNonce = $env:DVE_NONCE; sha256 = '' } }\n"
+            "$out = foreach ($log in ($env:DVE_LOGS -split '\\|\\|')) {\n"
+            "  $sha = Get-DvSha256OfText $log\n"
+            "  $result = [pscustomobject]@{ evidence = [pscustomobject]@{ runNonce = $env:DVE_NONCE; runLogSnapshot = [pscustomobject]@{ sha256 = $sha } } }\n"
+            "  $pb = Get-DvPlaybackEvidence -Summary $summary -EvidenceManifest $manifest -ResultJson $result -LogText $log -LogSha256 $sha -ExpectedClipId 'M16-1243'\n"
+            "  $fields = (Get-DvSmokeSummaryFields -LogText $log).fields\n"
+            "  [ordered]@{ valid = $pb.valid; reasons = @($pb.invalidReasons); repeats = $pb.conformRepeats; summaryConflicts = @($pb.summaryConflictingFields);"
+            " conformConflicts = @($pb.conformConflictingFields); summaryKeys = @($fields.Keys | Sort-Object) }\n"
+            "}\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 5")
+        proc, out = run_pwsh_json(script, DVE_LOGS="||".join(logs), DVE_NONCE=NONCE)
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(logs), out)
+        return out
+
+    def log(self, conform: str, summary_tail: str = "") -> str:
+        summary = conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                         source_advanced="480", required_source_frames="480")
+        return "\n".join([self.HEAD[0], "playback_smoke.measured_session id=3", self.HEAD[1] + conform, summary + summary_tail]) + "\n"
+
+    @requires_windows_pwsh
+    def test_adversary_7272acb4_a1_an_empty_occurrence_is_a_conflicting_reading(self) -> None:
+        """r2 adversary A1 on 7272acb4, its literal inputs: `\\S+` skipped an EMPTY occurrence, so `repeats= repeats=0` (either order), `last_frame=479
+        last_frame=`, `backward= backward=0` read one clean value and passed every list, and a summary `source_advanced= source_advanced=480` read valid.
+        An empty occurrence is a reading that differs from any non-empty one: the key conflicts and is left out."""
+        cases = {
+            "repeats= repeats=0": (self.SOUND.replace("repeats=0", "repeats= repeats=0"), ["conformRepeats"]),
+            "repeats=0 repeats=": (self.SOUND.replace("repeats=0", "repeats=0 repeats="), ["conformRepeats"]),
+            "last_frame=479 last_frame=": (self.SOUND.replace("last_frame=479", "last_frame=479 last_frame="), ["conformMaxJump", "conformTailUnpaintedFrames"]),
+            "backward= backward=0": (self.SOUND.replace("backward=0", "backward= backward=0"), ["conformMaxJump", "conformTailUnpaintedFrames"]),
+        }
+        for name, (line, failing) in cases.items():
+            for row in self.chain(line):
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), failing, row)
+                    for failure in row["failures"]:
+                        self.assertIn(self.CONFLICT, failure, row)
+        summary = self.reader([self.log(self.SOUND, " source_advanced= source_advanced=480")])[0]
+        self.assertFalse(summary["valid"], summary)
+        self.assertEqual(summary["summaryConflicts"], ["source_advanced"], summary)
+        self.assertTrue(any(r.startswith("SUMMARY_FIELD_CONFLICT:") for r in summary["reasons"]), summary)
+
+    @requires_windows_pwsh
+    def test_adversary_7272acb4_a2_a_key_glued_inside_another_token_is_no_key(self) -> None:
+        """r2 adversary A2 on 7272acb4, its literal inputs: the unanchored regex read `repeats=0` out of `-repeats=0` and `not-repeats=0`. A key starts a
+        whitespace-separated token; a glued one is no field, so the absent repeats is CouldNotCheck and the summary carries no `repeats` key."""
+        for row in self.chain(self.SOUND.replace("repeats=0", "-repeats=0")):
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformRepeats"], row)
+                self.assertIn("does not carry the field", row["failures"][0], row)
+        out = self.reader([self.log(self.SOUND.replace("repeats=0", "-repeats=0"), " not-repeats=0 x-y=1")])[0]
+        self.assertIsNone(out["repeats"], out)
+        self.assertNotIn("repeats", out["summaryKeys"], out)
+        self.assertNotIn("y", out["summaryKeys"], out)
+        self.assertIn("source_advanced", out["summaryKeys"], out)
+        self.assertTrue(out["valid"], out)
+
+    @requires_windows_pwsh
+    def test_adversary_7272acb4_a3_a_malformed_status_or_outcome_is_not_measured(self) -> None:
+        """r2 adversary A3 on 7272acb4 (advisory, in scope), its literal inputs: a zero-width space after VERIFIED, or after the raw PASS, compared equal
+        under PowerShell's culture-sensitive -ceq / -cin. The acceptance step compares ordinally, so either is NOT_MEASURED."""
+        zw = "​"
+        cases = [("PASS", "VERIFIED" + zw), ("PASS" + zw, "VERIFIED"), ("FAIL" + zw, "VERIFIED"), ("PASS", zw + "VERIFIED")]
+        script = (
+            "$out = foreach ($c in ($env:DVE_CASES | ConvertFrom-Json)) { $v = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = $c.outcome }) -VerificationStatus $c.status\n"
+            "  [ordered]@{ verdict = $v.verdict; reason = $v.reason } }\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 3")
+        proc, out = run_pwsh_json(script, DVE_CASES=json.dumps([{"outcome": o, "status": s} for o, s in cases]))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), len(cases), out)
+        for (outcome, status), row in zip(cases, out):
+            with self.subTest(outcome=outcome.encode("unicode_escape"), status=status.encode("unicode_escape")):
+                self.assertEqual(row["verdict"], "NOT_MEASURED", row)
+                self.assertTrue(row["reason"], row)
+
+    @requires_windows_pwsh
+    def test_adversary_7c84e75a_a1_paints_that_cannot_cover_the_advance_fail(self) -> None:
+        """r2 adversary A1 on 7c84e75a, its literal input: 478 paints with no repeat and no seek cannot cover 478 source frames one at a time (477 steps),
+        yet max_jump=1, repeats=0 and last_frame == engine_target passed every list. The implied step (ceil(478 / 477) = 2) contradicts the line's
+        max_jump=1, so conformMaxJump is CouldNotCheck; a line that carries repeats but no presented is CouldNotCheck too."""
+        line = " presented=478 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479"
+        for row in self.chain(line):
+            with self.subTest(case="presented=478", role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformMaxJump"], row)
+                self.assertIn("at least one painted step is 2 frames long", row["failures"][0], row)
+        for row in self.chain(self.SOUND.replace("presented=479 ", "")):
+            with self.subTest(case="no presented", role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformMaxJump"], row)
+                self.assertIn("no readable non-negative presented", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_adversary_7c84e75a_a2_a_token_in_the_log_prefix_is_no_field(self) -> None:
+        """r2 adversary A2 on 7c84e75a, its literal input: `[ repeats=0 ] playback_smoke.conform session=3 ...` with no repeats in the record body. The
+        selector allows the log prefix's bracket groups, and the reader scanned them, so the absent repeats read a measured 0 and every list passed."""
+        body = self.SOUND.replace(" repeats=0", "")
+        rows = ConformMeasuredFieldsAreJudgedTests.chain(
+            self, body, ends=False, specs=tuple(EVERY_FRAME_OLDEST_FIRST_LEGS), clip="M16-1243", backends=("cuda", "cpu"), head=(self.HEAD[0], "[ repeats=0 ] " + self.HEAD[1]),
+            engine_frames=480, summary=conformed_summary_line(status='gui_fps_status_text="Playback: 23.976 fps"', native_fps="23.976", pace_fps="23.976",
+                                                              source_advanced="480", required_source_frames="480"))
+        for row in rows:
+            with self.subTest(role=row["role"], backend=row["backend"]):
+                self.assertFalse(row["pass"], row)
+                self.assertEqual(self.failed_metrics(row), ["conformRepeats"], row)
+                self.assertIn("does not carry the field", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_adversary_7c84e75a_a3_a6_stored_fields_are_compared_and_the_verdict_takes_scalars_only(self) -> None:
+        """r2 adversary A3 on 7c84e75a: the validator compares the playback fields this card added (conformRepeats, conformPresented and both conflict
+        lists) with the re-derived block whenever the stored block carries them. A6 (advisory): an array outcome or status is NOT_MEASURED."""
+        proc, out = run_pwsh_json(
+            "$m = Get-Module DualVenueRunner\n"
+            "$list = & $m { $script:PlaybackComparedFieldsWhenStored }\n"
+            "$a = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = @('PASS') }) -VerificationStatus 'VERIFIED'\n"
+            "$b = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = 'PASS' }) -VerificationStatus @('VERIFIED')\n"
+            "$c = Get-DvAcceptanceVerdict -Receipt ([ordered]@{ outcome = 'PASS' }) -VerificationStatus 'VERIFIED'\n"
+            "ConvertTo-Json -Compress -Depth 3 -InputObject ([ordered]@{ list = @($list); a = $a.verdict; b = $b.verdict; c = $c.verdict })")
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(out["list"], ["conformRepeats", "conformPresented", "conformConflictingFields", "summaryConflictingFields"], out)
+        self.assertEqual((out["a"], out["b"], out["c"]), ("NOT_MEASURED", "NOT_MEASURED", "PASS"), out)
+        # r4 (sol r3 finding 3): the comparison moved into Get-DvStoredPlaybackFieldProblems, which finds a stored field by any casing; the
+        # behaviour is pinned by test_r3_sol_b3_a_case_variant_stored_field_is_refused_never_skipped
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("foreach ($f in $script:PlaybackComparedFieldsWhenStored) {", text)
+        self.assertIn("foreach ($p in @(Get-DvStoredPlaybackFieldProblems -Stored $stored -Derived $derived)) { $invalid.Add($p) }", text)
+
+    @requires_windows_pwsh
+    def test_r3_sol_b1_more_paint_steps_than_frames_advanced_fail(self) -> None:
+        """r3 sol finding 1 (fable r3 EVERY-FRAME-CONFORM-LINE-STEPS-EXCEED-ADVANCE-1), its literal input: 480 paints with no repeat, no seek and no wrap
+        make 479 forward steps, and every forward step advances at least one frame, so they cannot cover only 478 source frames: the line hides a
+        repeat. The paint-step check was one-sided (it caught too FEW paints only) and this line passed all four lists on both backends and roles.
+        Siblings of the same bound: no forward step can cover 0 or a negative advance either."""
+        cases = {
+            "presented=480 source_advanced=478": " presented=480 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479 engine_target=479",
+            "presented=481 repeats=1 source_advanced=478": " presented=481 source_advanced=478 max_jump=1 wraps=0 backward=0 repeats=1 first_frame=1 last_frame=479 engine_target=479",
+        }
+        for name, line in cases.items():
+            rows = self.chain(line)
+            self.assertEqual({(r["role"], r["backend"]) for r in rows}, {(r, b) for r in ("acceptance", "supplementary") for b in ("cuda", "cpu")})
+            for row in rows:
+                with self.subTest(case=name, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertIn("conformMaxJump", self.failed_metrics(row), row)
+                    self.assertTrue(any("forward step" in f and "more than the" in f for f in row["failures"]), row)
+
+    @requires_windows_pwsh
+    def test_r3_sol_b2_opus_b1_an_int64_ceiling_advance_is_could_not_check_never_a_throw(self) -> None:
+        """r3 sol finding 2 and opus r3 blocker (fable r3 DV-PAINT-STEP-IMPLIED-JUMP-INT64-OVERFLOW-TYPED-1), the literal input: source_advanced at the
+        Int64 ceiling with one painted step. [int64][Math]::Ceiling([double]...) cast 2^63 and threw, so the live leg ended UNRESOLVED RUNNER_ERROR in
+        place of a typed CouldNotCheck. The implied step is now integer arithmetic; the line is CouldNotCheck and FAILS, through the same criteria
+        path the live runner and receipt revalidation call. Siblings: every advance within 512 of the ceiling, and two and three steps."""
+        top = 9223372036854775807
+        for advance, presented in ((top, 2), (top - 511, 2), (top, 3), (top - 1, 4)):
+            line = (f" presented={presented} source_advanced={advance} max_jump=1 wraps=0 backward=0 repeats=0 first_frame=1 last_frame=479"
+                    " engine_target=479")
+            rows = self.chain(line)
+            self.assertEqual(len(rows), 4, rows)
+            for row in rows:
+                with self.subTest(advance=advance, presented=presented, role=row["role"], backend=row["backend"]):
+                    self.assertFalse(row["pass"], row)
+                    self.assertEqual(self.failed_metrics(row), ["conformMaxJump"], row)
+                    self.assertIn("contradict each other", row["failures"][0], row)
+
+    @requires_windows_pwsh
+    def test_r3_sol_b3_a_case_variant_stored_field_is_refused_never_skipped(self) -> None:
+        """r3 sol finding 3 (opus r3 STORED-PLAYBACK-FIELD-CASE-VARIANT-1): the when-stored comparison tested presence with case-sensitive -ccontains, while
+        Get-DvProp reads keys case-insensitively, so a stored "ConformRepeats": 999 read 999 yet was never compared and the receipt stayed ADVISORY.
+        Get-DvStoredPlaybackFieldProblems (the comparison Test-DvReceiptValid runs) finds a stored field by any casing and refuses a case-variant key of
+        any compared field outright (the class: the always-compared fields too), on a parsed object, a parsed hashtable and an ordinal dictionary."""
+        derived = {"sourceAdvanced": 480, "conformRepeats": 1, "conformPresented": 479, "conformConflictingFields": [], "summaryConflictingFields": []}
+        cases = [
+            ("canonical, equal", {"sourceAdvanced": 480, "conformRepeats": 1}, []),
+            ("old receipt, no new field", {"sourceAdvanced": 480}, []),
+            ("canonical conformRepeats 999", {"sourceAdvanced": 480, "conformRepeats": 999}, ["PLAYBACK_NOT_FROM_EVIDENCE: playback.conformRepeats"]),
+            ("ConformRepeats 999", {"sourceAdvanced": 480, "ConformRepeats": 999}, ["PLAYBACK_NOT_FROM_EVIDENCE: playback.conformRepeats", "PLAYBACK_FIELD_CASE_VARIANT"]),
+            ("ConformPresented 999", {"sourceAdvanced": 480, "ConformPresented": 999}, ["PLAYBACK_NOT_FROM_EVIDENCE: playback.conformPresented", "PLAYBACK_FIELD_CASE_VARIANT"]),
+            ("ConformConflictingFields", {"sourceAdvanced": 480, "ConformConflictingFields": ["repeats"]},
+             ["PLAYBACK_NOT_FROM_EVIDENCE: playback.conformConflictingFields", "PLAYBACK_FIELD_CASE_VARIANT"]),
+            ("SummaryConflictingFields", {"sourceAdvanced": 480, "SummaryConflictingFields": ["source_advanced"]},
+             ["PLAYBACK_NOT_FROM_EVIDENCE: playback.summaryConflictingFields", "PLAYBACK_FIELD_CASE_VARIANT"]),
+            ("ConformRepeats equal value", {"sourceAdvanced": 480, "ConformRepeats": 1}, ["PLAYBACK_FIELD_CASE_VARIANT"]),
+            ("SourceAdvanced (always compared)", {"SourceAdvanced": 480}, ["PLAYBACK_FIELD_CASE_VARIANT"]),
+        ]
+        script = (
+            "$derived = $env:DVE_DERIVED | ConvertFrom-Json\n"
+            "$out = foreach ($c in ($env:DVE_CASES | ConvertFrom-Json)) {\n"
+            "  $json = $c | ConvertTo-Json -Compress -Depth 4\n"
+            "  $ordinal = [hashtable]::new([StringComparer]::Ordinal)\n"
+            "  foreach ($p in $c.PSObject.Properties) { $ordinal[$p.Name] = $p.Value }\n"
+            "  foreach ($stored in @($c, ($json | ConvertFrom-Json -AsHashtable), $ordinal)) {\n"
+            "    , @(Get-DvStoredPlaybackFieldProblems -Stored $stored -Derived $derived) } }\n"
+            "ConvertTo-Json -InputObject @($out) -Compress -Depth 4")
+        proc, out = run_pwsh_json(script, DVE_DERIVED=json.dumps(derived), DVE_CASES=json.dumps([stored for _, stored, _ in cases]))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertEqual(len(out), 3 * len(cases), out)
+        for i, (name, _, expected) in enumerate(cases):
+            for j, shape in enumerate(("object", "hashtable", "ordinal dictionary")):
+                problems = out[3 * i + j] or []
+                with self.subTest(case=name, shape=shape):
+                    if not expected:
+                        self.assertEqual(problems, [], problems)
+                    for prefix in expected:
+                        self.assertTrue(any(p.startswith(prefix) for p in problems), (prefix, problems))
+        text = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        self.assertIn("foreach ($p in @(Get-DvStoredPlaybackFieldProblems -Stored $stored -Derived $derived)) { $invalid.Add($p) }", text)
+        self.assertNotIn("$storedNames -ccontains $f", text)
+
+    def test_the_leg_runner_prints_the_acceptance_verdict_from_the_acceptance_step(self) -> None:
+        """Invoke-VenueLeg prints DVE_ACCEPTANCE (Get-DvAcceptanceVerdict over the verification Write-DvReceipt just stamped) after DVE_VERIFICATION;
+        DVE_OUTCOME stays the raw outcome the chain records."""
+        text = (DV / "Invoke-VenueLeg.ps1").read_text(encoding="utf-8")
+        verification = text.index('Write-Output "DVE_VERIFICATION=')
+        call = text.index("$acceptance = Get-DvAcceptanceVerdict -Receipt $receipt -VerificationStatus", verification)
+        printed = text.index('Write-Output "DVE_ACCEPTANCE=$($acceptance.verdict)"', call)
+        self.assertLess(text.index('Write-Output "DVE_OUTCOME=$Outcome"'), verification)
+        self.assertLess(printed, text.index('Write-Output "DVE_RECEIPT_PATH=$path"'))
+        self.assertEqual(text.count("DVE_ACCEPTANCE="), 1)
+
+
 class DriftLegSpecTests(unittest.TestCase):
     """M16-1457-VENUE-BASELINE-DRIFT-1 r3: each drift leg is the tracked 1457 fullscreen s1 headroom leg with only legId, card and generatorArgs.playbackMaxThreads
     changed (the P-core arm also carries the 1243 b1-12-pcore arm's affinity keys and its two partition criteria), so a worker-cap sweep on the Bachelor
@@ -19869,7 +21786,8 @@ class DriftLegSpecTests(unittest.TestCase):
         for rel in DRIFT_VISUAL_LEGS:
             with self.subTest(leg=rel):
                 self.assertIn("-w10-visual-unpaced-", self.load(rel)["legId"])
-        self.assertEqual(sorted(p.name for p in (DV / "legs").glob("*-visual-*.json")), sorted(Path(r).name for r in DRIFT_VISUAL_LEGS), "a '-visual-' leg outside the registered twins")
+        self.assertEqual(sorted(p.name for p in (DV / "legs").glob("*-visual-*.json")), sorted(Path(r).name for r in (*DRIFT_VISUAL_LEGS, *EVERY_FRAME_OLDEST_FIRST_LEGS)),
+                         "a '-visual-' leg outside the registered twins")
         for path in sorted((DV / "legsets").glob("*.json")):
             with self.subTest(legset=path.name):
                 self.assertEqual(self.legset_drift_violations(json.loads(path.read_text(encoding="utf-8"))), [])
