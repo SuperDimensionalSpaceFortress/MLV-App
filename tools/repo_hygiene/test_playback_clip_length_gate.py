@@ -1027,6 +1027,22 @@ OVERRUN_CASES = [
     ("O22 the same at the tolerance", dict(
         _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254740990e0", required_source_frames=9007199254740942),
      25, False, True, 1200, False, False, False),
+    # r8 (adversary 3701447f A1): the same endpoints spelled as whole-number doubles (the exponent form of an integer literal), where
+    # only the exact read of the double (not the text check) tells 9007199254740991 from 9007199254740990.
+    ("O25 reversed endpoints spelled as whole doubles are a wrap", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+        first_presented_frame="9007199254740991e0", last_presented_frame="9007199254740990e0"),
+     25, False, True, 1200, True, False, True),
+    ("O25 a counter one frame short of the requirement is short, not rounded up", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254740989e0", required_source_frames=9007199254740990),
+     25, False, True, 1200, True, False, False),
+    # r8 (adversary accac79e A1): a counter whose text is not an integer is refused even when rounding would make it one.
+    ("O23 a 29-digit fractional counter below the requirement is refused", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="599.99999999999999999999999999999"),
+     25, False, True, 1200, True, False, False),
+    ("O24 an integral counter in exponent form is still clean", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="648e0", required_source_frames="6e2"),
+     25, False, True, 1200, False, False, False),
 ]
 
 
@@ -1130,6 +1146,20 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
                 outcome, failures = _overrun_outcome(row)
                 self.assertEqual(outcome, tuple(expected), failures)
 
+    def test_r8_a1_a_counter_text_that_is_not_an_integer_is_refused_not_rounded(self) -> None:
+        # The profile receipt keeps a counter as TEXT; [decimal]::TryParse rounds a 29+ digit fraction to an integer, and the
+        # Truncate check then passes it. The text must be an integer literal (a fraction of zeros, an exponent) to be read as one.
+        for text, ok in (("599.99999999999999999999999999999", False), ("600.0000000000000000000000000000001", False),
+                         ("0.9999999999999999999999999999999", False), ("1.5", False), ("600.0", True), ("6e2", True),
+                         ("+600", True), ("600", True)):
+            with self.subTest(text):
+                proc = _pwsh(f". {_q(GATE)}; Get-GuiSmokeExactCounter -Value {_q(text)} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                read = json.loads(proc.stdout)
+                self.assertEqual(read["ok"], ok, read)
+                if not ok:
+                    self.assertEqual(read["reason"], "not_an_integer", read)
+
     def test_the_overrun_failure_carries_its_numbers_and_says_what_it_means(self) -> None:
         _outcome, failures = _overrun_outcome(OVERRUN_CASES[0])
         overran = [f for f in failures if f.startswith("PLAY_OVERRAN_WINDOW: ")]
@@ -1158,6 +1188,10 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
             # r8 (adversary A1): the exact double read and its 2^53 bound
             "double counter read through a 15-digit decimal cast": ("$exact = [decimal][int64]$d }", "$exact = [decimal]$d }"),
             "2^53 double accepted as exact": ("[Math]::Abs($d) -ge 9007199254740992.0", "[Math]::Abs($d) -gt 9007199254740992.0"),
+            "a rounded fractional text read as an integer": ("-and (Test-GuiSmokeIntegerLiteral -Text ([string]$Value))", ""),
+            "parser keeps a rounded fractional literal as a double": (
+                "-not (Test-GuiSmokeIntegerLiteral -Text $rawValue)) { $result[$key] = $rawValue }",
+                "-not (Test-GuiSmokeIntegerLiteral -Text $rawValue) -and $false) { $result[$key] = $rawValue }"),
             "overrun block reads a double through its printed digits": (
                 "[Math]::Abs([double]$v) -lt 9007199254740992.0) { [decimal][int64][double]$v }",
                 "[Math]::Abs([double]$v) -lt 0.0) { [decimal][int64][double]$v }"),

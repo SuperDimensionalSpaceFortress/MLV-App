@@ -601,13 +601,28 @@ function Convert-PlaybackLogLineToObject {
             [System.Globalization.NumberStyles]::Float,
             [System.Globalization.CultureInfo]::InvariantCulture,
             [ref]$doubleValue)) {
-            $result[$key] = $doubleValue
+            # r8 (adversary accac79e A1): a fractional literal the double parser rounded to a whole number stays TEXT, so the gate's
+            # exact reader refuses it; a double here would read as an integer the receipt never held.
+            if ([Math]::Floor($doubleValue) -eq $doubleValue -and [Math]::Abs($doubleValue) -lt 9007199254740992.0 -and
+                -not (Test-GuiSmokeIntegerLiteral -Text $rawValue)) { $result[$key] = $rawValue }
+            else { $result[$key] = $doubleValue }
         }
         else {
             $result[$key] = $rawValue
         }
     }
     [pscustomobject]$result
+}
+
+function Test-GuiSmokeIntegerLiteral {
+    <#
+    .SYNOPSIS
+    GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r8 (adversary accac79e A1): $true when the TEXT spells an integer -- digits, an optional
+    fraction of zeros only, an optional exponent. A parser rounds a long fraction ("599.99999999999999999999999999999" -> 600), after which
+    "is it integral" is true of a value the receipt never held; only the text can say. Conservative: "1.5e1" (15) reads as not an integer.
+    #>
+    param([AllowNull()][string]$Text)
+    return ($null -ne $Text) -and [regex]::IsMatch($Text, '^\s*[+-]?[0-9]+(\.0*)?([eE][+-]?[0-9]+)?\s*$')
 }
 
 function Get-GuiSmokeExactCounter {
@@ -634,7 +649,7 @@ function Get-GuiSmokeExactCounter {
         elseif ([Math]::Abs($d) -ge 9007199254740992.0) { $reason = 'inexact_double' }    # r8 (adversary A1): 2^53 itself is where 2^53+1 rounds to
         else { $exact = [decimal][int64]$d }    # r8 (adversary A1): [decimal]$d rounds a double to 15 digits; the int64 cast of an integral |d| < 2^53 is exact
     } elseif ([decimal]::TryParse([string]$Value, [Globalization.NumberStyles]::Float, $inv, [ref]$m)) {
-        if ([decimal]::Truncate($m) -eq $m) { $exact = $m }
+        if ([decimal]::Truncate($m) -eq $m -and (Test-GuiSmokeIntegerLiteral -Text ([string]$Value))) { $exact = $m }    # r8 A1: the TEXT must spell an integer
     } elseif ([double]::TryParse([string]$Value, [Globalization.NumberStyles]::Float, $inv, [ref]$d) -and
               -not [double]::IsNaN($d) -and -not [double]::IsInfinity($d)) {
         $reason = 'out_of_range'    # a finite number past the range of a decimal
