@@ -6147,6 +6147,25 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(self.kinds(), [], "no claim, lease or leg. " + out)
         self.assertFalse(self.claim_path.exists(), out)
 
+    def test_r10_r4_deadline_a4_a_scalar_specs_zone_probe_is_bounded_by_the_deadline(self) -> None:
+        # R4-DEADLINE-RESIDUE-1 r3 (adversary ef31edb1 A4, sibling site): the scalar -LegSpec loop's Get-RunDirOutputRefusal is a synchronous probe of the share's own paths, and with a stalled one the
+        # preflight ran past -DeadlineUtc before any typed refusal. It runs on a worker given up on at the time left less 2 s now: no answer is OUTPUT_ZONE_UNRESOLVED, before the deadline.
+        spec = self.specs[0]
+        anchor = "    $hardLinkOf = ''; $hardLinkZone = $null; $script:refusalInputUnopened = $false; $script:refusalOutputUnresolved = $false\n"
+        stall = f"    if ($Path -like '*{spec.name}') {{ [Threading.Thread]::Sleep(40000) }}   # TEST FIXTURE: the output-zone probe of this spec answers 40 s late\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, stall + anchor),))
+        shas = self.case / "leg-spec-sha-r4dla4.log"
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_batch([spec], "-DeadlineUtc", utc_iso(deadline), FAKE_LEG_SPEC_SHA=str(shas))
+        ended = datetime.now(timezone.utc)
+        out = r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertFalse(shas.exists(), "a leg ran. " + out)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("OUTPUT_ZONE_UNRESOLVED", r.stderr, out)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the output-zone probe held it). " + out)
+        self.assertEqual(self.kinds(), [], "no claim, lease or leg. " + out)
+        self.assertFalse(self.claim_path.exists(), out)
+
     def test_r10_a2_a_key_lookup_is_bounded_by_what_is_left_before_the_deadline(self) -> None:
         # adversary pass 1 on 5a73d8e8, A2: the lookup waited a fixed 1 s, so a spec preflight that started it with 250 ms left refused about 750 ms past -DeadlineUtc. The mirror sets the deadline 250 ms
         # away right before the -LegSpec shape check and stamps the refusal's own time; the lookup (made to answer 3 s late) must wait only what the read bound allows (nothing here).
@@ -9735,8 +9754,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         c = self.commit_a
         manifest_probe = self.case / "r4dl-manifest-probe.ps1"
         manifest_probe.write_text("param($p)\n[Threading.Thread]::Sleep(120000)\n", encoding="utf-8")
-        anchor = "            if (-not (Test-Path -LiteralPath $batchLog)) { $logPlain = $true }\n"
-        self._mirror_with_bad_sidecar(runner_patches=((anchor, "            [Threading.Thread]::Sleep(8000)   # TEST FIXTURE: the share that holds batch.log answers 8 s late\n" + anchor),))
+        # (r3: the probe is the worker text Invoke-ProbeWithin runs; the stall sits in it, and with under 3 s left the probe is not made at all)
+        anchor = "if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, "[Threading.Thread]::Sleep(8000)   # TEST FIXTURE: the share that holds batch.log answers 8 s late\n" + anchor),))
         self.plan_runner = self.runner
         deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
         r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c)]), "-DeadlineUtc", utc_iso(deadline), "-StagedBuildProbeScript", str(manifest_probe))
@@ -9753,8 +9773,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         c = self.commit_a
         artifact_probe = self.case / "r4dl-artifact-probe.ps1"
         artifact_probe.write_text("param($items)\n[Threading.Thread]::Sleep(120000)\n", encoding="utf-8")
-        anchor = "            $outputRefusal = Get-RunDirOutputRefusal $st.path\n"
-        self._mirror_with_bad_sidecar(runner_patches=((anchor, "            [Threading.Thread]::Sleep(8000)   # TEST FIXTURE: the output-zone probe answers 8 s late\n" + anchor),))
+        # (r3: the stall sits in the manifest's zone probe itself; with under 3 s left it is not made at all)
+        anchor = "    $hardLinkOf = ''; $hardLinkZone = $null; $script:refusalInputUnopened = $false; $script:refusalOutputUnresolved = $false\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, "    if ($Path -like '*-build.json') { [Threading.Thread]::Sleep(8000) }   # TEST FIXTURE: the manifest's output-zone probe answers 8 s late\n" + anchor),))
         self.plan_runner = self.runner
         deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
         r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c)]), "-DeadlineUtc", utc_iso(deadline), "-ArtifactProbeScript", str(artifact_probe))
@@ -9764,6 +9785,77 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("could not be hashed", r.stderr)
         self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the output-zone probe held it)")
         self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
+
+    # BENCH-LIGHT-ARM-GAIN-GATES-1-R4-DEADLINE-RESIDUE-1 r3 (adversary ef31edb1 A4, major, introduced by r1's own threshold): the 3 s admission skipped the batch.log probe and the output-zone probe only
+    # when almost no time was left; with MORE than 3 s left a stalled probe still ran to its own end, past -DeadlineUtc. Each probe now runs on a worker given up on at the time left less 2 s. The mirror
+    # stalls the probe 40 s with about 15 s left: the run must end with the typed refusal BEFORE -DeadlineUtc.
+    def _r4dl_a4_zone_stall_mirror(self, leaf: str) -> None:
+        anchor = "    $hardLinkOf = ''; $hardLinkZone = $null; $script:refusalInputUnopened = $false; $script:refusalOutputUnresolved = $false\n"
+        stall = f"    if ($Path -like '*{leaf}') {{ [Threading.Thread]::Sleep(40000) }}   # TEST FIXTURE: the output-zone probe of this path answers 40 s late\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, stall + anchor),))
+        self.plan_runner = self.runner
+
+    def _r4dl_a4_zone_stall_refused_before_the_deadline(self, leaf: str, item_text: str) -> None:
+        self._r4dl_a4_zone_stall_mirror(leaf)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-DeadlineUtc", utc_iso(deadline))
+        ended = datetime.now(timezone.utc)
+        out = r.stdout[-2000:] + r.stderr[-3000:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn(f"LEG_PLAN_REFUSED reason=OUTPUT_ZONE_UNRESOLVED{item_text} ", r.stderr, out)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the output-zone probe held it). " + out)
+        self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
+
+    def test_artifact_preflight_r4_deadline_a4_the_plan_files_zone_probe_is_bounded_by_the_deadline(self) -> None:
+        self._r4dl_a4_zone_stall_refused_before_the_deadline("plan.json", "")
+
+    def test_artifact_preflight_r4_deadline_a4_an_item_specs_zone_probe_is_bounded_by_the_deadline(self) -> None:
+        self._r4dl_a4_zone_stall_refused_before_the_deadline(self.specs[0].name, " item=1")
+
+    def test_artifact_preflight_r4_deadline_a4_a_staged_manifests_zone_probe_is_bounded_by_the_deadline(self) -> None:
+        self._r4dl_a4_zone_stall_refused_before_the_deadline("-build.json", " item=1")
+
+    def test_artifact_preflight_r4_deadline_a4_the_refusal_logger_probe_with_room_left_is_bounded_by_the_deadline(self) -> None:
+        # BAD_ARM item=1 is refused through Stop-PlanRefused, which probes batch.log (about 15 s are left, so the 3 s admission lets the probe run). The mirror stalls the probe 40 s.
+        anchor = "if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, "[Threading.Thread]::Sleep(40000)   # TEST FIXTURE: the share that holds batch.log answers 40 s late\n" + anchor),))
+        self.plan_runner = self.runner
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "bad arm!", self.commit_a)]), "-DeadlineUtc", utc_iso(deadline))
+        ended = datetime.now(timezone.utc)
+        out = r.stdout[-2000:] + r.stderr[-3000:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=BAD_ARM item=1 ", r.stderr, out)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the batch.log probe held it). " + out)
+        log = self.run_dir / "batch.log"
+        self.assertNotIn("LEG_PLAN_REFUSED", log.read_text(encoding="utf-8") if log.exists() else "", "a probe that did not answer leaves batch.log unwritten (the share may hold it)")
+        self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
+
+    def test_artifact_preflight_r4_deadline_a4_without_a_deadline_the_probe_runs_inline_and_the_refusal_is_logged(self) -> None:
+        # No -DeadlineUtc: nothing to bound a probe to ($script:deadline is then a 6 h default), so the plain probe answers and the refusal reaches batch.log, as before. The plan_cmd default
+        # -DeadlineUtc pair is dropped from the command.
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "bad arm!", self.commit_a)]))
+        i = args.index("-DeadlineUtc")
+        del args[i:i + 2]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        out = r.stdout[-2000:] + r.stderr[-3000:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=BAD_ARM item=1 ", r.stderr, out)
+        log = self.run_dir / "batch.log"
+        self.assertIn("LEG_PLAN_REFUSED reason=BAD_ARM item=1 ", log.read_text(encoding="utf-8") if log.exists() else "", out)
+
+    def test_artifact_preflight_r4_deadline_a4_the_probe_helper_runs_a_probe_inline_when_no_deadline_was_given(self) -> None:
+        # Invoke-ProbeWithin tested `$bound -le 0`, which is TRUE for the $null that Get-ProbeBoundSec returns without -DeadlineUtc: no deadline read as "no time left" and the probe never ran.
+        # The two helpers are lifted out of the runner and run with $DeadlineUtc empty: the probe's answer comes back, and nothing is counted as unanswered.
+        source = RUNNER.read_text(encoding="utf-8")
+        m = re.search(r"^function Get-ProbeBoundSec \{.*?^\}\r?\n.*?^function Invoke-ProbeWithin\(.*?^\}\r?\n", source, re.S | re.M)
+        self.assertIsNotNone(m, "the probe helpers moved: update this case")
+        script = ("$DeadlineUtc = ''; $script:ProbeUnanswered = $false\n" + m.group(0) +
+                  "\n$r = Invoke-ProbeWithin 'param($a) $a.x * 2' @{ x = 21 }\n"
+                  "ConvertTo-Json -Compress -InputObject @{ answered = $r.answered; value = @($r.value)[-1]; unanswered = $script:ProbeUnanswered; noBound = ($null -eq (Get-ProbeBoundSec)) }\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"answered": True, "value": 42, "unanswered": False, "noBound": True}, out.stdout + out.stderr)
 
 
 # the runner cases are inherited only for their fixtures: they run once, in their own class (unittest collects callable test_* attributes only)

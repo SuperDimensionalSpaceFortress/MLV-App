@@ -401,6 +401,75 @@ function LogBest([string]$Message) {
     }
 }
 
+# R4-DEADLINE-RESIDUE-1 r2 (adversary ef31edb1 A4, major, introduced by r1's own threshold): r1 made the two synchronous preflight probes (the batch.log probe, the output-zone probe)
+# skip when under 3 s was left, but a stalled probe with MORE than 3 s left still ran to its own end, past -DeadlineUtc. A threshold admits a probe; it does not bound one. Each probe now
+# runs on a worker the caller gives up on at the time left before -DeadlineUtc less 2 s (VenueChain's Invoke-VenueBoundedRead, as every other bounded read here), so the typed refusal
+# lands before the deadline whatever the share does. A worker that does not answer is abandoned and counted (VenueAbandonedReads), so Complete-VenueProcess exits at once, and the
+# refusal goes to stderr only (nothing more is written into -RunDir: the share that stalled may hold it). No -DeadlineUtc: the probe runs inline, as before.
+$script:ProbeReserveSec = 2.0
+$script:ProbeUnanswered = $false
+function Get-ProbeBoundSec {
+    # $null = no -DeadlineUtc was given (the probe runs inline; $script:deadline is then a 6 h default, never a bound to hold a probe to); 0 = under the least bound (1 s) is left;
+    # else the longest a probe may take now, capped at the bounded read's own 600 s
+    if (-not $DeadlineUtc) { return $null }
+    $room = ($script:deadline - [DateTime]::UtcNow).TotalSeconds - $script:ProbeReserveSec
+    if ($room -lt 1.0) { return 0.0 }
+    [Math]::Min(600.0, $room)
+}
+function Invoke-ProbeWithin([string]$ScriptText, $Argument) {
+    # [pscustomobject]@{ answered; value; error }: the probe's output, or no answer (the bound ended, no room was left, or the worker threw)
+    $bound = Get-ProbeBoundSec
+    # no -DeadlineUtc: the plain inline probe. This branch comes FIRST: `$null -le 0` is TRUE, so the test below read "no deadline" as "no time left"
+    if ($null -eq $bound) {
+        try { return [pscustomobject]@{ answered = $true; value = @(& ([scriptblock]::Create($ScriptText)) $Argument); error = $null } }
+        catch { return [pscustomobject]@{ answered = $false; value = @(); error = $_.Exception.Message } }
+    }
+    if ($bound -le 0) { $script:ProbeUnanswered = $true; return [pscustomobject]@{ answered = $false; value = @(); error = 'no time is left before -DeadlineUtc for it' } }
+    $r = & (Get-Module VenueChain) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } $ScriptText $Argument $bound
+    if (-not $r.answered -and [string]$r.error -like 'no answer in*') { $script:ProbeUnanswered = $true }   # a stall (the worker is abandoned); a worker that threw is not one
+    $r
+}
+# the batch.log probe, one text for the worker and the inline call: 'plain' when batch.log is absent or a one-name file that is no link, else 'other'. The file identity is read through the
+# compiled type Get-PhysicalPath loaded (assemblies are process-wide, so the worker sees it); $A.delayMs is the offline -GuardReadDelay seam (0 in production).
+$script:LogProbeScriptText = @'
+$A = $args[0]
+$batchLog = $A.path
+if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }
+if (-not (Test-Path -LiteralPath $batchLog)) { return 'plain' }
+if (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    [uint32]$links = 0
+    $null = [VenueLeaseBatchFinalPath]::Identity([IO.Path]::GetFullPath($batchLog), [ref]$links)
+    if ([int]$links -le 1) { return 'plain' }
+}
+'other'
+'@
+function Get-RunDirReadSeamMs {
+    # Wait-RunDirReadSeam's own condition, as the delay the probe worker sleeps (the same stderr line, said once here); 0 in production
+    $d = $script:guardDelaySeam
+    if ($null -ne $d -and $d.read -ceq 'rundir' -and $d.guard -ceq $script:lastGuardSeam) { [Console]::Error.WriteLine('GUARD_READ_DELAY_SEAM rundir (a -RunDir read after the guard)'); return [int]$d.ms }
+    0
+}
+$script:ZoneProbeFunctions = @('Get-RunDirOutputRefusal', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator', 'Wait-GuardReadSeam')
+function Get-RunDirOutputRefusalWithin([string]$Path) {
+    # Get-RunDirOutputRefusal, bounded by -DeadlineUtc (same answer, same $script:refusalInputUnopened / refusalOutputUnresolved flags). A probe that gives no answer is the refusal
+    # OUTPUT_ZONE_UNRESOLVED ("an output location could not be resolved": nothing vouches for it), and nothing more is written into -RunDir. No -DeadlineUtc: the plain call.
+    if ($null -eq (Get-ProbeBoundSec)) { return Get-RunDirOutputRefusal $Path }
+    $script:ProbeUnanswered = $false
+    $fn = ($script:ZoneProbeFunctions | ForEach-Object { "function $_ {`n$((Get-Item -LiteralPath "function:$_").Definition)`n}" }) -join "`n"
+    $vars = @{ RunDir = $RunDir; RunDirOutputLeafPatterns = $script:RunDirOutputLeafPatterns; RunDirOutputDirs = $script:RunDirOutputDirs; ClaimDirPath = $script:ClaimDirPath
+        ClaimDirOutputLeafPatterns = $script:ClaimDirOutputLeafPatterns; ClaimDirOutputDirs = $script:ClaimDirOutputDirs; guardDelaySeam = $null }
+    $text = "`$A = `$args[0]; `$ErrorActionPreference = 'Stop'`nforeach (`$k in `$A.vars.Keys) { Set-Variable -Name `$k -Value `$A.vars[`$k] -Scope Global }`n$fn`n" +
+        "`$r = Get-RunDirOutputRefusal `$A.path`n[pscustomobject]@{ refusal = [string]`$r; unopened = [bool]`$script:refusalInputUnopened; unresolved = [bool]`$script:refusalOutputUnresolved }"
+    $r = Invoke-ProbeWithin $text @{ path = $Path; vars = $vars }
+    $o = $(if ($r.answered) { @($r.value | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['refusal'] })[-1] } else { $null })
+    if ($null -eq $o) {
+        $script:refusalInputUnopened = $false; $script:refusalOutputUnresolved = $true; $script:RunOutputAliased = $true
+        return "'$Path' cannot be checked against this run's outputs: the check did not answer within the time left before -DeadlineUtc ($($r.error)); the input itself opens, and outputs whose location is unknown are refused"
+    }
+    $script:refusalInputUnopened = [bool]$o.unopened; $script:refusalOutputUnresolved = [bool]$o.unresolved
+    [string]$o.refusal
+}
+
 function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
     # LEASE-BATCH-MULTI-BUILD-1 (item 9a): a -LegPlan item that cannot run refuses the WHOLE plan before any claim, open or lease. Nothing was submitted.
     $line = "LEG_PLAN_REFUSED reason=$Reason$(if ($Item -gt 0) { " item=$Item" }) $Detail"
@@ -420,11 +489,19 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
     # r14 (sol r13 B5): nor for a bounded read that got no answer (SPEC_READ_TIMEOUT, EXPORT_BUDGET_PREFLIGHT_TIMEOUT): the share that stalled may hold -RunDir too, and the synchronous batch.log
     # probe below would hold the typed refusal past the deadline the bound was there to keep; stderr carries the line.
     if (-not $script:RunOutputAliased -and $logRoomSec -ge 3.0 -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT', 'INPUT_VANISHED', 'INPUT_UNREADABLE', 'OUTPUT_ZONE_UNRESOLVED', 'SPEC_READ_TIMEOUT', 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT')) {
-        try {
-            Wait-RunDirReadSeam
-            if (-not (Test-Path -LiteralPath $batchLog)) { $logPlain = $true }
-            elseif (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (Get-FileIdentity $batchLog).links -le 1) { $logPlain = $true }
-        } catch { }
+        if ($DeadlineUtc) {
+            # R4-DEADLINE-RESIDUE-1 r3 (adversary ef31edb1 A4): the 3 s test above ADMITS the probe, it does not bound it. With more than 3 s left a stalled probe still ran to its own end,
+            # past -DeadlineUtc. It runs on a worker given up on at the time left less 2 s (Invoke-ProbeWithin); no answer leaves batch.log unwritten and every later line on stderr.
+            $probe = Invoke-ProbeWithin $script:LogProbeScriptText @{ path = $batchLog; delayMs = (Get-RunDirReadSeamMs) }
+            if (-not $probe.answered) { if ($script:ProbeUnanswered) { $script:RunOutputAliased = $true } }   # a stall: the share may hold -RunDir; a probe that threw only leaves batch.log unwritten, as before
+            elseif (@($probe.value)[-1] -ceq 'plain') { $logPlain = $true }
+        } else {
+            try {
+                Wait-RunDirReadSeam
+                if (-not (Test-Path -LiteralPath $batchLog)) { $logPlain = $true }
+                elseif (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (Get-FileIdentity $batchLog).links -le 1) { $logPlain = $true }
+            } catch { }
+        }
     }
     if ($logPlain -and (Test-RunDirWrite $batchLog)) {
         # r3 pass 3 (adversary r3 A1): a failed append is counted when a summary follows (a refusal once a batch receipt exists), so the count that summary reports includes it
@@ -1721,7 +1798,7 @@ if ($legPlanMode) {
         Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force   # the leg process's own spec predicates, run in preflight (Get-LegSpecRefusal)
         $planPath = $(if (Test-Path -LiteralPath $LegPlan -PathType Leaf) { (Resolve-Path -LiteralPath $LegPlan).Path } else { $null })
         if (-not $planPath) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "no plan file at '$LegPlan'" }
-        $outputRefusal = Get-RunDirOutputRefusal $planPath   # r9: the plan is an input too (leg-plan.json is written over it once the claim is held)
+        $outputRefusal = Get-RunDirOutputRefusalWithin $planPath   # r9: the plan is an input too (leg-plan.json is written over it once the claim is held); r3: bounded by -DeadlineUtc (A4 sibling)
         if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'LEG_PLAN_IS_RUN_OUTPUT') 0 "the plan file $outputRefusal" }
         # r19 (sol r18 B2 sibling sweep): the plan's read is bounded by the room before -DeadlineUtc too; no answer in it is the typed LEG_PLAN_UNREADABLE, never a read past the deadline
         $planRead = Read-SpecBytesWithin $planPath (Get-SpecReadBoundSec)
@@ -1760,7 +1837,7 @@ if ($legPlanMode) {
             $path = $(if ($ref) { Resolve-LegSpecPath $ref $planDir } else { $null })
             if (-not $path) { Stop-PlanRefused 'LEG_SPEC_MISSING' $n "no leg spec at '$ref'" }
             # adversary r7 pass 2 A1, r9: a spec that IS one of the files this run writes under -RunDir (the one list above) would be overwritten after the lease opened.
-            $outputRefusal = Get-RunDirOutputRefusal $path
+            $outputRefusal = Get-RunDirOutputRefusalWithin $path   # r3: bounded by -DeadlineUtc (A4 sibling)
             if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'LEG_SPEC_IS_RUN_OUTPUT') $n "the leg spec $outputRefusal" }
             $specRefusal = Get-LegSpecRefusal $path $be
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
@@ -1806,7 +1883,13 @@ if ($legPlanMode) {
                 $script:RunOutputAliased = $true
                 Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error); no time is left before -DeadlineUtc for the output-zone check, so batch.log is not written (this refusal is on stderr only)"
             }
-            $outputRefusal = Get-RunDirOutputRefusal $st.path
+            # R4-DEADLINE-RESIDUE-1 r3 (adversary ef31edb1 A4): the 3 s test above only skips the probe when almost no time is left; with more left it runs on a worker given up on at the time left
+            # less 2 s. An unhashed manifest whose zone check got no answer is the same typed SHARE_UNREACHABLE on stderr only; any other manifest is OUTPUT_ZONE_UNRESOLVED (nothing vouches for it).
+            $outputRefusal = Get-RunDirOutputRefusalWithin $st.path
+            if ($st.artifactsUnhashed -and $script:ProbeUnanswered) {
+                $script:RunOutputAliased = $true
+                Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error); the output-zone check did not answer within the time left before -DeadlineUtc, so batch.log is not written (this refusal is on stderr only)"
+            }
             if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'BUILD_MANIFEST_IS_RUN_OUTPUT') $it.item "the staged build manifest for $short $outputRefusal" }
             if ($st.artifactsUnhashed) { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
             if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
@@ -1875,7 +1958,7 @@ if ($legPlanMode) {
     foreach ($ref in $LegSpec) {
         $path = Resolve-LegSpecPath $ref ''
         if (-not $path) { Stop-Usage "no leg spec at '$ref'" }
-        $outputRefusal = Get-RunDirOutputRefusal $path   # r9: the same guard as a -LegPlan item's spec
+        $outputRefusal = Get-RunDirOutputRefusalWithin $path   # r9: the same guard as a -LegPlan item's spec; r3: bounded by -DeadlineUtc (A4 sibling)
         if ($outputRefusal) { Stop-Usage "$(Get-OutputRefusalCode 'LEG_SPEC_IS_RUN_OUTPUT') the leg spec $outputRefusal" }
         # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): the leg's shape refusals (Get-DvLegSpecShapeRefusal: a non-object control container, a look
         # leg with no look, a malformed look.pairedSeekFrames) are refused HERE, before any claim or lease, as the -LegPlan preflight refuses them; the leg would
