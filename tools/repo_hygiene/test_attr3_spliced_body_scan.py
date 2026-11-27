@@ -360,7 +360,8 @@ _allow("Get-AttrCudaEligibilityVerdict", _LOCAL_BLOCK, ("R3", "& $read", 8))
 # `{ [bool]($BudgetMs -gt 0 -and (& $budgetElapsed) -gt $BudgetMs) }`; 8 $overBudget calls (one per row-loop / result check) and 2 $budgetElapsed calls (that block, and the pre-dispatch guard of the CIM query).
 # R2-RESIDUE-3 r2 (adversary A2 on 3853fb75): the -BaselineOnly branch carries the bound too, so $budgetElapsed and $overBudget are defined BEFORE it (still pure blocks) and the branch reads them once
 # each: 3 $budgetElapsed calls (the $overBudget block, the baseline dispatch guard, the tree dispatch guard) and 9 $overBudget calls (the 8 above and the baseline's post-query check).
-_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 16), ("R3", "& $inBase", 2), ("R3", "& $overBudget", 11), ("R3", "& $budgetElapsed", 3))
+# r5 (sol r4 B3 sibling): 17 $unknown calls = the 16 above plus the typed unknown for a row with no readable pid (unreadable evidence the decode cannot classify).
+_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 17), ("R3", "& $inBase", 2), ("R3", "& $overBudget", 11), ("R3", "& $budgetElapsed", 3))
 # R2-RESIDUE-3 r2 fix iteration 2 (adversary A2 on 342a1ac7): 11 $overBudget calls = the 9 above plus the baseline decode's per-row check and its check before the table is returned.
 _allow("Get-AttrCudaProcessTreeSnapshot",
        "test-only seam: runs the caller's -Clock block (a stand-in for the elapsed-milliseconds read of the decode budget) only when a test passed one; production passes none and reads a Stopwatch",
@@ -371,7 +372,8 @@ _allow("Wait-AttrCudaProcessTreeGone",
 _allow("Wait-AttrCudaProcessTreeGone", _LOCAL_BLOCK, ("R3", "& $inBase", 2))
 # R2-RESIDUE-3 r2 (sol r8 A3): -Clock is the caller's own clock (a block reading the elapsed ms of the bound -WaitMs is measured on). $elapsedMs is the body's pure block, defined on its second
 # statement: `{ if ($null -ne $Clock) { [double](& $Clock) } else { $ownStopwatch.Elapsed.TotalMilliseconds } }`. 5 calls: the loop test, the scan grant (twice: the floor re-check and the whole seconds
-# left), the post-scan check and the sleep. It reads a clock and runs nothing else.
+# left), the post-scan check and the sleep. It reads a clock and runs nothing else. r5 (sol r4 B2): the block now also refuses a read that is not one finite number and takes the larger
+# of that read and the body's own stopwatch; still one `& $Clock` inside it and still 5 calls of it, so the counts are unchanged.
 _allow("Wait-AttrCudaProcessTreeGone",
        "runs the caller's -Clock block (the elapsed milliseconds of the caller's own clock, the one the bound -WaitMs is measured on) and the body's pure $elapsedMs reader of it; a clock read only",
        ("R3", "& $Clock", 1), ("R3", "& $elapsedMs", 5))

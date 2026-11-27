@@ -23,6 +23,7 @@ import hashlib
 import json
 import re
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -4465,11 +4466,11 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertLess(tree_wait, text.index("$logText = try {"), "the tree is settled before any output is read")
         self.assertIn("if (-not $exportTreeGone.confirmed) { $killConfirmed = $false;", text)
 
-    def snapshot_and_wait(self, body: str) -> dict:
+    def snapshot_and_wait(self, body: str, timeout: int = 600) -> dict:
         proc = run_pwsh(["-Command", f"$ErrorActionPreference = 'Stop'; Import-Module '{ARTIFACTS_MODULE}' -Force -DisableNameChecking\n"
                          "$t = [datetime]::new(2026, 11, 19, 12, 0, 0, [DateTimeKind]::Utc)\n"
                          "function Row($p, $pp, $c) { [pscustomobject]@{ ProcessId = $p; ParentProcessId = $pp; CreationDate = $c } }\n"
-                         + self.BASELINE_FIXTURE_PROXY + body])
+                         + self.BASELINE_FIXTURE_PROXY + body], timeout=timeout)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout.strip().splitlines()[-1])
 
@@ -4801,7 +4802,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
     def test_r7_a_wait_row_with_no_pid_under_the_tree_is_never_a_confirmed_kill(self) -> None:
         """r7 fold-in (sol r6d hardening; fable EKDC-WAIT-NULL-PID-ROW-FAIL-CLOSED-1). The snapshot fails closed on a row with no readable pid under a member
         (descendant-unreadable); the wait dropped the same row and confirmed. It now fails closed the same way, under a recorded member, the root, or a process the
-        wait found in the tree. Control: a no-pid row under an unrelated parent is ignored, as in the snapshot."""
+        wait found in the tree. r5 (sol r4 B3): a no-pid row under an unrelated parent is no longer ignored: it carries no identity, so it is unreadable evidence there too."""
         got = self.snapshot_and_wait(
             "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
             "$s = Get-AttrCudaProcessTreeSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)), (Row 400 4 $t.AddSeconds(-5))))\n"
@@ -4816,7 +4817,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertFalse(got["root"], got)
         self.assertFalse(got["late"], got)
         self.assertIn("descendant-unreadable", str(got["lateWhy"]), got)
-        self.assertTrue(got["other"], f"control: a no-pid row under an unrelated outsider is not the tree: {got}")
+        # r5 (sol r4 B3): a no-pid row carries no identity, so it is unreadable evidence wherever its parent is (this was a control that confirmed; it is now unconfirmed, typed)
+        self.assertFalse(got["other"], f"a no-pid row under an outsider is unreadable evidence too: {got}")
+        self.assertIn("row-without-pid", str(got["otherWhy"]), got)
 
     def test_r7_b2_the_helper_source_loads_before_the_child_starts_so_the_kill_never_waits_on_it(self) -> None:
         """r7, sol r6d B2. Invoke-VenueBoundedProcess read and compiled the helper source AFTER its child timed out, inside the -CleanupWaitMs allowance and before
@@ -5122,6 +5125,65 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             self.assertEqual(c["handSurvivors"], [600], got)
             self.assertNotIn(700, c["parentOthers"], got)
             self.assertFalse(c["parentConfirmed"], f"{name}: a child of a baseline process not older than the root is unproven: {got}")
+
+    def test_r5_sol_r4_b2_a_clock_that_reads_nothing_or_stands_still_never_holds_the_wait_open(self) -> None:
+        """r5 (sol r4 B2 on eb70c475). `-Clock {}` returns nothing, which [double] turns into 0 on every read: with a survivor that never goes, the loop test kept the whole 1200 ms bound, every
+        scan was granted and the wait never returned. A clock read that is not ONE finite number (nothing, $null, a string, NaN, two values) is now a spent bound ('clock-unreadable'), and every
+        read is held to the helper's own stopwatch, so a caller clock that stands still ends the wait inside the bound too ('clock-not-advancing'). Each returns unconfirmed, inside the bound.
+        Controls: a real caller clock with the survivor is an ordinary unconfirmed wait ('survivors') that ends at the bound, and with the tree gone it confirms."""
+        body = (
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$s = & $realSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t))) -Baseline (& $realSnapshot -BaselineOnly -Processes $sys)\n"
+            "$o = [ordered]@{}\n"
+            "$cases = [ordered]@{ empty = {}; null = { $null }; text = { 'soon' }; nan = { [double]::NaN }; two = { 1.0; 2.0 }; still = { 5.0 } }\n"
+            "foreach ($k in @($cases.Keys)) {\n"
+            "  $global:n = 0; $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            "  $w = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Clock $cases[$k] -Scan { $global:n++; @($sys + @((Row 100 4 $t))) }\n"
+            "  $o[$k] = [ordered]@{ confirmed = $w.confirmed; why = $w.error; ms = $sw.Elapsed.TotalMilliseconds; survivors = @($w.survivors) }\n"
+            "}\n"
+            "foreach ($k in @('real', 'gone')) {\n"
+            "  $global:real = [Diagnostics.Stopwatch]::StartNew(); $sw = [Diagnostics.Stopwatch]::StartNew()\n"
+            "  $w = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Clock { $global:real.Elapsed.TotalMilliseconds } -Scan { if ($k -eq 'real') { @($sys + @((Row 100 4 $t))) } else { @($sys) } }\n"
+            "  $o[$k] = [ordered]@{ confirmed = $w.confirmed; why = $w.error; ms = $sw.Elapsed.TotalMilliseconds; survivors = @($w.survivors) }\n"
+            "}\n"
+            "$o | ConvertTo-Json -Compress -Depth 4")
+        try:
+            got = self.snapshot_and_wait(body, timeout=180)
+        except subprocess.TimeoutExpired:
+            self.fail("sol r4 B2: the wait never returned: a caller clock that reads nothing held the bounded wait open (killed after 180 s)")
+        for name in ("empty", "null", "text", "nan", "two", "still"):
+            c = got[name]
+            self.assertIs(c["confirmed"], False, f"{name}: {got}")
+            self.assertLess(c["ms"], 3000, f"{name}: the wait returns inside its bound whatever the caller's clock reads: {got}")
+            self.assertEqual(c["why"], "clock-not-advancing" if name == "still" else "clock-unreadable", f"{name}: the refusal is typed: {got}")
+        self.assertIs(got["real"]["confirmed"], False, got)
+        self.assertEqual(got["real"]["why"], "survivors", got)
+        self.assertEqual(got["real"]["survivors"], [100], got)
+        # a 1200 ms bound scans only while 1.1 s (CIM's 1 s floor plus the 100 ms margin) is left: about 100 ms of real scanning
+        self.assertGreater(got["real"]["ms"], 90, f"control: a real clock scans until only the floor is left: {got}")
+        self.assertLess(got["real"]["ms"], 3000, got)
+        self.assertIs(got["gone"]["confirmed"], True, f"control: a real clock with the tree gone confirms: {got}")
+
+    def test_r5_sol_r4_b3_a_row_with_no_pid_is_unreadable_evidence_wherever_its_parent_is(self) -> None:
+        """r5 (sol r4 B3 on eb70c475). The sol literal: a valid snapshot of root 100 at T (no members, baseline process 400 older than T); the wait's scan holds baseline 400 and
+        {ProcessId=$null; ParentProcessId=900; CreationDate=T+1s}, 900 absent and unrecorded. The row was kept only by its parent, 900 was neither expanded nor adopted, so the row was dropped
+        and the kill confirmed. A row with no readable pid carries no identity, so its ancestry cannot be proved: it is unreadable evidence wherever its parent is and the scan confirms
+        nothing. The snapshot (sibling) makes the tree unknown on the same row. Control: the same scan without the row confirms."""
+        got = self.snapshot_and_wait(
+            "$sys0 = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)), (Row 400 4 $t.AddHours(-1)))\n"
+            "$bl = & $realSnapshot -BaselineOnly -Processes $sys0\n"
+            "$s = & $realSnapshot -RootProcessId 100 -Processes @($sys0 + @((Row 100 4 $t))) -Baseline $bl\n"
+            "$noPid = [pscustomobject]@{ ProcessId = $null; ParentProcessId = 900; CreationDate = $t.AddSeconds(1) }\n"
+            "$w = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys0 + @($noPid)) }\n"
+            "$snap = & $realSnapshot -RootProcessId 100 -Processes @($sys0 + @((Row 100 4 $t), $noPid)) -Baseline $bl\n"
+            "$ctl = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys0) }\n"
+            "[ordered]@{ sOk = $s.ok; confirmed = $w.confirmed; why = $w.error; snapOk = $snap.ok; snapWhy = $snap.error; ctl = $ctl.confirmed } | ConvertTo-Json -Compress")
+        self.assertIs(got["sOk"], True, got)
+        self.assertIs(got["confirmed"], False, f"a no-pid row under an absent, unrecorded parent must not confirm the kill: {got}")
+        self.assertIn("row-without-pid", str(got["why"]), got)
+        self.assertIs(got["snapOk"], False, f"sibling: the snapshot cannot classify a no-pid row either: {got}")
+        self.assertIn("row-without-pid", str(got["snapWhy"]), got)
+        self.assertIs(got["ctl"], True, f"control: the same scan without the row confirms: {got}")
 
     def test_r2_sol_a1_a2_a9_a_baseline_look_alike_under_the_tree_is_a_member_an_outsider_keeps_its_parent_and_a_blind_row_confirms_nothing(self) -> None:
         """sol r2 on b428e461. A1: baseline process 600 (parent 100, stamp t-30s) died, the old 100 died, the root reuses 100 and its child reuses 600 and (after a rollback) the very
@@ -5538,7 +5600,7 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertTrue(got["none"], f"control: no bound, as before: {got}")
         self.assertIsNone(got["thrown"], f"the wait never throws on a caller clock that throws: {got}")
         self.assertFalse(got["confirmed"], got)
-        self.assertEqual(got["why"], "no-time-to-confirm", got)
+        self.assertEqual(got["why"], "clock-unreadable", got)   # r5 (sol r4 B2): an unusable caller clock is typed as such
         self.assertEqual(got["scans"], 0, got)
 
     def test_r2_residue_3_a3_every_call_site_in_the_pr_hands_the_helpers_the_absolute_bound_and_its_clock(self) -> None:

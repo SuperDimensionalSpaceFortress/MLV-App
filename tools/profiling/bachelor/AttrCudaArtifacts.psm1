@@ -5079,7 +5079,9 @@ function Get-AttrCudaProcessTreeSnapshot {
     # query has its own -OperationTimeoutSec; the rows it returns were then decoded with no deadline. Past the budget the answer is the typed unknown 'deadline-exceeded' (no caller may confirm
     # a tree from it). The check is inline (no helper) because VenueChain embeds this function alone, by name.
     $budgetClock = [Diagnostics.Stopwatch]::StartNew()
-    $budgetElapsed = { if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds } }
+    # r5 (sol r4 B2 sibling): a caller clock read that is not ONE finite number (nothing, $null, a string, NaN, two values) is a spent budget (the typed unknown), never 0 ms
+    $budgetElapsed = { if ($null -ne $Clock) { $read = @(& $Clock); $v = $(if ($read.Count -eq 1) { $read[0] } else { $null })
+            if (-not ($v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [single] -or $v -is [decimal]) -or [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { 1e15 } else { [double]$v } } else { $budgetClock.Elapsed.TotalMilliseconds } }
     $overBudget = { [bool]($BudgetMs -gt 0 -and (& $budgetElapsed) -gt $BudgetMs) }
     if ($BaselineOnly) {
         try {
@@ -5179,7 +5181,9 @@ function Get-AttrCudaProcessTreeSnapshot {
         $rowParent = @{}
         foreach ($row in $rows) {
             if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
-            if ($null -eq $row -or $null -eq $row.ProcessId) { continue }
+            if ($null -eq $row) { continue }
+            # r5 (sol r4 B3 sibling): a row with no readable pid (under a member it already failed the walk above) cannot be classified: it is unreadable evidence, so the tree is unknown
+            if ($null -eq $row.ProcessId) { return (& $unknown "unreadable-row row-without-pid parent=$($row.ParentProcessId)") }
             $rp = [int64]$row.ProcessId
             $rowTicks[$rp] = $(if ($null -eq $row.CreationDate) { $null } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
             $rowParent[$rp] = $(if ($null -eq $row.ParentProcessId) { $null } else { [int64]$row.ParentProcessId })
@@ -5237,7 +5241,13 @@ function Wait-AttrCudaProcessTreeGone {
     # (PowerShell names are case-insensitive: the stopwatch is $ownStopwatch because $clock would overwrite the -Clock parameter)
     $ownStopwatch = [Diagnostics.Stopwatch]::StartNew()
     # (adversary A6 on 3853fb75: the helper never throws, so a caller clock that throws reads as no time at all: the bound is spent and nothing is scanned)
-    $elapsedMs = { if ($null -ne $Clock) { try { [double](& $Clock) } catch { 1e15 } } else { $ownStopwatch.Elapsed.TotalMilliseconds } }
+    # r5 (sol r4 B2 on eb70c475): `-Clock {}` returned nothing, which [double] turns into 0 on every read, so with a survivor that never went the loop kept the whole bound and never returned. A read
+    # that is not ONE finite number (nothing, $null, a string, NaN, a throw, two values) is a spent bound ('clock-unreadable'), and every read is held to this body's own stopwatch: a caller clock
+    # started before this call can never read less than it, so the larger of the two changes nothing for a real clock and a clock that stands still cannot hold the wait open ('clock-not-advancing').
+    $clockSeen = @{ unreadable = $false; ownWon = $false }
+    $elapsedMs = { $own = $ownStopwatch.Elapsed.TotalMilliseconds; if ($null -eq $Clock) { return $own }; $read = @(try { & $Clock } catch { $clockSeen.unreadable = $true }); $v = $(if ($read.Count -eq 1) { $read[0] } else { $null })
+        if (-not ($v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [single] -or $v -is [decimal]) -or [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { $clockSeen.unreadable = $true; return 1e15 }
+        $clockSeen.ownWon = ($own -gt [double]$v); [Math]::Max([double]$v, $own) }
     # r3 fix 2 (adversary A2 advisory on 6b788356): every snapshot field is read through PSObject.Properties, so a snapshot missing one (under strict mode) is an
     # unknown tree, never a throw. r5b fix (adversary A4 on 2420b65f): a property getter that throws is read inside the same guard.
     $snapProps = $null
@@ -5373,6 +5383,9 @@ function Wait-AttrCudaProcessTreeGone {
             foreach ($np in $noPidParents) { if ($expanded.Contains($np) -or $adopted.Contains($np)) { $noPidUnder = $np; break } }
             if ($blindRow -and $null -eq $noPidUnder) { $noPidUnder = 'none'; $lastError = 'descendant-unreadable row-without-pid' }
             elseif ($null -ne $noPidUnder) { $lastError = "descendant-unreadable parent=$noPidUnder" }
+            # r5 (sol r4 B3 on eb70c475): a row with no readable pid whose parent the walk did not reach (absent, unrecorded, or an outsider's number that may have been recycled) was dropped and
+            # the kill confirmed. Its ancestry cannot be proved from a row that carries no identity, so it is unreadable evidence wherever it sits: this scan confirms nothing.
+            elseif ($noPidParents.Count -gt 0) { $noPidUnder = $noPidParents[0]; $lastError = "unreadable-row row-without-pid parent=$noPidUnder" }
             if ((& $elapsedMs) -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
             if ($survivors.Count -eq 0 -and $null -eq $noPidUnder) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
         } catch { $lastError = "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
@@ -5381,6 +5394,8 @@ function Wait-AttrCudaProcessTreeGone {
         if ($sleepMs -lt 0) { break }
         if ($sleepMs -gt 0) { Start-Sleep -Milliseconds ([int]$sleepMs) }
     }
+    # r5 (sol r4 B2): a bound that ended on an unusable caller clock, or on this body's own stopwatch because the caller's clock stood still, is typed as such (still unconfirmed)
+    if ($clockSeen.unreadable) { $lastError = 'clock-unreadable' } elseif ($clockSeen.ownWon -and $lastError -ne 'scan-ended-past-the-bound') { $lastError = 'clock-not-advancing' }
     [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = $lastError }
 }
 
