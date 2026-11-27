@@ -5804,6 +5804,98 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
                 self.assertFalse(self.claim_path.exists(), "no claim was written")
 
+    # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the leg refuses a spec that is not COMMITTED (LEG_SPEC_NOT_COMMITTED, Invoke-VenueLeg.ps1 via Find-DvCommittedLegSpec) only
+    # after the lease is open: on 2026-11-27T19:11:55Z an untracked swap0 spec spent about 2 min of Bachelor lease and a quiet probe before that refusal. The batch preflight now
+    # asks the SAME function before any claim, open or lease. -CommittedSpecRepoRoot is the offline seam that turns the preflight on against a repo's HEAD while the stubs stand in
+    # for the leg (the check is on by default only when the leg script is the real Invoke-VenueLeg.ps1, as the leg's own check is on outside -OfflineTestMode).
+    _COMMITTED_SPEC = DV / "legs" / "m16-1243-chainattr-l-fullscreen-s1.json"
+
+    def _untracked_copy_of_a_committed_spec(self) -> Path:
+        doc = json.loads(self._COMMITTED_SPEC.read_text(encoding="utf-8"))
+        doc["playSeconds"] = 26   # one field changed: the bytes are no committed blob's bytes
+        p = self.case / "untracked-swap0.json"
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        return p
+
+    def _reset_committed_case(self) -> None:
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+
+    def _assert_nothing_claimed_or_leased(self, mode: str, r: subprocess.CompletedProcess) -> None:
+        out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted: no open, no probe, no leg. " + out)
+        self.assertEqual(self.leg_calls(), [], f"{mode}: no leg ran. " + out)
+        self.assertFalse(self.claim_path.exists(), f"{mode}: a claim was written for a spec the leg refuses. " + out)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: a lease was opened. " + out)
+
+    def test_legspec_committed_an_uncommitted_spec_is_refused_before_any_claim_in_every_mode(self) -> None:
+        untracked = self._untracked_copy_of_a_committed_spec()
+        seam = ("-CommittedSpecRepoRoot", str(ROOT))
+        self._reset_committed_case()
+        r = self.run_batch([untracked], *seam)
+        self._assert_nothing_claimed_or_leased("-LegSpec", r)
+        self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+        # the plan form: the whole plan is refused at the item (item 2: item 1 is a committed spec and is fine), naming the index
+        committed_item = self.item(self._COMMITTED_SPEC, "A", self.commit_a)
+        self._reset_committed_case()
+        r = self.run_plan(self.write_plan([committed_item, self.item(untracked, "B", self.commit_a)]), *seam)
+        self._assert_nothing_claimed_or_leased("-LegPlan", r)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_NOT_COMMITTED item=2 ", r.stderr)
+        # -LegSet: a set under legsets/ naming an untracked copy beside the committed legs (both removed in the finally)
+        name = f"zz-legspec-committed-{uuid.uuid4().hex[:8]}"
+        legset_path = DV / "legsets" / f"{name}.json"
+        spec_in_legs = DV / "legs" / f"{name}.json"
+        doc = json.loads(untracked.read_text(encoding="utf-8"))
+        spec_in_legs.write_text(json.dumps(dict(doc, legId=name)), encoding="utf-8")
+        legset_path.write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": name, "card": doc["card"], "clipId": doc["clipId"],
+                                           "description": "legspec-committed test stand-in, removed by the test", "legs": [f"legs/{name}.json"]}), encoding="utf-8")
+        try:
+            self._reset_committed_case()
+            args, e = self.batch_cmd([untracked], *seam)
+            args[args.index("-LegSpec"):args.index("-LegSpec") + 2] = ["-LegSet", name]
+            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+            self._assert_nothing_claimed_or_leased("-LegSet", r)
+            self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+        finally:
+            legset_path.unlink(missing_ok=True)
+            spec_in_legs.unlink(missing_ok=True)
+
+    def test_legspec_committed_the_real_leg_script_turns_the_preflight_on_without_the_seam(self) -> None:
+        # production: the batch runs the real Invoke-VenueLeg.ps1, whose own check refuses an uncommitted spec, so the preflight is on with no seam at all
+        self._reset_committed_case()
+        # (-ReceiptRoot: a regression here lets the real leg run, and it would write its refusal receipt into the shared receipt root; a scratch root under the repo's .claude-state keeps that out)
+        scratch = ROOT / ".claude-state" / f"zz-legspec-committed-{uuid.uuid4().hex[:8]}"
+        try:
+            args, e = self.batch_cmd([self._untracked_copy_of_a_committed_spec()], "-ReceiptRoot", str(scratch / "receipts"))
+            args[args.index("-LegScript") + 1] = str(LEG)
+            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        self._assert_nothing_claimed_or_leased("real leg script", r)
+        self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+
+    def test_legspec_committed_a_committed_spec_still_passes_the_preflight(self) -> None:
+        seam = ("-CommittedSpecRepoRoot", str(ROOT))
+        self._reset_committed_case()
+        r = self.run_batch([self._COMMITTED_SPEC], *seam)
+        self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr, r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self._reset_committed_case()
+        r = self.run_plan(self.write_plan([self.item(self._COMMITTED_SPEC, "A", self.commit_a, "cpu")]), *seam)
+        self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr, r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_legspec_committed_the_seam_is_refused_with_the_real_um_run(self) -> None:
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT))
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("-CommittedSpecRepoRoot is an offline test seam", r.stderr)
+        self.assertEqual(self.kinds(), [])
+
     def test_r8_export_a_window_the_agent_job_cap_refuses_is_refused_before_the_claim_in_every_mode(self) -> None:
         # EXPORT-VENUE-LEG-1 r8 (adversary r7 A3): maxFrames=20000 on the shipped 3.4 GB ProRes leg is a job the agent refuses (submitted timeout past 86400 s), but only the
         # generator Invoke-VenueLeg runs AFTER the lease opened said so. The batch now asks the export generator's -PreflightBudgetOnly mode in its preflight; -ExportBudgetScript
