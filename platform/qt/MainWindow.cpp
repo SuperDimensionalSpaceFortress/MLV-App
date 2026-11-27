@@ -5804,7 +5804,9 @@ void MainWindow::waitGuiThreadForSmokeEvents( int maxMs )
     // session (the target stop reaches finishPlaybackSmokeTelemetry from inside it); the finish then counts it.
     SmokeEventWaitInFlight *const outer = m_smokeEventWaitInFlight;
     m_smokeEventWaitInFlight = &wait;
+    const MeasuredDispatchInFlight outerDispatch = measuredDispatchBegin( MeasuredDispatchEventWait );   // STOP-STARVATION-1
     qApp->processEvents( QEventLoop::AllEvents | QEventLoop::WaitForMoreEvents );
+    measuredDispatchEnd( outerDispatch );
     if( m_smokeEventWaitInFlight == &wait )
         closeSmokeEventWait( wait );
     else if( wait.counted )
@@ -5842,6 +5844,73 @@ void MainWindow::closeSmokeEventWait( SmokeEventWaitInFlight &wait )
         ++m_playbackSmokeRunnerEventWaitTimeouts;
     if( gui_hop_wait::smokeEventWaitOverran( waitedNs, wait.maxMs ) )
         ++m_playbackSmokeRunnerEventWaitOverruns;
+}
+
+// GUI-SMOKE-PACED-STOP-STARVATION-1: the measured loop's dispatch calls (the loop-top processEvents and the event wait's
+// WaitForMoreEvents pass), timed by site only while that loop runs for the open session. The call in flight is kept in a member,
+// set before the call and restored after it (a nested call saves the outer one), so the paced hold and the finish, which can
+// both run inside a dispatch, read which call is dispatching and for how long. A call the session ended inside is not counted:
+// the finish already printed it as in flight.
+bool MainWindow::measuredDispatchCounting( void ) const
+{
+    return m_measuredDispatchLoopSession != 0 && m_playbackSmokeActive
+        && m_measuredDispatchLoopSession == m_playbackSmokeSessionId;
+}
+
+MainWindow::MeasuredDispatchInFlight MainWindow::measuredDispatchBegin( int site )
+{
+    const MeasuredDispatchInFlight outer = m_measuredDispatchInFlight;
+    m_measuredDispatchInFlight = MeasuredDispatchInFlight();
+    if( measuredDispatchCounting() && site > MeasuredDispatchNone && site <= MeasuredDispatchEventWait )
+    {
+        // the loop armed the hold before its first dispatch, so the first call sees the arm (paced_hold_armed)
+        if( m_pacedMeasuredHoldSession == m_measuredDispatchLoopSession ) m_pacedHoldArmedSeen = true;
+        m_measuredDispatchInFlight.site = site;
+        m_measuredDispatchInFlight.startS = mlv_stage_timing_now();
+    }
+    return outer;
+}
+
+void MainWindow::measuredDispatchEnd( const MeasuredDispatchInFlight &outer )
+{
+    const MeasuredDispatchInFlight call = m_measuredDispatchInFlight;
+    m_measuredDispatchInFlight = outer;
+    if( call.site <= MeasuredDispatchNone || call.site > MeasuredDispatchEventWait || !measuredDispatchCounting() ) return;
+    const double callMs = ( mlv_stage_timing_now() - call.startS ) * 1000.0;
+    ++m_measuredDispatchCalls[call.site];
+    m_measuredDispatchMaxMs[call.site] = qMax( m_measuredDispatchMaxMs[call.site], callMs );
+}
+
+// The measured loop starts (for the open session, if any) and exits; the exit records how far the timeline ran and when a
+// paced hold, if one engaged, was released (the loop disarmed it on the line before).
+void MainWindow::beginMeasuredDispatchLoop( void )
+{
+    m_measuredDispatchLoopSession = m_playbackSmokeActive ? m_playbackSmokeSessionId : 0;
+    m_measuredDispatchLoopStartS = mlv_stage_timing_now();
+}
+
+void MainWindow::endMeasuredDispatchLoop( void )
+{
+    if( measuredDispatchCounting() )
+    {
+        m_measuredDispatchConsumedAtLoopExit = m_sourceAdvance.consumed();
+        if( m_pacedHoldEngaged && m_pacedHoldReleasedS <= 0.0 ) m_pacedHoldReleasedS = mlv_stage_timing_now();
+    }
+    m_measuredDispatchLoopSession = 0;
+}
+
+// The paced hold in playbackHandling: every held tick is counted; the first records when it engaged and which measured
+// dispatch call was in flight, and for how long (the call that starved the stop check, on a slow-present leg).
+void MainWindow::notePacedMeasuredHold( void )
+{
+    ++m_pacedHoldTicks;
+    if( m_pacedHoldEngaged ) return;
+    const double now = mlv_stage_timing_now();
+    m_pacedHoldEngaged = true;
+    m_pacedHoldEngagedS = now;
+    m_pacedHoldSiteAtEngage = m_measuredDispatchInFlight.site;
+    m_pacedHoldInFlightMsAtEngage = m_measuredDispatchInFlight.site != MeasuredDispatchNone
+        ? ( now - m_measuredDispatchInFlight.startS ) * 1000.0 : 0.0;
 }
 
 // CPU-S1-PRESENT-INTERVAL-BOUND-1: the hop split's clock (frameReadyEmitStageTime's), and the paint
@@ -11330,16 +11399,23 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
     };
     // VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1 STEP END
+    // GUI-SMOKE-PACED-STOP-STARVATION-1: on a paced run a dispatch call below can hold the GUI thread past the required frame
+    // (present slower than the frame period), so the engine holds the timeline there while this loop runs (playbackHandling).
+    // A clip-lifecycle stress run is never armed: it plays on past the required frames to its switch.
+    beginMeasuredDispatchLoop();
+    m_pacedMeasuredHoldSession = ( options.exerciseClipLifecycleStress || !m_playbackSmokeActive ) ? 0 : m_playbackSmokeSessionId;
     playback_frame_range::PlayStopState measuredState = playback_frame_range::PlayStopState::Continue;
     for( ;; )
     {
         // CUDA-HEADROOM-1: unpaced, the GUI thread never runs dry of present / advance events, so an unbounded
         // processEvents() returned only at a decode stall (r1 venue: the 480-frame requirement was reached at
         // ~11.3 s but seen at 14.5 s, 624 frames). A bounded slice keeps the stop check on time; paced runs are unchanged.
+        const MeasuredDispatchInFlight outer = measuredDispatchBegin( MeasuredDispatchLoopTop );   // STOP-STARVATION-1
         if( m_automationPacingIsolated && mlvappPlaybackUnpacedRequested() )
             qApp->processEvents( QEventLoop::AllEvents, 5 );
         else
             qApp->processEvents( QEventLoop::AllEvents );
+        measuredDispatchEnd( outer );
         // ENFORCE-2 round 2 (sol B2) / ENFORCE-3: the switch STOPS Play on the first clip, so it only ever happens
         // once the engine has consumed the required source frames (and not before --stress-switch-at-ms, which the
         // app refuses below 20000 at launch); a Play the engine already ended is attempted too, to fail typed.
@@ -11439,6 +11515,8 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         stepWindowToggles();   // VENUE-LEG-FULLSCREEN-TOGGLE-DURING-PLAY-1: a no-op unless the leg asked for toggles
         waitGuiThreadForSmokeEvents( 10 );
     }
+    m_pacedMeasuredHoldSession = 0;
+    endMeasuredDispatchLoop();
     const qint64 playedMs = playbackClock.elapsed();
     if( windowToggleRequested && windowedSmoke && windowToggleSchedule.ok() )
     {
@@ -13226,6 +13304,24 @@ void MainWindow::playbackHandling(int timeDiff)
         const double paceNowMs = mlv_stage_timing_now() * 1000.0;
         const bool paceGuardArmedBeforeTick = m_playbackPaceGuard.armed();   // slip_summary: a re-arm mid-session
 
+        // GUI-SMOKE-PACED-STOP-STARVATION-1: paced, a measured-loop dispatch call can hold the GUI thread across the required
+        // frame (Bachelor fullscreen, present ~32 ms per 16.7 ms frame: one stall ran 1499 -> 2858). While that loop is armed
+        // for this open session, an unpinned paced Play holds once the required source frames are consumed, so the loop's
+        // next stop check sees Reached at the required frame; the loop disarms it on exit and the tail plays on.
+        const bool pacedHoldArmed = m_pacedMeasuredHoldSession != 0 && m_playbackSmokeActive
+                                 && m_pacedMeasuredHoldSession == m_playbackSmokeSessionId;
+        if( playback_frame_range::pacedMeasuredHoldReached( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(), pacedHoldArmed,
+                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames ) )
+        {
+            notePacedMeasuredHold();
+            return;
+        }
+        // r2 (hub ruling, r1 adversary A1 / A2): nor does the drop-frame tick that crosses the requirement land past it, or on its
+        // epsilon band (counted, not rendered): while this applies that tick's advanced position is clamped in frames, inside the
+        // completing frame (pacedMeasuredHoldLanding). Not applying, the tick below is bit for bit what it was.
+        const bool pacedHoldClampArmed = playback_frame_range::pacedMeasuredHoldApplies( m_automationPacingIsolated,
+                mlvappPlaybackUnpacedRequested(), pacedHoldArmed, m_playbackSmokeTargetPresentedFrames, m_playRequiredSourceFrames );
+
         // CUDA-HEADROOM-1: unpaced, present -> early advance -> render -> present never yields to the smoke's stop check
         // (r1 venue: Reached at 480 frames, seen at 615). Once the required source frames are consumed, hold.
         // REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1 r8 fix 1 (adversary A1): a pinned capture holds one frame later, on its
@@ -13354,7 +13450,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 const double dropFrameStart = playback_frame_range::dropFrameCorrectedStart(
                     m_newPosDropMode, ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), ui->actionLoop->isChecked(),
                     playbackConformActive() );
-                const playback_frame_range::DropFrameTickResult dropFrameTick =
+                playback_frame_range::DropFrameTickResult dropFrameTick =   // r2: not const, for the paced hold's landing clamp
                     playback_frame_range::advanceDropFrameTick(
                         m_newPosDropMode,
                         playback_frame_range::conformDropFrameDelta(
@@ -13367,6 +13463,16 @@ void MainWindow::playbackHandling(int timeDiff)
                         ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(),
                         ui->actionLoop->isChecked(),
                         playbackConformActive() );   // r32 (adversary A1 on 2e0a3985): conform presents the cut's last frame before a Loop wrap
+                // GUI-SMOKE-PACED-STOP-STARVATION-1 r2: the armed paced hold's landing clamp (a strict no-op when it does not apply).
+                // r6 (the fork/master merge of PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1, #905): the clamp reads the tick start the counter
+                // reads below (correctedStart), and a landing it moves is applied to the tick by pacedMeasuredHoldLandTick, so
+                // appliedFrames (the present trace's and the slip histogram's grant) is the move the clamped tick really made.
+                if( pacedHoldClampArmed )
+                {
+                    const double pacedLanding = playback_frame_range::pacedMeasuredHoldLanding( dropFrameTick.correctedStart, dropFrameTick,
+                        m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );
+                    playback_frame_range::pacedMeasuredHoldLandTick( dropFrameTick, pacedLanding );
+                }
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
                 // the clamp at the last frame without Loop reports what was actually advanced).
                 // r33 (adversary A1 on e0947e37): a tick can wrap more than one lap; each moved the position back by wrapWidth.
@@ -28161,6 +28267,20 @@ void MainWindow::beginPlaybackSmokeTelemetry( void )
     m_playbackSmokeRunnerEventWaits = 0;
     m_playbackSmokeRunnerEventWaitTimeouts = 0;
     m_playbackSmokeRunnerEventWaitOverruns = 0;
+    // GUI-SMOKE-PACED-STOP-STARVATION-1: the measured_dispatch line is this session's (its measured loop starts after this)
+    m_measuredDispatchInFlight = MeasuredDispatchInFlight();
+    m_measuredDispatchLoopSession = 0;
+    m_measuredDispatchLoopStartS = 0.0;
+    for( uint64_t &calls : m_measuredDispatchCalls ) calls = 0;
+    for( double &maxMs : m_measuredDispatchMaxMs ) maxMs = 0.0;
+    m_measuredDispatchConsumedAtLoopExit = -1;
+    m_pacedHoldArmedSeen = false;
+    m_pacedHoldEngaged = false;
+    m_pacedHoldSiteAtEngage = MeasuredDispatchNone;
+    m_pacedHoldInFlightMsAtEngage = 0.0;
+    m_pacedHoldEngagedS = 0.0;
+    m_pacedHoldReleasedS = 0.0;
+    m_pacedHoldTicks = 0;
     m_guiHopPrepResultWait.reset();
     m_guiHopEmitToRequestIssue.reset();
     m_guiHopRequestIssues = 0;
@@ -31955,6 +32075,7 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
         }
     }
 
+    m_pacedMeasuredHoldSession = 0;   // GUI-SMOKE-PACED-STOP-STARVATION-1: the paced hold ends with the session
     // CPU-S1-GUI-HOP-SLEEP-AND-PRESENT-1 r2 fix iteration 1 (adversary A1 on 9f2a3316): a measured wait still dispatching
     // when the session ends (this finish runs inside it) is counted and classified now, before the summary prints it.
     if( m_smokeEventWaitInFlight )
@@ -32130,6 +32251,42 @@ void MainWindow::finishPlaybackSmokeTelemetry( const char *reason )
                    .arg( bool01( m_automationPacingIsolated ) )
                    .arg( bool01( ui->actionDropFrameMode->isChecked() ) )
                    .arg( unpacedRunNonce );
+    }
+
+    // GUI-SMOKE-PACED-STOP-STARVATION-1: the measured loop's dispatch calls by site, the call still in flight at this finish
+    // (it can run inside one), and the paced hold: whether the loop armed it, when it engaged (from the loop's start) and which
+    // call was in flight then, and how long it held (to the loop's disarm, or to here). Printed on every run, paced or unpaced.
+    // consumed_at_loop_exit is -1 when the session ended before its measured loop exited.
+    {
+        const auto siteName = []( int site ) -> QString
+        {
+            return site == MeasuredDispatchLoopTop ? QStringLiteral( "loop_top" )
+                 : site == MeasuredDispatchEventWait ? QStringLiteral( "event_wait" ) : QStringLiteral( "none" );
+        };
+        const double heldEndS = m_pacedHoldReleasedS > 0.0 ? m_pacedHoldReleasedS : now;
+        qInfo().noquote()
+            << QStringLiteral(
+                   "playback_smoke.measured_dispatch session=%1 loop_top_calls=%2 loop_top_max_ms=%3 event_wait_calls=%4 "
+                   "event_wait_max_ms=%5 in_flight_site_at_finish=%6 in_flight_ms_at_finish=%7 paced_hold_armed=%8 "
+                   "paced_hold_engaged=%9 hold_site_at_engage=%10 hold_in_flight_ms_at_engage=%11 hold_engaged_at_ms=%12 "
+                   "held_ms=%13 held_ticks=%14 consumed_at_loop_exit=%15 required=%16" )
+                   .arg( static_cast<qulonglong>( m_playbackSmokeSessionId ) )
+                   .arg( static_cast<qulonglong>( m_measuredDispatchCalls[MeasuredDispatchLoopTop] ) )
+                   .arg( m_measuredDispatchMaxMs[MeasuredDispatchLoopTop], 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( m_measuredDispatchCalls[MeasuredDispatchEventWait] ) )
+                   .arg( m_measuredDispatchMaxMs[MeasuredDispatchEventWait], 0, 'f', 3 )
+                   .arg( siteName( m_measuredDispatchInFlight.site ) )
+                   .arg( m_measuredDispatchInFlight.site != MeasuredDispatchNone
+                             ? ( now - m_measuredDispatchInFlight.startS ) * 1000.0 : 0.0, 0, 'f', 3 )
+                   .arg( bool01( m_pacedHoldArmedSeen ) )
+                   .arg( bool01( m_pacedHoldEngaged ) )
+                   .arg( siteName( m_pacedHoldSiteAtEngage ) )
+                   .arg( m_pacedHoldInFlightMsAtEngage, 0, 'f', 3 )
+                   .arg( m_pacedHoldEngaged ? ( m_pacedHoldEngagedS - m_measuredDispatchLoopStartS ) * 1000.0 : 0.0, 0, 'f', 3 )
+                   .arg( m_pacedHoldEngaged ? qMax( 0.0, heldEndS - m_pacedHoldEngagedS ) * 1000.0 : 0.0, 0, 'f', 3 )
+                   .arg( static_cast<qulonglong>( m_pacedHoldTicks ) )
+                   .arg( static_cast<qlonglong>( m_measuredDispatchConsumedAtLoopExit ) )
+                   .arg( static_cast<qlonglong>( m_playRequiredSourceFrames ) );
     }
 
     // PLAYBACK-BACHELOR-PRESENT-JITTER-1: the slip summary is taken here, before pace_summary, because the wait for the

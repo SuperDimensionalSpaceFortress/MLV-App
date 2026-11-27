@@ -983,6 +983,7 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             problems.append(f"missing Loop-off at an automation entry: {marker}")
     problems.extend(_scan_stop_sites(main_blank, main_keep))
     problems.extend(_scan_counter_writes(main_blank, main_keep))
+    problems.extend(_scan_counter_macros(sources, main_blank))
     problems.extend(_scan_budget_writes(main_blank))
     problems.extend(_scan_verdict_latch(main_blank))
     problems.extend(_scan_header_members(sources.get(HEADER_SOURCE, "")))
@@ -1079,8 +1080,19 @@ PINNED_COUNTER_WRITES = {
 _WRITE_OP = r"(?:\s*\))*\s*(?:(?:[-+*/%&|^]|<<|>>)?=(?!=)|\+\+|--)"
 _ADV_USE = re.compile(r"\bm_sourceAdvance\b")
 _ADV_READ = re.compile(r"\s*\.\s*(?:consumed\s*\(\s*\)|startFrame\b(?!" + _WRITE_OP + r"))")
-PINNED_COUNTER_READS = {"MainWindow::finishPlaybackSmokeTelemetry": 1}   # the conform line's engine_target
+PINNED_COUNTER_READS = {"MainWindow::finishPlaybackSmokeTelemetry": 1,   # the conform line's engine_target
+                        "MainWindow::playbackHandling": 1}               # r3: the paced hold landing clamp's high-water mark
 _ADV_PINNED_READ = re.compile(r"\bm_sourceAdvance\s*\.\s*armed\s*\?\s*m_sourceAdvance\s*\.\s*highWater\s*:\s*-\s*1\s*\)")
+# GUI-SMOKE-PACED-STOP-STARVATION-1 r3 (hub ruling HUB-TICK 20261127T1152Z, adversary A1 on 8b386cb9): the paced hold's landing clamp needs the
+# counter's real high-water mark. Its one reviewed read is the THIRD argument of the guarded landing call, an int64_t taken by value, matched only
+# by this expression and only inside playbackHandling; any other .highWater / .armed use there (a plain read, a second call, another argument
+# position, the conform line's expression) stays unreviewed. r6 (the fork/master merge of #905, which removed sourcePositionBeforeDropTick and
+# feeds the counter dropFrameTick.correctedStart): the landing's tick start is that same correctedStart.
+_ADV_PINNED_HOLD_READ = re.compile(r"\bplayback_frame_range::pacedMeasuredHoldLanding\s*\(\s*dropFrameTick\s*\.\s*correctedStart\s*,"
+                                   r"\s*dropFrameTick\s*,\s*m_sourceAdvance\s*\.\s*highWater\s*,")
+# each reviewed read is matched only by its own pinned expression, in its own function
+PINNED_COUNTER_READ_EXPRESSIONS = {"MainWindow::finishPlaybackSmokeTelemetry": _ADV_PINNED_READ,
+                                   "MainWindow::playbackHandling": _ADV_PINNED_HOLD_READ}
 _ADV_BEGIN = re.compile(r"\s*\.\s*begin\s*\(")
 _ADV_TICK = re.compile(r"\s*\.\s*noteEngineTick\s*\(")
 _ADV_RESET = re.compile(r"\s*=(?!=)\s*playback_frame_range::SourceFrameAdvanceCounter\s*\(\s*\)\s*;")
@@ -1088,6 +1100,70 @@ _REQ_USE = re.compile(r"\bm_playRequiredSourceFrames\b")
 _REQ_WRITE_AFTER = re.compile(_WRITE_OP)
 _REQ_ASSIGN_OK = re.compile(r"\s*=\s*verdict\.requiredFrames\s*;")
 _ESCAPE_BEFORE = re.compile(r"(?:(?<!&)&\s*(?:\w+\s*=\s*)?|\b(?:swap|exchange|move)\s*\(\s*|\+\+\s*|--\s*)$")
+
+
+# GUI-SMOKE-PACED-STOP-STARVATION-1 r3 fix iteration 1 (adversary A1 on ab3873f1, and A2, its pre-existing sibling at the conform line): a macro
+# over a token of a reviewed or free counter read turns the read into a write while the text still matches --
+# `#define pacedMeasuredHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)` zeroed the high-water mark through the landing's
+# pinned argument, `#define highWater highWater += 1500` moved it through the conform line's. As for the Space binding (_DEFINE above): any
+# #define of an identifier the counter pins rely on -- the counter and the requirement, every counter member, the pinned read expressions'
+# tokens, the required write's `verdict.requiredFrames` -- fails, in any scanned source (the header MainWindow.cpp includes too). A macro
+# BODY that uses the counter is already an unreviewed use (directive lines are scanned like code).
+COUNTER_MACRO_IDENTIFIERS = frozenset({
+    "m_sourceAdvance", "m_playRequiredSourceFrames", "SourceFrameAdvanceCounter", "playback_frame_range",
+    "armed", "startFrame", "highWater", "forwardSteps", "wrapOrBackwardTicks", "beginsIgnored", "externalJumpRebases",
+    "begin", "noteEngineTick", "consumed",
+    "pacedMeasuredHoldLanding", "correctedStart", "dropFrameTick", "verdict", "requiredFrames"})
+
+
+# r3 fix iteration 2 (adversary A1 on 60e25099): the digraph `%:define` and a line-spliced `#de\<nl>fine` re-spelled that macro past
+# _DEFINE. Fail-closed on the spelling, the way the key table's rule is: the text is read as translation phases 1-2 read it (the
+# trigraph `??=` and the digraph `%:` are `#`, a backslash-newline splice -- trailing blanks allowed, as GCC allows them -- joins the
+# lines), comments and literals are blanked, and then the word `define` followed by a protected name ANYWHERE fails -- with or
+# without a `#`, across any whitespace (a block comment between `#` and `define` blanks to whitespace, newlines included).
+_COUNTER_RESPELL_SPLICE = re.compile(r"\\[ \t\f\v]*\r?\n")
+_COUNTER_DEFINE_ANYWHERE = re.compile(r"(?<!\w)define\s+([A-Za-z_]\w*)")
+
+# r4 (adversary A1 on f7e81e1a, and advisory A3, its sibling at the reset): the pinned landing call and the pinned reset name
+# `playback_frame_range::`, and a namespace alias (`namespace playback_frame_range = ::hold_override;`) made that qualifier resolve to an
+# override -- one taking the high-water mark by reference and writing it, or returning an armed counter -- while the text still matched.
+# A qualified name resolves through the qualifier's own declaration only, so the qualifier is the thing to pin: outside the namespace's
+# own opening (`namespace playback_frame_range {`) in its defining header, every `playback_frame_range` token in a scanned source must be
+# followed by `::`. An alias, a reopened namespace, a type alias, a local type or a variable of that name fails.
+_QUALIFIER_DEFINING_SOURCE = "platform/qt/PlaybackFrameRange.h"
+_QUALIFIER_TOKEN = re.compile(r"(?<!\w)playback_frame_range(?!\w)")
+_QUALIFIER_QUALIFIES = re.compile(r"\s*::")
+_QUALIFIER_OPENING = re.compile(r"(?<!\w)namespace\s+(playback_frame_range)\s*\{")
+# r4 fix iteration 2 (adversary A1 on ebdc7a65): a SECOND opening at the end of the defining header added a mutable overload that the pinned
+# call then selected. The header opens the namespace ONCE (only its first opening is exempt), and names each pinned callee ONCE: a second
+# pacedMeasuredHoldLanding is an overload, a second SourceFrameAdvanceCounter can be a function that hides the counter's class name.
+# (Adversary A2 on ebdc7a65: the trigraph `??/` is a backslash in translation phase 1, so it splices a line like `\` does.)
+_QUALIFIER_PINNED_CALLEES = ("pacedMeasuredHoldLanding", "SourceFrameAdvanceCounter")
+
+
+def _scan_counter_macros(sources: dict[str, str], main_blank: str) -> list[str]:
+    problems: list[str] = []
+    for path, text in sources.items():
+        normalised = _COUNTER_RESPELL_SPLICE.sub("", text.replace("??=", "#").replace("??/", "\\").replace("%:", "#"))
+        blank = main_blank if path == "platform/qt/MainWindow.cpp" and normalised == text else strip_cpp(normalised)[0]
+        for match in _COUNTER_DEFINE_ANYWHERE.finditer(blank):
+            if match.group(1) in COUNTER_MACRO_IDENTIFIERS:
+                problems.append(f"{path}:{_line_of(blank, match.start())}: #define of {match.group(1)}, a token the source-frame "
+                                "counter's pinned reads and writes rely on")
+        first_opening = _QUALIFIER_OPENING.search(blank) if path == _QUALIFIER_DEFINING_SOURCE else None
+        openings = {first_opening.start(1)} if first_opening else set()
+        if path == _QUALIFIER_DEFINING_SOURCE:
+            for callee in _QUALIFIER_PINNED_CALLEES:
+                named = len(re.findall(r"(?<!\w)" + callee + r"(?!\w)", blank))
+                if named != 1:
+                    problems.append(f"{path}: names the pinned callee {callee} {named}x in playback_frame_range, pinned 1 (an overload or a "
+                                    "hiding function redirects the source-frame counter's pinned call)")
+        for match in _QUALIFIER_TOKEN.finditer(blank):
+            if _QUALIFIER_QUALIFIES.match(blank, match.end()) or match.start() in openings:
+                continue
+            problems.append(f"{path}:{_line_of(blank, match.start())}: rebinds playback_frame_range (not followed by ::), the qualifier the "
+                            f"source-frame counter's pinned calls resolve through: {_normalise(blank[match.start():match.start() + 60])}")
+    return problems
 
 
 def _scan_counter_writes(blank: str, keep: str) -> list[str]:
@@ -1102,13 +1178,16 @@ def _scan_counter_writes(blank: str, keep: str) -> list[str]:
         found[function][kind] += 1
 
     # r30 fix iteration 2: the uses inside the pinned read expression, at most PINNED_COUNTER_READS per function
+    # (r3: each reviewed function by its own expression; an expression in any other function reviews nothing)
     reviewed_reads: set[int] = set()
-    reads_seen: dict[str, int] = {}
-    for read in _ADV_PINNED_READ.finditer(blank):
-        function = _enclosing(spans, read.start())
-        reads_seen[function] = reads_seen.get(function, 0) + 1
-        if reads_seen[function] <= PINNED_COUNTER_READS.get(function, 0):
-            reviewed_reads.update(use.start() for use in _ADV_USE.finditer(blank, read.start(), read.end()))
+    for pinned_function, expression in PINNED_COUNTER_READ_EXPRESSIONS.items():
+        reads_seen = 0
+        for read in expression.finditer(blank):
+            if _enclosing(spans, read.start()) != pinned_function:
+                continue
+            reads_seen += 1
+            if reads_seen <= PINNED_COUNTER_READS.get(pinned_function, 0):
+                reviewed_reads.update(use.start() for use in _ADV_USE.finditer(blank, read.start(), read.end()))
 
     for match in _ADV_USE.finditer(blank):
         function = _enclosing(spans, match.start())

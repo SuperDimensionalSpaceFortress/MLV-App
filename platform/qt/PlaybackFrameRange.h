@@ -1708,6 +1708,74 @@ inline bool pinnedUnpacedHoldReached( int64_t targetPresentedFrames, int64_t con
 {
     return targetPresentedFrames <= 0 || consumedSourceFrames > requiredSourceFrames;
 }
+// GUI-SMOKE-PACED-STOP-STARVATION-1: a PACED automation measured Play holds its timeline once the required source frames are
+// consumed, only while the measured loop that checks the stop is running (armed for this open session), and never for a pinned
+// capture (its present path stops Play at exactly N) or an unpaced run (CUDA-HEADROOM-1's hold owns that).
+// The scope of that hold, without its reached test: an isolated paced unpinned Play with a requirement, while the loop is armed.
+inline bool pacedMeasuredHoldApplies( bool automationIsolated, bool unpacedRequested, bool armedForOpenSession,
+                                      int64_t targetPresentedFrames, int64_t requiredSourceFrames )
+{
+    return automationIsolated && !unpacedRequested && armedForOpenSession && targetPresentedFrames <= 0
+        && requiredSourceFrames > 0;
+}
+inline bool pacedMeasuredHoldReached( bool automationIsolated, bool unpacedRequested, bool armedForOpenSession,
+                                      int64_t targetPresentedFrames, int64_t consumedSourceFrames, int64_t requiredSourceFrames )
+{
+    return pacedMeasuredHoldApplies( automationIsolated, unpacedRequested, armedForOpenSession, targetPresentedFrames,
+                                     requiredSourceFrames )
+        && consumedSourceFrames >= requiredSourceFrames;
+}
+// r2 (hub ruling HUB-TICK 20261127T0957Z, closes r1 adversary A1 and A2 on 21b6d81e): the hold above runs BEFORE a tick, so one
+// drop-frame tick that crosses the requirement decides where the hold freezes. r1 capped that tick's millisecond span, which cannot
+// land exactly: the span is quantised to 1 ms (above 1000 fps one ms is more than a frame: 3000 fps, 22 owed, 8 ms -> 24 frames,
+// consumed 75002 of 75000), and the landing is read through two roundings, the counter's floor( position + 1e-9 ) and the render's
+// truncation (25 fps, 498.79999999998 + 0.2 = 498.9999999999802: the counter credits 499, the slider shows 498, the hold froze one
+// frame short of what it counted). This clamps the ADVANCED POSITION instead, in frames, so it holds at any fps and any span.
+//
+// The frame that completes the requirement is the counter's high-water mark (after this tick's rebase) plus the frames still owed.
+// r3 (hub ruling HUB-TICK 20261127T1152Z, closes adversary A1 on 8b386cb9): the caller passes the counter's REAL high-water mark
+// (MainWindow's one reviewed .highWater read in playbackHandling, pinned by tools/repo_hygiene/app_play_scan.py), and the mark after
+// the tick's rebase is max( highWater, floor( tickStart + 1e-9 ) ) -- the counter's own rebase rule, so the completing frame is exact
+// on forward play, after a rebase, after a backward seek, and after a backward seek that follows an external forward jump. r2's
+// estimate from startFrame + consumed - 1 read below the mark there (a jump to 3001, a seek back to 2000, one frame owed: the
+// completing frame read 2001, not 3002), cut every tick to about one frame, and timed out (PLAY_SAFETY_TIMEOUT at 65000 ms).
+// When the tick lands on or past the completing frame on the counter's rounding, the landing is clamped into [frame, frame + 0.5],
+// where both roundings agree on the frame: consumed reaches the requirement exactly and the hold freezes ON the rendered frame. A
+// landing already inside that span is returned unchanged (bit for bit).
+// Anything else -- a lap (never counted as footage), a backward or non-finite tick, an unarmed counter (consumed 0), no
+// requirement, the requirement already met, a landing short of the completing frame -- returns tick.position unchanged.
+// MainWindow calls it only while pacedMeasuredHoldApplies.
+// r6 (the fork/master merge of PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1, #905): MainWindow passes the tick's correctedStart, the start the
+// counter's noteEngineTick reads, and the guard reads whether the tick LAPPED (dropFrameTickLapped), as the counter does: #905's fold of a
+// stale Loop start marks a tick wrapped with no lap, and the counter counts that tick's step from correctedStart, so the clamp applies.
+inline double pacedMeasuredHoldLanding( double tickStartPosition, const DropFrameTickResult & tick, int64_t counterHighWater,
+                                        int64_t consumedSourceFrames, int64_t requiredSourceFrames )
+{
+    if( dropFrameTickLapped( tick ) || requiredSourceFrames <= 0 || consumedSourceFrames < 1 || consumedSourceFrames >= requiredSourceFrames
+     || !std::isfinite( tickStartPosition ) || !std::isfinite( tick.position ) || !( tick.position >= tickStartPosition ) )
+        return tick.position;
+    // 1 <= consumed < required here: the shortfall is formed in uint64_t, exact for every int64 pair (the signed form overflows)
+    const double owed = static_cast<double>( static_cast<uint64_t>( requiredSourceFrames )
+                                             - static_cast<uint64_t>( consumedSourceFrames ) );
+    const double completingFrame = std::max( static_cast<double>( counterHighWater ), std::floor( tickStartPosition + 1e-9 ) ) + owed;
+    if( !( std::floor( tick.position + 1e-9 ) >= completingFrame ) ) return tick.position;
+    const double insideFrame = completingFrame + 0.5;
+    // r2 (adversary advisory A2 on 8b386cb9): past 2^52 a half frame (and past 2^53 a whole one) is not representable, so the span
+    // collapses and the clamp could hand back the start position (no progress); there it passes the tick through unchanged
+    if( !( insideFrame > completingFrame ) || !( completingFrame > tickStartPosition ) ) return tick.position;
+    if( tick.position < completingFrame ) return completingFrame;   // the epsilon band: counted as the frame, rendered as the one before
+    return tick.position > insideFrame ? insideFrame : tick.position;
+}
+// r6 (the #905 merge): the landing above applied to the tick. #905's readers take the tick's grant from appliedFrames, never from its
+// endpoints, so a landing the clamp MOVED also moves appliedFrames, to the move the position made from correctedStart -- the subtraction
+// advanceDropFrameTick itself makes on a tick that did not lap, which is the only kind the clamp moves. A landing equal to the tick's
+// position (the clamp did not apply) leaves the tick bit for bit as it was; a NaN landing (only from a NaN position) is never applied.
+inline void pacedMeasuredHoldLandTick( DropFrameTickResult & tick, double landing )
+{
+    if( std::isnan( landing ) || landing == tick.position ) return;
+    tick.position = landing;
+    tick.appliedFrames = landing - tick.correctedStart;
+}
 // r8 fix 1 (adversary A2): a pinned capture is admitted only when its identity frame start + N exists and lies BEFORE the last frame
 // (lastFrameIndex, 0-based) -- the engine's end-of-clip stop can end Play before the last frame's present is credited. Refused
 // up front (exit 14) rather than played to a short count. An unpinned run (N <= 0) is never refused here.

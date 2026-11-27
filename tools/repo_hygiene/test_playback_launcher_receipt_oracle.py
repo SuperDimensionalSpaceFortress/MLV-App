@@ -827,10 +827,191 @@ class CounterWritePinTests(unittest.TestCase):
                                 ("adversary: shift-right write", "m_sourceAdvance.highWater >>= 1;"),
                                 ("adversary: parenthesised armed write", "(m_sourceAdvance.armed) = false;"),
                                 ("a plain read outside the pinned site", "const bool advArmed = m_sourceAdvance.armed;"),
-                                ("the pinned expression outside its function", "const long long advHigh = ( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 );")):
+                                ("the pinned expression outside its function", "const long long advHigh = ( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 );"),
+                                ("r3: the landing's pinned argument outside playbackHandling",
+                                 "const double advLand = playback_frame_range::pacedMeasuredHoldLanding( dropFrameTick.correctedStart, dropFrameTick,"
+                                 " m_sourceAdvance.highWater, 0, 0 );")):
             with self.subTest(name):
                 self.assert_caught(self.inject_in_smoke(statement), "unreviewed use of m_sourceAdvance")
-        self.assertEqual(PINNED_COUNTER_READS, {"MainWindow::finishPlaybackSmokeTelemetry": 1})
+        self.assertEqual(PINNED_COUNTER_READS, {"MainWindow::finishPlaybackSmokeTelemetry": 1, "MainWindow::playbackHandling": 1})
+
+    def test_r3_fix1_a_macro_over_a_counter_pin_token_fails(self) -> None:
+        """GUI-SMOKE-PACED-STOP-STARVATION-1 r3 fix iteration 1 (adversary A1 on ab3873f1, and A2, its pre-existing sibling): a #define over a
+        token of a pinned counter read turned the read into a write and still scanned clean -- before playbackHandling,
+        `#define pacedMeasuredHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)` (zeroes the high-water mark through the landing's
+        argument); before finishPlaybackSmokeTelemetry, `#define highWater highWater += 1500`. Any #define of a counter-pin identifier, in any
+        scanned source, fails; the real sources define none."""
+        from tools.repo_hygiene import app_play_scan   # getattr: the RED run on the pre-fix scanner reaches the adversary rows
+        COUNTER_MACRO_IDENTIFIERS = getattr(app_play_scan, "COUNTER_MACRO_IDENTIFIERS", frozenset())
+        HEADER_SOURCE = app_play_scan.HEADER_SOURCE
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        needle = "#define of"
+        adversary = (
+            ("A1: the landing call rewritten", "void MainWindow::playbackHandling(",
+             "#define pacedMeasuredHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)"),
+            ("A2: the conform line's member rewritten", "void MainWindow::finishPlaybackSmokeTelemetry(",
+             "#define highWater highWater += 1500"),
+        )
+        # r3 fix iteration 2 (adversary A1 on 60e25099): the same macro re-spelled -- a digraph, a trigraph, a line splice (with and without
+        # trailing blanks, in the directive word and in the name), a block comment between `#` and `define`, across a line
+        landing = "pacedMeasuredHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)"
+        adversary += tuple(
+            (f"fix2: {name}", "void MainWindow::playbackHandling(", define) for name, define in (
+                ("the digraph", "%:define " + landing),
+                ("the digraph, spaced", "  %:  define " + landing),
+                ("the trigraph", "??=define " + landing),
+                ("a splice in the directive word", "#de\\\nfine " + landing),
+                ("a splice with trailing blanks", "#de\\  \r\nfine " + landing),
+                ("a splice in the name", "#define pacedMeasured\\\nHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)"),
+                ("a splice after the hash", "#\\\ndefine " + landing),
+                ("a block comment between", "#/* x */define " + landing),
+                ("a block comment across a line", "#/*\n*/define " + landing),
+                ("the digraph over the conform line's member", "%:define highWater highWater += 1500")))
+        for name, anchor, define in adversary:
+            with self.subTest(name):
+                self.assertIn(anchor, self.sources[self.MAIN_WINDOW])
+                self.assert_caught(self.mutated(anchor, define + "\n" + anchor), needle)
+        for identifier in sorted(COUNTER_MACRO_IDENTIFIERS):
+            for path in (self.MAIN_WINDOW, self.MAIN):
+                with self.subTest(f"{identifier} in {path}"):
+                    sources = dict(self.sources)
+                    sources[path] = f"#define {identifier} {identifier}\n" + sources[path]
+                    self.assert_caught(sources, needle)
+        with self.subTest("a spaced directive in the header"):
+            sources = dict(self.sources)
+            sources[HEADER_SOURCE] = "  #  define consumed() highWater\n"
+            self.assert_caught(sources, needle)
+        self.assertTrue({"m_sourceAdvance", "highWater", "armed", "startFrame", "consumed", "pacedMeasuredHoldLanding"}
+                        <= COUNTER_MACRO_IDENTIFIERS)
+
+    def test_r4_a_rebinding_of_the_pinned_qualifier_fails(self) -> None:
+        """GUI-SMOKE-PACED-STOP-STARVATION-1 r4 (adversary A1 on f7e81e1a, and advisory A3, its sibling at the reset): the pinned landing call
+        and reset name `playback_frame_range::`, and a NAMESPACE ALIAS made that qualifier resolve to an override that takes the high-water mark
+        by reference and writes it (A1, in playbackHandling) or returns an armed counter (A3, in programmaticPlay), while the text still matched.
+        Outside the namespace's own opening in PlaybackFrameRange.h, every `playback_frame_range` token in a scanned source must be followed by
+        `::`: an alias, a reopened namespace, a type alias, a local type or a variable of that name fails."""
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        needle = "rebinds playback_frame_range"
+        override = ("namespace hold_override { using namespace ::playback_frame_range; inline double pacedMeasuredHoldLanding(double, "
+                    "const ::playback_frame_range::DropFrameTickResult &tick, int64_t &mark, int64_t, int64_t) { mark=0; return tick.position; } }\n")
+        handling = "void MainWindow::playbackHandling(int timeDiff)\n{"
+        play = "bool MainWindow::programmaticPlay("
+        self.assertIn(play, self.sources[self.MAIN_WINDOW])
+        cases = (
+            ("A1: an alias as playbackHandling's first statement", handling,
+             override + handling + "\n    namespace playback_frame_range = ::hold_override;"),
+            ("A3: an alias before programmaticPlay", play,
+             "namespace counter_override { using namespace ::playback_frame_range; }\nnamespace playback_frame_range = ::counter_override;\n" + play),
+            ("the namespace reopened in MainWindow.cpp", handling,
+             "namespace playback_frame_range { inline double pacedMeasuredHoldLanding(double, const DropFrameTickResult &t, int64_t &m, int, int)"
+             " { m = 0; return t.position; } }\n" + handling),
+            ("a type alias", handling, "using playback_frame_range = ::hold_override_t;\n" + handling),
+            ("a local struct", handling, handling + "\n    struct playback_frame_range { static double pacedMeasuredHoldLanding(...) { return 0; } };"),
+            ("a spaced alias", handling, handling + "\n    namespace  playback_frame_range\n      =  ::hold_override ;"),
+        )
+        for name, anchor, replacement in cases:
+            with self.subTest(name):
+                self.assert_caught(self.mutated(anchor, replacement), needle)
+        for path in (self.MAIN_WINDOW, self.MAIN):
+            with self.subTest(f"an alias at the top of {path}"):
+                sources = dict(self.sources)
+                sources[path] = "namespace playback_frame_range = ::hold_override;\n" + sources[path]
+                self.assert_caught(sources, needle)
+        with self.subTest("an alias in the defining header itself"):
+            self.assert_caught({"platform/qt/PlaybackFrameRange.h": "namespace playback_frame_range {\n}\nnamespace playback_frame_range = ::x;\n"},
+                               needle)
+        with self.subTest("the defining header's own opening is not a rebinding"):
+            problems = scan_app_play_sources({"platform/qt/PlaybackFrameRange.h": "namespace playback_frame_range {\nint f();\n}\n"})
+            self.assertFalse(any(needle in p for p in problems), problems)
+        with self.subTest("a qualified use, comment or string is not a rebinding"):
+            problems = scan_app_play_sources({"platform/qt/main.cpp": "int a = ::playback_frame_range::f();\n// playback_frame_range alias\n"
+                                                                      "const char *s = \"playback_frame_range\";\n"})
+            self.assertFalse(any(needle in p for p in problems), problems)
+
+    def test_r4_fix2_the_defining_header_opens_the_namespace_once_and_declares_each_pinned_callee_once(self) -> None:
+        """r4 fix iteration 2 (adversary A1 on ebdc7a65): a SECOND `namespace playback_frame_range {` block at the end of PlaybackFrameRange.h
+        (under `#ifdef MAINWINDOW_H`) added a mutable overload of pacedMeasuredHoldLanding, which the pinned call then selected. The defining
+        header opens the namespace once, and names each pinned callee once (pacedMeasuredHoldLanding, SourceFrameAdvanceCounter): an overload,
+        or a function that hides the counter's class name, fails. Adversary A2 on ebdc7a65: the trigraph `??/` is a backslash in translation
+        phase 1, so `#de??/<newline>fine` is the protected macro too."""
+        from tools.repo_hygiene import app_play_scan
+        header_path = "platform/qt/PlaybackFrameRange.h"
+        header = (Path(app_play_scan.__file__).resolve().parents[2] / header_path).read_text(encoding="utf-8")
+        tail = "#endif"
+        cut = header.rindex(tail)
+        def with_tail(insert: str) -> dict[str, str]:
+            return {header_path: header[:cut] + insert + header[cut:]}
+        def caught(sources: dict[str, str], needle: str) -> bool:
+            return any(needle in p for p in scan_app_play_sources(sources))
+        with self.subTest("the real header is clean"):
+            problems = [p for p in scan_app_play_sources({header_path: header}) if p.startswith(header_path)]
+            self.assertEqual(problems, [])
+        overload = ("inline double pacedMeasuredHoldLanding(double start, DropFrameTickResult &tick, int64_t &mark, int64_t consumed, "
+                    "int64_t required) { mark = 0; return tick.position; }\n")
+        cases = (
+            ("A1: a second opening under #ifdef", "#ifdef MAINWINDOW_H\nnamespace playback_frame_range {\n" + overload + "}\n#endif\n",
+             "rebinds playback_frame_range"),
+            ("a second opening, plain", "namespace playback_frame_range {\nint extra();\n}\n", "rebinds playback_frame_range"),
+        )
+        for name, insert, needle in cases:
+            with self.subTest(name):
+                self.assertTrue(caught(with_tail(insert), needle), scan_app_play_sources(with_tail(insert)))
+        close = "} // namespace playback_frame_range"
+        self.assertIn(close, header)
+        for name, insert in (("an overload inside the one block", overload),
+                             ("a function hiding the counter's class", "inline SourceFrameAdvanceCounter SourceFrameAdvanceCounter() "
+                                                                         "{ return {}; }\n")):
+            with self.subTest(name):
+                sources = {header_path: header.replace(close, insert + close, 1)}
+                self.assertTrue(caught(sources, "pinned callee"), scan_app_play_sources(sources))
+        landing = "pacedMeasuredHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)"
+        anchor = "void MainWindow::playbackHandling("
+        for name, define in (("A2: a trigraph splice in the directive word", "#de??/\nfine " + landing),
+                             ("a trigraph splice with trailing blanks", "#de??/  \r\nfine " + landing),
+                             ("a trigraph splice in the name", "#define pacedMeasured??/\nHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)")):
+            with self.subTest(name):
+                self.assert_caught(self.mutated(anchor, define + "\n" + anchor), "#define of")
+
+    # r6 (the fork/master merge of #905): the landing's tick start is dropFrameTick.correctedStart, the start the counter reads
+    LANDING_CALL = ("const double pacedLanding = playback_frame_range::pacedMeasuredHoldLanding( dropFrameTick.correctedStart, dropFrameTick,\n"
+                    "                        m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );")
+
+    def test_r3_the_paced_hold_landing_mark_is_the_one_reviewed_high_water_read_in_playback_handling(self) -> None:
+        """GUI-SMOKE-PACED-STOP-STARVATION-1 r3 (hub ruling HUB-TICK 20261127T1152Z, adversary A1 on 8b386cb9): the paced hold's landing clamp
+        needs the counter's real high-water mark, so playbackHandling has ONE reviewed `.highWater` read, matched only by its own pinned expression:
+        the third argument of the guarded `pacedMeasuredHoldLanding( dropFrameTick.correctedStart, dropFrameTick, m_sourceAdvance.highWater, ...`
+        (an int64_t by value, nothing writes through it). Every other `.highWater` use in playbackHandling, a second landing call, the argument in
+        another position, and the other site's pinned expression there all stay unreviewed (the real sources are clean)."""
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        self.assertEqual(PINNED_COUNTER_READS.get("MainWindow::playbackHandling"), 1)
+        adv = "unreviewed use of m_sourceAdvance"
+        call = self.LANDING_CALL
+        cases = (
+            ("a plain read beside the landing", call + "\n                const long long advHigh = m_sourceAdvance.highWater;"),
+            ("a second landing call", call + "\n                " + call),
+            ("the mark in another argument position",
+             call + "\n                dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( dropFrameTick.correctedStart,"
+                    " dropFrameTick, m_sourceAdvance.consumed(), m_sourceAdvance.highWater, m_playRequiredSourceFrames );"),
+            ("the landing with another tick start",
+             call + "\n                dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( m_newPosDropMode, dropFrameTick,"
+                    " m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );"),
+            ("the telemetry site's expression in playbackHandling",
+             call + "\n                const long long advHigh = ( m_sourceAdvance.armed ? m_sourceAdvance.highWater : -1 );"),
+            ("a write beside the landing", call + "\n                m_sourceAdvance.highWater = 0;"),
+            ("a parenthesised write beside the landing", call + "\n                (m_sourceAdvance.highWater) += 1500;"),
+            ("armed read beside the landing", call + "\n                const bool advArmed = m_sourceAdvance.armed;"),
+        )
+        for name, replacement in cases:
+            with self.subTest(name):
+                self.assert_caught(self.mutated(call, replacement), adv)
+        # the one read itself, rewritten as anything but the pinned argument, is unreviewed too
+        for name, replacement in (
+                ("the mark read into a local first",
+                 "const int64_t advHigh = m_sourceAdvance.highWater;\n                " + call.replace("m_sourceAdvance.highWater,", "advHigh,")),
+                ("the mark taken by reference", call.replace("m_sourceAdvance.highWater,", "&m_sourceAdvance.highWater,"))):
+            with self.subTest(name):
+                problems = scan_app_play_sources(self.mutated(call, replacement))
+                self.assertTrue(any("m_sourceAdvance" in p for p in problems), problems)
 
     def test_r31_every_compound_and_parenthesised_write_is_a_write(self) -> None:
         """HFR-NATIVE-60FPS-FULLRES-1 r31 (Dot M2 on aa598479, the class): the read rule for .startFrame and the write rule for
