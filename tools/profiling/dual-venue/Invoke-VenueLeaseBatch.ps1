@@ -268,7 +268,9 @@ param(
     [string]$SpecDigestKeyDelay = '',
     # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the committed-leg-spec preflight (Get-LegSpecCommittedRefusal) is on whenever -LegScript is the real Invoke-VenueLeg.ps1, against
     # the HEAD of the checkout this script runs from (the repo the leg reads its own HEAD in). A non-empty value turns it on for a stand-in leg too, against that repo's HEAD. Offline only: refused with the real um-run.ps1.
-    [string]$CommittedSpecRepoRoot = ''
+    [string]$CommittedSpecRepoRoot = '',
+    # r2 (adversary A3): the bounded child the committed-spec preflight runs (default: Test-LegSpecCommitted.ps1 beside this script). Offline only: refused with the real um-run.ps1, so a test can time a lookup that overruns.
+    [string]$CommittedSpecScript = ''
 )
 $ErrorActionPreference = 'Stop'
 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A3 sibling): a caller's $PSNativeCommandUseErrorActionPreference = $true is inherited by `& script`; with Stop it would turn the
@@ -309,8 +311,13 @@ if ($umRunIsReal -and $CommittedSpecRepoRoot) { Stop-Usage '-CommittedSpecRepoRo
 if ($CommittedSpecRepoRoot -and -not (Test-Path -LiteralPath $CommittedSpecRepoRoot -PathType Container)) { Stop-Usage "-CommittedSpecRepoRoot '$CommittedSpecRepoRoot' is not a directory" }
 # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the repo whose HEAD the committed-leg-spec preflight reads ('' = the preflight is off). The real leg refuses an uncommitted spec (LEG_SPEC_NOT_COMMITTED,
 # Invoke-VenueLeg.ps1, outside -OfflineTestMode, which this script never forwards), so with the real leg the preflight is on, in the repo the leg resolves for itself ($here\..\..\.., its own -RepoRoot default).
-$legScriptIsReal = ([IO.Path]::GetFullPath($LegScript) -ieq [IO.Path]::GetFullPath((Join-Path $here 'Invoke-VenueLeg.ps1')))
-$script:CommittedSpecRepoRoot = $(if ($CommittedSpecRepoRoot) { (Resolve-Path -LiteralPath $CommittedSpecRepoRoot).Path } elseif ($legScriptIsReal) { (Resolve-Path -LiteralPath (Join-Path $here '..\..\..')).Path } else { '' })
+# r2 (adversary A1): "real" is by path OR by content, as $umRunIsReal is (a byte-identical copy of the leg elsewhere is the real leg), and the repo is the one THAT leg resolves for itself
+# (its own $PSScriptRoot\..\..\..), not this script's: the leg that runs is the one admitted at its own HEAD.
+$realLegPath = [IO.Path]::GetFullPath((Join-Path $here 'Invoke-VenueLeg.ps1'))
+$legScriptIsReal = ([IO.Path]::GetFullPath($LegScript) -ieq $realLegPath) -or ((Test-Path -LiteralPath $realLegPath -PathType Leaf) -and (Get-FileHash -LiteralPath $LegScript).Hash -ceq (Get-FileHash -LiteralPath $realLegPath).Hash)
+$script:CommittedSpecRepoRoot = $(if ($CommittedSpecRepoRoot) { (Resolve-Path -LiteralPath $CommittedSpecRepoRoot).Path } elseif ($legScriptIsReal) { (Resolve-Path -LiteralPath (Join-Path (Split-Path -Parent ([IO.Path]::GetFullPath($LegScript))) '..\..\..')).Path } else { '' })
+if ($umRunIsReal -and $CommittedSpecScript) { Stop-Usage '-CommittedSpecScript is an offline test seam: with the real um-run.ps1 the committed-spec preflight always runs Test-LegSpecCommitted.ps1' }
+$script:CommittedSpecScript = $(if ($CommittedSpecScript) { $CommittedSpecScript } else { Join-Path $here 'Test-LegSpecCommitted.ps1' })
 if (-not $ExportBudgetScript) { $ExportBudgetScript = Join-Path $here '..\bachelor\export-stage-job.ps1' }
 # r11 (sol r9 B1): the export-budget preflight child's bounds (Get-ExportBudgetRefusal): a hard cap per child, and the seconds kept back from the room before -DeadlineUtc for the typed refusal
 $script:ExportBudgetPreflightCapSec = 120
@@ -1673,6 +1680,7 @@ function Get-LegSpecCommittedRefusal([string]$Path) {
     # with the SAME line-ending-normalised hash (Get-DvLegSpecSha256: the CRLF/LF trap named at Invoke-VenueLeg.ps1:316): no second implementation of the comparison.
     # The commit is HEAD of $script:CommittedSpecRepoRoot at THIS preflight (the leg reads HEAD again when it is admitted, so a HEAD that moves between this check and a later leg is the one bound
     # this check cannot close; it is read last-moment by the leg and never trusted here). '' = the preflight is off (a stand-in leg and no seam). Returns code, detail; '', '' when the spec is committed.
+    # The repo is the one the LEG THAT RUNS resolves for itself (its own ..\..\.., whichever tree it sits in), and the lookup is Test-LegSpecCommitted.ps1, a bounded child (see below).
     # Called AFTER Get-ExportBudgetRefusal, whose read recorded the judged bytes' digest: these bytes must be those, or two checks judged two specs (SPEC_CHANGED_AFTER_PREFLIGHT).
     # A check that cannot run is a refusal, never "no refusal": the leg would refuse a spec it cannot find committed.
     if (-not $script:CommittedSpecRepoRoot) { return '', '' }
@@ -1686,13 +1694,27 @@ function Get-LegSpecCommittedRefusal([string]$Path) {
         if ($judgedSha -and $readSha -cne $judgedSha) {
             return 'SPEC_CHANGED_AFTER_PREFLIGHT', "'$Path' cannot be run: the leg spec read as sha256 $readSha on the committed-spec preflight's read, not the $judgedSha the export budget preflight judged; no claim or lease is taken on bytes no single check judged"
         }
-        $head = [string](& git -C $script:CommittedSpecRepoRoot rev-parse --verify HEAD 2>$null | Select-Object -First 1)
-        $headCommit = $head.Trim()
-        $found = Find-DvCommittedLegSpec -RepoRoot $script:CommittedSpecRepoRoot -Commit $headCommit -LegSpecSha256 (Get-DvLegSpecSha256 $specBytes)
-        if ($found.ok) { return '', '' }
-        return 'LEG_SPEC_NOT_COMMITTED', "'$Path' cannot be run: its leg spec (line-ending-normalised sha256 $(Get-DvLegSpecSha256 $specBytes)) is not a spec committed under tools/profiling/dual-venue/legs/ at HEAD $(if ($headCommit.Length -ge 12) { $headCommit.Substring(0, 12) } else { "'$headCommit'" }) of $script:CommittedSpecRepoRoot, which Invoke-VenueLeg refuses (LEG_SPEC_NOT_COMMITTED) only after the lease is open; commit the spec first; no claim or lease is taken on it"
+        $normSha = Get-DvLegSpecSha256 $specBytes
+        # r2 (adversary A2/A3/A4): the lookup (HEAD, then every blob under legs/: about 15 s cold) runs in a BOUNDED child, Test-LegSpecCommitted.ps1, on the room left before -DeadlineUtc, as the export
+        # budget generator does, and every git call in it is the module's hardened Invoke-DvGit (no inherited GIT_DIR / GIT_TRACE* override), never a raw git here. No room, or a child still running
+        # at its bound (killed with its tree), is the typed COMMITTED_SPEC_PREFLIGHT_TIMEOUT; every caller turns any code into an exit 2 before any claim or lease.
+        $room = ($deadline - [DateTime]::UtcNow).TotalSeconds - $script:ExportBudgetPreflightReserveSec - ($script:ExportBudgetPreflightCleanupMs / 1000.0)
+        $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
+        if ($boundFloor -lt 1) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s); no claim or lease is taken on it" }
+        $boundSec = [int]$boundFloor
+        $pwshExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $script:CommittedSpecScript, '-RepoRoot', $script:CommittedSpecRepoRoot, '-LegSpecSha256', $normSha) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+        if ($bp.timedOut) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' })); no claim or lease is taken on it" }
+        $answer = [string]$bp.stdout
+        if ($bp.exit -eq 0 -and $answer -match '(?m)^DV_LEGSPEC_COMMITTED FOUND ') { return '', '' }
+        if ($bp.exit -eq 3 -and $answer -match '(?m)^DV_LEGSPEC_COMMITTED NOT_FOUND head=(?<head>[0-9a-f]{0,40})\s*$') {
+            $headCommit = $Matches['head']
+            return 'LEG_SPEC_NOT_COMMITTED', "'$Path' cannot be run: its leg spec (line-ending-normalised sha256 $normSha) is not a spec committed under tools/profiling/dual-venue/legs/ at HEAD $(if ($headCommit.Length -ge 12) { $headCommit.Substring(0, 12) } else { "'$headCommit'" }) of $script:CommittedSpecRepoRoot, which Invoke-VenueLeg refuses (LEG_SPEC_NOT_COMMITTED) only after the lease is open; commit the spec first; no claim or lease is taken on it"
+        }
+        $firstLine = @((@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n" -split '\r?\n' | Where-Object { $_.Trim() } | Select-Object -First 1)
+        return 'COMMITTED_SPEC_PREFLIGHT_FAILED', "'$Path' cannot be run: the committed-spec preflight gave no answer (exit $($bp.exit)$(if ($firstLine.Count) { ': ' + ($firstLine[0] -replace '\s+', ' ') })), so whether its leg spec is committed is unchecked, and Invoke-VenueLeg refuses a spec it cannot find committed (LEG_SPEC_NOT_COMMITTED); no claim or lease is taken on it"
     } catch {
-        return 'LEG_SPEC_NOT_COMMITTED', "'$Path' cannot be run: whether its leg spec is committed could not be checked ($($_.Exception.Message -replace '\s+', ' ')), and Invoke-VenueLeg refuses a spec it cannot find committed (LEG_SPEC_NOT_COMMITTED); no claim or lease is taken on it"
+        return 'COMMITTED_SPEC_PREFLIGHT_FAILED', "'$Path' cannot be run: whether its leg spec is committed could not be checked ($($_.Exception.Message -replace '\s+', ' ')), and Invoke-VenueLeg refuses a spec it cannot find committed (LEG_SPEC_NOT_COMMITTED); no claim or lease is taken on it"
     }
 }
 

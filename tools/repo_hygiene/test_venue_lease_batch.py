@@ -5887,14 +5887,64 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr, r.stdout + r.stderr)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def test_legspec_committed_the_seam_is_refused_with_the_real_um_run(self) -> None:
+    def test_legspec_committed_the_seams_are_refused_with_the_real_um_run(self) -> None:
+        stand_in = self.case / "stand-in-committed.ps1"
+        stand_in.write_text("param([string]$RepoRoot, [string]$LegSpecSha256)\nWrite-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head='\nexit 0\n", encoding="utf-8")
+        for flag, value in (("-CommittedSpecRepoRoot", str(ROOT)), ("-CommittedSpecScript", str(stand_in))):
+            with self.subTest(seam=flag):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], flag, value)
+                args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+                r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(f"{flag} is an offline test seam", r.stderr)
+                self.assertEqual(self.kinds(), [])
+
+    # r2 (adversary A1): "the real leg" is the real leg by CONTENT as well as by path (a byte-identical copy elsewhere is the real leg), and the repo is the one THAT leg resolves for itself
+    def test_legspec_committed_a_byte_identical_copy_of_the_real_leg_turns_the_preflight_on_in_its_own_repo(self) -> None:
+        leg_copy_root = self.case / "legcopy"
+        leg_copy_dir = leg_copy_root / "tools" / "profiling" / "dual-venue"
+        leg_copy_dir.mkdir(parents=True)
+        shutil.copyfile(LEG, leg_copy_dir / "Invoke-VenueLeg.ps1")
+        scratch = ROOT / ".claude-state" / f"zz-legspec-committed-{uuid.uuid4().hex[:8]}"
         self._reset_committed_case()
-        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT))
-        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
-        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
-        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("-CommittedSpecRepoRoot is an offline test seam", r.stderr)
-        self.assertEqual(self.kinds(), [])
+        try:
+            args, e = self.batch_cmd([self._COMMITTED_SPEC], "-ReceiptRoot", str(scratch / "receipts"))
+            args[args.index("-LegScript") + 1] = str(leg_copy_dir / "Invoke-VenueLeg.ps1")
+            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        # the spec IS committed in this repo, but the copy's own repo (its ..\..\.. : a plain directory, no HEAD) holds nothing: the leg that runs would refuse it, so the batch does first
+        self._assert_nothing_claimed_or_leased("copy of the real leg", r)
+        self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+        self.assertIn("legcopy", r.stderr)   # the message names the repo the check ran in: the copy's own tree, not this checkout
+
+    # r2 (adversary A2, A4): an inherited GIT_DIR / GIT_TRACE must neither choose the commit nor make git write: every git call is the module's hardened one, in a child
+    def test_legspec_committed_an_inherited_git_environment_changes_neither_the_commit_nor_writes_a_file(self) -> None:
+        trace = self.case / "git-trace.log"
+        self._reset_committed_case()
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT), GIT_DIR=str(self.case / "no-such-override.git"), GIT_TRACE=str(trace), GIT_TRACE2_EVENT=str(trace))
+        self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr, r.stdout + r.stderr)
+        self.assertNotIn("COMMITTED_SPEC_PREFLIGHT", r.stdout + r.stderr, r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(trace.exists(), "git wrote the trace file its environment named")
+
+    # r2 (adversary A3): the lookup is bounded by the room left before -DeadlineUtc, and a child that gives no answer is a typed refusal, never "no refusal"
+    def test_legspec_committed_a_lookup_that_overruns_the_deadline_is_killed_and_refused_before_any_claim(self) -> None:
+        slow = self.case / "slow-committed.ps1"
+        slow.write_text("param([string]$RepoRoot, [string]$LegSpecSha256)\nStart-Sleep -Seconds 120\nWrite-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head='\nexit 0\n", encoding="utf-8")
+        silent = self.case / "silent-committed.ps1"
+        silent.write_text("param([string]$RepoRoot, [string]$LegSpecSha256)\nexit 0\n", encoding="utf-8")
+        for name, script, code, limit_s in (("slow", slow, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT", 40), ("silent", silent, "COMMITTED_SPEC_PREFLIGHT_FAILED", 40)):
+            with self.subTest(child=name):
+                self._reset_committed_case()
+                deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=30))
+                t0 = time.monotonic()
+                r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT), "-CommittedSpecScript", str(script), "-DeadlineUtc", deadline)
+                elapsed = time.monotonic() - t0
+                self._assert_nothing_claimed_or_leased(name, r)
+                self.assertIn(f"BATCH_USAGE {code}", r.stderr)
+                self.assertLess(elapsed, limit_s, f"{name}: the run outlived the child's bound ({elapsed:.1f} s): " + r.stderr[-1500:])
 
     def test_r8_export_a_window_the_agent_job_cap_refuses_is_refused_before_the_claim_in_every_mode(self) -> None:
         # EXPORT-VENUE-LEG-1 r8 (adversary r7 A3): maxFrames=20000 on the shipped 3.4 GB ProRes leg is a job the agent refuses (submitted timeout past 86400 s), but only the
