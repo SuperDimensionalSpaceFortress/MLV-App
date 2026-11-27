@@ -410,12 +410,16 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
     # names (a staged manifest refused for its digest), so only a plain one-name batch.log, or none yet, is appended to. One that cannot be read is not appended to either.
     # r4: nor once the guard could not verify where an input is (Invoke-InputGuard, locationUnknown): batch.log may be that input. r5 (sol r4 B1 sibling): and then batch.log is not
     # even probed -- the guard gave up on that location, and a -RunDir that stopped answering would hold the probe before the typed refusal
+    # R4-DEADLINE-RESIDUE-1 (sol r2 on 4b328ae0, B1): the typed refusal is printed FIRST, before any batch.log probe or append: a refusal reached under -DeadlineUtc (a stalled staged-build
+    # read ends 2 s before it) must not wait on a synchronous probe of a share that may be the one that stalled. And with under 3 s left the probe is not made at all: the line is on stderr only.
+    [Console]::Error.WriteLine("BATCH_USAGE $line")
+    $logRoomSec = $(if ($script:deadline -is [datetime]) { ($script:deadline - [DateTime]::UtcNow).TotalSeconds } else { [double]::PositiveInfinity })
     $logPlain = $false
     # r7: nor for an input that no longer resolves (it is exactly when a write is unsafe), and only through the write guard (Test-RunDirWrite)
     # r7 pass 3 (adversary r7 pass 2 A4): nor for OUTPUT_ZONE_UNRESOLVED: the guard could not tell whether the refused input is batch.log (before any input is accepted nothing is compared)
     # r14 (sol r13 B5): nor for a bounded read that got no answer (SPEC_READ_TIMEOUT, EXPORT_BUDGET_PREFLIGHT_TIMEOUT): the share that stalled may hold -RunDir too, and the synchronous batch.log
     # probe below would hold the typed refusal past the deadline the bound was there to keep; stderr carries the line.
-    if (-not $script:RunOutputAliased -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT', 'INPUT_VANISHED', 'INPUT_UNREADABLE', 'OUTPUT_ZONE_UNRESOLVED', 'SPEC_READ_TIMEOUT', 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT')) {
+    if (-not $script:RunOutputAliased -and $logRoomSec -ge 3.0 -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT', 'INPUT_VANISHED', 'INPUT_UNREADABLE', 'OUTPUT_ZONE_UNRESOLVED', 'SPEC_READ_TIMEOUT', 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT')) {
         try {
             Wait-RunDirReadSeam
             if (-not (Test-Path -LiteralPath $batchLog)) { $logPlain = $true }
@@ -426,7 +430,6 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
         # r3 pass 3 (adversary r3 A1): a failed append is counted when a summary follows (a refusal once a batch receipt exists), so the count that summary reports includes it
         try { Add-Content -LiteralPath $batchLog -Value "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $line" } catch { if ($script:summaryBeforeExit) { Register-LogFailure $_.Exception.Message } }
     }
-    [Console]::Error.WriteLine("BATCH_USAGE $line")
     # r3 pass 3: the summary is the LAST thing this run writes, after the refusal line, so no append it reports on is still to come
     if ($script:summaryBeforeExit) { & $script:summaryBeforeExit }
     try { Complete-VenueProcess -ExitCode 2 } catch { }
@@ -1797,6 +1800,12 @@ if ($legPlanMode) {
             # r12 (adversary r12 A1): the manifest is an input the legs read, so it gets the guard the plan and the specs get: a hard link or a link that makes it one of the files this run writes
             # (leg-plan.json, a batch receipt, ...) would have it overwritten after the lease opened. r16 (adversary r16 A1): BEFORE its digest and content refusals, as the specs' guard
             # comes before theirs: a manifest that is batch.log was appended to by the BUILD_MANIFEST_MISMATCH refusal's own log line.
+            # R4-DEADLINE-RESIDUE-1 (sol r2 on 4b328ae0, B1 row 2): an artifact hash that got no answer ends 2 s before -DeadlineUtc, and the zone probe below is a synchronous read of the share's
+            # own paths. With under 3 s left it is not made: the same typed refusal as after the probe, on stderr only (the zone check that would have shown the manifest is not batch.log was not made).
+            if ($st.artifactsUnhashed -and ($script:deadline -is [datetime]) -and (($script:deadline - [DateTime]::UtcNow).TotalSeconds -lt 3.0)) {
+                $script:RunOutputAliased = $true
+                Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error); no time is left before -DeadlineUtc for the output-zone check, so batch.log is not written (this refusal is on stderr only)"
+            }
             $outputRefusal = Get-RunDirOutputRefusal $st.path
             if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'BUILD_MANIFEST_IS_RUN_OUTPUT') $it.item "the staged build manifest for $short $outputRefusal" }
             if ($st.artifactsUnhashed) { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
@@ -1882,6 +1891,16 @@ if ($legPlanMode) {
         $judgedSha = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey $path)]   # r2 (adversary A1 class): THIS entry's judged bytes
         for ($r = 1; $r -le $Repeats; $r++) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); specSha256 = $judgedSha })
+        }
+        # R4-DEADLINE-RESIDUE-1 (sol r2 on 4b328ae0, B2): a digest mismatch THIS entry's preflight just established (an earlier entry for the same file was judged as other bytes) is refused now,
+        # before the next entry's path lookup (a synchronous Test-Path that a stalled share can hold past -DeadlineUtc), in the order the planner paths refuse. Only entries with a judged digest and
+        # a resolved key are compared here, with the post-loop check's own message; an unjudged or unresolved one still gets its own typed refusal there, first. The key is memoised: no new read.
+        foreach ($earlier in $plan) {
+            if (Get-UnresolvedSpecKeyRefusal ([string]$earlier.spec)) { continue }
+            $boundNow = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey ([string]$earlier.spec))]
+            if ($earlier.specSha256 -and $boundNow -and [string]$earlier.specSha256 -cne $boundNow) {
+                Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($earlier.spec)' cannot be run: leg $($earlier.name) was judged as sha256 $($earlier.specSha256) but a later preflight read of the same path judged sha256 $boundNow (planned_sha256=$($earlier.specSha256)); no claim or lease is taken on bytes this leg's checks did not judge"
+            }
         }
     }
 }

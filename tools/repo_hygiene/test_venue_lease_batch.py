@@ -6119,6 +6119,34 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                       "old: the two names had two keys and the claim was taken before the content guard refused. " + out)
         self.assertEqual(self.kinds(), [], out)
 
+    def test_r10_r4_deadline_scalar_an_established_digest_mismatch_is_refused_before_a_later_entrys_path_lookup(self) -> None:
+        # R4-DEADLINE-RESIDUE-1 (sol r2 on 4b328ae0, B2): -LegSpec s.json,s.json,third.json where the two preflights of s.json judge different bytes. The parent refuses before visiting third.json;
+        # the scalar loop looked third.json up (a synchronous Test-Path) and only then compared the entries' digests, so a slow third lookup put SPEC_CHANGED_AFTER_PREFLIGHT past -DeadlineUtc.
+        # The mirror swaps s.json's bytes on its second visit and makes the third entry's lookup answer 60 s late: the refusal must come from the second entry, before that lookup.
+        s = self.case / "r4dl-s.json"
+        s.write_text(self.specs[0].read_text(encoding="utf-8"), encoding="utf-8")
+        other = self.case / "r4dl-other-bytes.json"
+        other.write_text(self.specs[1].read_text(encoding="utf-8"), encoding="utf-8")
+        third = self.case / "r4dl-third.json"
+        third.write_text(self.specs[1].read_text(encoding="utf-8"), encoding="utf-8")
+        swap = ("        if ([IO.Path]::GetFileName($path) -ceq 'r4dl-s.json') { $script:DvtVisits++; if ($script:DvtVisits -eq 2) { [IO.File]::Copy($env:DVT_SWAP_FROM, $path, $true) } }   # TEST FIXTURE: the second visit's bytes differ\n"
+                "        $shapeRefusal = Get-ScalarLegShapeRefusal $path\n")
+        lookup = "        try { if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return (Resolve-Path -LiteralPath $c).Path } } catch { }\n"
+        slow = ("        if ($c -and $c.EndsWith('r4dl-third.json')) { [Threading.Thread]::Sleep(60000) }   # TEST FIXTURE: the third entry's path lookup answers 60 s late\n" + lookup)
+        self._mirror_with_bad_sidecar(runner_patches=(("        $shapeRefusal = Get-ScalarLegShapeRefusal $path\n", swap), (lookup, slow)))
+        shas = self.case / "leg-spec-sha-r4dl.log"
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=50)
+        r = self.run_batch([s, s, third], "-DeadlineUtc", utc_iso(deadline), FAKE_LEG_SPEC_SHA=str(shas), DVT_SWAP_FROM=str(other))
+        ended = datetime.now(timezone.utc)
+        out = r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertEqual(s.read_bytes(), other.read_bytes(), "the fixture swapped s.json's bytes on its second visit. " + out)
+        self.assertFalse(shas.exists(), "a leg ran. " + out)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("SPEC_CHANGED_AFTER_PREFLIGHT", r.stderr, out)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the third entry's lookup held it). " + out)
+        self.assertEqual(self.kinds(), [], "no claim, lease or leg. " + out)
+        self.assertFalse(self.claim_path.exists(), out)
+
     def test_r10_a2_a_key_lookup_is_bounded_by_what_is_left_before_the_deadline(self) -> None:
         # adversary pass 1 on 5a73d8e8, A2: the lookup waited a fixed 1 s, so a spec preflight that started it with 250 ms left refused about 750 ms past -DeadlineUtc. The mirror sets the deadline 250 ms
         # away right before the -LegSpec shape check and stamps the refusal's own time; the lookup (made to answer 3 s late) must wait only what the read bound allows (nothing here).
@@ -9699,6 +9727,43 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
         source = RUNNER.read_text(encoding="utf-8")
         self.assertIn("-ArtifactProbeScript $artifactProbe -CallDeadlineUtc $deadline.AddSeconds(-2.0) -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }", source)
+
+    def test_artifact_preflight_r4_deadline_a9_the_refusal_logger_probe_never_holds_a_stalled_read_refusal_past_the_deadline(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1-R4-DEADLINE-RESIDUE-1 (sol r2 on 4b328ae0, B1 row 1): the stalled manifest read ends at -DeadlineUtc less 2 s, and Stop-PlanRefused then probed batch.log
+        # synchronously (Test-Path) BEFORE it printed SHARE_UNREACHABLE item=1: a share that answered that probe 8 s late put the typed refusal after the deadline. The refusal line is printed
+        # first now, and the probe is not made at all with under 3 s left. The mirror makes the batch.log probe answer 8 s late.
+        c = self.commit_a
+        manifest_probe = self.case / "r4dl-manifest-probe.ps1"
+        manifest_probe.write_text("param($p)\n[Threading.Thread]::Sleep(120000)\n", encoding="utf-8")
+        anchor = "            if (-not (Test-Path -LiteralPath $batchLog)) { $logPlain = $true }\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, "            [Threading.Thread]::Sleep(8000)   # TEST FIXTURE: the share that holds batch.log answers 8 s late\n" + anchor),))
+        self.plan_runner = self.runner
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c)]), "-DeadlineUtc", utc_iso(deadline), "-StagedBuildProbeScript", str(manifest_probe))
+        ended = datetime.now(timezone.utc)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the log probe held it)")
+        self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
+
+    def test_artifact_preflight_r4_deadline_a9_the_output_zone_probe_never_holds_an_artifact_hash_timeout_refusal_past_the_deadline(self) -> None:
+        # R4-DEADLINE-RESIDUE-1 (sol r2, B1 row 2): the manifest was read and its artifact hash got no answer (VenueChain: artifactsUnhashed, ending at -DeadlineUtc less 2 s); the preflight then
+        # ran the output-zone probe (Get-RunDirOutputRefusal on the manifest) before it could refuse. With under 3 s left the probe is skipped, the refusal is on stderr only (batch.log is not
+        # written: the zone check that would have shown the manifest is no run output was not made), and it lands before the deadline. The mirror makes that probe answer 8 s late.
+        c = self.commit_a
+        artifact_probe = self.case / "r4dl-artifact-probe.ps1"
+        artifact_probe.write_text("param($items)\n[Threading.Thread]::Sleep(120000)\n", encoding="utf-8")
+        anchor = "            $outputRefusal = Get-RunDirOutputRefusal $st.path\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, "            [Threading.Thread]::Sleep(8000)   # TEST FIXTURE: the output-zone probe answers 8 s late\n" + anchor),))
+        self.plan_runner = self.runner
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c)]), "-DeadlineUtc", utc_iso(deadline), "-ArtifactProbeScript", str(artifact_probe))
+        ended = datetime.now(timezone.utc)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("could not be hashed", r.stderr)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the output-zone probe held it)")
+        self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
 
 
 # the runner cases are inherited only for their fixtures: they run once, in their own class (unittest collects callable test_* attributes only)
