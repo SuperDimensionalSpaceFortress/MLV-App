@@ -356,8 +356,9 @@ _allow("Get-AttrCudaEligibilityVerdict", _LOCAL_BLOCK, ("R3", "& $read", 8))
 # `{ param($BasePid, $BaseTicks) ... $baseTable.ContainsKey(...) -and ([int64]$baseTable[...] -eq [int64]$BaseTicks) }` (an identity test against the listing taken before the root started).
 # sol r2 on b428e461 (A1): the two walks no longer call $inBase (a child of a member is always a member), so each body holds 2 calls (late classification, direct-parent check).
 # R2-RESIDUE-2 r1 (sol B2): -BudgetMs bounds the decode. 16 $unknown calls = the 7 above + 9 'deadline-exceeded' returns (before the CIM dispatch, after its rows, in each of the row loops, and at the end).
-# $overBudget is the body's own pure block (defined beside $unknown): `{ [bool]($BudgetMs -gt 0 -and <elapsed ms> -gt $BudgetMs) }`, read from one Stopwatch or from the -Clock test seam; 9 calls, one per check.
-_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 16), ("R3", "& $inBase", 2), ("R3", "& $overBudget", 9))
+# $overBudget and $budgetElapsed are the body's own pure blocks (defined beside $unknown): $budgetElapsed reads one Stopwatch (or the -Clock test seam) and $overBudget is
+# `{ [bool]($BudgetMs -gt 0 -and (& $budgetElapsed) -gt $BudgetMs) }`; 8 $overBudget calls (one per row-loop / result check) and 2 $budgetElapsed calls (that block, and the pre-dispatch guard of the CIM query).
+_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 16), ("R3", "& $inBase", 2), ("R3", "& $overBudget", 8), ("R3", "& $budgetElapsed", 2))
 _allow("Get-AttrCudaProcessTreeSnapshot",
        "test-only seam: runs the caller's -Clock block (a stand-in for the elapsed-milliseconds read of the decode budget) only when a test passed one; production passes none and reads a Stopwatch",
        ("R3", "& $Clock", 1))

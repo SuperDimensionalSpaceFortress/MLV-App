@@ -5236,6 +5236,18 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertEqual(got["shortWhy"], "deadline-exceeded", f"no CIM query is dispatched under a budget smaller than its timeout: {got}")
         self.assertTrue(got["holdsOk"], got)
 
+    def test_r2_residue_2_a1_adversary_pass_2_the_scan_needs_its_timeout_in_what_is_LEFT_of_the_budget(self) -> None:
+        """R2-RESIDUE-2 r1, adversary pass 2 A1 on 9a98b537. The guard compared the whole budget with the query's timeout: BudgetMs=1100 against a 1000 ms query passed with 900 ms
+        already spent (200 ms left), so the 1 s query ran and the kill came at 5800 ms against a 5000 ms bound. The scan is dispatched only when the budget LESS the time spent still
+        holds the timeout. Literal input: OperationTimeoutSec=1, BudgetMs=1100, no -Processes, the clock at 900 (the passing side of the guard is the 'holds' control of the A3 test above)."""
+        got = self.snapshot_and_wait(
+            "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$bl = & $realSnapshot -BaselineOnly -Processes $sys\n"
+            "$spent = & $realSnapshot -RootProcessId 100 -Baseline $bl -OperationTimeoutSec 1 -BudgetMs 1100 -Clock { 900.0 }\n"
+            "[ordered]@{ spentOk = $spent.ok; spentWhy = $spent.error } | ConvertTo-Json -Compress")
+        self.assertFalse(got["spentOk"], got)
+        self.assertEqual(got["spentWhy"], "deadline-exceeded", f"900 ms of a 1100 ms budget are spent: a 1000 ms query is not dispatched: {got}")
+
     def test_r2_sol_a3_a4_the_tree_is_recorded_before_the_bound_so_the_kill_is_at_the_bound(self) -> None:
         """sol r2 A3 on b428e461: a call granted 5 s or more records the tree one lead (2 s) BEFORE the bound, so the kill is not held behind a slow scan; a call granted less records it
         at the timeout (the earlier rule). Behavior: the fake snapshot reports when it ran."""

@@ -5092,15 +5092,17 @@ function Get-AttrCudaProcessTreeSnapshot {
         } catch { return $null }
     }
     $unknown = { param([string]$Why) [pscustomobject]@{ ok = $false; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $null; members = @(); error = $Why } }
-    $overBudget = { [bool]($BudgetMs -gt 0 -and $(if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds }) -gt $BudgetMs) }
+    $budgetElapsed = { if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds } }
+    $overBudget = { [bool]($BudgetMs -gt 0 -and (& $budgetElapsed) -gt $BudgetMs) }
     try {
         $baseTable = @{}
         if ($null -ne $Baseline) { foreach ($bk in @($Baseline.Keys)) { if ($null -ne $Baseline[$bk]) { $baseTable[[int64]$bk] = [int64[]]@($Baseline[$bk]) } } }
         if ($baseTable.Count -eq 0) { return (& $unknown 'baseline-unknown') }
         # an entry is (stamp) or (stamp, parent pid): a row is that baseline process only when its pid, stamp AND (when the entry has one) parent pid all match
         $inBase = { param($BasePid, $BaseTicks, $BaseParent) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid][0] -eq [int64]$BaseTicks) -and (($baseTable[[int64]$BasePid].Count -lt 2) -or (($null -ne $BaseParent) -and ([int64]$baseTable[[int64]$BasePid][1] -eq [int64]$BaseParent))) }
-        # (adversary A3 on 36c22ed2) the CIM query is dispatched only when the budget still holds its own timeout: a budget under it (a grant read just before the bound) starts no scan
-        if ($BudgetMs -ne 0 -and -not $PSBoundParameters.ContainsKey('Processes') -and ($BudgetMs -lt ($OperationTimeoutSec * 1000.0) -or (& $overBudget))) { return (& $unknown 'deadline-exceeded') }
+        # (adversary A3 on 36c22ed2; pass 2 A1 on 9a98b537) the CIM query is dispatched only when what is LEFT of the budget (the budget less the time spent since the first statement) still holds its own
+        # timeout: a budget under it (a grant read just before the bound, or time already spent in this call) starts no scan
+        if ($BudgetMs -ne 0 -and -not $PSBoundParameters.ContainsKey('Processes') -and (($BudgetMs - (& $budgetElapsed)) -lt ($OperationTimeoutSec * 1000.0))) { return (& $unknown 'deadline-exceeded') }
         $rows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
         if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
         # r5b fix (adversary A1 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started, so the
