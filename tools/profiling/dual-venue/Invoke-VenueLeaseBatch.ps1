@@ -477,6 +477,14 @@ function Get-RunDirOutputRefusalWithin([string]$Path) {
     $script:refusalInputUnopened = [bool]$o.unopened; $script:refusalOutputUnresolved = [bool]$o.unresolved
     [string]$o.refusal
 }
+function Test-NoRoomForSpecRead {
+    # R4-DEADLINE-RESIDUE-1 r4 (hosted CI on 2ee7d054; round-11 contract): with no room left before -DeadlineUtc a leg input is refused as the budget/timeout (SPEC_READ_TIMEOUT, or LEG_PLAN_UNREADABLE for the
+    # plan file) BEFORE any probe or claim. An output-zone check is a probe, so r3's bounded Get-RunDirOutputRefusalWithin answered OUTPUT_ZONE_UNRESOLVED first. The three call sites whose NEXT step is
+    # the input's own bounded read (the plan file, a plan item's spec, a -LegSpec spec) skip the zone check when this is true: that read starts nothing on a bound of 0 and refuses at once, before any claim
+    # or lease, so nothing is accepted unchecked. NOT for the staged-manifest site: its read has already been made and the run would go on to accept it. No -DeadlineUtc: never true (no bound to keep).
+    if ($null -eq (Get-ProbeBoundSec)) { return $false }
+    (Get-SpecReadBoundSec) -le 0.0
+}
 
 function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
     # LEASE-BATCH-MULTI-BUILD-1 (item 9a): a -LegPlan item that cannot run refuses the WHOLE plan before any claim, open or lease. Nothing was submitted.
@@ -1806,7 +1814,7 @@ if ($legPlanMode) {
         Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force   # the leg process's own spec predicates, run in preflight (Get-LegSpecRefusal)
         $planPath = $(if (Test-Path -LiteralPath $LegPlan -PathType Leaf) { (Resolve-Path -LiteralPath $LegPlan).Path } else { $null })
         if (-not $planPath) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "no plan file at '$LegPlan'" }
-        $outputRefusal = Get-RunDirOutputRefusalWithin $planPath   # r9: the plan is an input too (leg-plan.json is written over it once the claim is held); r3: bounded by -DeadlineUtc (A4 sibling)
+        $outputRefusal = $(if (Test-NoRoomForSpecRead) { '' } else { Get-RunDirOutputRefusalWithin $planPath })   # r9: the plan is an input too (leg-plan.json is written over it once the claim is held); r3: bounded by -DeadlineUtc (A4 sibling); r4: with no room the plan's own bounded read below refuses first (LEG_PLAN_UNREADABLE)
         if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'LEG_PLAN_IS_RUN_OUTPUT') 0 "the plan file $outputRefusal" }
         # r19 (sol r18 B2 sibling sweep): the plan's read is bounded by the room before -DeadlineUtc too; no answer in it is the typed LEG_PLAN_UNREADABLE, never a read past the deadline
         $planRead = Read-SpecBytesWithin $planPath (Get-SpecReadBoundSec)
@@ -1845,7 +1853,7 @@ if ($legPlanMode) {
             $path = $(if ($ref) { Resolve-LegSpecPath $ref $planDir } else { $null })
             if (-not $path) { Stop-PlanRefused 'LEG_SPEC_MISSING' $n "no leg spec at '$ref'" }
             # adversary r7 pass 2 A1, r9: a spec that IS one of the files this run writes under -RunDir (the one list above) would be overwritten after the lease opened.
-            $outputRefusal = Get-RunDirOutputRefusalWithin $path   # r3: bounded by -DeadlineUtc (A4 sibling)
+            $outputRefusal = $(if (Test-NoRoomForSpecRead) { '' } else { Get-RunDirOutputRefusalWithin $path })   # r3: bounded by -DeadlineUtc (A4 sibling); r4: with no room the spec's own bounded read below refuses first (SPEC_READ_TIMEOUT)
             if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'LEG_SPEC_IS_RUN_OUTPUT') $n "the leg spec $outputRefusal" }
             $specRefusal = Get-LegSpecRefusal $path $be
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
@@ -1966,7 +1974,7 @@ if ($legPlanMode) {
     foreach ($ref in $LegSpec) {
         $path = Resolve-LegSpecPath $ref ''
         if (-not $path) { Stop-Usage "no leg spec at '$ref'" }
-        $outputRefusal = Get-RunDirOutputRefusalWithin $path   # r9: the same guard as a -LegPlan item's spec; r3: bounded by -DeadlineUtc (A4 sibling)
+        $outputRefusal = $(if (Test-NoRoomForSpecRead) { '' } else { Get-RunDirOutputRefusalWithin $path })   # r9: the same guard as a -LegPlan item's spec; r3: bounded by -DeadlineUtc (A4 sibling); r4: with no room the shape read below refuses first (SPEC_READ_TIMEOUT)
         if ($outputRefusal) { Stop-Usage "$(Get-OutputRefusalCode 'LEG_SPEC_IS_RUN_OUTPUT') the leg spec $outputRefusal" }
         # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): the leg's shape refusals (Get-DvLegSpecShapeRefusal: a non-object control container, a look
         # leg with no look, a malformed look.pairedSeekFrames) are refused HERE, before any claim or lease, as the -LegPlan preflight refuses them; the leg would

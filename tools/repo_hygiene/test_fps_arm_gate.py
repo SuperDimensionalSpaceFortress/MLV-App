@@ -720,13 +720,15 @@ class LeaseBatchPlanCheckerTests(unittest.TestCase):
         # refusal): the timeout codes are in Stop-PlanRefused's no-probe list, beside the codes that already skip it.
         refused = re.search(r"function Stop-PlanRefused\(.*?\n\}\r?\n", source, re.DOTALL)
         self.assertIsNotNone(refused)
-        skip = re.search(r"\$Reason -cnotin @\(([^)]*)\)\) \{\s*\n\s*try \{\s*\n\s*Wait-RunDirReadSeam", refused.group(0))
+        # R4-DEADLINE-RESIDUE-1 r4 (hosted CI on 2ee7d054): r3 moved the guard. The same no-probe list still opens the one block that holds BOTH batch.log probes (the bounded worker under -DeadlineUtc, the
+        # inline one without it); the pattern follows the list to that block, never to a particular probe's first line, so a probe moved out from under the list does not match.
+        skip = re.search(r"\$Reason -cnotin @\(([^)]*)\)\) \{\s*\n\s*if \(\$DeadlineUtc\) \{.*?\$probe = Invoke-ProbeWithin \$script:LogProbeBlock .*?\} else \{\s*\n\s*try \{\s*\n\s*Wait-RunDirReadSeam", refused.group(0), re.DOTALL)
         self.assertIsNotNone(skip, "the no-probe list guards the batch.log probe")
         self.assertIn("'SPEC_READ_TIMEOUT'", skip.group(1))
         self.assertIn("'EXPORT_BUDGET_PREFLIGHT_TIMEOUT'", skip.group(1))
         # the sibling (adversary r14 pass 17 A4 / pass 18 A5): the plan file's own read timeout keeps its LEG_PLAN_UNREADABLE code but skips the probe the same way a location the guard gave up on does
         self.assertIn("if ($planRead.state -ceq 'TIMEOUT') { $script:RunOutputAliased = $true; Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 ", source)
-        self.assertIn("if (-not $script:RunOutputAliased -and $Reason -cnotin", refused.group(0))
+        self.assertIn("if (-not $script:RunOutputAliased -and $logRoomSec -ge 3.0 -and $Reason -cnotin", refused.group(0))   # r4: r3 added the time-left test before the list
 
     def test_the_arm_is_judged_from_the_bytes_the_leg_is_bound_to(self) -> None:
         # adversary A4: Get-LegSpecTelemetryArm must hash its read against the digest the preflight judged (the one -ExpectSpecSha256 binds the leg to). A spec shown as LIGHT to this

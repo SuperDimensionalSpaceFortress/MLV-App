@@ -6359,6 +6359,16 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertRegex(r.stderr, r"LEG_PLAN_REFUSED reason=(EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 |SPEC_READ_TIMEOUT item=1 |LEG_PLAN_UNREADABLE )")
         self.assertNotIn("LEG_PLAN_INVALID", r.stderr)
         self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
+        # R4-DEADLINE-RESIDUE-1 r4 (hosted CI on 2ee7d054): r3's bounded zone probe answered OUTPUT_ZONE_UNRESOLVED ahead of the typed timeout. The sites whose next step is the input's own bounded read
+        # (the plan file, a plan item's spec, a -LegSpec spec) skip the zone probe when no room is left; the staged-manifest site, whose read is already made, keeps its zone check.
+        source = RUNNER.read_text(encoding="utf-8")
+        skip = "$(if (Test-NoRoomForSpecRead) { '' } else { Get-RunDirOutputRefusalWithin "
+        for var in ("$planPath", "$path"):
+            self.assertIn(skip + var + " })", source)
+        self.assertEqual(source.count(skip), 3, "plan file, plan item spec and -LegSpec spec: three sites skip the probe with no room")
+        self.assertIn("$outputRefusal = Get-RunDirOutputRefusalWithin $st.path", source, "the staged manifest keeps its zone check")
+        # the no-room test is the spec read's own bound at 0, and never true without -DeadlineUtc (there is no bound to keep)
+        self.assertRegex(source, re.compile(r"function Test-NoRoomForSpecRead \{.*?if \(\$null -eq \(Get-ProbeBoundSec\)\) \{ return \$false \}\s*\n\s*\(Get-SpecReadBoundSec\) -le 0\.0", re.DOTALL))
 
     def test_dualvenue_bool_args_a_non_boolean_generatorargs_switch_is_refused_by_the_batch_entrypoint_before_the_claim(self) -> None:
         # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1 r2 (inherited A1, Dot pr-757): the strict-boolean refusal lives in the shared shape predicate; this drives it through
