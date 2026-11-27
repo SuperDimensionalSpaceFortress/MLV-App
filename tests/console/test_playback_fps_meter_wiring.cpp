@@ -7,6 +7,7 @@
 #include "../common/repo_paths.h"
 
 #include <QFile>
+#include <QRegularExpression>
 #include <QString>
 #include <QTextStream>
 
@@ -44,20 +45,20 @@ TEST(PlaybackFpsMeterWiring, FpsMeterMeasuresDrawToDrawAndIdleTicksDoNotRestartI
 {
     const QString body = timerFrameEventBody();
     ASSERT_FALSE(body.isEmpty());
-    ASSERT_TRUE(body.contains(QStringLiteral("static QTime lastDrawTime;")));
+    ASSERT_TRUE(body.contains(QStringLiteral("static QElapsedTimer lastDrawTime;")));
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "const int measuredFrameMs = lastDrawTime.isValid() ? lastDrawTime.msecsTo( nowTime ) : 0;")));
+        "const int measuredFrameMs = playback_fps_meter::stampAgeMs( lastDrawTime, nowTime );")));
     ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::smoothedFrameMs(")));
     // the old measurement off the idle-re-armed lastTime is gone
     ASSERT_FALSE(body.contains(QStringLiteral("const int measuredFrameMs = lastTime.msecsTo( nowTime );")));
     // the reset policy lives in one pure function, called with the real play state and draw age
     // (exact text: a `true ||` or dropped operand cannot slip through)
-    const int lambdaAt = body.indexOf(QStringLiteral("const auto resetFpsMeterIfIdle = [this]( const QTime & now )"));
+    const int lambdaAt = body.indexOf(QStringLiteral("const auto resetFpsMeterIfIdle = [this]( const QElapsedTimer & now )"));
     ASSERT_TRUE(lambdaAt >= 0);
     const QString lambda = body.mid(lambdaAt);
     const int policyAt = lambda.indexOf(QStringLiteral(
         "playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,\n"
-        "                                                     hasDraw ? lastDrawTime.msecsTo( now ) : 0 )"));
+        "                                                     hasDraw ? playback_fps_meter::stampAgeMs( lastDrawTime, now ) : 0 )"));
     const int zeroAt = lambda.indexOf(QStringLiteral("m_playbackFpsEmaFrameMs = 0.0;"));
     ASSERT_TRUE(policyAt >= 0);
     ASSERT_TRUE(zeroAt > policyAt); // the reset sits inside the guarded block, not before it
@@ -79,7 +80,7 @@ TEST(PlaybackFpsMeterWiring, FpsMeterResetRunsOnTheStillDrawingEarlyReturnPath)
     ASSERT_TRUE(busyAt >= 0);
     ASSERT_TRUE(busyEnd > busyAt);
     const QString busy = body.mid(busyAt, busyEnd - busyAt);
-    const int callAt = busy.indexOf(QStringLiteral("resetFpsMeterIfIdle( QTime::currentTime() );"));
+    const int callAt = busy.indexOf(QStringLiteral("resetFpsMeterIfIdle( mlvappMonotonicNow() );"));
     const int firstReturnAt = busy.indexOf(QStringLiteral("return;"));
     ASSERT_TRUE(callAt >= 0);
     ASSERT_TRUE(firstReturnAt > callAt); // evaluated before either early return
@@ -87,4 +88,255 @@ TEST(PlaybackFpsMeterWiring, FpsMeterResetRunsOnTheStillDrawingEarlyReturnPath)
     const int idleAt = body.indexOf(QStringLiteral("timer_frame.idle"));
     ASSERT_TRUE(idleAt >= 0);
     ASSERT_TRUE(body.mid(idleAt).contains(QStringLiteral("resetFpsMeterIfIdle( nowTime );")));
+}
+
+// PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: the meter, stall and drop-frame tick ages were taken off the wall
+// clock (time of day, msecsTo kept inside +-86,400,000 ms). Across midnight an age read about -86,399,970,
+// across a DST end about -3,600,000: the status fps froze, a stall never zeroed it, and the unpaced
+// automation path asked for about -2 M frames. Every age now comes off a monotonic QElapsedTimer stamp
+// through playback_fps_meter::stampAgeMs (0 for a never-started stamp, saturated to int).
+TEST(PlaybackFpsMeterWiring, MeterAndTickClocksAreMonotonic)
+{
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_FALSE(body.contains(QRegularExpression(QStringLiteral("\\bQTime\\b"))));
+    ASSERT_TRUE(body.contains(QStringLiteral("static QElapsedTimer lastTime;")));
+    ASSERT_TRUE(body.contains(QStringLiteral("static QElapsedTimer lastDrawTime;")));
+    ASSERT_FALSE(body.contains(QStringLiteral(".msecsTo(")));
+    ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::stampAgeMs( lastTime, nowTime )")));
+    ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::stampAgeMs( lastDrawTime, nowTime )")));
+    ASSERT_TRUE(body.contains(QStringLiteral("playback_fps_meter::stampAgeMs( lastDrawTime, now )")));
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "playback_fps_meter::stampAgeMs( m_lastPlaybackFpsStatusUpdateTime, nowTime ) >= 250")));
+    // the tick and the busy-path reset read the monotonic clock, never the time of day
+    ASSERT_TRUE(body.contains(QStringLiteral("QElapsedTimer nowTime = mlvappMonotonicNow();")));
+    // r4 iteration 2 (pass 7 A3): lastTime only ever takes a tick's own stamp (never a fresh re-arm), so ages telescope
+    ASSERT_FALSE(body.contains(QStringLiteral("lastTime.start();")));
+    ASSERT_EQ(2, body.count(QStringLiteral("lastTime = nowTime;")));
+
+    const QString header = readRepoFile(QStringLiteral("platform/qt/MainWindow.h"));
+    ASSERT_TRUE(header.contains(QStringLiteral("QElapsedTimer m_lastPlaybackFpsStatusUpdateTime;")));
+    ASSERT_FALSE(header.contains(QStringLiteral("QTime m_lastPlaybackFpsStatusUpdateTime;")));
+}
+
+// adversary r1 A6 (c7c88bf8): the pins above passed a mlvappMonotonicNow() that never starts its timer (every
+// stamp invalid, every age 0), a timeDiff overwritten after its stampAgeMs assignment with a difference of
+// QDateTime::currentMSecsSinceEpoch() samples, an unconditional (`true ||`) reset and a dead busy-path reset call.
+TEST(PlaybackFpsMeterWiring, MonotonicClockAndResetWiringRejectTheirMutations)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp"));
+    ASSERT_FALSE(source.isEmpty());
+    // the clock helper, exactly: a started QElapsedTimer and nothing else
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "static QElapsedTimer mlvappMonotonicNow()\n"
+        "{\n"
+        "    QElapsedTimer now;\n"
+        "    now.start();\n"
+        "    return now;\n"
+        "}\n")));
+    ASSERT_EQ(1, source.count(QStringLiteral("static QElapsedTimer mlvappMonotonicNow()")));
+
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    // no other clock reaches the tick
+    ASSERT_FALSE(body.contains(QStringLiteral("QDateTime")));
+    ASSERT_FALSE(body.contains(QStringLiteral("currentMSecsSinceEpoch")));
+    ASSERT_FALSE(body.contains(QStringLiteral("currentTime")));
+    // the age reaches the shaping call untouched: no other timeDiff write between the two
+    const QString ageLine = QStringLiteral("timeDiff = playback_fps_meter::stampAgeMs( lastTime, nowTime );");
+    const int ageAt = body.indexOf(ageLine);
+    const int shapedAt = body.indexOf(QStringLiteral("timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff,"));
+    ASSERT_TRUE(ageAt >= 0);
+    ASSERT_EQ(1, body.count(ageLine));
+    ASSERT_TRUE(shapedAt > ageAt);
+    ASSERT_FALSE(body.mid(ageAt + ageLine.size(), shapedAt - (ageAt + ageLine.size())).contains(QStringLiteral("timeDiff")));
+    // the tick stamp is taken just before the age, from the helper
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "    QElapsedTimer nowTime = mlvappMonotonicNow();\n"
+        "    timeDiff = playback_fps_meter::stampAgeMs( lastTime, nowTime );\n")));
+    // the reset is guarded by the policy itself (no `true ||` in front of it)
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "        if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,\n")));
+    // the busy-path reset is a plain statement right after the trace block, not behind a dead condition
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "                    true );\n"
+        "            }\n"
+        "            resetFpsMeterIfIdle( mlvappMonotonicNow() );\n"
+        "            //On setup slider priority\n")));
+    // adversary r2 A1 (894b938d): the shaped tick is bounded in frames before playbackHandling reads it, exactly once.
+    // r4 (pass 5 A2 on b70f718d): only the Drop Frame request reads the tick as frames, so Normal mode passes no rate and
+    // keeps its whole tick; r5 (pass 8 A3): the fps meter's gate reads the shaped meterTickMs taken before the cap, so it
+    // stays open at any source rate in either mode, as on the base.
+    const QString boundLine = QStringLiteral(
+        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, ui->actionDropFrameMode->isChecked() ? getPlaybackFramerate() : 0.0 );\n");
+    const int boundAt = body.indexOf(boundLine);
+    const int handlingAt = body.indexOf(QStringLiteral("    playbackHandling( timeDiff );"));
+    ASSERT_TRUE(boundAt > shapedAt);
+    ASSERT_EQ(1, body.count(boundLine));
+    ASSERT_TRUE(handlingAt > boundAt);
+    ASSERT_FALSE(body.mid(boundAt + boundLine.size(), handlingAt - (boundAt + boundLine.size())).contains(QStringLiteral("timeDiff")));
+    // ...and the idle-branch reset likewise runs on every idle tick, right before the re-arm
+    ASSERT_TRUE(body.contains(QStringLiteral(
+        "        resetFpsMeterIfIdle( nowTime );\n"
+        "        lastTime = nowTime; //do that for calculation of timeDiff for DropFrameMode (the tick's own stamp: ages telescope);\n")));
+}
+
+// adversary r2 A7 (3bb01140): the cap pin accepted a dead `if( false )` line in front of the cap, and the reset pin
+// accepted `|| true` after the policy call (both pins stopped short of the statement's end). Each pin now holds the
+// whole statement and its neighbours contiguously, and each rejects its mutation applied in memory to the real source.
+namespace
+{
+bool frameCapIsLive(const QString & body)
+{
+    return body.contains(QStringLiteral(
+        "ui->actionPlay->isChecked(), hadPendingAdvance );\n"
+        "    // r5 (pass 8 A3 on c37d6fd5, pass 9 A1 on 22c93691): the fps meter gate, the present trace and both interaction logs\n"
+        "    // read the shaped tick, as on the base; the cap below bounds only the frame request (playbackHandling).\n"
+        "    const int shapedTickMs = timeDiff;\n"
+        "    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1): one tick never asks the drop-frame loop for more frames than\n"
+        "    // it can count (a long suspension at a high source rate); every ordinary tick is unchanged.\n"
+        "    // r4 (pass 5 A2): only the Drop Frame request reads the tick as frames, so Normal mode keeps its whole tick (fps meter).\n"
+        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, ui->actionDropFrameMode->isChecked() ? getPlaybackFramerate() : 0.0 );\n"
+        "\n"
+        "    //Playback\n"));
+}
+
+bool fpsResetIsConditional(const QString & body)
+{
+    return body.contains(QStringLiteral(
+        "        const bool hasDraw = lastDrawTime.isValid();\n"
+        "        if( playback_fps_meter::fpsMeterShouldReset( ui->actionPlay->isChecked(), hasDraw,\n")
+        + QString(53, QLatin1Char(' '))
+        + QStringLiteral(
+        "hasDraw ? playback_fps_meter::stampAgeMs( lastDrawTime, now ) : 0 ) )\n"
+        "        {\n"
+        "            const QString playbackFpsText = playback_conform::playbackFpsStatusText(\n"));
+}
+} // namespace
+
+TEST(PlaybackFpsMeterWiring, CapAndResetPinsRejectADeadCapAndAnUnconditionalReset)
+{
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_TRUE(frameCapIsLive(body));
+    ASSERT_TRUE(fpsResetIsConditional(body));
+
+    const QString capLine = QStringLiteral(
+        "    timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff, ui->actionDropFrameMode->isChecked() ? getPlaybackFramerate() : 0.0 );\n");
+    ASSERT_EQ(1, body.count(capLine));
+    QString deadCap = body;
+    deadCap.replace(capLine, QStringLiteral("    if( false )\n") + capLine);
+    ASSERT_FALSE(frameCapIsLive(deadCap));
+
+    const QString resetTail = QStringLiteral("stampAgeMs( lastDrawTime, now ) : 0 ) )\n");
+    ASSERT_EQ(1, body.count(resetTail));
+    QString alwaysReset = body;
+    alwaysReset.replace(resetTail, QStringLiteral("stampAgeMs( lastDrawTime, now ) : 0 ) || true )\n"));
+    ASSERT_FALSE(fpsResetIsConditional(alwaysReset));
+    QString alwaysResetFront = body;
+    alwaysResetFront.replace(QStringLiteral("if( playback_fps_meter::fpsMeterShouldReset("),
+                             QStringLiteral("if( true || playback_fps_meter::fpsMeterShouldReset("));
+    ASSERT_FALSE(fpsResetIsConditional(alwaysResetFront));
+}
+
+// r5 (pass 8 A3 on c37d6fd5): in Drop Frame mode at >= 999,990,001 fps the request cap zeroed the shared timeDiff, so a
+// scrub draw on an ordinary 8 ms tick skipped the meter (the label stayed at 0.0 fps; the base seeded 25 fps). The meter's
+// gate reads the SHAPED tick, stamped right after shaping and before the cap; the cap bounds only the frame request.
+TEST(PlaybackFpsMeterWiring, FpsMeterGateReadsTheShapedTickNotTheCappedRequest)
+{
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    const QString meterLine = QStringLiteral("    const int shapedTickMs = timeDiff;\n");
+    ASSERT_EQ(1, body.count(meterLine));
+    ASSERT_EQ(1, body.count(QStringLiteral("shapedTickMs =")));
+    const int shapedAt = body.indexOf(QStringLiteral("timeDiff = playback_native_pace::shapedTickTimeDiffMs( timeDiff,"));
+    const int meterAt = body.indexOf(meterLine);
+    const int capAt = body.indexOf(QStringLiteral("timeDiff = playback_fps_meter::frameBoundedTickTimeDiffMs( timeDiff,"));
+    ASSERT_TRUE(shapedAt >= 0);
+    ASSERT_TRUE(meterAt > shapedAt);
+    ASSERT_TRUE(capAt > meterAt);
+    // the gate: exactly one, on the shaped tick, between the draw-to-draw sample and the EMA step
+    const QString gateLine = QStringLiteral("        if( shapedTickMs != 0 )\n");
+    ASSERT_EQ(1, body.count(gateLine));
+    ASSERT_FALSE(body.contains(QStringLiteral("if( timeDiff != 0 )")));
+    const int sampleAt = body.indexOf(QStringLiteral("const int measuredFrameMs = playback_fps_meter::stampAgeMs( lastDrawTime, nowTime );"));
+    const int gateAt = body.indexOf(gateLine);
+    const int emaAt = body.indexOf(QStringLiteral("playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );"));
+    ASSERT_TRUE(sampleAt >= 0);
+    ASSERT_TRUE(gateAt > sampleAt);
+    ASSERT_TRUE(emaAt > gateAt);
+    // the cap still owns the request: playbackHandling reads the capped timeDiff, never meterTickMs
+    ASSERT_TRUE(body.contains(QStringLiteral("    playbackHandling( timeDiff );")));
+    ASSERT_FALSE(body.contains(QStringLiteral("playbackHandling( shapedTickMs )")));
+}
+
+// r5 (pass 9 A1 on 22c93691): the cap rewrote the shared timeDiff before the present trace (last_tick_diff, "that
+// advance's shaped timeDiff", PlaybackPresentTrace.h:50) and both interaction logs read it, so a 50000 ms tick at 25000 fps
+// reported 39999. Every reader except the request reads the shaped tick. A6 (pass 9): the meter gate pin is contiguous with
+// its neighbours, so a dead `if( false )` in front of the gate is rejected.
+namespace
+{
+bool meterGateIsLive(const QString & body)
+{
+    return body.contains(QStringLiteral(
+        "        lastDrawTime = nowTime;\n"
+        "        if( shapedTickMs != 0 )\n"
+        "        {\n"
+        "            m_playbackFpsEmaFrameMs =\n"
+        "                playback_fps_meter::smoothedFrameMs( m_playbackFpsEmaFrameMs, measuredFrameMs );\n"));
+}
+} // namespace
+
+TEST(PlaybackFpsMeterWiring, TraceAndLogsReadTheShapedTickAndTheGatePinRejectsADeadGate)
+{
+    const QString body = timerFrameEventBody();
+    ASSERT_FALSE(body.isEmpty());
+    ASSERT_EQ(1, body.count(QStringLiteral(
+        "m_playbackPresentTrace.noteAdvance( mlv_stage_timing_now() * 1000.0, m_playbackTickAppliedFrames, shapedTickMs );")));   // r7 iter2: the applied grant only
+    ASSERT_FALSE(body.contains(QStringLiteral("m_playbackTickAppliedFrames, timeDiff );")));
+    // timer_frame.playback_handled and timer_frame.draw: their time_diff_ms field is the shaped tick
+    ASSERT_EQ(2, body.count(QStringLiteral(".arg( shapedTickMs )")));
+    ASSERT_FALSE(body.contains(QStringLiteral(".arg( timeDiff )")));
+    const int handledAt = body.indexOf(QStringLiteral("timer_frame.playback_handled"));
+    const int drawAt = body.indexOf(QStringLiteral("timer_frame.draw"));
+    ASSERT_TRUE(handledAt >= 0);
+    ASSERT_TRUE(drawAt > handledAt);
+    const int firstArgAt = body.indexOf(QStringLiteral(".arg( shapedTickMs )"));
+    ASSERT_TRUE(firstArgAt > handledAt && firstArgAt < drawAt);
+    ASSERT_TRUE(body.indexOf(QStringLiteral(".arg( shapedTickMs )"), firstArgAt + 1) > drawAt);
+    // the stamp is taken before the cap (FpsMeterGateReadsTheShapedTickNotTheCappedRequest) and the trace follows playbackHandling
+    const int handlingAt = body.indexOf(QStringLiteral("    playbackHandling( timeDiff );"));
+    const int traceAt = body.indexOf(QStringLiteral("m_playbackPresentTrace.noteAdvance("));
+    ASSERT_TRUE(handlingAt >= 0);
+    ASSERT_TRUE(traceAt > handlingAt);
+
+    ASSERT_TRUE(meterGateIsLive(body));
+    const QString gateLine = QStringLiteral("        if( shapedTickMs != 0 )\n");
+    ASSERT_EQ(1, body.count(gateLine));
+    QString deadGate = body;
+    deadGate.replace(gateLine, QStringLiteral("        if( false )\n") + gateLine);
+    ASSERT_FALSE(meterGateIsLive(deadGate));
+}
+
+// r6 (sol r5 S1 on 6aaac7f5): an accepted positive rate the cap cannot bound (+inf: a silent MLV with an FPS denominator
+// of 0, macros.h) cut an 8 ms Drop Frame tick to 0 ms, and the call site's own expression made inf * 0 = NaN, which the
+// pace guard's comparisons pass on to the drop position and the slider's int. The request is now taken through
+// playback_fps_meter::dropFrameRequestFrames, which keeps that expression when it is finite and asks for nothing
+// otherwise. S2 (same round): a start at or past the lap limit is folded, and the slip histogram's granted share adds
+// the folded distance back (DropFrameTickResult::foldedFrames), so the advance it reads is still the applied one.
+TEST(PlaybackFpsMeterWiring, DropFrameRequestIsFiniteAndTheGrantedShareCountsAFoldedStart)
+{
+    const QString handling = functionBody(readRepoFile(QStringLiteral("platform/qt/MainWindow.cpp")),
+        QStringLiteral("void MainWindow::playbackHandling(int timeDiff)"),
+        QStringLiteral("void MainWindow::showPerformanceProfilingDialog"));
+    ASSERT_FALSE(handling.isEmpty());
+    ASSERT_EQ(1, handling.count(QStringLiteral(
+        "m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),")));
+    ASSERT_FALSE(handling.contains(QStringLiteral("getPlaybackFramerate() * (double)timeDiff / 1000.0")));
+    const int tickAt = handling.indexOf(QStringLiteral("playback_frame_range::advanceDropFrameTick("));
+    // r8 iteration 1 (pass 14 A1 on a2983bf2): the tick reports the delta it applied, a fold's included
+    const int grantedAt = handling.indexOf(QStringLiteral(
+        "const double grantedDropFrames = dropFrameTick.appliedFrames;\n"));
+    ASSERT_TRUE(tickAt >= 0);
+    ASSERT_TRUE(grantedAt > tickAt);
 }

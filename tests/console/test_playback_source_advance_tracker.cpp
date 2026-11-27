@@ -1026,3 +1026,176 @@ TEST(PlaybackSourceAdvanceTracker, R30AnOffscreenGrabPaintNeverOpensTheConformGa
     ASSERT_FALSE(surface.valid());
     ASSERT_EQ(0u, surface.serial());
 }
+
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the paint credit of a POSITION CORRECTION, driven as MainWindow drives it. The drop
+// tick records the correction (PlaybackWrapRecorder::noteEngineCorrection) before its laps, the presentation's hand-off asks
+// paintCreditHandOff for the rebase and the post-correction wrap width, and the ledger rebases the tracker before crediting.
+namespace
+{
+struct CorrectionPaint
+{
+    PlaybackSourceAdvanceTracker tracker;
+    PlaybackPaintCreditLedger ledger;
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    uint64_t serial = 0;
+    int wrapsConsumed = 0;
+    int correctionsConsumed = 0;
+    double now = 1.0;
+
+    // the engine's drop-frame tick from \a start (MainWindow::playbackHandling's order); returns the frame the slider shows
+    int tick( double start, double grant, int cutIn, int cutOut, bool loop )
+    {
+        const playback_frame_range::DropFrameTickResult t =
+            playback_frame_range::advanceDropFrameTick( start, grant, cutIn, cutOut, loop, false );
+        if( t.corrected ) recorder.noteEngineCorrection( playback_frame_range::dropFrameCorrectionFrame( t.correctedStart ) );
+        if( t.wrapped ) recorder.noteEngineWrap( t.wrapWidth, t.wrapLaps );
+        return static_cast<int>( t.position );
+    }
+    // a request stamped now and handed to the surface (notePlaybackSmokePresentedFrame), not yet painted
+    uint64_t submit( int frame )
+    {
+        const bool havePrevious = serial > 0;
+        const int wrapsBefore = wrapsConsumed;
+        const int wraps = presentationLoopWraps( recorder.engineWraps, recorder.engineWraps, wrapsConsumed, havePrevious );
+        const int correctionsBefore = correctionsConsumed;
+        const int corrections = presentationLoopWraps( recorder.engineCorrections, recorder.engineCorrections,
+                                                       correctionsConsumed, havePrevious );
+        const playback_frame_range::PaintCreditHandOff handOff =
+            playback_frame_range::paintCreditHandOff( recorder, wrapsBefore, wraps, correctionsBefore, corrections );
+        ++serial;
+        ledger.noteSubmitted( serial, frame, wraps, handOff.wrapsWidth, handOff.rebase, handOff.rebaseFrame, tracker );
+        return serial;
+    }
+    void paint( uint64_t s ) { now += 0.042; ledger.notePainted( s, now, tracker ); }
+    void present( int frame ) { paint( submit( frame ) ); }
+};
+} // namespace
+
+// Sol r9 B1 on 4279b9ee: Loop, cut 1..50, frame 10 painted, the stale drop position 120 folds to 22 with a grant of 0 or 0.192.
+// 4279b9ee credited 12 frames and max_jump 12; the correction is a rebase, so nothing is credited.
+TEST(PlaybackSourceAdvanceTracker, R1AStaleCorrectionAboveTheLastPaintIsARebaseNotAJump)
+{
+    const double grants[] = { 0.0, 0.192 };
+    for( double grant : grants )
+    {
+        CorrectionPaint p;
+        p.present( 10 );
+        const int frame = p.tick( 120.0, grant, 1, 50, true );
+        ASSERT_EQ(22, frame);
+        p.present( frame );
+        ASSERT_EQ(0LL, (long long)p.tracker.advancedFrames());   // 4279b9ee: 12
+        ASSERT_EQ(0, p.tracker.maxJump());                        // 4279b9ee: 12
+        ASSERT_EQ(0ull, (unsigned long long)p.tracker.backwardJumps());
+        ASSERT_EQ(0ull, (unsigned long long)p.tracker.repeatedFrames());
+        ASSERT_EQ(1ull, (unsigned long long)p.tracker.rebases());
+        ASSERT_EQ(0ull, (unsigned long long)p.tracker.wraps());
+        ASSERT_EQ(0, p.recorder.replayCount());
+    }
+}
+
+// Sol r9 B2: cut 41..50, frame 10 painted, the start below the cut folds to 40: 0 credited, max_jump 0 (76e554e3 booked 30).
+TEST(PlaybackSourceAdvanceTracker, R1ABelowCutCorrectionIsARebaseNotTravel)
+{
+    CorrectionPaint p;
+    p.present( 10 );
+    const int frame = p.tick( 10.0, 0.0, 41, 50, true );
+    ASSERT_EQ(40, frame);
+    p.present( frame );
+    ASSERT_EQ(0LL, (long long)p.tracker.advancedFrames());       // 4279b9ee folds nothing; 76e554e3 booked 30
+    ASSERT_EQ(0, p.tracker.maxJump());
+    ASSERT_EQ(1ull, (unsigned long long)p.tracker.rebases());
+}
+
+// Travel after the correction IS credited, and is a real jump: rebase 22, present 25 books 3 frames and max_jump 3.
+TEST(PlaybackSourceAdvanceTracker, R1TravelAfterARebaseIsCreditedAndIsAJump)
+{
+    CorrectionPaint p;
+    p.present( 10 );
+    p.recorder.noteEngineCorrection( 22 );
+    p.present( 25 );
+    ASSERT_EQ(3LL, (long long)p.tracker.advancedFrames());
+    ASSERT_EQ(3, p.tracker.maxJump());
+    ASSERT_EQ(1ull, (unsigned long long)p.tracker.rebases());
+    // the rebase is one-shot: the next frame is an ordinary step from 25
+    p.present( 26 );
+    ASSERT_EQ(4LL, (long long)p.tracker.advancedFrames());
+    ASSERT_EQ(3, p.tracker.maxJump());
+}
+
+// A rebase landing replaced before its paint passes the rebase on, as carried wraps pass: 22 (rebase 22) superseded by 23, which is
+// painted, credits 1, never 13.
+TEST(PlaybackSourceAdvanceTracker, R1ASupersededRebaseCarriesToTheNextSubmission)
+{
+    CorrectionPaint p;
+    p.present( 10 );
+    p.tick( 120.0, 0.0, 1, 50, true );
+    p.submit( 22 );                     // superseded below, never painted
+    const uint64_t s = p.submit( 23 );
+    p.paint( s );
+    ASSERT_EQ(1LL, (long long)p.tracker.advancedFrames());       // 4279b9ee: 13
+    ASSERT_EQ(1, p.tracker.maxJump());
+    ASSERT_EQ(1ull, (unsigned long long)p.ledger.superseded());
+    // an unverified (serial 0) submission carries it too: rebase 40, a serial-0 hand-off, then 41 painted credits 1
+    CorrectionPaint q;
+    q.present( 10 );
+    q.recorder.noteEngineCorrection( 40 );
+    q.ledger.noteSubmitted( 0, 40, 0, 0, true, 40, q.tracker );
+    q.ledger.noteSubmitted( 99, 41, 0, 0, q.tracker );
+    q.ledger.notePainted( 99, 2.0, q.tracker );
+    ASSERT_EQ(1LL, (long long)q.tracker.advancedFrames());       // 4279b9ee: 31
+    // a newer rebase wins and drops the carried wrap width (that travel was before it), keeping the carried count
+    PlaybackSourceAdvanceTracker t;
+    PlaybackPaintCreditLedger l;
+    l.noteSubmitted( 1, 10, 0, 0, t );
+    l.notePainted( 1, 1.0, t );
+    l.noteSubmitted( 2, 5, 1, 49, true, 2, t );   // a lap to 5 after a rebase to 2, superseded
+    l.noteSubmitted( 3, 30, 0, 0, true, 28, t );  // a newer rebase to 28 before 30
+    l.notePainted( 3, 1.1, t );
+    ASSERT_EQ(2LL, (long long)t.advancedFrames());
+    ASSERT_EQ(1ull, (unsigned long long)t.wraps());
+}
+
+// Stale 100 plus a 60-frame grant on cut 1..50 with Loop: folded to 2, one 49-frame lap from there, landing on 13. The paint
+// credits 13 + 49 - 2 = 60, the applied frames, not 13 + 49 - 10 = 52 from the last paint.
+TEST(PlaybackSourceAdvanceTracker, R1ALapAfterACorrectionIsCreditedFromTheCorrectedStart)
+{
+    CorrectionPaint p;
+    p.present( 10 );
+    const playback_frame_range::DropFrameTickResult t = playback_frame_range::advanceDropFrameTick( 100.0, 60.0, 1, 50, true );
+    ASSERT_EQ(1, t.wrapLaps);
+    ASSERT_TRUE(t.appliedFrames == 60.0);
+    const int frame = p.tick( 100.0, 60.0, 1, 50, true );
+    ASSERT_EQ(13, frame);
+    p.present( frame );
+    ASSERT_EQ(60LL, (long long)p.tracker.advancedFrames());      // 4279b9ee: 52
+    ASSERT_EQ(1ull, (unsigned long long)p.tracker.wraps());
+    ASSERT_EQ(0, p.tracker.maxJump());
+}
+
+// Fable r9 H1 / N3: Loop off, cut 1..50, frame 10 painted, the stale 100 clamps to 49: 0 credited (4279b9ee: 39).
+TEST(PlaybackSourceAdvanceTracker, R1ALoopOffClampIsARebaseNotTravel)
+{
+    CorrectionPaint p;
+    p.present( 10 );
+    const int frame = p.tick( 100.0, 0.0, 1, 50, false );
+    ASSERT_EQ(49, frame);
+    p.present( frame );
+    ASSERT_EQ(0LL, (long long)p.tracker.advancedFrames());       // 4279b9ee: 39
+    ASSERT_EQ(0, p.tracker.maxJump());
+}
+
+// Control: without a correction, 10 then 22 is still a 12-frame forward jump, and a rebase before any presentation does nothing.
+TEST(PlaybackSourceAdvanceTracker, R1WithoutACorrectionAForwardStepIsStillAJump)
+{
+    CorrectionPaint p;
+    p.present( 10 );
+    p.present( 22 );
+    ASSERT_EQ(12LL, (long long)p.tracker.advancedFrames());
+    ASSERT_EQ(12, p.tracker.maxJump());
+    ASSERT_EQ(0ull, (unsigned long long)p.tracker.rebases());
+    PlaybackSourceAdvanceTracker fresh;
+    fresh.noteRebase( 40 );
+    fresh.notePresented( 1.0, 40, 0, 0 );
+    ASSERT_EQ(0ull, (unsigned long long)fresh.rebases());
+    ASSERT_EQ(40, fresh.firstFrame());
+}

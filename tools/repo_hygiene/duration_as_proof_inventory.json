@@ -1965,9 +1965,9 @@
       "anchor": "if ( msSinceLastDraw <= 0 ) return emaFrameMs ;",
       "class": "value_fallback_select",
       "clock": "other",
-      "justification": "STATUS-FPS-METER-1: smoothedFrameMs() input-validity guard. msSinceLastDraw is a Qt QTime::msecsTo() draw-to-draw wall-clock delta; a non-positive value (first draw with no prior timestamp, or a clock step) leaves the FPS EMA unchanged instead of blending a bogus sample. A display smoothing guard for the status-bar FPS meter, not proof that any stage ran or a frame rendered.",
+      "justification": "STATUS-FPS-METER-1: smoothedFrameMs() input-validity guard. msSinceLastDraw is the draw-to-draw age from playback_fps_meter::stampAgeMs() on monotonic QElapsedTimer stamps (PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 replaced the wall clock); a non-positive value (first draw with no prior stamp, or two draws in the same millisecond) leaves the FPS EMA unchanged instead of blending a bogus sample. A display smoothing guard for the status-bar FPS meter, not proof that any stage ran or a frame rendered.",
       "lines": [
-        34
+        121
       ]
     },
     {
@@ -1977,7 +1977,7 @@
       "clock": "other",
       "justification": "STATUS-FPS-METER-1: smoothedFrameMs() seed-or-reset select. emaFrameMs <= 0.0 is the EMA's uninitialized sentinel (seed with the raw sample rather than blend); fpsMeterStalled() re-seeds after a long gap between draws. Both choose how the displayed FPS smooths a measured interval, never whether work ran; the value feeds only the status-bar FPS text.",
       "lines": [
-        35
+        122
       ]
     },
     {
@@ -2813,6 +2813,148 @@
       ]
     },
     {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , cappedMs ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S1): asserts frameBoundedTickTimeDiffMs's own contract value for an injected 8 ms tick at a +inf rate (the cut leaves 0 ms); pure arithmetic on literal inputs, no stage-ran inference and no clock read.",
+      "lines": [
+        550
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( FakeStamp { false , 10 } , FakeStamp { true , 52 } ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: asserts stampAgeMs's own contract value on injected or same-instant stamps; no stage-ran inference. A never-started 'then' stamp reads age 0 (the wall-clock type it replaced returned 0).",
+      "lines": [
+        133
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( FakeStamp { true , 10 } , FakeStamp { false , 52 } ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: asserts stampAgeMs's own contract value on injected or same-instant stamps; no stage-ran inference. A never-started 'now' stamp reads age 0.",
+      "lines": [
+        134
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( never , never ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: asserts stampAgeMs's own contract value on injected or same-instant stamps; no stage-ran inference. Two default (invalid) QElapsedTimer stamps read age 0.",
+      "lines": [
+        153
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( a , b ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: asserts stampAgeMs's own contract value on injected or same-instant stamps; no stage-ran inference. b is a copy of a (the same instant), and after a.invalidate() the never-started rule applies; both read age 0.",
+      "lines": [
+        157,
+        160
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , stampAgeMs ( never , a ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1: asserts stampAgeMs's own contract value on injected or same-instant stamps; no stage-ran inference. A never-started 'then' against a started QElapsedTimer reads age 0.",
+      "lines": [
+        158
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , frameBoundedTickTimeDiffMs ( kMaxStampAgeMs , 1.0 e13 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r3 (adversary pass 4 A3): asserts frameBoundedTickTimeDiffMs's own contract value on an injected age and rate; no stage-ran inference. Past kMaxTickFrames * 1000 = 999,990,000 fps even 1 ms is over the frame bound, so a positive over-long tick asks for 0 ms.",
+      "lines": [
+        315
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_policy.cpp",
+      "anchor": "ASSERT_EQ ( 0 , frameBoundedTickTimeDiffMs ( - kMaxStampAgeMs , 1.0 e13 ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r3 (adversary pass 4 A3): asserts frameBoundedTickTimeDiffMs's own contract value on an injected age and rate; no stage-ran inference. The negative mirror of the 1e13 fps row: a negative over-long tick also asks for 0 ms.",
+      "lines": [
+        316
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "if ( ! ( framerate > 0.0 ) || timeDiffMs == 0 ) return timeDiffMs ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1) frameBoundedTickTimeDiffMs: with no positive rate or a zero tick there is no frame request to bound, so the tick's milliseconds pass through unchanged. Bounds an input of the drop-frame request; never decides whether any stage ran. Normal mode passes rate 0 (r4 pass 5 A2), so its tick passes through here unchanged.",
+      "lines": [
+        81
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "return timeDiffMs > 0 ? magnitude : - magnitude ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 (adversary r2 A1) frameBoundedTickTimeDiffMs: keeps the sign of an over-long tick while cutting its magnitude to the frame bound. A sign select on the drop-frame request; never a run-proof.",
+      "lines": [
+        94
+      ]
+    },
+    {
+      "path": "platform/qt/PlaybackFpsMeterPolicy.h",
+      "anchor": "const long long tickMagnitude = timeDiffMs > 0 ? static_cast < long long > ( timeDiffMs ) : - static_cast < long long > ( timeDiffMs ) ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r4 iteration 2 (adversary pass 7 A1) frameBoundedTickTimeDiffMs: the tick's magnitude in 64 bits (so INT_MIN negates safely), the ceiling the step-up to the largest accepted age never passes. An absolute-value select on the drop-frame request; never a run-proof.",
+      "lines": [
+        91
+      ]
+    },
+    {
+      "path": "platform/qt/MainWindow.cpp",
+      "anchor": "if ( shapedTickMs != 0 )",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r5 (adversary pass 8 A3) timerFrameEvent (clock: a QElapsedTimer monotonic stamp age): the status-bar fps meter folds a draw-to-draw sample into its EMA only on a tick whose SHAPED elapsed time (monotonic stampAgeMs, taken before the Drop Frame request cap) is nonzero, as the base gated on the shaped tick. It selects whether a display sample is smoothed in; the draw itself already happened, and it never proves a stage ran or a frame rendered. Pass 9 A1: the same shaped tick feeds the present trace and both interaction logs.",
+      "lines": [
+        3136
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_wiring.cpp",
+      "anchor": "const QString gateLine = QStringLiteral ( \"        if( shapedTickMs != 0 )\\n\" ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r5 (adversary pass 8 A3, pass 9 A6): a source-text pin string for the meter gate in timerFrameEvent; the wiring tests count and order it in the source and apply a dead-gate mutation to it in memory. No duration is compared at runtime and nothing is proven to have run.",
+      "lines": [
+        259,
+        314
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_fps_meter_wiring.cpp",
+      "anchor": "\"        if( shapedTickMs != 0 )\\n\"",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r5 (adversary pass 9 A6): one line of meterGateIsLive's contiguous source-text pin (the gate with its neighbours), which rejects a dead `if( false )` in front of the gate. A string literal matched against the source; no duration is compared and nothing is proven to have run.",
+      "lines": [
+        283
+      ]
+    },
+    {
       "path": "platform/qt/MainWindow.cpp",
       "anchor": "if ( postMs >= 0.0 )",
       "class": "value_fallback_select",
@@ -3245,6 +3387,56 @@
       "justification": "HFR-NATIVE-60FPS-FULLRES-1 r24 test R24A1HeldCatchupIsRepaidSoTheConformedSourcePaceStaysInTheBand: asserts the conformed simulation reached frame 1498, i.e. playConformed() replaced its -1.0 'not reached' sentinel. reachedMs is a SIMULATED tick clock in a unit fixture (the sum of the fixture's own tickMs values, at least 8 ms per tick), not a wall clock or any timer read, so the sub-resolution 'ran but read 0 ms' flake this inventory exists for cannot occur. The reach is also proved independently by the source-frame counter assert named in 'flag'; this compare is kept because the following line bounds the same value (reachedMs <= 62500.0) and a -1.0 sentinel would pass that bound alone.",
       "lines": [
         3303
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "const QString kRefusalEnd = QStringLiteral ( \"        return 2;\\n    }\\n    if (!ok || seconds <= 0.0)\" ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r10 (hosted CI run 46021899954, ubuntu shard 2/4): the text of a mutation anchor in a source-text wiring test. kRefusalEnd is a QStringLiteral copy of main.cpp's `--seconds` refusal tail that mutateOnce() finds and replaces in memory before secondsRefusalWiringDefect() reads the result. `seconds` is a CLI argument value, not a timer read, and nothing is compared at run time here; the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        5304
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "QStringLiteral ( \"        return 2; // }\\n        if (seconds < 0) return 0;\\n    }\\n    if (!ok || seconds <= 0.0)\" ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r10 (hosted CI run 46021899954): RED mutant text (SecondsRefusalWiringRedB1CommentBrace) fed to the source-text wiring checker, a `}` in a comment hiding a second return. `seconds` is the CLI argument value of main.cpp's text, not a timer read; nothing is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        5314
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "QStringLiteral ( \"        err << \\\"}\\\";\\n        return 2;\\n        if (seconds < 0) return 0;\\n    }\\n    if (!ok || seconds <= 0.0)\" ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r10 (hosted CI run 46021899954): RED mutant text (SecondsRefusalWiringRedB1LiteralBrace) fed to the source-text wiring checker, a `}` in a string literal hiding a second return. `seconds` is the CLI argument value of main.cpp's text, not a timer read; nothing is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        5325
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "QStringLiteral ( \"    {\\n        if (seconds < 0) return\\t0;\\n        err << \\\"[GUI-SMOKE] ERROR: SECONDS_OUT_OF_RANGE\" ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r10 (hosted CI run 46021899954): RED mutant text (SecondsRefusalWiringRedB2TabReturn) fed to the source-text wiring checker, a `return<TAB>0;` early exit. `seconds` is the CLI argument value of main.cpp's text, not a timer read; nothing is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        5336
+      ]
+    },
+    {
+      "path": "tests/console/test_playback_frame_range.cpp",
+      "anchor": "QStringLiteral ( \"        return 2;\\n        err << parser.value(secondsOpt).trimmed() << \\\"at most 2147483647\\\";\\n    }\\n    if (!ok || seconds <= 0.0)\" ) ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "other",
+      "justification": "GUI-SMOKE-ARG-RANGE-WIRING-TEST-BOUND-1 r10 (hosted CI run 46021899954): RED mutant text (SecondsRefusalWiringRedB3TextAfterReturn) fed to the source-text wiring checker, the diagnostic emitted after `return 2;`. `seconds` is the CLI argument value of main.cpp's text, not a timer read; nothing is compared at run time, the scanner matches the quoted source inside the string literal.",
+      "lines": [
+        5351
       ]
     },
     {
