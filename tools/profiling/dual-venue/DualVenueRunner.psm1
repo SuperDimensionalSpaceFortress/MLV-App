@@ -231,6 +231,17 @@ $script:BlanketScope = 'any clip id, any venue'
 $script:ConsentRelativePath = 'tools/profiling/dual-venue/venue-clip-consent.json'
 $script:VenueTableRelativePath = 'tools/profiling/dual-venue/venues.json'
 
+function Test-DvOrdinalIn {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r1 (adversary-fd0141e8.json A2): membership by ORDINAL, case-sensitive comparison of printable ASCII only.
+    # -ceq / -cin / -cnotin compare by the current culture, which ignores a soft hyphen (U+00AD): 'PA<U+00AD>SS' -cin @('PASS') is true. A token with any
+    # character outside 0x20-0x7E is never in the set.
+    param([object]$Value, [string[]]$Set)
+    if ($Value -isnot [string]) { return $false }
+    foreach ($ch in $Value.ToCharArray()) { if ([int]$ch -lt 0x20 -or [int]$ch -gt 0x7E) { return $false } }
+    foreach ($member in $Set) { if ([string]::Equals($Value, $member, [StringComparison]::Ordinal)) { return $true } }
+    return $false
+}
+
 function Get-DvProp {
     # A property of a hashtable OR an object, $null when absent (StrictMode-safe). `return ,` keeps an empty array an
     # empty array (it is unrolled once by the caller, so a scalar still arrives as a scalar).
@@ -2871,7 +2882,34 @@ function Get-DvLegSetPlan {
         if ($specLegId -cnotmatch '^[a-z0-9][a-z0-9-]{1,62}$' -or -not [string]::Equals([IO.Path]::GetFileName($full), "$specLegId.json", [StringComparison]::OrdinalIgnoreCase)) {
             throw "DVE_LEGSET_INVALID '$ref' read as legId '$($spec.legId)': a committed leg spec is named <legId>.json, so a spec reached under another name (an alias, a hard link, a link swapped in) is refused"
         }
-        $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256 })
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3): the PLANNED leg type comes from THESE bytes (the ones the child is pinned to by
+        # specSha256), by the child's own rule (Invoke-VenueLeg.ps1 $isExport: legType exactly the string 'export'), so no caller re-reads the path to learn it
+        # adversary-b3d61554.json A7: a spec that declares legType more than once is ambiguous (ConvertFrom-Json keeps the LAST one, so a playback declaration ahead of an export one read
+        # as export and earned the export exemption). VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R3-MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A1): the planner no longer re-derives that by counting
+        # the literal text "legType": a JSON-escaped spelling of the name ("legType") is the same member to the parser and was invisible to the count, so the plan said export where the
+        # strict reader the chain, the baseline, the leg job and the batch judge by (Get-VenuePlannedLegType: one JSON walk, a repeated member anywhere in any spelling is 'unknown') said
+        # unknown. The planned type is now that ONE function's answer for these bytes; every consumer of plannedLegType (Invoke-VenueChain, Invoke-VenueLeg, Invoke-VenueBaseline's
+        # chain rows) takes it from this plan, so none can disagree with the strict reader.
+        if (-not (Get-Command -Name Get-VenuePlannedLegType -ErrorAction SilentlyContinue)) {
+            Import-Module (Join-Path $PSScriptRoot 'VenueChain.psm1') -Function Get-VenuePlannedLegType -DisableNameChecking
+        }
+        $specPlannedLegType = Get-VenuePlannedLegType -SpecText $specText
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A6, NARROWED): a spec the strict reader types 'unknown' (a repeated member in any spelling, not one JSON
+        # object, unreadable) is refused here, typed. It used to be planned with plannedLegType 'unknown' beside a cellId and downstream branches (preflight, dispatch) made by the
+        # last-wins object, so two readers disagreed about one leg: an ambiguous ProRes spec took the 'cpu-export-prores' cell and collided with an unambiguous one.
+        if ([string]::Equals($specPlannedLegType, 'unknown', [StringComparison]::Ordinal)) {
+            throw "DVE_LEGSET_INVALID leg '$($spec.legId)' has a legType the strict spec reader cannot judge (a member repeated in any spelling, or a spec that is not one JSON object); a spec whose legType is ambiguous is never planned"
+        }
+        # adversary-ac722a96.json A5: the strict reader types ["export"] or "ex<soft hyphen>port" as playback, while the loose casts downstream took them for export. A legType that is present must be ONE string of the schema's
+        # enum, compared ordinally (the rule Get-DvLegSpecShapeRefusal applies to a leg that runs), or the spec is refused here; and the cell is chosen from the strict planned type below, never from the raw member.
+        # adversary-d10f5241.json A3: PRESENCE, not a non-null value, is what the child tests (Get-DvLegSpecShapeRefusal: the legType PROPERTY exists), so "legType": null is refused here too
+        $legTypeProp = $spec.PSObject.Properties['legType']
+        $rawLegType = $null
+        if ($null -ne $legTypeProp) { $rawLegType = $legTypeProp.Value }   # (a plain assignment: a $(if ...) would unroll a one-element array into its member)
+        if ($null -ne $legTypeProp -and -not ($rawLegType -is [string] -and @($script:LegTypes | Where-Object { [string]::Equals([string]$_, $rawLegType, [StringComparison]::Ordinal) }).Count -eq 1)) {
+            throw "DVE_LEGSET_INVALID leg '$($spec.legId)' has a legType that is not one string of the schema's enum ($($script:LegTypes -join ', ')); a spec whose legType is an array, an object or a look-alike spelling is never planned"
+        }
+        $specs.Add([pscustomobject]@{ path = $full; spec = $spec; sha256 = $specSha256; plannedLegType = $specPlannedLegType })
     }
     $backends = [System.Collections.Generic.List[string]]::new()
     foreach ($s in $specs) { foreach ($b in @($s.spec.backends)) { if ($b -notin $backends) { $backends.Add([string]$b) } } }
@@ -2882,10 +2920,10 @@ function Get-DvLegSetPlan {
             if ($b -notin @($s.spec.backends)) { continue }
             $mode = $(if ($null -ne (Get-DvProp $s.spec 'displayMode')) { [string]$s.spec.displayMode } else { 'fullscreen' })
             # EXPORT-VENUE-LEG-1: an export leg plays nothing and has no display mode; its cell is its format, so both formats of one clip are two cells
-            $cellId = $(if ([string](Get-DvProp $s.spec 'legType') -ceq 'export') { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
+            $cellId = $(if ([string]::Equals([string]$s.plannedLegType, 'export', [StringComparison]::Ordinal)) { "$b-export-$([string]$s.spec.export.format)" } else { "$b-$mode-s$([int]$s.spec.scaleFactor)" })
             if ($seen.ContainsKey($cellId)) { throw "DVE_LEGSET_INVALID two legs of the set make the cell $cellId" }
             $seen[$cellId] = $true
-            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor })
+            $cells.Add([pscustomobject]@{ cellId = $cellId; legId = [string]$s.spec.legId; specPath = $s.path; specSha256 = $s.sha256; backend = $b; displayMode = $mode; scaleFactor = [int]$s.spec.scaleFactor; plannedLegType = $s.plannedLegType })
         }
     }
     $cellList = @($cells | Where-Object { [string]::IsNullOrEmpty($Backend) -or $_.backend -ceq $Backend })
@@ -2896,7 +2934,7 @@ function Get-DvLegSetPlan {
         $walk = $(if ($r % 2 -eq 1) { $cellList } else { @($cellList[($cellList.Count - 1)..0]) })
         foreach ($c in $walk) {
             $seq++
-            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; specSha256 = $c.specSha256; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor })
+            $plan.Add([pscustomobject]@{ seq = $seq; repeat = $r; cellId = $c.cellId; legId = $c.legId; specPath = $c.specPath; specSha256 = $c.specSha256; backend = $c.backend; displayMode = $c.displayMode; scaleFactor = $c.scaleFactor; plannedLegType = $c.plannedLegType })
         }
     }
     [pscustomobject]@{ legSet = $setName; card = $card; clipId = $clipId; repeats = $Repeats; cells = @($cellList); plan = @($plan) }
@@ -3194,13 +3232,33 @@ function Get-DvMatrixRow {
     One planned leg's row of the matrix summary, from the receipt the leg wrote. Rates are read only when the outcome is a measurement (PASS or FAIL: every other outcome is no signal,
     its row carries the outcome and no numbers) AND the hashed run log still hashes to receipt.evidence.logSha256 (a swapped log is no measurement: rates stay absent and `note` says so).
     #>
-    param([Parameter(Mandatory)]$PlanEntry, $Receipt)
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): -HostLoad is the leg's host-load standing (VenueChain.psm1 Get-VenueLegHostLoad, read by the caller from the leg's
+    # hash-bound smoke result). The row carries hostLoadState and hostLoadProvisional; no standing reads 'unknown' / provisional, and a provisional row is never
+    # a measurement (Test-DvMatrixRowMeasured), whatever its outcome and rates.
+    param([Parameter(Mandatory)]$PlanEntry, $Receipt, $HostLoad = $null)
     $row = [ordered]@{
         seq = $PlanEntry.seq; repeat = $PlanEntry.repeat; cellId = $PlanEntry.cellId; backend = $PlanEntry.backend
         requestedDisplay = $PlanEntry.displayMode; observedDisplay = 'UNKNOWN'; requestedScale = $PlanEntry.scaleFactor; effectiveScale = 'UNKNOWN'
         windowSize = $null; previewSize = $null; outcome = 'NO_RECEIPT'; receiptId = $null
         presentedFps = $null; timelineFpsAfterFirstPresent = $null; renderWorkMs = $null; dualIsoMs = $null; note = $null
+        hostLoadState = 'unknown'; hostLoadProvisional = $true; hostLoadCollected = $false
     }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): the standing's members are read without unrolling (Get-DvProp returns through the pipeline)
+    $hlState = $null; $hlProv = $null; $hlColl = $null
+    if ($null -ne $HostLoad -and $HostLoad -isnot [System.Collections.IList]) {
+        foreach ($hlName in 'state', 'provisional', 'collected') {
+            $hlVal = $null
+            if ($HostLoad -is [System.Collections.IDictionary]) { if ($HostLoad.Contains($hlName)) { $hlVal = $HostLoad[$hlName] } }
+            else { $hlP = $HostLoad.PSObject.Properties[$hlName]; if ($null -ne $hlP) { $hlVal = $hlP.Value } }
+            switch ($hlName) { 'state' { $hlState = $hlVal } 'provisional' { $hlProv = $hlVal } 'collected' { $hlColl = $hlVal } }
+        }
+    }
+    if ($hlState -is [string] -and [regex]::IsMatch($hlState, '\A[a-z][a-z_-]{0,31}\z')) { $row.hostLoadState = $hlState }
+    # r1 (sol r6 B3): the row keeps the standing's collected (only a real $true is collected), so collected=false is never dropped on the way to the count
+    $row.hostLoadCollected = ($hlColl -is [bool] -and $hlColl)
+    # r6 (sol r5 B3) + residue r1 (sol r6 B3): provisional unless the standing is clean by Test-DvHostLoadRowClean's rule (state exactly 'quiet', provisional
+    # a real $false AND collected a real $true): the rule Get-VenueReferenceHostLoadRefusal applies to the same standing
+    $row.hostLoadProvisional = -not ($hlProv -is [bool] -and -not $hlProv -and $hlState -is [string] -and [string]::Equals($hlState, 'quiet', [StringComparison]::Ordinal) -and $hlColl -is [bool] -and $hlColl)
     if ($null -eq $Receipt) { $row.note = 'the leg wrote no receipt'; return [pscustomobject]$row }
     $row.outcome = [string](Get-DvProp $Receipt 'outcome'); $row.receiptId = [string](Get-DvProp $Receipt 'receiptId')
     # r6 (sol r5 B1): a visual twin's rates are never read, whichever path its plan entry or receipt came through (the entry's leg id and the receipt's leg id both count)
@@ -3219,7 +3277,7 @@ function Get-DvMatrixRow {
     }
     $scale = Get-DvProp $Receipt 'scale'
     if ($null -ne $scale) { $row.effectiveScale = Get-DvProp $scale 'effectiveScale' }
-    if ($row.outcome -cnotin @('PASS', 'FAIL')) { $row.note = [string](Get-DvProp $Receipt 'outcomeDetail'); return [pscustomobject]$row }
+    if (-not (Test-DvOrdinalIn $row.outcome @('PASS', 'FAIL'))) { $row.note = [string](Get-DvProp $Receipt 'outcomeDetail'); return [pscustomobject]$row }
     $evidence = Get-DvProp $Receipt 'evidence'
     $dir = [string](Get-DvProp $evidence 'localEvidenceDir'); $claimed = [string](Get-DvProp $evidence 'logSha256')
     $logPath = $(if ($dir) { Join-Path $dir 'logs\smoke-run.log' } else { '' })
@@ -3237,8 +3295,54 @@ function Test-DvMatrixRowMeasured {
     M16-1457-VENUE-BASELINE-DRIFT-1 r7 (sol r6 INV-2): is this matrix row a MEASUREMENT? Only a PASS or FAIL row that carries a presented-fps value is (the reader leaves the rates null for a
     visual twin, a missing or swapped run log and every non-measurement outcome). The ONE predicate the table's `measured / ran` column and the summary header's `N measured` both use.
     #>
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): and only a row whose hostLoadProvisional is the boolean false; a provisional, unknown or absent
+    # host-load standing is recorded in the row and never counted. (r6: a matrix row is a playback measurement, so an export leg's not-applicable is not counted.)
+    # r6 (sol r5 B3, opus r5 A4): the host-load half is Test-DvHostLoadRowClean (state exactly 'quiet' AND provisional a real $false): a row that says
+    # unknown, exceeded or no state beside provisional=false is never counted, whoever built it.
     param([Parameter(Mandatory)]$Row)
-    ($Row.outcome -cin @('PASS', 'FAIL')) -and ($null -ne $Row.presentedFps)
+    (Test-DvOrdinalIn $Row.outcome @('PASS', 'FAIL')) -and ($null -ne $Row.presentedFps) -and (Test-DvHostLoadRowClean -Row $Row)
+}
+
+function Test-DvHostLoadRowClean {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B3): the ONE strict host-load predicate for a recorded row (a matrix row, a baseline trend row): clean only when
+    hostLoadState is exactly the string 'quiet' (ordinal) AND hostLoadProvisional is a real [bool] $false. Anything else (unknown, exceeded, not-applicable,
+    missing, 'QUIET', provisional 0, 'false', [false] or absent) is not clean. Pure.
+    #>
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): and hostLoadCollected a real [bool] $true (Get-DvMatrixRow and the baseline row carry it), so a
+    # row whose standing said collected=false is never measured and never in a median, the same refusal as VenueChain.psm1 Get-VenueReferenceHostLoadRefusal.
+    # Members are read without unrolling (a [false] is an array, never the boolean inside it).
+    param([AllowNull()]$Row)
+    if ($null -eq $Row -or $Row -is [System.Collections.IList]) { return $false }
+    $st = $null; $prov = $null; $coll = $null
+    foreach ($rn in 'hostLoadState', 'hostLoadProvisional', 'hostLoadCollected') {
+        $rv = $null
+        if ($Row -is [System.Collections.IDictionary]) { if ($Row.Contains($rn)) { $rv = $Row[$rn] } }
+        else { $rp = $Row.PSObject.Properties[$rn]; if ($null -ne $rp) { $rv = $rp.Value } }
+        switch ($rn) { 'hostLoadState' { $st = $rv } 'hostLoadProvisional' { $prov = $rv } 'hostLoadCollected' { $coll = $rv } }
+    }
+    # adversary-de8e3799.json A5: ordinal, never -ceq (culture-aware: 'qui<soft hyphen>et' -ceq 'quiet' is true)
+    ($st -is [string]) -and [string]::Equals($st, 'quiet', [StringComparison]::Ordinal) -and ($prov -is [bool]) -and (-not $prov) -and ($coll -is [bool]) -and $coll
+}
+
+function ConvertTo-DvMatrixHostLoadTable {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the per-leg host-load table under the matrix summary: every leg's hostLoad.state and provisional, and whether
+    it was counted as a measurement (Test-DvMatrixRowMeasured), so a provisional or unknown leg is visible in the report and never silently in the medians.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Rows)
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('| seq | repeat | cell | outcome | hostLoad.state | provisional | counted |')
+    $lines.Add('|---|---|---|---|---|---|---|')
+    foreach ($r in $Rows) {
+        $prov = Get-DvProp $r 'hostLoadProvisional'
+        $provText = $(if ($prov -is [bool]) { $(if ($prov) { 'true' } else { 'false' }) } else { 'unknown' })
+        $state = [string](Get-DvProp $r 'hostLoadState'); if (-not $state) { $state = 'unknown' }
+        $lines.Add("| $($r.seq) | $($r.repeat) | $($r.cellId) | $($r.outcome) | $state | $provText | $(if (Test-DvMatrixRowMeasured -Row $r) { 'yes' } else { 'no' }) |")
+    }
+    $lines.ToArray()
 }
 
 function Get-DvMatrixMeasuredCount {
@@ -3677,7 +3781,10 @@ function Get-DvLegSpecShapeRefusal {
     # leg's -eq against the array was truthy and indexed the absent look before any receipt. An array, object, number, null, empty or other-case value is
     # refused here, for the leg and every batch preflight alike. An ABSENT legType stays a speed leg, as the runner has always read it.
     $legTypeProp = $Spec.PSObject.Properties['legType']
-    if ($null -ne $legTypeProp -and -not ($legTypeProp.Value -is [string] -and $legTypeProp.Value -cin $script:LegTypes)) {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (adversary-ac6205bd.json A8): ORDINAL membership. -cin is culture-aware and ignores a soft hyphen, so
+    # "ex<U+00AD>port" passed here and every later -ceq 'export' dispatched it as an export, while the ordinal planned-type reader (VenueChain.psm1
+    # Get-VenuePlannedLegType) read playback. Refusing it here makes the validator, the dispatch and the exemption agree.
+    if ($null -ne $legTypeProp -and -not ($legTypeProp.Value -is [string] -and @($script:LegTypes | Where-Object { [string]::Equals($_, [string]$legTypeProp.Value, [StringComparison]::Ordinal) }).Count -eq 1)) {
         return "legType must be one of $(($script:LegTypes | ForEach-Object { '"' + $_ + '"' }) -join ', ') (one JSON string; it is $(ConvertTo-Json -InputObject $legTypeProp.Value -Compress -Depth 3))"
     }
     $exportRefusal = Get-DvExportShapeRefusal -Spec $Spec -IsExportLeg ($null -ne $legTypeProp -and $legTypeProp.Value -ceq 'export')
@@ -6475,7 +6582,7 @@ function Get-DvExportOutcome {
     $base = Resolve-DvJobOutcome -ResultToken $ResultToken -ExitCode $ExitCode
     # Only the export's own failure terminals are a product FAIL. A clip-length refusal (the job's RESULT is the gate's verdict), an owner-footage or work-dir
     # refusal, a missing RESULT line or any unknown token falls through Resolve-DvJobOutcome to FAIL; for an export leg that is no measurement: INVALID.
-    if ($base.outcome -eq 'FAIL' -and $ResultToken -cnotin $script:ExportFailResults) {
+    if ($base.outcome -eq 'FAIL' -and -not (Test-DvOrdinalIn $ResultToken $script:ExportFailResults)) {
         $why = $(if ($ResultToken -cin $script:PlayLengthRefusalReasons) { 'the clip failed the export length gate' } else { 'not an export failure terminal' })
         return [pscustomobject]@{ outcome = 'INVALID'; detail = "$(if ([string]::IsNullOrEmpty($ResultToken)) { 'no RESULT line' } else { $ResultToken }) (job exit ${ExitCode}): $why, so it is no product result"; criteria = $null }
     }
@@ -6603,7 +6710,7 @@ function Test-DvExportReceiptValid {
             $role = [string](Get-DvProp (Get-DvProp $Receipt 'venue') 'role')
             $criteria = Get-DvProp (Get-DvProp (Get-DvProp $contract 'criteria') $role) 'cpu'
             $derived = Get-DvExportOutcome -ResultToken ([string](Get-DvProp $umRun 'resultToken')) -ExitCode ([int]$exit) -Evidence $ev -Criteria $criteria
-            if ($derived.outcome -cnotin @('PASS', 'FAIL')) { $Invalid.Add("OUTCOME_NOT_DERIVABLE: the export evidence derives $($derived.outcome) ($($derived.detail)), which is not a PASS/FAIL signal") }
+            if (-not (Test-DvOrdinalIn $derived.outcome @('PASS', 'FAIL'))) { $Invalid.Add("OUTCOME_NOT_DERIVABLE: the export evidence derives $($derived.outcome) ($($derived.detail)), which is not a PASS/FAIL signal") }
             elseif ($derived.outcome -cne $Outcome) { $Invalid.Add("OUTCOME_NOT_DERIVED: the export evidence and the leg's criteria derive $($derived.outcome) but the receipt says $Outcome") }
         }
     }
@@ -6656,8 +6763,9 @@ function Test-DvReceiptValid {
     $invalid = [System.Collections.Generic.List[string]]::new()
     $outcome = [string](Get-DvProp $Receipt 'outcome')
     # Case-sensitive on purpose: 'pass' / 'PASS ' is not an outcome the writer can produce, so it is neither a signal nor "no signal".
-    if ($outcome -cnotin $script:OutcomeEnum) { return [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @('OUTCOME_UNKNOWN: the receipt outcome is not one of the typed outcomes'); unbound = @() } }
-    if ($outcome -cnotin @('PASS', 'FAIL')) { return [pscustomobject]@{ valid = $true; status = 'NO_SIGNAL'; reasons = @(); unbound = @() } }
+    # adversary-fd0141e8.json A2: ORDINAL ASCII, so 'PA<U+00AD>SS' is neither PASS nor a typed outcome
+    if (-not (Test-DvOrdinalIn $outcome $script:OutcomeEnum)) { return [pscustomobject]@{ valid = $false; status = 'INVALID'; reasons = @('OUTCOME_UNKNOWN: the receipt outcome is not one of the typed outcomes'); unbound = @() } }
+    if (-not (Test-DvOrdinalIn $outcome @('PASS', 'FAIL'))) { return [pscustomobject]@{ valid = $true; status = 'NO_SIGNAL'; reasons = @(); unbound = @() } }
     # Claims the receipt makes that NO hashed artifact carries (fable r1 B1 / sol r1 B3). They are recorded, typed, and never used as a verdict input.
     $unbound = @('CLIP_CONTENT_UNBOUND: subject.clipContentSha256 is computed by the local generator and written to no artifact the venue returns; it is recorded, never trusted',
                  'LEG_IDENTITY_UNBOUND: legId / legSpecSha256 name a committed spec, but no hashed artifact carries them; only the leg TYPE (summary.lookLeg), look flavor, backend, venue, clip and build are bound')
@@ -7480,7 +7588,7 @@ function Resolve-DvJobOutcome {
     if ($reasonSuffix -and $SmokeRefusalReason -in $script:PlayLengthRefusalReasons -and $ResultToken -notin $script:VenueConditionResults -and $ResultToken -notin $script:DeviceUnavailableResults) {
         return [pscustomobject]@{ outcome = 'INVALID'; detail = ($ResultToken + $reasonSuffix) }
     }
-    if ($ResultToken -cin $script:ExportFailResults) { return [pscustomobject]@{ outcome = 'FAIL'; detail = "$ResultToken (job exit $ExitCode)" } }
+    if (Test-DvOrdinalIn $ResultToken $script:ExportFailResults) { return [pscustomobject]@{ outcome = 'FAIL'; detail = "$ResultToken (job exit $ExitCode)" } }
     if ($ResultToken -cin $script:ExportInvalidResults) { return [pscustomobject]@{ outcome = 'INVALID'; detail = "$ResultToken (job exit $ExitCode): the export's stage evidence or output does not bind, so it is no measurement" } }
     if ($ResultToken -cin $script:ExportToolingResults) { return [pscustomobject]@{ outcome = 'VENUE_TOOLING'; detail = "$ResultToken (job exit $ExitCode): the staged package carries no ffmpeg.exe for the rendered export" } }
     if ($ResultToken -eq 'VENUE_NOT_QUIESCENT') { return [pscustomobject]@{ outcome = 'VENUE_NOT_QUIESCENT'; detail = $ResultToken } }
@@ -7912,8 +8020,8 @@ function Write-DvReceipt {
     Returns the path written.
     #>
     param([Parameter(Mandatory)]$Receipt, [Parameter(Mandatory)][string]$ReceiptRoot, [string]$RepoRoot = '', [switch]$OfflineTestMode, [byte[]]$LegSpecBytes = $null)
-    if ($Receipt['outcome'] -notin $script:OutcomeEnum) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
-    if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {
+    if (-not (Test-DvOrdinalIn $Receipt['outcome'] $script:OutcomeEnum)) { throw "DVE_RECEIPT_OUTCOME_INVALID '$($Receipt['outcome'])' is not one of: $($script:OutcomeEnum -join ', ')" }
+    if (Test-DvOrdinalIn $Receipt['outcome'] @('PASS', 'FAIL')) {
         # The writer never records a signal without its proof, whatever the caller believed: the SAME evidence-bearing validator a
         # reader calls re-derives the admission from the committed blobs and the run from the hashed evidence files.
         # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r5 (sol r4 B4): the validator RE-READS the hashed evidence. A throw there (a file held with FileShare.None
@@ -7944,7 +8052,19 @@ function Write-DvReceipt {
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json + "`n")
     $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)   # CreateNew: never overwrite
     try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the exact bytes just written, so the runner can print it
+    # (DVE_RECEIPT_SHA256=) and its parent binds every later read of the receipt to the receipt this run wrote, never to one swapped in afterwards.
+    $script:DvLastWrittenReceiptSha256 = Get-DvSha256OfBytes $bytes
     $path
+}
+
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r7 (sol r7 B3, key3 fable r7 B3): initialised at module scope. This module runs Set-StrictMode -Version Latest, so a read of the
+# variable before the first successful Write-DvReceipt threw VariableIsUndefined instead of answering the '' the getter below promises.
+$script:DvLastWrittenReceiptSha256 = ''
+
+function Get-DvLastWrittenReceiptSha256 {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes Write-DvReceipt last wrote in this session ('' when none).
+    [string]$script:DvLastWrittenReceiptSha256
 }
 
 # --- the display-path block (VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2) -----------------------------
@@ -8292,11 +8412,11 @@ function Get-DvAcceptanceVerdict {
     }
 }
 
-Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
+Export-ModuleMember -Function Test-DvOrdinalIn, Get-DvLastWrittenReceiptSha256, Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-DvSha256OfBytes, Get-DvSha256OfText, Get-DvSha256OfFile,
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, ConvertTo-DvOneLineText, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Test-DvHostLoadRowClean, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, ConvertTo-DvMatrixHostLoadTable,Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict, Get-DvStoredPlaybackFieldProblems,
     Read-DvReceiptDisplayPath, New-DvDisplayPathBlock

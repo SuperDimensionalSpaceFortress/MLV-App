@@ -22,7 +22,11 @@
 #      venue was NOT MEASURED: the leg is NOT run (`LEG <name> NOT_RUN VENUE_QUIET_UNKNOWN reason=...`) and the chain stops (-OnUnknown Stop, the default)
 #      or goes on to the next leg (-OnUnknown Continue). A measured COOLDOWN_UNMET still runs the leg, as before, but the LEG line carries verdict=,
 #      quietMean= and the leg's preLoadMean= and class= (QUIET_PRELOAD_OK when QUIET and preLoad <= 30 %: docs/cuda-playback-present-cadence.md:206 COUNTED
-#      = QUIET plus preLoad <= 30; PASS and the exe match stay lane-side). A FOREIGN_FLOOR line in EITHER the pre-claim or the under-claim probe keeps class=COOLDOWN_UNMET whatever the
+#      = QUIET plus preLoad <= 30; PASS and the exe match stay lane-side). VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: a leg whose smoke host load (result.json hostLoad,
+#      VenueChain.psm1 Get-VenueLegHostLoad) is provisional or was not collected is class=HOSTLOAD_PROVISIONAL instead of QUIET_PRELOAD_OK (never counted; the line
+#      REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state> follows), and every LEG RAN line carries hostLoadState= / hostLoadProvisional=. Only a QUIET leg with a
+#      pre-load <= 30 % takes that class: one whose pre-load is > 30 % or unknown keeps QUIET_PRELOAD_HIGH / QUIET_PRELOAD_UNKNOWN (still uncounted, the typed
+#      line still printed), and a COOLDOWN_UNMET leg keeps that class (r3, sol r2). A FOREIGN_FLOOR line in EITHER the pre-claim or the under-claim probe keeps class=COOLDOWN_UNMET whatever the
 #      under-claim verdict reads (the LEG line and the result carry preClaimForeignFloor= / underClaimForeignFloor=). The quiet gate itself is unchanged: threshold and waits pass straight through.
 #   4. QUIET WINDOWS. -QuietRateTable prints the per-UTC-hour QUIET rate of the venue's PROBE lines in -GateLogPath (default every
 #      <main checkout>\.claude-state\fleet-runs\*\gate.log) and exits. -PreferQuietWindows: when the current hour's observed rate is under -PreferRatePercent
@@ -186,9 +190,16 @@ if ($LegSet) {
     Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force
     $setPath = Join-Path $here "legsets\$LegSet.json"
     $sp = try { Get-DvLegSetPlan -LegSetPath $setPath -Repeats $Repeats -Backend $(if ($Backend) { $Backend } else { '' }) } catch { Stop-Usage $_.Exception.Message }
+    # r6 (adversary-de8e3799.json A3): the planned leg type is read HERE, at planning, before any leg runs; a spec replaced later never grants an exemption
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3): no second read of the path. The type is the planner's own (Get-DvLegSetPlan judged it from the
+    # bytes it hashed), and the planner's raw sha256 goes to the child as -ExpectSpecSha256, so the leg runs the planned bytes or refuses DVE_LEG_SPEC_CHANGED
     # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 (sol r6 INV-3 sibling): each entry keeps the sha256 of the spec bytes the set planner judged (Get-DvLegSetPlan), and every leg child
     # below is bound to it with -ExpectSpecSha256, so bytes swapped in after planning (a committed visual twin's) are refused by the leg, never run in the planned speed slot
-    foreach ($e in $sp.plan) { $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256 }) }
+    foreach ($e in $sp.plan) {
+        $ePlanned = $(if ($null -ne $e.PSObject.Properties['plannedLegType']) { $e.PSObject.Properties['plannedLegType'].Value } else { $null })
+        $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256
+            plannedLegType = $(if ($ePlanned -is [string] -and ($ePlanned -ceq 'export' -or $ePlanned -ceq 'playback')) { $ePlanned } else { 'unknown' }) })
+    }
 } else {
     $seq = 0
     foreach ($ref in $LegSpec) {
@@ -199,12 +210,15 @@ if ($LegSet) {
         # the hash Invoke-VenueLeg's -ExpectSpecSha256 takes), decoded BOM-detected as File.ReadAllText does. Bytes that cannot be read here are a usage refusal before any claim:
         # an unread spec has no planned hash to bind the child to.
         # (r2, adversary A2: a direct assignment, so an empty file is a zero-length array; `$x = try { <empty array> }` enumerates it to $null and the hash then threw)
+        # r6 (adversary-fa329743.json A4): the spec is read ONCE at planning; its legId and its planned leg type both come from that one decoded text (the same bytes the hash covers)
         try { [byte[]]$specBytes = [IO.File]::ReadAllBytes($path) } catch { Stop-Usage "LEG_SPEC_UNREADABLE '$path' could not be read to plan it ($($_.Exception.Message -replace '\s+', ' '))" }
         $specSha256 = ([BitConverter]::ToString([Security.Cryptography.SHA256]::HashData([byte[]]$specBytes)) -replace '-', '').ToLowerInvariant()
-        $legId = try { $rdr = [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$specBytes), [Text.Encoding]::UTF8, $true); try { [string](($rdr.ReadToEnd() | ConvertFrom-Json).legId) } finally { $rdr.Dispose() } } catch { '' }
+        $specText = try { $rdr = [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$specBytes), [Text.Encoding]::UTF8, $true); try { $rdr.ReadToEnd() } finally { $rdr.Dispose() } } catch { '' }
+        $legId = try { [string](($specText | ConvertFrom-Json).legId) } catch { '' }
         if ($legId -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$') { $legId = [IO.Path]::GetFileNameWithoutExtension($path) }
+        $plannedType = Get-VenuePlannedLegType -SpecText $specText   # r6 (adversary-de8e3799.json A3): read at planning, before any leg runs
         for ($r = 1; $r -le $Repeats; $r++) {
-            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); specSha256 = $specSha256 })
+            $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); specSha256 = $specSha256; plannedLegType = $plannedType })
         }
     }
 }
@@ -562,8 +576,8 @@ foreach ($leg in $plan) {
             $out = Join-Path $RunDir "leg-$($leg.name).out.txt"
             $lArgs = @('-NoProfile', '-NonInteractive', '-File', $LegScript, '-Venue', $Venue, '-LegSpec', $leg.spec, '-SourceCommit', $SourceCommit, '-BuildManifestSha256', $BuildManifestSha256)
             if ($leg.backend) { $lArgs += @('-Backend', $leg.backend) }
-            # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 (sol r6 INV-3 sibling): the leg runs the bytes the planner judged or nothing (Invoke-VenueLeg refuses DVE_LEG_SPEC_CHANGED before it
-            # generates or submits anything); a path whose bytes changed between the plan and the leg's read is never measured in this leg's slot
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3) + DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 (sol r6 INV-3 sibling): the leg runs the bytes the planner
+            # judged or nothing (Invoke-VenueLeg refuses DVE_LEG_SPEC_CHANGED before it generates or submits anything); every planned leg (set or -LegSpec) now carries its hash
             $lArgs += @('-ExpectSpecSha256', [string]$leg.specSha256)
             if ($SheetCopyDir) { $lArgs += @('-SheetCopyDir', $SheetCopyDir) }
             L "LEG $($leg.name) RUN verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) spec=$($leg.spec) backend=$(if ($leg.backend) { $leg.backend } else { 'spec' })"
@@ -582,6 +596,10 @@ foreach ($leg in $plan) {
             $outcome = $(if ($o -and $o -match '^DVE_OUTCOME=(\S+)') { $Matches[1] } else { 'NONE' })
             $p = $legStdoutLines | Where-Object { $_ -match '^DVE_RECEIPT_PATH=(.+)$' } | Select-Object -Last 1
             $receipt = $(if ($p -and $p -match '^DVE_RECEIPT_PATH=(.+)$') { $Matches[1].Trim() } else { $null })
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes the child wrote ('' when it printed none: the read is unknown)
+            # (a STDOUT record of the child, like the outcome, receipt path and detail: a whole line on its stderr is no result of the leg)
+            $rs = $legStdoutLines | Where-Object { $_ -cmatch '^DVE_RECEIPT_SHA256=[0-9A-Fa-f]{64}$' } | Select-Object -Last 1
+            $receiptSha = $(if ($rs) { $rs.Substring('DVE_RECEIPT_SHA256='.Length) } else { '' })
             $dl = $legStdoutLines | Where-Object { $_ -match '^DVE_DETAIL=' } | Select-Object -Last 1
             $detail = $(if ($dl) { ($dl -replace '^DVE_DETAIL=', '').Trim() } else { '' })
             if ($legCode -ne 0) {
@@ -602,14 +620,30 @@ foreach ($leg in $plan) {
                 }
             } else {
                 $preLoad = Get-LegPreLoadMean $receipt
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the smoke's own host-load verdict (VenueChain.psm1's one reader); provisional or not collected is never a counted class
+                # r6 (sol r5 B2): the export exemption comes only from the leg's PLANNED type (its spec's legType), never from the receipt's shape
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): read only from the receipt bytes the child wrote (a receipt and result.json swapped in together read unknown)
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R3-MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A4): the two file reads are bounded by 20 s or what is left before -DeadlineUtc, whichever is less
+                # (as the lease batch does): without it the reader's own default gave a stalled result.json a fresh 20 s past the deadline, so a final leg overran it and a baseline parent
+                # killed the chain with the result lost. Under 1 s left the read is not started and the standing is unknown (uncounted, the safe side).
+                $hl = Get-VenueLegHostLoad -ReceiptPath $receipt -PlannedLegType ([string]$leg.plannedLegType) -ExpectReceiptSha256 $receiptSha -ReadTimeoutSec 20.0 -CallDeadlineUtc $deadline
+                # R2-RESIDUE-1 r2 (adversary-f1221390.json A2): a standing this caller sees after its own -DeadlineUtc is never acted on, whatever the reader returned (the caller can be suspended after the reader's last check)
+                # R2-NARROW-1 r7 (sol r7 A3): the guard is VenueChain.psm1's one Limit-VenueHostLoadToDeadline (the baseline applies the same one)
+                $hl = Limit-VenueHostLoadToDeadline -Standing $hl -DeadlineUtc $deadline
+                $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($receipt) { [IO.Path]::GetFileNameWithoutExtension($receipt) } else { "leg:$($leg.name)" }) -Standing $hl
                 # a FOREIGN_FLOOR early exit in ANY probe of the leg (either phase, any attempt, GATE_BUSY retries included) leaves it contended: a later QUIET reading never promotes it to a counted class
-                $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET' -or $legPreFF -or $legReFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { 'QUIET_PRELOAD_OK' } else { 'QUIET_PRELOAD_HIGH' })
-                $ranExtra = @{ verdict = $re.verdict; quietMean = $re.mean; preClaimVerdict = $pre.verdict; preClaimMean = $pre.mean; preLoadMean = $preLoad; class = $class; preClaimForeignFloor = $legPreFF; underClaimForeignFloor = $legReFF; outcome = $outcome; legExit = $legCode; receipt = $receipt }
+                $class = $(if ($re.verdict -ceq 'COOLDOWN_UNMET' -or $legPreFF -or $legReFF) { 'COOLDOWN_UNMET' } elseif ($null -eq $preLoad) { 'QUIET_PRELOAD_UNKNOWN' } elseif ($preLoad -le 30.0) { $(if ($hlRefusal) { 'HOSTLOAD_PROVISIONAL' } else { 'QUIET_PRELOAD_OK' }) } else { 'QUIET_PRELOAD_HIGH' })
+                $ranExtra = @{ verdict = $re.verdict; quietMean = $re.mean; preClaimVerdict = $pre.verdict; preClaimMean = $pre.mean; preLoadMean = $preLoad; class = $class; hostLoadState = [string]$hl.state; hostLoadProvisional = [bool]$hl.provisional; preClaimForeignFloor = $legPreFF; underClaimForeignFloor = $legReFF; outcome = $outcome; legExit = $legCode; receipt = $receipt; receiptSha256 = $receiptSha }
+                # adversary-7efea617.json A2: the sha256 the leg PUBLISHED for its receipt (DVE_RECEIPT_SHA256, the one the host-load read above is bound to) travels in the
+                # chain row ('' when the child printed none), so a consumer that re-reads the receipt later compares those bytes with it and never with its own read
                 if ($legPreFF) { $ranExtra['preClaimForeignFloorLine'] = $legPreFFLine }
                 if ($legReFF) { $ranExtra['underClaimForeignFloorLine'] = $legReFFLine }
                 if ($detail) { $ranExtra['outcomeDetail'] = $detail }
                 Add-Result $leg 'RAN' $ranExtra
-                L "LEG $($leg.name) RAN exit=$legCode outcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) preLoadMean=$(Format-Mean $preLoad) class=$class receipt=$receipt$(if ($legPreFF) { ' preClaimForeignFloor=1' })$(if ($legReFF) { ' underClaimForeignFloor=1' })$(if ($detail) { " detail=$detail" })"
+                L "LEG $($leg.name) RAN exit=$legCode outcome=$outcome verdict=$($re.verdict) quietMean=$(Format-Mean $re.mean) preLoadMean=$(Format-Mean $preLoad) class=$class hostLoadState=$($hl.state) hostLoadProvisional=$([bool]$hl.provisional) receipt=$receipt$(if ($legPreFF) { ' preClaimForeignFloor=1' })$(if ($legReFF) { ' underClaimForeignFloor=1' })$(if ($detail) { " detail=$detail" })"
+                # r1 (adversary-b0c05520.json A5): whatever the class; A4: this added append never ends the chain (a held chain.log still gets the line on stdout)
+                # (a leg that printed no receipt measured nothing: its pre-load is QUIET_PRELOAD_UNKNOWN and it has no host load to name)
+                if ($hlRefusal -and $receipt) { try { L $hlRefusal } catch { Write-Output $hlRefusal } }
                 # VENUE-CHAIN-UNHEALTHY-STREAK-STOP-1: only a RAN leg counts or resets (LEG_FAILED / NOT_RUN never reach here). VENUE_UNHEALTHY with a detail extends the
                 # streak when the detail KEY is the same (Get-UnhealthyDetailKey), otherwise starts it at 1; anything else (a different outcome, or no detail to compare) resets it.
                 # -UnhealthyStreakStop 0 switches off the count only: the owner-only first occurrence stops the chain whatever N is.

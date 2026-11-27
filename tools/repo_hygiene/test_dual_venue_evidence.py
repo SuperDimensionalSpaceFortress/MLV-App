@@ -28,6 +28,7 @@ Windows-only: the job generator and runner are PowerShell-on-Windows tools (the 
 from __future__ import annotations
 
 import ast
+import base64
 import concurrent.futures
 import contextlib
 import hashlib
@@ -1740,7 +1741,7 @@ class RunnerHarness:
                         manifest_nonce: str | None | bool = True, log: bool = True, result: bool = True, isolated: str | None = "run_scoped",
                         declared_log_sha: str | None = None, compose_marker: str | None = None, raw_frames: bool = False,
                         exact_summary: dict | None = None, extra_log_lines: list[str] | None = None,
-                        look_assist_state: str | None = "look_assist_enabled=1") -> None:
+                        look_assist_state: str | None = "look_assist_enabled=1", host_load: dict | None = None) -> None:
         """Write the job's artifacts the way master's generator does, INCLUDING the run's own records the receipt is re-derived
         from: the launcher's result.json (evidence.runNonce = the nonce it generated, the sha256 of the log snapshot) and
         logs/smoke-run.log (the app's playback_smoke.summary line carrying source_advanced / required_source_frames / native_fps /
@@ -1775,7 +1776,10 @@ class RunnerHarness:
             evidence = {"runLogSnapshot": {"sha256": declared_log_sha or log_sha, "length": len(log_bytes)}}
             if nonce is not None:
                 evidence["runNonce"] = nonce
-            (self.artifacts / "result.json").write_text(json.dumps({"schema": "mlvapp-gui-smoke-result.v2", "evidence": evidence}), encoding="utf-8")
+            doc = {"schema": "mlvapp-gui-smoke-result.v2", "evidence": evidence}
+            if host_load is not None:   # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: the smoke's hostLoad block (the matrix reads it; none = an older result with no block)
+                doc["hostLoad"] = host_load
+            (self.artifacts / "result.json").write_text(json.dumps(doc), encoding="utf-8")
         body = {"result": "MEASUREMENT_CAPTURED", "fixtureRehearsal": False, "clipId": OWNER_CLIP, "rows": 900, "gpuFramesTotal": 900,
                 "cpuFrames": 0, "artifactRoot": "X:\\stub"}
         if source_frames is True:
@@ -2563,15 +2567,16 @@ class ReceiptOracleVerdictTests(RunnerHarness, unittest.TestCase):
         self.assertEqual(receipt["outcome"], "PASS")
 
     def test_mutation_without_the_writer_validation_a_proofless_pass_is_written(self) -> None:
-        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {", "if ($false) {"),
-                                       ("Invoke-VenueLeg.ps1", "if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {", "if ($false) {")])
+        # R4-NARROW-1 r2 (hosted CI on 55dcf49e, heavy 12/14): the writer's PASS/FAIL check reads the outcome through Test-DvOrdinalIn (the ordinal membership the PR introduced); the mutation anchor is that text
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if (Test-DvOrdinalIn $Receipt['outcome'] @('PASS', 'FAIL')) {", "if ($false) {"),
+                                       ("Invoke-VenueLeg.ps1","if ($outcome -in @('PASS', 'FAIL') -and $proofProblems.Count -gt 0) {", "if ($false) {")])
         self.write_artifacts(line={"source_advanced": 100})
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), dv=mutated)
         self.assertEqual(receipt["outcome"], "PASS", "with both layers removed a proofless capture is a PASS -- each layer is needed")
 
     def test_mutation_the_runner_layer_alone_still_stops_a_proofless_pass(self) -> None:
         # Defence in depth: removing only the WRITER's check, the runner's own downgrade still yields INVALID ...
-        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if ($Receipt['outcome'] -in @('PASS', 'FAIL')) {", "if ($false) {")])
+        mutated = self.mutated_runner([("DualVenueRunner.psm1", "if (Test-DvOrdinalIn $Receipt['outcome'] @('PASS', 'FAIL')) {", "if ($false) {")])
         self.write_artifacts(line={"source_advanced": 100})
         _, receipt, _ = self.run_leg("ultra-magnus", self.write_spec(), dv=mutated)
         self.assertEqual(receipt["outcome"], "INVALID")
@@ -4129,7 +4134,55 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
     # tests/**), never by file name; everything else, including a test-looking name outside the class, is still counted.
     PRODUCTION_RECEIPT_CALLERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/New-VenueSheetPair.ps1",
                                             "tools/profiling/dual-venue/New-VenueFlavorPair.ps1", "tools/profiling/dual-venue/Invoke-VenueBaseline.ps1"})
-    PRODUCTION_RECEIPT_READERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1"})
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r4: VenueChain.psm1 reads a receipt in ONE place, Get-VenueLegHostLoad (its export test, Test-VenueReceiptIsExportLeg, names the
+    # receipt schema). That read only ever REFUSES a leg (host load unknown or provisional); its one non-refusing outcome, an export leg, is not-applicable, which is
+    # the pre-card behaviour, so it never admits a figure the validator would refuse and does not call Test-DvReceiptValid. The pin below keeps it to that function.
+    PRODUCTION_RECEIPT_READERS = frozenset({"tools/profiling/dual-venue/DualVenueRunner.psm1", "tools/profiling/dual-venue/Invoke-VenueLeg.ps1",
+                                            "tools/profiling/dual-venue/VenueChain.psm1"})
+    REFUSAL_ONLY_RECEIPT_READERS = {"tools/profiling/dual-venue/VenueChain.psm1": "Test-VenueReceiptIsExportLeg"}
+
+    RECEIPT_LITERALS = ("dual-venue-receipt/v1", "dual-venue\\receipts", "dual-venue/receipts")
+
+    @staticmethod
+    def powershell_function_extents(text: str) -> list[tuple[int, int, str]]:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 H1): every function's extent as the PowerShell PARSER sees it (FunctionDefinitionAst
+        Extent.StartOffset / EndOffset, UTF-16 offsets into the text, nested functions included). The text goes over stdin as base64, so no console code page
+        can change it."""
+        pwsh = shutil.which("pwsh")
+        if pwsh is None:
+            raise unittest.SkipTest("pwsh is not on PATH (the receipt-reader pin needs the PowerShell parser)")
+        script = ("$t = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd())); "
+                  "$e = $null; $k = $null; $ast = [System.Management.Automation.Language.Parser]::ParseInput($t, [ref]$k, [ref]$e); "
+                  "foreach ($f in $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) { "
+                  "[Console]::Out.WriteLine([string]::Join([char]9, @([string]$f.Extent.StartOffset, [string]$f.Extent.EndOffset, $f.Name))) }")
+        p = subprocess.run([pwsh, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script],
+                           input=base64.b64encode(text.encode("utf-8")).decode("ascii"), capture_output=True, text=True, timeout=120,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0)
+        if p.returncode != 0:
+            raise AssertionError("the PowerShell parser did not run: " + p.stdout + p.stderr)
+        out = []
+        for row in p.stdout.splitlines():
+            if row.strip():
+                start, end, name = row.split("\t", 2)
+                out.append((int(start), int(end), name.strip()))
+        return out
+
+    @classmethod
+    def receipt_literal_functions(cls, text: str) -> list[str]:
+        # The function each receipt-literal line sits in, in order; '' for a line outside any function. r6 (sol r5 H1) bounded a function by its column-0
+        # closing brace; sol r6 H1: an indented closing brace defeated that. Residue r1: the boundaries are the PARSED function extents
+        # (powershell_function_extents: the AST), so a literal below the function's real closing brace, however that brace is indented, is outside it;
+        # a literal inside a nested function is attributed to the innermost one.
+        extents = cls.powershell_function_extents(text)
+        out, offset = [], 0  # offset: UTF-16 code units, as the parser counts them
+        for line in text.split("\n"):
+            hits = [line.find(lit) for lit in cls.RECEIPT_LITERALS if lit in line]
+            if hits:
+                pos = offset + len(line[:min(hits)].encode("utf-16-le")) // 2
+                inside = [e for e in extents if e[0] <= pos < e[1]]
+                out.append(max(inside, key=lambda e: e[0])[2] if inside else "")
+            offset += len(line.encode("utf-16-le")) // 2 + 1
+        return out
 
     @staticmethod
     def is_test_module(path: str) -> bool:
@@ -4152,6 +4205,36 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         # nothing else in the tree reads a receipt file: a new reader must call the validator (and be added to this list in review)
         self.assertEqual(readers, set(self.PRODUCTION_RECEIPT_READERS),
                          "an unknown reader of dual-venue receipts must call Test-DvReceiptValid -RepoRoot and be named here")
+        # r4: a refusal-only reader that does not call the validator keeps its receipt read inside the one named function (a second read anywhere else fails here)
+        for path, fn in self.REFUSAL_ONLY_RECEIPT_READERS.items():
+            self.assertNotIn(path, callers, path)
+            self.assertEqual(self.receipt_literal_functions(texts[path]), [fn], path)
+        self.assertEqual(self.receipt_literal_functions("function Read-X {\n  $s = 'mlv-app/dual-venue-receipt/v1'\n}\n"), ["Read-X"],
+                         "the pin sees a receipt literal in a second function, so it guards the refusal-only reader")
+        # r6 (sol r5 H1): function boundaries are the function's own braces. A literal moved below the closing brace of Test-VenueReceiptIsExportLeg (module
+        # scope, before the next function) is no longer attributed to it, so the pin above fails on that mutation.
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  if ($x) { 'a' }\n}\n$s = 'mlv-app/dual-venue-receipt/v1'\nfunction Test-B { }\n"), [""])
+        # residue r1 (sol r6 H1): a brace in a comment or a string is not a boundary, a nested block's brace is not the function's, and an INDENTED closing
+        # brace still closes the function (the parser decides, not the column)
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  # a } in a comment\n  $q = '}'\n  if ($x) {\n  }\n  $s = 'mlv-app/dual-venue-receipt/v1'\n}\n"), ["Test-A"])
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  $q = '}'\n  }\n$s = 'mlv-app/dual-venue-receipt/v1'\n"), [""],
+                         "an indented closing brace closes the function: the literal after it is at module scope")
+        self.assertEqual(self.receipt_literal_functions("function Test-A {\n  function Test-In {\n    $s = 'mlv-app/dual-venue-receipt/v1'\n  }\n}\n"), ["Test-In"])
+        self.assertEqual(self.receipt_literal_functions("function Test-A { $x }\n$s = 'mlv-app/dual-venue-receipt/v1'\n"), [""], "a one-line function closes on its line")
+        live = texts["tools/profiling/dual-venue/VenueChain.psm1"]
+        lines = live.splitlines(keepends=True)
+        start = next(i for i, l in enumerate(lines) if l.startswith("function Test-VenueReceiptIsExportLeg"))
+        end = next(i for i in range(start + 1, len(lines)) if lines[i].rstrip("\r\n") == "}")
+        hit = next(i for i in range(start, end) if "dual-venue-receipt/v1" in lines[i])
+        moved = "".join(lines[:hit] + lines[hit + 1:end + 1] + [lines[hit]] + lines[end + 1:])
+        self.assertNotEqual(self.receipt_literal_functions(moved), ["Test-VenueReceiptIsExportLeg"],
+                            "a schema literal moved below the function's closing brace is not attributed to it")
+        self.assertEqual(self.receipt_literal_functions(moved), [""])
+        # residue r1 (sol r6 H1, its mutation): the function's actual closing brace indented two spaces and the schema literal placed after it is at
+        # module scope, so the live function no longer owns it and the pin above fails on that mutation
+        indented = "".join(lines[:hit] + lines[hit + 1:end] + ["  }\n", lines[hit]] + lines[end + 1:])
+        self.assertNotEqual(indented, live)
+        self.assertEqual(self.receipt_literal_functions(indented), [""], "a literal after an indented closing brace is not attributed to the function")
         mutated = texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"].replace("Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot", "Test-DvReceiptValid -Receipt $r")
         self.assertNotEqual(mutated, texts["tools/profiling/dual-venue/New-VenueSheetPair.ps1"])
         self.assertEqual(self.readers_without_repo_root({"New-VenueSheetPair.ps1": mutated}), ["New-VenueSheetPair.ps1:" + str(next(
@@ -6402,7 +6485,9 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         backend, mode, scale = cell.split("-")
         base = {"cellId": cell, "backend": backend, "outcome": outcome, "observedDisplay": mode, "effectiveScale": 1 if backend == "cuda" else int(scale[1:]),
                 "windowSize": "2560x1529" if mode == "windowed" else "2560x1600", "previewSize": "2380x1373" if mode == "windowed" else "2560x1600",
-                "presentedFps": fps, "timelineFpsAfterFirstPresent": 19.5, "renderWorkMs": 28.0, "dualIsoMs": 25.0}
+                "presentedFps": fps, "timelineFpsAfterFirstPresent": 19.5, "renderWorkMs": 28.0, "dualIsoMs": 25.0,
+                "hostLoadState": "quiet", "hostLoadProvisional": False,   # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: a quiet leg (a provisional one is never measured)
+                "hostLoadCollected": True}   # residue r1 (sol r6 B3): and collected (a collected=false row is never measured)
         base.update(over)
         return base
 
@@ -6459,11 +6544,37 @@ class DisplayMatrixLegSetTests(unittest.TestCase):
         for line in lines[2:]:
             self.assertNotRegex(line, r"\| \d->\S+ \|", "a bare factor in the scale column is the confusing form this card replaces")
 
+    def test_hostload_r3_a_provisional_or_unstated_row_is_ran_but_never_measured(self) -> None:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): Test-DvMatrixRowMeasured counted any PASS/FAIL row with a rate. A row whose hostLoadProvisional is not
+        the boolean false (true, absent, a string, a list) is ran, never measured; the quiet row still counts."""
+        cells = [{"cellId": "cuda-windowed-s1", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 1}]
+        absent = self.row("cuda-windowed-s1", fps=30.0); del absent["hostLoadProvisional"]
+        rows = [self.row("cuda-windowed-s1", fps=12.0), self.row("cuda-windowed-s1", fps=59.56, hostLoadState="unknown", hostLoadProvisional=True), absent,
+                self.row("cuda-windowed-s1", fps=31.0, hostLoadProvisional="false"), self.row("cuda-windowed-s1", fps=32.0, hostLoadProvisional=[False])]
+        line = self.table(rows, cells).splitlines()[2]
+        self.assertIn("| 1/5 | 12.00 (12.00-12.00) |", line, "only the quiet row is in the median")
+
+    def test_residue_b3_a_collected_false_row_is_ran_but_never_measured(self) -> None:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B3): a row whose standing said collected=false (or whose collected is not the boolean true)
+        is ran, never measured and never in the median, beside state quiet and provisional false."""
+        cells = [{"cellId": "cuda-windowed-s1", "backend": "cuda", "displayMode": "windowed", "scaleFactor": 1}]
+        absent = self.row("cuda-windowed-s1", fps=30.0); del absent["hostLoadCollected"]
+        rows = [self.row("cuda-windowed-s1", fps=12.0), self.row("cuda-windowed-s1", fps=59.56, hostLoadCollected=False), absent,
+                self.row("cuda-windowed-s1", fps=31.0, hostLoadCollected="true"), self.row("cuda-windowed-s1", fps=32.0, hostLoadCollected=[True])]
+        line = self.table(rows, cells).splitlines()[2]
+        self.assertIn("| 1/5 | 12.00 (12.00-12.00) |", line, "only the collected quiet row is in the median")
+
     def test_a_cell_with_no_measurement_shows_dashes_and_its_outcome(self) -> None:
         cells = [{"cellId": "cpu-windowed-s1", "backend": "cpu", "displayMode": "windowed", "scaleFactor": 1}]
         line = self.table([self.row("cpu-windowed-s1", outcome="INVALID", fps=None, presentedFps=None, timelineFpsAfterFirstPresent=None, renderWorkMs=None, dualIsoMs=None)], cells).splitlines()[2]
         self.assertIn("| 0/1 | - | - | - | - | INVALID x1 |", line)
         self.assertIn("| cpu | windowed / windowed |", line)
+
+
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: a quiet, collected host (the smoke result's hostLoad block), and the 2026-11-21 a134532e CimException shape.
+MATRIX_QUIET_HOSTLOAD = {"before": {"collected": True}, "after": {"collected": True}, "state": "quiet", "provisional": False, "reason": "peak 18% <= 75%"}
+MATRIX_CIM_HOSTLOAD = {"before": {"collected": False, "error": "collection failed: CimException"}, "after": {"collected": False, "error": "collection failed: CimException"},
+                       "state": "unknown", "provisional": True, "reason": "Host load telemetry could not be collected"}
 
 
 @requires_windows_pwsh
@@ -6475,8 +6586,9 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
     def setUp(self) -> None:
         self.make_harness()
 
-    def cell_artifacts(self, cell: str, placement: str, fps: float) -> str:
-        """Write one cell's run artifacts (its own app log: the placement the app ran in, the scale it rendered at, the four rates) and return the agent-side path."""
+    def cell_artifacts(self, cell: str, placement: str, fps: float, host_load: dict | None = None) -> str:
+        """Write one cell's run artifacts (its own app log: the placement the app ran in, the scale it rendered at, the four rates) and return the agent-side path.
+        `host_load`: the smoke result's hostLoad block (default a quiet, collected host: VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3, an unknown leg is never measured)."""
         _, mode, scale = cell.split("-")
         eff = int(scale[1:])   # the CUDA texture route renders at the requested 1, 2 or 4 (PLAYBACK-CUDA-HONOUR-SCALE-1)
         name = f"{cell}.artifacts"
@@ -6487,19 +6599,23 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
                                  line={"scale_request_last": eff, "scale_active_last": eff, "presented_fps": fps, "avg_render_work_ms": 28.5},
                                  extra_log_lines=[placement,
                                                   "playback_smoke.pace_summary session=3 first_present_ms=1000.000 paced_elapsed_ms=30000.000 timeline_fps_after_first_present=19.40 presented_fps_after_first_present=12.5 pace_fps=23.976 first_present_catchup_frames=0",
-                                                  "playback_smoke.cpu_summary session=3 avg_llrawproc_total_ms=26.000 avg_llrawproc_dual_iso_ms=25.5 avg_processing_ms=5.000"])
+                                                  "playback_smoke.cpu_summary session=3 avg_llrawproc_total_ms=26.000 avg_llrawproc_dual_iso_ms=25.5 avg_processing_ms=5.000"],
+                                 host_load=host_load if host_load is not None else MATRIX_QUIET_HOSTLOAD)
             self.stamp_identity("ultra-magnus", self.build_sha)
         finally:
             self.artifacts = saved
         return f"X:\\stub\\agent\\outbox\\{name}"
 
-    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str], dv: Path = DV, native_error_pref: bool = False):
-        """`native_error_pref`: run the script IN a session that has $PSNativeCommandUseErrorActionPreference = $true (a caller's preference the matrix walk inherits)."""
+    def run_matrix(self, repeats: int, extra: list[str], placements: dict[str, str], dv: Path = DV, native_error_pref: bool = False,
+                   host_loads: dict[str, dict] | None = None):
+        """`native_error_pref`: run the script IN a session that has $PSNativeCommandUseErrorActionPreference = $true (a caller's preference the matrix walk inherits).
+        `host_loads`: a cell's smoke hostLoad block (default quiet)."""
         by_leg = {}
         for cell in (c for c in MATRIX_CELLS if c.startswith("cuda-")):
             _, mode, scale = cell.split("-")
             placement = placements.get(cell, WINDOWED_PLACEMENT if mode == "windowed" else FULLSCREEN_PLACEMENT)
-            by_leg[f"display-{mode}-{scale}-ultra-magnus-cuda"] = self.cell_artifacts(cell, placement, 12.0 + (0.5 if mode == "windowed" else 0.0) + 0.1 * int(scale[1:]))
+            by_leg[f"display-{mode}-{scale}-ultra-magnus-cuda"] = self.cell_artifacts(cell, placement, 12.0 + (0.5 if mode == "windowed" else 0.0) + 0.1 * int(scale[1:]),
+                                                                                     host_load=(host_loads or {}).get(cell))
         cfg = {"log": str(self.log), "genLog": str(self.gen_log), "probe": HEALTHY_PROBE, "mainMode": "capture", "healthMode": "ok", "artifactsByLeg": by_leg,
                "artifactsAgentPath": "X:\\stub\\agent\\outbox\\unused.artifacts", "genRefusal": None, "clipContentSha256": CLIP_CONTENT_SHA, "token": None, "exitCode": 0}
         self.stub_cfg.write_text(json.dumps(cfg), encoding="utf-8")
@@ -6572,6 +6688,36 @@ class DisplayMatrixRunTests(EvidenceFactory, unittest.TestCase):
         row = json.loads(out.stdout)
         self.assertIsNone(row["presentedFps"], "a log that does not hash to the receipt is no measurement")
         self.assertIn("does not hash to the receipt", row["note"])
+
+    def test_hostload_r3_a_cim_failed_leg_is_shown_and_never_measured_and_quiet_legs_still_count(self) -> None:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1, its literal): the a134532e shape (a PASS leg whose hash-bound smoke result says before/after
+        collected=false CimException) was counted as a measurement and the matrix row carried no host-load field. It is now recorded (hostLoadState unknown,
+        hostLoadProvisional true, a REFERENCE_PROVISIONAL line, the per-leg host-load table) and never measured; the quiet legs still count."""
+        cim_cell = "cuda-fullscreen-s1"
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {}, host_loads={cim_cell: MATRIX_CIM_HOSTLOAD})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        refusals = [l for l in proc.stdout.splitlines() if l.startswith("REFERENCE_PROVISIONAL ")]
+        self.assertEqual(len(refusals), 1, proc.stdout)
+        self.assertIn("reason=hostload-unknown", refusals[0])
+        summary = Path(re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip())
+        text = summary.read_text(encoding="utf-8")
+        self.assertIn("= 6 leg(s), 5 measured.", text, "the provisional leg is not a measurement")
+        cim_row = next(l for l in text.splitlines() if l.startswith(f"| {cim_cell} "))
+        self.assertIn("| 0/1 | - |", cim_row, "the provisional leg ran, shows no median and is not counted")
+        self.assertIn(f"| {cim_cell} | PASS | unknown | true | no |", text, "the per-leg table shows its host-load state and provisional")
+        self.assertEqual(text.count("| quiet | false | yes |"), 5, "every quiet leg is shown and counted")
+        rows = json.loads((summary.parent / "summary.json").read_text(encoding="utf-8"))["rows"]
+        got = {r["cellId"]: (r["hostLoadState"], r["hostLoadProvisional"]) for r in rows}
+        self.assertEqual(got[cim_cell], ("unknown", True))
+        self.assertEqual({v for k, v in got.items() if k != cim_cell}, {("quiet", False)})
+
+    def test_hostload_r3_a_leg_whose_smoke_result_has_an_empty_hostload_block_is_unknown_and_never_measured(self) -> None:
+        """Row (d) on the matrix route: a hostLoad block with no collected snapshot and no state is 'unknown', never quiet."""
+        proc = self.run_matrix(1, ["-Backend", "cuda"], {}, host_loads={"cuda-windowed-s4": {}})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        text = Path(re.search(r"DVE_MATRIX_SUMMARY=(.+)", proc.stdout).group(1).strip()).read_text(encoding="utf-8")
+        self.assertIn("= 6 leg(s), 5 measured.", text)
+        self.assertIn("| cuda-windowed-s4 | PASS | unknown | true | no |", text)
 
     def run_swapped_matrix(self, source_name: str, native_error_pref: bool = False):
         """A cuda matrix run in a COPY of the runner tree (the swap must never touch the checked-in specs) whose first leg's generator stub overwrites the spec of plan entry 2
@@ -22108,7 +22254,7 @@ class DriftLegSpecTests(unittest.TestCase):
                                       "  $entry = [pscustomobject]@{ seq = 1; repeat = 1; cellId = 'cuda-fullscreen-s1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1; legId = [string]$c.leg }\n"
                                       "  $dir = $(if ($c.log) { $env:DVE_EV } else { Join-Path $env:DVE_EV 'absent' })\n"
                                       "  $r = [pscustomobject]@{ outcome = [string]$c.outcome; receiptId = 'rid'; legId = [string]$c.leg; evidence = [pscustomobject]@{ localEvidenceDir = $dir; logSha256 = $env:DVE_SHA } }\n"
-                                      "  Get-DvMatrixRow -PlanEntry $entry -Receipt $r }\n"
+                                      "  Get-DvMatrixRow -PlanEntry $entry -Receipt $r -HostLoad ([pscustomobject]@{ state = 'quiet'; provisional = $false; collected = $true }) }\n"
                                       "$cells = @([pscustomobject]@{ cellId = 'cuda-fullscreen-s1'; backend = 'cuda'; displayMode = 'fullscreen'; scaleFactor = 1 })\n"
                                       "$t = ConvertTo-DvMatrixTable -Rows @($rows) -Cells $cells\n"
                                       "[ordered]@{ header = (Get-DvMatrixMeasuredCount -Rows @($rows)); table = $t } | ConvertTo-Json -Compress",
