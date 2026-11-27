@@ -5245,9 +5245,9 @@ function Wait-AttrCudaProcessTreeGone {
     # that is not ONE finite number (nothing, $null, a string, NaN, a throw, two values) is a spent bound ('clock-unreadable'), and every read is held to this body's own stopwatch: a caller clock
     # started before this call can never read less than it, so the larger of the two changes nothing for a real clock and a clock that stands still cannot hold the wait open ('clock-not-advancing').
     $clockSeen = @{ unreadable = $false; ownWon = $false }
-    $elapsedMs = { $own = $ownStopwatch.Elapsed.TotalMilliseconds; if ($null -eq $Clock) { return $own }; $read = @(try { & $Clock } catch { $clockSeen.unreadable = $true }); $v = $(if ($read.Count -eq 1) { $read[0] } else { $null })
-        if (-not ($v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [single] -or $v -is [decimal]) -or [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { $clockSeen.unreadable = $true; return 1e15 }
-        $clockSeen.ownWon = ($own -gt [double]$v); [Math]::Max([double]$v, $own) }
+    $elapsedMs = { $own = $ownStopwatch.Elapsed.TotalMilliseconds; if ($null -eq $Clock) { return $own }; $read = @(try { & $Clock } catch { $clockSeen['unreadable'] = $true }); $v = $(if ($read.Count -eq 1) { $read[0] } else { $null })
+        if (-not ($v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [single] -or $v -is [decimal]) -or [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { $clockSeen['unreadable'] = $true; return 1e15 }
+        $clockSeen['ownWon'] = ($own -gt [double]$v); [Math]::Max([double]$v, $own) }
     # r3 fix 2 (adversary A2 advisory on 6b788356): every snapshot field is read through PSObject.Properties, so a snapshot missing one (under strict mode) is an
     # unknown tree, never a throw. r5b fix (adversary A4 on 2420b65f): a property getter that throws is read inside the same guard.
     $snapProps = $null
@@ -5395,7 +5395,7 @@ function Wait-AttrCudaProcessTreeGone {
         if ($sleepMs -gt 0) { Start-Sleep -Milliseconds ([int]$sleepMs) }
     }
     # r5 (sol r4 B2): a bound that ended on an unusable caller clock, or on this body's own stopwatch because the caller's clock stood still, is typed as such (still unconfirmed)
-    if ($clockSeen.unreadable) { $lastError = 'clock-unreadable' } elseif ($clockSeen.ownWon -and $lastError -ne 'scan-ended-past-the-bound') { $lastError = 'clock-not-advancing' }
+    if ($clockSeen['unreadable']) { $lastError = 'clock-unreadable' } elseif ($clockSeen['ownWon'] -and $lastError -ne 'scan-ended-past-the-bound') { $lastError = 'clock-not-advancing' }
     [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = $lastError }
 }
 
