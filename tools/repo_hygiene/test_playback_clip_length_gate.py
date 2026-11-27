@@ -216,27 +216,54 @@ class ClipLengthGateTests(_TmpCase):
             write_synthetic_mlv(self.tmp / (name + suffix), 400, file_num=num, file_count=count, guid=part_guid)
         return first
 
+    # The name the app probes for part n: the first part's path with its LAST TWO characters replaced by the two-digit
+    # number (load_all_chunks: strcpy(&filename[strlen(filename) - 2], seq_name)), so it keeps the first part's own case.
+    # MLV_EXTENSION is lower case, so the probed names here end ".m00", ".m01" ... and hold on a case-sensitive file system.
+    @staticmethod
+    def _probed(n: int) -> str:
+        return MLV_EXTENSION[:-2] + f"{n:02d}"
+
+    def _case_insensitive_tmp(self) -> bool:
+        probe = self.tmp / "case-probe-lower"
+        probe.write_bytes(b"")
+        try:
+            return (self.tmp / "CASE-PROBE-LOWER").exists()
+        finally:
+            probe.unlink()
+
     def test_g1_an_under_declaring_first_part_still_counts_the_probed_m00(self) -> None:
-        verdict = _gate(self._span("g1", 1, {".M00": (1, 1, 0x5A5A0001)}), 24)
+        verdict = _gate(self._span("g1", 1, {self._probed(0): (1, 1, 0x5A5A0001)}), 24)
         self.assertEqual(verdict["verdict"], "OK", verdict)
         self.assertEqual(verdict["frames"], 800, verdict)
 
     def test_g2_a_zero_file_count_header_still_counts_the_probed_m00(self) -> None:
-        verdict = _gate(self._span("g2", 0, {".M00": (1, 0, 0x5A5A0001)}), 24)
+        verdict = _gate(self._span("g2", 0, {self._probed(0): (1, 0, 0x5A5A0001)}), 24)
         self.assertEqual(verdict["frames"], 800, verdict)
 
     def test_g3_a_probed_part_from_another_recording_fails_closed(self) -> None:
-        verdict = _gate(self._span("g3", 1, {".M00": (1, 1, 0x5A5A0002)}), 24)
+        verdict = _gate(self._span("g3", 1, {self._probed(0): (1, 1, 0x5A5A0002)}), 24)
         self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
         self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_mismatch)")
 
     def test_g4_a_gap_ends_the_probed_set_as_it_does_in_the_app(self) -> None:
-        verdict = _gate(self._span("g4", 1, {".M00": (1, 1, 0x5A5A0001), ".M02": (3, 1, 0x5A5A0001)}), 24)
+        verdict = _gate(self._span("g4", 1, {self._probed(0): (1, 1, 0x5A5A0001), self._probed(2): (3, 1, 0x5A5A0001)}), 24)
         self.assertEqual(verdict["frames"], 800, verdict)
 
-    def test_g5_a_lower_case_m00_sibling_is_probed(self) -> None:
-        verdict = _gate(self._span("g5", 1, {".m00": (1, 1, 0x5A5A0001)}), 24)
-        self.assertEqual(verdict["frames"], 800, verdict)
+    def test_g5_a_sibling_in_the_other_case_counts_only_where_the_app_can_open_it(self) -> None:
+        # adversary e8eeaee1 A1: the app opens the probed NAME, so a sibling whose extension differs in case from the first
+        # part's is a part only on a case-insensitive volume (the venues' NTFS). On a case-sensitive one (the ubuntu CI shard)
+        # fopen misses it and the app plays the first part alone.
+        other_case = self._probed(0).swapcase()
+        verdict = _gate(self._span("g5", 1, {other_case: (1, 1, 0x5A5A0001)}), 24)
+        self.assertEqual(verdict["frames"], 800 if self._case_insensitive_tmp() else 400, verdict)
+
+    def test_g7_a_sibling_whose_base_differs_in_case_counts_only_where_the_app_can_open_it(self) -> None:
+        # The same rule from the base-name side: on a case-insensitive volume fopen("g7" + probed) opens "G7" + probed, so the
+        # app plays it and the count must include it; on a case-sensitive volume it does not exist for the app.
+        first = write_synthetic_mlv(self.tmp / ("g7" + MLV_EXTENSION), 400, file_num=0, file_count=1, guid=0x5A5A0001)
+        write_synthetic_mlv(self.tmp / ("G7" + self._probed(0)), 400, file_num=1, file_count=1, guid=0x5A5A0001)
+        verdict = _gate(first, 24)
+        self.assertEqual(verdict["frames"], 800 if self._case_insensitive_tmp() else 400, verdict)
 
     def test_g6_a_declared_three_part_set_with_a_gap_is_incomplete(self) -> None:
         verdict = _gate(self._span("g6", 3, {".M00": (1, 3, 0x5A5A0001), ".M02": (2, 3, 0x5A5A0001)}), 24)
@@ -844,6 +871,9 @@ OVERRUN_CASES = [
     ("O8 a real wrap", dict(_OVERRUN_F1, wrapped=1, wrap_count=1), 25, False, True, 2859, True, True, True),
     ("O9 launch-only probe", dict(_OVERRUN_BASE, presented_frames=0, last_presented_frame=0, source_advanced=0,
                                   required_source_frames=0), 25, True, True, 2859, False, False, False),
+    # adversary e8eeaee1 A2: a counter far outside any real Play (9e15) is still an overrun, never a silent pass.
+    ("O10 a counter of 9e15", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9000000000000000),
+     25, False, True, 1200, True, True, False),
 ]
 
 
