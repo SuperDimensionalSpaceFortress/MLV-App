@@ -4345,8 +4345,7 @@ function Resolve-AttrCudaSmokeRunLog {
     $evidenceNode = $result.PSObject.Properties['evidence']
     if ($null -ne $evidenceNode -and $null -ne $evidenceNode.Value) {
         $nonceProperty = $evidenceNode.Value.PSObject.Properties['runNonce']
-        # R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A10 sibling on 560c9642): the launcher writes runNonce as a JSON string; a number is no nonce, never cast
-        if ($null -ne $nonceProperty -and $nonceProperty.Value -is [string]) { $runNonce = [string]$nonceProperty.Value }
+        if ($null -ne $nonceProperty) { $runNonce = [string]$nonceProperty.Value }
         $snapshotProperty = $evidenceNode.Value.PSObject.Properties['runLogSnapshot']
         if ($null -ne $snapshotProperty -and $null -ne $snapshotProperty.Value) {
             $shaProperty = $snapshotProperty.Value.PSObject.Properties['sha256']
