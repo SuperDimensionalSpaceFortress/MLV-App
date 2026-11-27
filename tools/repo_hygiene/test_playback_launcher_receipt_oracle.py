@@ -852,6 +852,21 @@ class CounterWritePinTests(unittest.TestCase):
             ("A2: the conform line's member rewritten", "void MainWindow::finishPlaybackSmokeTelemetry(",
              "#define highWater highWater += 1500"),
         )
+        # r3 fix iteration 2 (adversary A1 on 60e25099): the same macro re-spelled -- a digraph, a trigraph, a line splice (with and without
+        # trailing blanks, in the directive word and in the name), a block comment between `#` and `define`, across a line
+        landing = "pacedMeasuredHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)"
+        adversary += tuple(
+            (f"fix2: {name}", "void MainWindow::playbackHandling(", define) for name, define in (
+                ("the digraph", "%:define " + landing),
+                ("the digraph, spaced", "  %:  define " + landing),
+                ("the trigraph", "??=define " + landing),
+                ("a splice in the directive word", "#de\\\nfine " + landing),
+                ("a splice with trailing blanks", "#de\\  \r\nfine " + landing),
+                ("a splice in the name", "#define pacedMeasured\\\nHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)"),
+                ("a splice after the hash", "#\\\ndefine " + landing),
+                ("a block comment between", "#/* x */define " + landing),
+                ("a block comment across a line", "#/*\n*/define " + landing),
+                ("the digraph over the conform line's member", "%:define highWater highWater += 1500")))
         for name, anchor, define in adversary:
             with self.subTest(name):
                 self.assertIn(anchor, self.sources[self.MAIN_WINDOW])

@@ -1115,11 +1115,21 @@ COUNTER_MACRO_IDENTIFIERS = frozenset({
     "pacedMeasuredHoldLanding", "sourcePositionBeforeDropTick", "dropFrameTick", "verdict", "requiredFrames"})
 
 
+# r3 fix iteration 2 (adversary A1 on 60e25099): the digraph `%:define` and a line-spliced `#de\<nl>fine` re-spelled that macro past
+# _DEFINE. Fail-closed on the spelling, the way the key table's rule is: the text is read as translation phases 1-2 read it (the
+# trigraph `??=` and the digraph `%:` are `#`, a backslash-newline splice -- trailing blanks allowed, as GCC allows them -- joins the
+# lines), comments and literals are blanked, and then the word `define` followed by a protected name ANYWHERE fails -- with or
+# without a `#`, across any whitespace (a block comment between `#` and `define` blanks to whitespace, newlines included).
+_COUNTER_RESPELL_SPLICE = re.compile(r"\\[ \t\f\v]*\r?\n")
+_COUNTER_DEFINE_ANYWHERE = re.compile(r"(?<!\w)define\s+([A-Za-z_]\w*)")
+
+
 def _scan_counter_macros(sources: dict[str, str], main_blank: str) -> list[str]:
     problems: list[str] = []
     for path, text in sources.items():
-        blank = main_blank if path == "platform/qt/MainWindow.cpp" else strip_cpp(text)[0]
-        for match in _DEFINE.finditer(blank):
+        normalised = _COUNTER_RESPELL_SPLICE.sub("", text.replace("??=", "#").replace("%:", "#"))
+        blank = main_blank if path == "platform/qt/MainWindow.cpp" and normalised == text else strip_cpp(normalised)[0]
+        for match in _COUNTER_DEFINE_ANYWHERE.finditer(blank):
             if match.group(1) in COUNTER_MACRO_IDENTIFIERS:
                 problems.append(f"{path}:{_line_of(blank, match.start())}: #define of {match.group(1)}, a token the source-frame "
                                 "counter's pinned reads and writes rely on")
