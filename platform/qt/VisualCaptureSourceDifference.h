@@ -98,7 +98,12 @@ inline bool isSourceBoundCaptureKind( const QString &kind )
 constexpr qint64 kCaptureStartMarginMs = 1;
 inline bool captureMayStartBeforeCutoff( qint64 nowMs, qint64 reserveMs, qint64 cutoffMs )
 {
-    return cutoffMs < 0 || nowMs + reserveMs + kCaptureStartMarginMs < cutoffMs;
+    // r4 (sol A13 on 560c9642): never forms nowMs + reserveMs + margin, which overflows qint64 for a large nowMs; a negative read or reserve
+    // refuses (a tail clock read is never negative). With cutoffMs >= 0, cutoffMs - kCaptureStartMarginMs cannot overflow.
+    if( cutoffMs < 0 ) return true;
+    if( nowMs < 0 || reserveMs < 0 ) return false;
+    const qint64 room = cutoffMs - kCaptureStartMarginMs;   // the start must be strictly before cutoff - margin
+    return nowMs < room && reserveMs < room - nowMs;
 }
 
 /* A frame's source_id in visual.json: 16 lowercase hex digits, zero-padded. */

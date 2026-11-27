@@ -1453,6 +1453,7 @@ function Get-DvVisualCaptureBeginRecord {
     #>
     param([AllowNull()][AllowEmptyString()][string]$LogText)
     $begin = [System.Collections.Generic.List[string]]::new()
+    $burstEnd = [System.Collections.Generic.List[string]]::new()
     $clipChanged = 0L
     $tailDrops = 0L
     if (-not [string]::IsNullOrEmpty($LogText)) {
@@ -1462,7 +1463,12 @@ function Get-DvVisualCaptureBeginRecord {
         foreach ($line in $bodies) {
             if ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture\.begin(\s|$)'), $script:DvCi)) { $begin.Add([string]$line) }
             elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture\.clip_changed(\s|$)'), $script:DvCi)) { $clipChanged++ }
-            elseif ($begin.Count -gt 0 -and [regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=playback_prep\.invalidate_generation(\s|$)'), $script:DvCi)) {
+            elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture\.burst_end(\s|$)'), $script:DvCi)) {
+                # R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A1 + A2 on 560c9642): the burst's end. Its counter deltas are written with tracing off too, and only the
+                # invalidations between the begin record and it can have replaced what a burst capture shows (the normal play-stop one comes after it)
+                if ($begin.Count -gt 0) { $burstEnd.Add([string]$line) } else { $burstEnd.Add('') }
+            }
+            elseif ($begin.Count -gt 0 -and $burstEnd.Count -eq 0 -and [regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=playback_prep\.invalidate_generation(\s|$)'), $script:DvCi)) {
                 # r4 adversary fix 2 (A7 on b6c53917): a prepared result dropped AFTER the measured close (a resize during the tail) is logged after the summary,
                 # so its counters never reach the summary's prep_* fields; any such drop (or an unreadable count) after the begin record refuses the credit.
                 # R5-RESIDUE-1 adversary A1 (on 4de735e6): EVERY invalidation after the begin record counts, whatever its dropped_* fields say: a task the
@@ -1476,7 +1482,23 @@ function Get-DvVisualCaptureBeginRecord {
         $read = ConvertFrom-DvRecordKeyValues -Record $begin[0]
         if (@($read.conflicts).Count -eq 0) {
             $s = [string]$read.fields['measured_session']; $u = [string]$read.fields['tail_begin_utc']
-            if ($s -cmatch '^[0-9]+$' -and $u -ne '') { $session = $s; $utc = $u }
+            # r4 (sol A9 on 560c9642): tail_begin_utc must be the app's own UTC text (Qt::ISODateWithMs), never any non-empty token
+            if ($s -cmatch '^[0-9]+\z' -and (Test-DvTailUtcText $u)) { $session = $s; $utc = $u }
+        }
+    }
+    # r4 (sol A1 + A2 on 560c9642): exactly one readable burst_end record after the begin record, naming the same session, with every counter delta a
+    # decimal 0; otherwise the drops are unknown ($null), and the credit is refused. A delta adds to the traced invalidation count.
+    if ($null -eq $session -or $burstEnd.Count -ne 1 -or $burstEnd[0] -eq '' -or $burstEnd[0].IndexOf($script:DvQuotedEqualsMask) -ge 0 -or
+        $burstEnd[0].EndsWith($script:DvLocationUnreadable, [StringComparison]::Ordinal)) { $tailDrops = $null }
+    else {
+        $endRead = ConvertFrom-DvRecordKeyValues -Record $burstEnd[0]
+        if (@($endRead.conflicts).Count -ne 0 -or -not [string]::Equals([string]$endRead.fields['measured_session'], $session, [StringComparison]::Ordinal)) { $tailDrops = $null }
+        else {
+            foreach ($k in 'generation_changes', 'stale_drops', 'generation_drops', 'replaced_before', 'replaced_after') {
+                $v = [string]$endRead.fields[$k]
+                if ($v -cnotmatch '^[0-9]{1,18}\z') { $tailDrops = $null; break }
+                $tailDrops += [int64]$v
+            }
         }
     }
     [pscustomobject]@{ session = $session; tailBeginUtc = $utc; clipChanged = $clipChanged; tailPrepDrops = $tailDrops }
@@ -1573,7 +1595,8 @@ function Get-DvPlaybackEvidence {
         fpsOverride = (ConvertTo-DvInt64 $f['fps_override'])
         wrapped = $(if ($null -eq $wrappedField) { $null } else { $wrappedField -ne 0 })
         wrapCount = (ConvertTo-DvInt64 $f['wrap_count'])
-        expectedRunNonce = $(if ($null -ne (Get-DvProp $evidence 'runNonce')) { [string](Get-DvProp $evidence 'runNonce') } else { $null })
+        # R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A10 on 560c9642): the launcher writes runNonce as a JSON string; a number (or anything else) is no nonce, never cast
+        expectedRunNonce = $(if ((Get-DvProp $evidence 'runNonce') -is [string]) { [string](Get-DvProp $evidence 'runNonce') } else { $null })
         observedRunNonce = $(if ($f.ContainsKey('run_nonce')) { [string]$f['run_nonce'] } else { $null })
         manifestRunNonce = $(if ($null -ne (Get-DvProp $manifestLog 'runNonce')) { [string](Get-DvProp $manifestLog 'runNonce') } else { $null })
         logSha256 = $(if ([string]::IsNullOrEmpty($LogSha256)) { $null } else { $LogSha256 })
@@ -4136,6 +4159,15 @@ function Get-DvVisualCaptureRequest {
     [pscustomobject]@{ applies = $applies; requested = $applies; optOutReason = $null }
 }
 
+function Test-DvTailUtcText($Value) {
+    # R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A9 on 560c9642): a readable UTC instant in ISO form ending in Z (the app's Qt::ISODateWithMs, or the 'o' round-trip
+    # ConvertTo-DvVisualUtcText writes), never a raw token ConvertTo-DvVisualUtcText handed back unparsed. Pure; never throws.
+    if ($Value -isnot [string] -or $Value -cnotmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,7})?Z\z') { return $false }
+    $parsed = [datetime]::MinValue
+    return [datetime]::TryParseExact($Value, 'yyyy-MM-ddTHH:mm:ss.FFFFFFFZ', [Globalization.CultureInfo]::InvariantCulture,
+                                     [Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)
+}
+
 function ConvertTo-DvVisualUtcText($Value) {
     # ConvertFrom-Json turns an ISO date string into a DateTime on some pwsh versions and leaves it a string on others: one round-trip UTC text either way.
     if ($null -eq $Value -or [string]::IsNullOrWhiteSpace([string]$Value)) { return $null }
@@ -4763,8 +4795,13 @@ function Read-DvVisualCaptures {
         $kind = [string](Get-DvProp $f 'kind'); $index = [int](Get-DvProp $f 'index'); $file = [string](Get-DvProp $f 'file')
         # R4-RESIDUE-1: play_first_unbound (the unforced burst before the first forced paint) is collected and hashed like the play kinds; the frozen check
         # below judges play_unbound (or play) only, so these rows never enter it
-        if ($kind -cnotin @('play', 'play_unbound', 'play_first_unbound', 'stop_unbound', 'stop', 'paused_unbound', 'paused') -or $file -cnotmatch '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$') { continue }
-        $isPlayKind = $kind -cin @('play', 'play_unbound', 'play_first_unbound')
+        # R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A5 on 560c9642): kind and file were checked independently, so a play_unbound row naming play-first-unbound-0.png
+        # copied burst pixels under a late-play name into the frozen check. The file must now be the kind's OWN name (MainWindow.cpp: `<kind-stem>-<index>.png`
+        # for a play kind, `<kind-stem>.png` otherwise), compared ordinally, as must the kind (a culture compare ignores a NUL, sol A6)
+        if (@(@('play', 'play_unbound', 'play_first_unbound', 'stop_unbound', 'stop', 'paused_unbound', 'paused') | Where-Object { [string]::Equals($kind, $_, [StringComparison]::Ordinal) }).Count -ne 1) { continue }
+        $isPlayKind = @(@('play', 'play_unbound', 'play_first_unbound') | Where-Object { [string]::Equals($kind, $_, [StringComparison]::Ordinal) }).Count -eq 1
+        $ownFile = $(if ($isPlayKind) { "$($kind.Replace('_', '-'))-$index.png" } else { "$($kind.Replace('_', '-')).png" })
+        if ($index -lt 0 -or -not [string]::Equals($file, $ownFile, [StringComparison]::Ordinal)) { continue }
         $legName = $(if ($isPlayKind) { "$LegId-$($kind.Replace('_', '-'))-$index.png" } else { "$LegId-$($kind.Replace('_', '-')).png" })
         $entry = [ordered]@{ kind = $kind; index = $index; file = $legName; sha256 = $null; contentHash = $null; viewportMean = $null; viewportStd = $null; viewportAvailable = $true
                              exposureLumaMean = $null; exposureNearBlackFraction = $null; exposureClippedFraction = $null; exposureLetterboxRowsDropped = $null
@@ -7737,9 +7774,10 @@ function Get-DvTailVisualEvidence {
         $app = ConvertFrom-DvStrictJsonBytes -Bytes $jsonBytes
         if ($null -eq $app) { return $null }
         $schema = Get-DvProp $app 'schema'
-        if ($schema -isnot [string] -or $schema -cne 'mlv-app/visual-capture/v1') { return $null }
+        # r4 (sol A6 on 560c9642): ordinal and by length; -cne / -ne are culture compares that equate "...v1\u0000" with the schema and "\u0000" with ''
+        if ($schema -isnot [string] -or -not [string]::Equals($schema, 'mlv-app/visual-capture/v1', [StringComparison]::Ordinal)) { return $null }
         $appError = Get-DvProp $app 'error'
-        if ($appError -isnot [string] -or $appError -ne '') { return $null }
+        if ($appError -isnot [string] -or $appError.Length -ne 0) { return $null }
         $session = Get-DvProp $app 'measured_session'
         if (-not (($session -is [int]) -or ($session -is [long]))) { return $null }
         $sessionNumber = [int64]$session
@@ -7778,8 +7816,12 @@ function Get-DvTailVisualEvidence {
             $tailOk = ($tail -is [int] -or $tail -is [long] -or $tail -is [double]) -and -not [double]::IsNaN([double]$tail) -and -not [double]::IsInfinity([double]$tail) -and [double]$tail -ge 0
             $png = Join-Path $dir "$LegId-$($kind.Replace('_', '-'))-$index.png"
             $pngSha = $null
-            # r4 adversary fix 2 (A3 on b6c53917): only an unforced play PNG can supply credit, so only it is read (a locked forced play PNG is no tail evidence I/O)
-            if ($isUnforcedPlay -and (($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
+            # r4 adversary fix 2 (A3 on b6c53917): only an unforced play PNG can supply credit, so only it is read (a locked forced play PNG is no tail evidence I/O).
+            # R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A8 on 560c9642): and only when no forced paint preceded it (forced_paints_before = JSON integer 0): a late
+            # play_unbound PNG after six forced paints can never be credited, so a lock on it is no tail evidence I/O either
+            $forcedRaw = Get-DvProp $row 'forced_paints_before'
+            $mayCredit = (($forcedRaw -is [int]) -or ($forcedRaw -is [long])) -and [int64]$forcedRaw -eq 0
+            if ($isUnforcedPlay -and $mayCredit -and (($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
                 try { $pngBytes = [IO.File]::ReadAllBytes($png) } catch { return (& $unreadable $png $_) }   # r4 (A7): typed, never $null
                 $recordedSha = $null
                 [void]$recorded.TryGetValue("$kind|$([int64]$index)", [ref]$recordedSha)
@@ -7864,7 +7906,7 @@ function Get-DvTailInFlightCredit {
     $refusedWhy = [string](Get-DvProp $Visual 'refused')
     if ($refusedWhy -ne '') { return (& $no $refusedWhy) }   # r4 (A3, A7): a typed refusal of the whole tail
     $summarySession = $(if ($null -ne $Playback) { [string](Get-DvProp $Playback 'summarySession') } else { '' })
-    if ($summarySession -eq '' -or [string](Get-DvProp $Visual 'measuredSession') -cne $summarySession) { return (& $no "the visual capture is of another session (measured_session=$([string](Get-DvProp $Visual 'measuredSession'))), not the measured session $summarySession") }
+    if ($summarySession -cnotmatch '^[0-9]+\z' -or -not [string]::Equals([string](Get-DvProp $Visual 'measuredSession'), $summarySession, [StringComparison]::Ordinal)) { return (& $no "the visual capture is of another session (measured_session=$([string](Get-DvProp $Visual 'measuredSession'))), not the measured session $summarySession") }
     # R4-RESIDUE-1 (r4 pass-5 A8): the tail is THIS run's by its launcher nonce. A session number and a millisecond tail_begin_utc can repeat across runs and
     # hosts, so another run's genuine visual.json, collected into this run's evidence, matched them; the app now writes MLVAPP_RUN_NONCE into visual.json and it
     # must equal, ordinally, BOTH the nonce the launcher generated (result.json) and the one the app echoed on its summary line (each itself well-formed)
@@ -7884,7 +7926,10 @@ function Get-DvTailInFlightCredit {
     # (both sides as one round-trip UTC text: ConvertFrom-Json turns an ISO string into a DateTime on some pwsh versions, ConvertTo-DvVisualUtcText)
     $beginUtc = [string]$(if ($null -ne $Playback) { ConvertTo-DvVisualUtcText (Get-DvProp $Playback 'visualCaptureBeginUtc') } else { '' })
     $visualBeginUtc = [string](Get-DvProp $Visual 'tailBeginUtc')
-    if ($beginSession -cne $summarySession -or $beginUtc -eq '' -or -not [string]::Equals($beginUtc, $visualBeginUtc, [StringComparison]::Ordinal)) {
+    # r4 (sol A9 on 560c9642): ConvertTo-DvVisualUtcText hands an unparsable token back unchanged, so two equal unreadable tokens compared equal; both sides
+    # must now be readable UTC text. (A6): the session compare is ordinal (a culture compare ignores a NUL).
+    if (-not [string]::Equals($beginSession, $summarySession, [StringComparison]::Ordinal) -or -not (Test-DvTailUtcText $beginUtc) -or -not (Test-DvTailUtcText $visualBeginUtc) -or
+        -not [string]::Equals($beginUtc, $visualBeginUtc, [StringComparison]::Ordinal)) {
         return (& $no "TAIL_VISUAL_NOT_THIS_RUN: the hashed run log's gui_smoke.visual_capture.begin record (session=$beginSession tail_begin_utc=$beginUtc) does not bind visual.json's tail_begin_utc=$visualBeginUtc to the measured session $summarySession, so the tail may be another run's")
     }
     $clipChanged = $(if ($null -ne $Playback) { ConvertTo-DvInt64 (Get-DvProp $Playback 'visualCaptureClipChanged') } else { $null })
@@ -7910,7 +7955,8 @@ function Get-DvTailInFlightCredit {
         $unforcedKind = [string]::Equals($fKind, 'play_unbound', [StringComparison]::Ordinal) -or [string]::Equals($fKind, 'play_first_unbound', [StringComparison]::Ordinal)
         # R5-RESIDUE-1 (sol r1 B1): and its painted serial is a paint-path record (never a forced repaint's by-construction one)
         $fBasis = Get-DvProp $f 'labelBoundBasis'
-        $paintBasis = ($fBasis -is [string]) -and ($fBasis -cin $script:TailCreditPaintBases)
+        # r4 (sol A6 on 560c9642): ordinal membership; -cin is a culture compare, which ignores a NUL ("gl_window_paint\u0000" matched)
+        $paintBasis = ($fBasis -is [string]) -and (@($script:TailCreditPaintBases | Where-Object { [string]::Equals($fBasis, $_, [StringComparison]::Ordinal) }).Count -eq 1)
         if ((Get-DvProp $f 'saved') -eq $true -and (Get-DvProp $f 'playActive') -eq $true -and (Get-DvProp $f 'labelBound') -eq $true -and $paintBasis -and
             $unforcedKind -and $null -ne $forcedBefore -and [int64]$forcedBefore -eq 0 -and
             -not [string]::IsNullOrEmpty([string](Get-DvProp $f 'sourceId')) -and $null -ne (Get-DvProp $f 'serial') -and
@@ -7927,7 +7973,10 @@ function Get-DvTailInFlightCredit {
     for ($i = 1; $i -lt $byTime.Count; $i++) {
         $prev = $byTime[$i - 1]; $cur = $byTime[$i]
         if ([double](Get-DvProp $cur 'tailElapsedMs') -le [double](Get-DvProp $prev 'tailElapsedMs') -or
-            [int64](Get-DvProp $cur 'displayFrame') -lt [int64](Get-DvProp $prev 'displayFrame') -or [int64](Get-DvProp $cur 'serial') -lt [int64](Get-DvProp $prev 'serial')) {
+            [int64](Get-DvProp $cur 'displayFrame') -lt [int64](Get-DvProp $prev 'displayFrame') -or [int64](Get-DvProp $cur 'serial') -lt [int64](Get-DvProp $prev 'serial') -or
+            # r4 (sol A7 on 560c9642): the app allocates one serial per request and stamps that request's frame, so two frames on one serial are not two paints
+            ([int64](Get-DvProp $cur 'serial') -eq [int64](Get-DvProp $prev 'serial') -and [int64](Get-DvProp $cur 'displayFrame') -ne [int64](Get-DvProp $prev 'displayFrame')) -or
+            ([int64](Get-DvProp $cur 'displayFrame') -gt [int64](Get-DvProp $prev 'displayFrame') -and [int64](Get-DvProp $cur 'serial') -le [int64](Get-DvProp $prev 'serial'))) {
             return (& $no "TAIL_CREDIT_PAINT_ORDER: the qualifying captures are not in paint order (display frame $(Get-DvProp $prev 'displayFrame') serial $(Get-DvProp $prev 'serial') at $(Get-DvProp $prev 'tailElapsedMs') ms, then display frame $(Get-DvProp $cur 'displayFrame') serial $(Get-DvProp $cur 'serial') at $(Get-DvProp $cur 'tailElapsedMs') ms), so the tail may hide a backward paint and is not credited")
         }
     }

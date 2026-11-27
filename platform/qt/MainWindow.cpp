@@ -1704,9 +1704,12 @@ static bool setPlaybackDisplayRequiredExecutionState( bool required )
 static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
                                                   QWidget *viewportWidget,
                                                   QRect *viewportRectOut,
-                                                  QString *reasonOut )
+                                                  QString *reasonOut,
+                                                  const std::function<bool()> &mayStartNow = std::function<bool()>(),
+                                                  bool *startRefusedOut = nullptr )
 {
     if( viewportRectOut ) *viewportRectOut = QRect();
+    if( startRefusedOut ) *startRefusedOut = false;
 #ifdef Q_OS_WIN
     if( !topLevel )
     {
@@ -1749,6 +1752,16 @@ static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
 #ifndef PW_RENDERFULLCONTENT
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
+        // R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A3 on 560c9642): the HWND, window rectangle, DC and DIB setup above can take over a millisecond, so a
+        // start decision taken before this function (the r1-r3 gate in grabVisual) did not bound the native capture's start. The caller's
+        // predicate now reads the clock HERE, after all setup: the only statement after a true answer is the PrintWindow call itself.
+        if( mayStartNow && !mayStartNow() )
+        {
+            if( startRefusedOut ) *startRefusedOut = true;
+            if( reasonOut ) *reasonOut = QStringLiteral( "start_refused_at_cutoff" );
+        }
+        else
+        {
         const BOOL printed = PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT );
         GdiFlush();
         if( printed )
@@ -1760,6 +1773,7 @@ static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
         else if( reasonOut )
         {
             *reasonOut = QStringLiteral( "print_window_failed error=%1" ).arg( static_cast<qulonglong>( GetLastError() ) );
+        }
         }
         SelectObject( memoryDc, previous );
     }
@@ -11876,12 +11890,16 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             grab.clip = visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject );
             // R6-BURST-CUTOFF-RESIDUE-1: the clock read that decides the start is the last statement before it. r2 (luna A1 on c4d5d5f6): the capture
             // timer starts before that read, so only the branch separates the read from the PrintWindow call, and the decision keeps a 1 ms margin
-            // (kCaptureStartMarginMs) for elapsed()'s whole-millisecond truncation
+            // (kCaptureStartMarginMs) for elapsed()'s whole-millisecond truncation. r4 (sol A3 on 560c9642): the deciding read moved INTO the
+            // capture function, after its HWND / DC / DIB setup and immediately before the native PrintWindow call (mayStartNow).
             QElapsedTimer captureClock;
             captureClock.start();
-            if( visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ) )
+            bool captureStartRefused = false;
+            grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason,
+                [&]() { return visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ); },
+                &captureStartRefused );
+            if( !captureStartRefused )
             {
-                grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
                 grab.captureMs = static_cast<double>( captureClock.nsecsElapsed() ) / 1.0e6;
                 grab.capturedUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
                 visualGrabs.append( grab );
@@ -11893,6 +11911,15 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         const qulonglong visualMeasuredSession = static_cast<qulonglong>( m_playbackSmokeSessionId );
         finishPlaybackSmokeTelemetry( "visual-capture" );
         const QString visualTailBeginUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+        // R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A1 + A2 on 560c9642): the prep counters at the tail's start. The burst_end record below carries how
+        // far each moved by the burst's end, written whether or not MLVAPP_INTERACTIVE_TRACE is on (the per-invalidation record is trace-only, so
+        // with tracing off a resize that dropped and reissued the target was invisible to the runner, A2), and it ends the window the runner
+        // counts invalidations in (the normal play-stop invalidation after the burst no longer refuses a target the burst already proved, A1).
+        const quint64 visualBurstGeneration0 = static_cast<quint64>( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+        const quint64 visualBurstStaleDrops0 = static_cast<quint64>( m_playbackPrepStaleDropCount.load( std::memory_order_acquire ) );
+        const quint64 visualBurstGenerationDrops0 = static_cast<quint64>( m_playbackPrepGenerationDropCount.load( std::memory_order_acquire ) );
+        const quint64 visualBurstReplacedBefore0 = static_cast<quint64>( m_playbackPrepReplacedBeforeComputeCount.load( std::memory_order_acquire ) );
+        const quint64 visualBurstReplacedAfter0 = static_cast<quint64>( m_playbackPrepReplacedAfterComputeCount.load( std::memory_order_acquire ) );
         logInteractionEvent(
             QStringLiteral("gui_smoke.visual_capture.begin"),
             QStringLiteral("measured_session=%1 tail_ms=%2 play_frames=%3 tail_begin_utc=%4")
@@ -11946,6 +11973,16 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                     sleepGuiThreadForSmokeRunner( 2 );
                 }
             }
+            // r4 (sol A1 + A2 on 560c9642): never trace-only; the runner credits a burst capture only when every delta here is 0
+            logInteractionEvent(
+                QStringLiteral("gui_smoke.visual_capture.burst_end"),
+                QStringLiteral("measured_session=%1 burst_captures=%2 generation_changes=%3 stale_drops=%4 generation_drops=%5 replaced_before=%6 replaced_after=%7")
+                    .arg( visualMeasuredSession ).arg( visualBurstCount )
+                    .arg( static_cast<qulonglong>( static_cast<quint64>( m_playbackPresentationGeneration.load( std::memory_order_acquire ) ) - visualBurstGeneration0 ) )
+                    .arg( static_cast<qulonglong>( static_cast<quint64>( m_playbackPrepStaleDropCount.load( std::memory_order_acquire ) ) - visualBurstStaleDrops0 ) )
+                    .arg( static_cast<qulonglong>( static_cast<quint64>( m_playbackPrepGenerationDropCount.load( std::memory_order_acquire ) ) - visualBurstGenerationDrops0 ) )
+                    .arg( static_cast<qulonglong>( static_cast<quint64>( m_playbackPrepReplacedBeforeComputeCount.load( std::memory_order_acquire ) ) - visualBurstReplacedBefore0 ) )
+                    .arg( static_cast<qulonglong>( static_cast<quint64>( m_playbackPrepReplacedAfterComputeCount.load( std::memory_order_acquire ) ) - visualBurstReplacedAfter0 ) ) );
         }
 
         // (2) K forced, bound play frames evenly spaced across the FIRST half of the untimed tail (the centres of K equal
@@ -12119,7 +12156,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 viewportJson.insert( QStringLiteral("h"), savedViewport.height() );
                 frameJson.insert( QStringLiteral("viewport"), viewportJson );
                 if( saved ) ++visualFramesWritten;
-                else if( visualError.isEmpty() ) visualError = QStringLiteral( "%1 could not be written" ).arg( fileName );
+                // r4 (sol A4 on 560c9642): a burst PNG that could not be written leaves its row saved=false (no tail credit) but never latches the
+                // error, which would skip every later save, the late play_unbound evidence the frozen-display check reads included
+                else if( visualError.isEmpty() && grab.kind != QStringLiteral("play_first_unbound") )
+                    visualError = QStringLiteral( "%1 could not be written" ).arg( fileName );
             }
             frameJson.insert( QStringLiteral("saved"), saved );
             frameJson.insert( QStringLiteral("reason"), grab.reason );

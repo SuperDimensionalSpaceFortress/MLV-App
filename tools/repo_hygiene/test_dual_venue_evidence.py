@@ -21152,8 +21152,16 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
     # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): the burst's admission check read 124 ms, the next clock read
     # 125 ms, and a capture still STARTED at the 125 ms cutoff and delayed forced play 0; a 150 ms delay inserted after the admission check passed the
     # old wiring test. grabVisual now re-reads the tail clock immediately before the capture starts and the burst passes it its cutoff and reserve.
-    BURST_START_GATE = ("if( visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ) )")
+    # r4 (sol A3 on 560c9642): the gate read the clock before captureTopLevelWindowByPrintWindow's HWND / DC / DIB setup, so the native PrintWindow
+    # start was unbounded. The read is now a predicate grabVisual passes in, asked inside the capture function immediately before PrintWindow.
+    BURST_START_GATE = ("[&]() { return visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ); },")
+    BURST_ASK = "if( mayStartNow && !mayStartNow() )"
+    BURST_ASK_TO_PRINT = ('if( mayStartNow && !mayStartNow() ) { if( startRefusedOut ) *startRefusedOut = true; '
+                          'if( reasonOut ) *reasonOut = QStringLiteral( "start_refused_at_cutoff" ); } else { const BOOL printed =')
     BURST_CALL = 'grabVisual( QStringLiteral("play_first_unbound"), visualBurstCount, false, visualFirstForcedMs, visualBurstLongestMs );'
+    HEADER_PREDICATE = ("    if( cutoffMs < 0 ) return true;\n    if( nowMs < 0 || reserveMs < 0 ) return false;\n"
+                        "    const qint64 room = cutoffMs - kCaptureStartMarginMs;   // the start must be strictly before cutoff - margin\n"
+                        "    return nowMs < room && reserveMs < room - nowMs;\n")
 
     @classmethod
     def burst_start_gate_problems(cls, src: str, header: str) -> list:
@@ -21168,21 +21176,32 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         if block.count(cls.BURST_START_GATE) != 1 or lam.count(cls.BURST_START_GATE) != 1:
             return problems + ["no single clock read gates the capture start inside grabVisual"]
         gate_at = lam.index(cls.BURST_START_GATE)
-        if gate_at < lam.index("grab.clip = "):
-            problems.append("the gate reads the clock before the probe and label reads, not immediately before the capture")
-        capture_at = lam.find("captureTopLevelWindowByPrintWindow(", gate_at)
-        if capture_at < 0:
-            return problems + ["the capture does not follow the gate"]
-        # between the read and the capture start nothing may run (comments dropped, whitespace normalised): any statement there is a delay.
-        # r2 (luna A1 on c4d5d5f6): the capture timer now starts BEFORE the gate, so only the branch itself separates the read from the call.
-        between = " ".join(re.sub(r"//[^\n]*", "", lam[gate_at + len(cls.BURST_START_GATE):capture_at]).split())
-        if between != "{ grab.image =":
-            problems.append(f"code between the clock read and the capture start: {between!r}")
-        pre_gate = " ".join(re.sub(r"//[^\n]*", "", lam[:gate_at]).split())
-        if not pre_gate.endswith("QElapsedTimer captureClock; captureClock.start();"):
-            problems.append("the capture timer does not start immediately before the gate")
+        capture_at = lam.find("grab.image = captureTopLevelWindowByPrintWindow(")
+        if capture_at < 0 or capture_at > gate_at:
+            return problems + ["the gate is not the predicate handed to the capture"]
+        if capture_at < lam.index("grab.clip = "):
+            problems.append("the capture starts before the probe and label reads")
+        after_gate = " ".join(re.sub(r"//[^\n]*", "", lam[gate_at + len(cls.BURST_START_GATE):]).split())
+        if not after_gate.startswith("&captureStartRefused ); if( !captureStartRefused ) {"):
+            problems.append("a refused capture start is still appended")
+        pre_capture = " ".join(re.sub(r"//[^\n]*", "", lam[:capture_at]).split())
+        if not pre_capture.endswith("QElapsedTimer captureClock; captureClock.start(); bool captureStartRefused = false;"):
+            problems.append("the capture timer does not start immediately before the capture")
         if block.count("visualGrabs.append( grab );") != 1:
             problems.append("a capture is appended outside the gated branch")
+        # inside the capture function: asked after all setup, and only the refusal branch separates the read from the native PrintWindow call
+        fn_at = src.find("static QImage captureTopLevelWindowByPrintWindow(")
+        fn_end = src.find("SelectObject( memoryDc, previous );", fn_at)
+        fn = src[fn_at:fn_end] if 0 <= fn_at < fn_end else ""
+        select_at = fn.find("SelectObject( memoryDc, dib );")
+        ask_at = fn.find(cls.BURST_ASK)
+        print_at = fn.find("PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT )")
+        if not (0 < select_at < ask_at < print_at) or fn.count("PrintWindow( hwnd,") != 1:
+            problems.append("the capture function does not ask the predicate after its setup and before PrintWindow")
+        else:
+            between = " ".join(re.sub(r"//[^\n]*", "", fn[ask_at:print_at]).split())
+            if between != cls.BURST_ASK_TO_PRINT:
+                problems.append(f"code between the clock read and the capture start: {between!r}")
         pre_forced = block[block.index("visualTailClock.start();"):block.index('grabVisual( QStringLiteral("play"), k, false );')]
         if pre_forced.count(cls.BURST_CALL) != 1:
             problems.append("the burst does not pass its cutoff and reserve to grabVisual")
@@ -21194,7 +21213,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             if not (0 <= before_at < call_at < refused_at < longest_at):
                 problems.append("the burst does not stop on a refused capture before it measures it")
         if "inline bool captureMayStartBeforeCutoff( qint64 nowMs, qint64 reserveMs, qint64 cutoffMs )" not in header \
-                or "return cutoffMs < 0 || nowMs + reserveMs + kCaptureStartMarginMs < cutoffMs;" not in header:
+                or cls.HEADER_PREDICATE not in header:
             problems.append("captureMayStartBeforeCutoff is not the strict before-the-cutoff decision with the start margin")
         # r2 (luna A1 on c4d5d5f6): QElapsedTimer::elapsed() truncates to whole ms, so a read of 124 can be 124.9 ms; the margin of one whole ms is what
         # keeps a read of 124 against a 125 ms cutoff (reserve 0, the first burst capture) from starting a capture at 125 ms
@@ -21208,17 +21227,17 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         src = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
         header = (ROOT / "platform" / "qt" / "VisualCaptureSourceDifference.h").read_text(encoding="utf-8")
         self.assertIn("constexpr qint64 kCaptureStartMarginMs = 1;", header)
-        self.assertIn("return cutoffMs < 0 || nowMs + reserveMs + kCaptureStartMarginMs < cutoffMs;", header)
-        no_margin = header.replace("nowMs + reserveMs + kCaptureStartMarginMs < cutoffMs;", "nowMs + reserveMs < cutoffMs;")
+        self.assertIn(self.HEADER_PREDICATE, header)
+        no_margin = header.replace("const qint64 room = cutoffMs - kCaptureStartMarginMs;", "const qint64 room = cutoffMs;")
         self.assertNotEqual(self.burst_start_gate_problems(src, no_margin), [])
         zero_margin = header.replace("constexpr qint64 kCaptureStartMarginMs = 1;", "constexpr qint64 kCaptureStartMarginMs = 0;")
         self.assertIn("the capture start margin is not one whole millisecond", self.burst_start_gate_problems(src, zero_margin))
-        gate_at = src.index(self.BURST_START_GATE)
+        image_at = src.index("grab.image = captureTopLevelWindowByPrintWindow(")
         timer = "QElapsedTimer captureClock;\n            captureClock.start();\n            "
-        timer_at = src.rindex(timer, 0, gate_at)
-        image_at = src.index("grab.image = captureTopLevelWindowByPrintWindow(", gate_at)
-        moved_back = src[:timer_at] + src[timer_at + len(timer):image_at] + "QElapsedTimer captureClock; captureClock.start();\n                " + src[image_at:]
-        self.assertTrue(any("between the clock read" in p for p in self.burst_start_gate_problems(moved_back, header)))
+        timer_at = src.rindex(timer, 0, image_at)
+        moved_after = src[:timer_at] + src[timer_at + len(timer):image_at] + src[image_at:].replace(
+            "            if( !captureStartRefused )\n", "            QElapsedTimer captureClock; captureClock.start();\n            if( !captureStartRefused )\n", 1)
+        self.assertIn("the capture timer does not start immediately before the capture", self.burst_start_gate_problems(moved_after, header))
 
     def test_r6_burst_capture_start_rereads_the_clock_with_nothing_between_the_read_and_the_capture(self) -> None:
         src = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
@@ -21230,15 +21249,18 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         lose the read (an event pump there, the burst no longer passing its cutoff, a `<=` cutoff)."""
         src = (ROOT / "platform" / "qt" / "MainWindow.cpp").read_text(encoding="utf-8")
         header = (ROOT / "platform" / "qt" / "VisualCaptureSourceDifference.h").read_text(encoding="utf-8")
-        gate_at = src.index(self.BURST_START_GATE)
-        timer_at = src.index("grab.image = captureTopLevelWindowByPrintWindow(", gate_at)   # r2: the timer now starts before the gate
-        delayed = src[:timer_at] + "sleepGuiThreadForSmokeRunner( 150 );\n                " + src[timer_at:]
+        # r4 (sol A3 on 560c9642): the delay now sits inside the capture function, between the predicate's read and the native PrintWindow call
+        print_at = src.index("        const BOOL printed = PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT );")
+        delayed = src[:print_at] + "        Sleep( 150 );\n" + src[print_at:]
         self.assertTrue(any("between the clock read" in p for p in self.burst_start_gate_problems(delayed, header)))
-        pumped = src[:timer_at] + "qApp->processEvents( QEventLoop::AllEvents );\n                " + src[timer_at:]
-        self.assertNotEqual(self.burst_start_gate_problems(pumped, header), [])
+        # sol A3's input: the predicate asked BEFORE the HWND / DC / DIB setup
+        ask = "        if( mayStartNow && !mayStartNow() )\n"
+        early = src.replace(ask, "        if( false )\n", 1).replace("    if( startRefusedOut ) *startRefusedOut = false;\n",
+                                                                     "    if( startRefusedOut ) *startRefusedOut = false;\n" + ask.replace("        ", "    ", 1) + "    {}\n", 1)
+        self.assertIn("the capture function does not ask the predicate after its setup and before PrintWindow", self.burst_start_gate_problems(early, header))
         uncut = src.replace(self.BURST_CALL, 'grabVisual( QStringLiteral("play_first_unbound"), visualBurstCount, false );')
         self.assertIn("the burst does not pass its cutoff and reserve to grabVisual", self.burst_start_gate_problems(uncut, header))
-        loose = header.replace("nowMs + reserveMs + kCaptureStartMarginMs < cutoffMs;", "nowMs + reserveMs + kCaptureStartMarginMs <= cutoffMs;")
+        loose = header.replace("return nowMs < room && reserveMs < room - nowMs;", "return nowMs <= room && reserveMs <= room - nowMs;")
         self.assertNotEqual(self.burst_start_gate_problems(src, loose), [])
 
     @staticmethod
@@ -21247,7 +21269,8 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         credited row is UNFORCED (play_unbound) and taken before any forced repaint (forced_paints_before=0), with its clip-bound source_id (A2); a forced
         `play` row is passed as kind='play', file='play-<i>.png'."""
         frame = {"kind": "play_unbound", "index": index, "file": f"play-unbound-{index}.png", "display_frame": 479, "play_active": True,
-                 "tail_elapsed_ms": 126 + 250 * index, "saved": True, "serial": 484, "painted_serial": 484, "painted_serial_valid": True, "label_bound": True,
+                 # r4 (sol A7 on 560c9642): the app allocates one serial per request, so each row's default serial is its own (484, 485, ...)
+                 "tail_elapsed_ms": 126 + 250 * index, "saved": True, "serial": 484 + index, "painted_serial": 484 + index, "painted_serial_valid": True, "label_bound": True,
                  "label_bound_basis": "gl_window_paint", "forced_paints_before": 0, "source_id": "00000000000001df"}
         frame.update(over)
         if "kind" in over and "file" not in over and isinstance(frame["kind"], str):
@@ -21766,21 +21789,39 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             self.assertIsNotNone(out, proc.stdout + proc.stderr)
             return out
 
+        # R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A1 + A2 on 560c9642): the app's burst_end record (never trace-only) closes the window invalidations count in,
+        # and its counter deltas are the drops a trace-off run still reports
+        bend = pre + ("gui_smoke.visual_capture.burst_end measured_session=3 burst_captures=2 generation_changes=0 stale_drops=0 generation_drops=0 "
+                      "replaced_before=0 replaced_after=0") + loc
+        playstop = drop.replace("reason=resize-keep-playing", "reason=play-stop").replace("dropped_pending=1", "dropped_pending=0").replace("latest_serial=483", "latest_serial=484")
         ms = "playback_smoke.measured_session id=3"
-        self.assertEqual(derive([ms, conform, summary, begin]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 0, "e": 2, "d": 0})
-        self.assertEqual(derive([ms, conform, summary, begin, clip]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 1, "e": 2, "d": 0})
+        self.assertEqual(derive([ms, conform, summary, begin, bend]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 0, "e": 2, "d": 0})
+        self.assertEqual(derive([ms, conform, summary, begin, bend, clip]), {"s": "3", "u": "2026-11-25T18:00:00.000Z", "c": 1, "e": 2, "d": 0})
         # a drop before the begin record is the measured session's (its summary counters carry it); one after it is a tail drop
-        self.assertEqual(derive([ms, conform, summary, drop, begin])["d"], 0)
-        self.assertEqual(derive([ms, conform, summary, begin, drop])["d"], 1)
+        self.assertEqual(derive([ms, conform, summary, drop, begin, bend])["d"], 0)
+        self.assertEqual(derive([ms, conform, summary, begin, drop, bend])["d"], 1)
         # R5-RESIDUE-1 adversary A1 (on 4de735e6), its input: an invalidation after the begin record with every dropped_* field 0 (the target was already
         # computing, so it is in no dropped_* field; the worker drops its stale result later and reissues it), and the cancelled_render=1 sibling. 4de735e6
-        # counted 0 for both, so a reissued frame could be credited. Every invalidation after the begin record now counts.
-        self.assertEqual(derive([ms, conform, summary, drop, begin, nodrop])["d"], 1)
-        self.assertEqual(derive([ms, conform, summary, begin, nodrop.replace("cancelled_render=0", "cancelled_render=1")])["d"], 1)
+        # counted 0 for both, so a reissued frame could be credited. Every invalidation between the begin record and the burst's end counts.
+        self.assertEqual(derive([ms, conform, summary, drop, begin, nodrop, bend])["d"], 1)
+        self.assertEqual(derive([ms, conform, summary, begin, nodrop.replace("cancelled_render=0", "cancelled_render=1"), bend])["d"], 1)
+        # sol A1 on 560c9642, its input: the app's normal final pause logs a play-stop invalidation AFTER the burst; it no longer refuses the burst's proof
+        self.assertEqual(derive([ms, conform, summary, begin, bend, playstop])["d"], 0)
+        # sol A2 on 560c9642, its input: tracing off, a resize during the burst drops and reissues the target; no invalidate record, but the burst_end deltas say so
+        self.assertEqual(derive([ms, conform, summary, begin, bend.replace("generation_changes=0", "generation_changes=1").replace("generation_drops=0", "generation_drops=1")])["d"], 2)
+        # no burst_end record (a pre-r4 build), two of them, another session's, or an unreadable delta: the drops are unknown, so no credit
+        self.assertIsNone(derive([ms, conform, summary, begin])["d"])
+        self.assertIsNone(derive([ms, conform, summary, begin, bend, bend])["d"])
+        self.assertIsNone(derive([ms, conform, summary, begin, bend.replace("measured_session=3", "measured_session=4")])["d"])
+        self.assertIsNone(derive([ms, conform, summary, begin, bend.replace("stale_drops=0", "stale_drops=x")])["d"])
+        self.assertIsNone(derive([ms, conform, summary, bend, begin])["d"])
+        # sol A9 on 560c9642, its input: an unparsable tail_begin_utc in the sole begin record is no binding
+        bad_utc = derive([ms, conform, summary, begin.replace("tail_begin_utc=2026-11-25T18:00:00.000Z", "tail_begin_utc=not-a-time"), bend])
+        self.assertEqual((bad_utc["s"], bad_utc["u"], bad_utc["d"]), (None, None, None), bad_utc)
         two = derive([ms, conform, summary, begin, begin.replace("18:00", "17:00")])
         self.assertEqual((two["s"], two["u"]), (None, None), two)
         none = derive([ms, conform.replace(" paint_wait_escapes=2", ""), summary])
-        self.assertEqual(none, {"s": None, "u": None, "c": 0, "e": None, "d": 0})
+        self.assertEqual(none, {"s": None, "u": None, "c": 0, "e": None, "d": None})
         # a bare marker without the formatter's `interaction_trace event=` is not the app's record
         bare = derive([ms, conform, summary, begin.replace("interaction_trace event=", "")])
         self.assertEqual((bare["s"], bare["u"]), (None, None), bare)
@@ -21973,6 +22014,56 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                 out = self.metrics({**self.HELD, **pb}, app=self.app_json(self.play(0)), criteria=self.BOTH)
                 self.assert_no_credit(out, 1)
                 self.assertTrue(out["m"]["conformTailInFlightCreditNote"].startswith("TAIL_VISUAL_NONCE_MISMATCH"), out)
+
+    def test_r6_r4_sol_a6_a7_ordinal_strings_and_one_frame_per_serial(self) -> None:
+        """R6-BURST-CUTOFF-RESIDUE-1 r4, sol's inputs on 560c9642. A6: a NUL-suffixed label_bound_basis, schema or error passed the culture compares (-cin,
+        -cne, -ne). A7: two rows showing 478 and 479 on the SAME serial 484 credited both targets (the app stamps one frame per request serial)."""
+        first = self.play(0, kind="play_first_unbound", tail_elapsed_ms=4)
+        cases = {"basis gl_window_paint + NUL": self.app_json(self.play(0, kind="play_first_unbound", tail_elapsed_ms=4, label_bound_basis="gl_window_paint\u0000")),
+                 "schema + NUL": self.app_json(first, schema="mlv-app/visual-capture/v1\u0000"),
+                 "error NUL": self.app_json(first, error="\u0000")}
+        for name, app in cases.items():
+            with self.subTest(case=name):
+                self.assert_no_credit(self.metrics(self.HELD, app=app, criteria=self.BOTH), 1)
+        two = self.app_json(self.play(0, kind="play_first_unbound", tail_elapsed_ms=8, display_frame=478, serial=484, painted_serial=484),
+                            self.play(1, kind="play_first_unbound", tail_elapsed_ms=45, display_frame=479, serial=484, painted_serial=484))
+        out = self.metrics(None, app=two, criteria=self.BOTH)
+        self.assertEqual((out["m"].get("conformTailInFlightCreditedFrames"), out["m"]["conformTailUnpaintedFrames"]), (None, 2), out)
+        self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
+        # the same two frames on their own serials are two paints, both credited
+        own = self.app_json(self.play(0, kind="play_first_unbound", tail_elapsed_ms=8, display_frame=478, serial=484, painted_serial=484),
+                            self.play(1, kind="play_first_unbound", tail_elapsed_ms=45, display_frame=479, serial=485, painted_serial=485))
+        self.assertEqual(self.metrics(None, app=own, criteria=self.BOTH)["m"].get("conformTailInFlightCreditedFrames"), 2)
+
+    def test_r6_r4_sol_a8_a10_a_locked_uncreditable_png_and_a_numeric_launcher_nonce(self) -> None:
+        """A8 (sol on 560c9642): a late play_unbound PNG (forced_paints_before=6) held with FileShare.None returned TAIL_VISUAL_UNREADABLE, so a sound
+        measurement threw; that PNG can never be credited, so it is no longer read. A10: result.json evidence.runNonce as a JSON number was cast to a
+        string and accepted as the launcher's nonce; only a JSON string is a nonce."""
+        late = self.play(0, forced_paints_before=6, tail_elapsed_ms=1625)
+        first = self.play(0, kind="play_first_unbound", tail_elapsed_ms=4)
+        doc = self.app_json(first, late)
+        raw = json.dumps(doc).encode("utf-8")
+        with tempfile.TemporaryDirectory() as d:
+            vis = Path(d) / "visual"
+            vis.mkdir()
+            (vis / "app-visual.json").write_bytes(raw)
+            rec = []
+            for row in (first, late):
+                body = self.png_bytes(row["index"])
+                (vis / f"{self.LEG}-{row['kind'].replace('_', '-')}-{row['index']}.png").write_bytes(body)
+                rec.append({"kind": row["kind"], "index": row["index"], "sha256": hashlib.sha256(body).hexdigest()})
+            proc, out = run_pwsh_json(
+                "$rec = @($env:DVE_REC | ConvertFrom-Json)\n"
+                "$lock = [IO.File]::Open((Join-Path $env:DVE_DIR ('visual\\' + $env:DVE_LEG + '-play-unbound-0.png')), 'Open', 'Read', 'None')\n"
+                "try { $vis = Get-DvTailVisualEvidence -EvidenceDir $env:DVE_DIR -LegId $env:DVE_LEG -ExpectedSha256 $env:DVE_SHA -RecordedFrames $rec } finally { $lock.Dispose() }\n"
+                "$result = '{\"evidence\":{\"runNonce\":12345678901234567890123456789012,\"runLogSnapshot\":{\"sha256\":\"00\"}}}' | ConvertFrom-Json\n"
+                "$pb = Get-DvPlaybackEvidence -Summary $null -EvidenceManifest $null -ResultJson $result -LogText '' -LogSha256 '' -ExpectedClipId 'M16-1243'\n"
+                "[ordered]@{ refused = $vis.refused; frames = @($vis.frames).Count; nonce = $pb.expectedRunNonce } | ConvertTo-Json -Compress",
+                DVE_DIR=d, DVE_LEG=self.LEG, DVE_SHA=hashlib.sha256(raw).hexdigest(), DVE_REC=json.dumps(rec))
+        self.assertIsNotNone(out, proc.stdout + proc.stderr)
+        self.assertIsNone(out["refused"], out)
+        self.assertEqual(out["frames"], 2, out)
+        self.assertIsNone(out["nonce"], out)
 
     def test_r4r_r4_the_play_first_unbound_burst_before_the_first_forced_paint_is_credited(self) -> None:
         """R4: the app's play_first_unbound burst (index 0, play-first-unbound-0.png, forced_paints_before=0, saved, Play active, label-bound, a 16-hex source_id,

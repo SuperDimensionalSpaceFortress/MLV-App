@@ -928,19 +928,40 @@ TEST(VisualCaptureBinding, TheBurstRereadsTheClockImmediatelyBeforeEachCaptureSt
     const QString lambda = block.mid(lambdaAt, lambdaEnd - lambdaAt);
     ASSERT_TRUE(lambda.startsWith(QStringLiteral(
         "auto grabVisual = [&]( const QString &kind, int index, bool settled, qint64 startCutoffMs = -1, qint64 startReserveMs = 0 )")));
+    // r4 (sol A3 on 560c9642): the deciding read is a predicate the capture function calls AFTER its HWND / DC / DIB setup, immediately before
+    // the native PrintWindow call; a refused start appends nothing.
     const QString gate = QStringLiteral(
-        "if( visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ) )");
+        "[&]() { return visual_capture_source_difference::captureMayStartBeforeCutoff( visualTailClock.elapsed(), startReserveMs, startCutoffMs ); },");
     ASSERT_EQ(1, countOccurrences(block, gate));
+    const int captureAt = lambda.indexOf(QStringLiteral("grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason,"));
+    ASSERT_TRUE(captureAt > lambda.indexOf(QStringLiteral("grab.clip = ")));
     const int gateAt = lambda.indexOf(gate);
-    ASSERT_TRUE(gateAt > lambda.indexOf(QStringLiteral("grab.clip = ")));
-    const int captureAt = lambda.indexOf(QStringLiteral("captureTopLevelWindowByPrintWindow("));
-    ASSERT_TRUE(captureAt > gateAt);
-    // between the read and the capture: nothing but the branch (whitespace normalised; any statement there is a delay the read does not see).
-    // r2 (luna A1 on c4d5d5f6): the capture timer starts immediately BEFORE the gate, so captureMs still spans the capture.
-    const QString between = lambda.mid(gateAt + gate.size(), captureAt - gateAt - gate.size()).simplified();
-    ASSERT_EQ(std::string("{ grab.image ="), between.toStdString());
-    ASSERT_TRUE(lambda.left(gateAt).simplified().endsWith(QStringLiteral("QElapsedTimer captureClock; captureClock.start();")));
+    ASSERT_TRUE(gateAt > captureAt);
+    ASSERT_TRUE(lambda.mid(gateAt + gate.size()).simplified().startsWith(QStringLiteral("&captureStartRefused ); if( !captureStartRefused ) {")));
+    ASSERT_TRUE(lambda.left(captureAt).simplified().endsWith(
+        QStringLiteral("QElapsedTimer captureClock; captureClock.start(); bool captureStartRefused = false;")));
     ASSERT_EQ(1, countOccurrences(block, QStringLiteral("visualGrabs.append( grab );")));
+    // inside the capture function: the predicate is asked after the DIB is selected, and a true answer is followed by the PrintWindow call only
+    const int fnAt = source.indexOf(QStringLiteral("static QImage captureTopLevelWindowByPrintWindow("));
+    const int fnEnd = source.indexOf(QStringLiteral("SelectObject( memoryDc, previous );"), fnAt);
+    ASSERT_TRUE(fnAt >= 0 && fnEnd > fnAt);
+    const QString fn = source.mid(fnAt, fnEnd - fnAt);
+    const int selectAt = fn.indexOf(QStringLiteral("SelectObject( memoryDc, dib );"));
+    const int askAt = fn.indexOf(QStringLiteral("if( mayStartNow && !mayStartNow() )"));
+    const int printAt = fn.indexOf(QStringLiteral("PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT )"));
+    ASSERT_TRUE(selectAt > 0 && askAt > selectAt && printAt > askAt);
+    ASSERT_EQ(1, countOccurrences(fn, QStringLiteral("PrintWindow( hwnd,")));
+    const QString askToPrint = fn.mid(askAt, printAt - askAt).simplified();
+    ASSERT_EQ(std::string("if( mayStartNow && !mayStartNow() ) { if( startRefusedOut ) *startRefusedOut = true; "
+                          "if( reasonOut ) *reasonOut = QStringLiteral( \"start_refused_at_cutoff\" ); } else { const BOOL printed ="),
+              askToPrint.toStdString());
+    // r4 (sol A1 + A2): the burst ends with ONE burst_end record that is never trace-only (no `, true )` argument)
+    const int burstEndAt = block.indexOf(QStringLiteral("QStringLiteral(\"gui_smoke.visual_capture.burst_end\"),"));
+    ASSERT_TRUE(burstEndAt > block.indexOf(QStringLiteral("const qint64 visualFirstForcedMs")));
+    ASSERT_TRUE(burstEndAt < block.indexOf(QStringLiteral("// (2) K forced, bound play frames")));
+    ASSERT_EQ(1, countOccurrences(block, QStringLiteral("gui_smoke.visual_capture.burst_end")));
+    const QString burstEndCall = block.mid(burstEndAt, block.indexOf(QStringLiteral("- visualBurstReplacedAfter0 ) ) );"), burstEndAt) - burstEndAt);
+    ASSERT_FALSE(burstEndCall.contains(QStringLiteral(", true )")));
 
     // the burst passes the cutoff and reserve, counts the captures before its call, and stops when the call appended none
     const QString burst = QStringLiteral(

@@ -21,6 +21,7 @@
 #include <QTemporaryDir>
 #include <QThread>
 #include <cstdio>
+#include <limits>
 
 #include <QFile>
 #include <QJsonObject>
@@ -258,6 +259,21 @@ TEST(VisualCaptureSourceDifference, ABurstCaptureNeverStartsWhenTheReadIsWithinO
     ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(100, 24, cutoffMs));  // the margin adds to the reserve, it does not replace it
     ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(100, 23, cutoffMs));
     ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(124, 0, -1));          // no cutoff: no margin either
+}
+
+// R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A13 on 560c9642): captureMayStartBeforeCutoff(INT64_MAX, 0, 125) used to add the margin to INT64_MAX (signed
+// overflow, undefined behaviour). The predicate now never forms that sum: a huge read or reserve refuses, a negative one refuses.
+TEST(VisualCaptureSourceDifference, TheCutoffPredicateNeverOverflowsOnAnExtremeRead)
+{
+    const qint64 maxMs = std::numeric_limits<qint64>::max();
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(maxMs, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(0, maxMs, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(maxMs, maxMs, maxMs));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(-1, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(0, -1, 125));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(maxMs - 2, 0, maxMs));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(maxMs - 1, 0, maxMs));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(maxMs, maxMs, -1));
 }
 
 // r7 (adversary r6 pass 3 A2 on 3663c8a3): the capture path pumps events after the play captures (the post-stop drain at the
