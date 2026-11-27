@@ -5092,12 +5092,15 @@ function Get-AttrCudaProcessTreeSnapshot {
             # sol A1 on 91e548f8: the identity is the pid, the creation stamp AND the parent pid (immutable for a process's whole life): a replacement that reuses the number and, after a
             # rollback, even the stamp is another process unless it also names the same parent. A row with no readable parent is recorded by pid and stamp alone.
             foreach ($baseRow in $baseRows) {
+                # R2-RESIDUE-3 r2 fix iteration 2 (adversary A2 on 342a1ac7): the decode is held to the bound row by row, and once more before the table is returned
+                if ($BudgetMs -ne 0 -and (& $overBudget)) { return $null }
                 if ($null -ne $baseRow -and $null -ne $baseRow.ProcessId -and $null -ne $baseRow.CreationDate) {
                     $baseStamp = ([datetime]$baseRow.CreationDate).ToUniversalTime().Ticks
                     $baseTable[[int64]$baseRow.ProcessId] = $(if ($null -eq $baseRow.ParentProcessId) { [int64[]]@($baseStamp) } else { [int64[]]@($baseStamp, [int64]$baseRow.ParentProcessId) })
                 }
             }
             if ($baseTable.Count -eq 0) { return $null }
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return $null }
             return $baseTable
         } catch { return $null }
     }

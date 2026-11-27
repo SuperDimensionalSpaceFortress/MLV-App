@@ -5428,16 +5428,25 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             "$late = & $realSnapshot -BaselineOnly -OperationTimeoutSec 1 -BudgetMs 5000 -Clock { 5001.0 }\n"
             "$global:reads = 0\n"
             "$back = & $realSnapshot -BaselineOnly -OperationTimeoutSec 1 -BudgetMs 5000 -Clock { $global:reads++; if ($global:reads -le 1) { 3000.0 } else { 5001.0 } }\n"
+            # fix iteration 2 (adversary A2 on 342a1ac7): the rows are decoded under the bound too. A row whose CreationDate getter moves the caller's clock past it (the last row, read after the
+            # per-row check) makes the listing past-the-bound: $null, never a table the caller would cache.
+            "$global:ms = 0.0\n"
+            "$slow = New-Object psobject -Property @{ ProcessId = 4; ParentProcessId = 0 }; Add-Member -InputObject $slow -MemberType ScriptProperty -Name CreationDate -Value { $global:ms = 5001.0; $t.AddDays(-1) }\n"
+            "$decoded = & $realSnapshot -BaselineOnly -Processes @($slow) -BudgetMs 5000 -Clock { $global:ms }\n"
+            "$global:ms = 0.0; $fast = New-Object psobject -Property @{ ProcessId = 4; ParentProcessId = 0; CreationDate = $t.AddDays(-1) }\n"
+            "$decodedOk = & $realSnapshot -BaselineOnly -Processes @($fast) -BudgetMs 5000 -Clock { $global:ms }\n"
             "$holds = & $realSnapshot -BaselineOnly -OperationTimeoutSec 1 -BudgetMs 5000 -Clock { 3000.0 }\n"
             "$none = & $realSnapshot -BaselineOnly -OperationTimeoutSec 1\n"
             "$sys = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
             "$s = & $realSnapshot -RootProcessId 100 -Processes @($sys + @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))) -Baseline (& $realSnapshot -BaselineOnly -Processes $sys)\n"
             "$global:n = 0\n"
             "$thrown = $null; try { $w = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Clock { throw 'clock-down' } -Scan { $global:n++; @() } } catch { $thrown = [string]$_.Exception.Message }\n"
-            "[ordered]@{ late = ($null -eq $late); back = ($null -eq $back); holds = ($null -ne $holds -and $holds.Count -gt 0); none = ($null -ne $none -and $none.Count -gt 0);\n"
+            "[ordered]@{ late = ($null -eq $late); back = ($null -eq $back); decoded = ($null -eq $decoded); decodedOk = ($null -ne $decodedOk -and $decodedOk.Count -eq 1); holds = ($null -ne $holds -and $holds.Count -gt 0); none = ($null -ne $none -and $none.Count -gt 0);\n"
             "            thrown = $thrown; confirmed = $w.confirmed; why = $w.error; scans = $global:n } | ConvertTo-Json -Compress")
         self.assertTrue(got["late"], f"a listing whose bound is already past is never dispatched: {got}")
         self.assertTrue(got["back"], f"a listing that came back past the bound is no listing: {got}")
+        self.assertTrue(got["decoded"], f"a listing whose rows are decoded past the bound is $null: {got}")
+        self.assertTrue(got["decodedOk"], f"control: rows decoded inside the bound return the table: {got}")
         self.assertTrue(got["holds"], f"control: a bound that holds returns the listing: {got}")
         self.assertTrue(got["none"], f"control: no bound, as before: {got}")
         self.assertIsNone(got["thrown"], f"the wait never throws on a caller clock that throws: {got}")
