@@ -11257,6 +11257,24 @@ class VisualCaptureRunnerModuleTests(unittest.TestCase):
         # ... and a count that fits still says it
         proc, out = run_pwsh_json(f"{base}-PlayFrames 2 -DistinctContentHashes 1 -AppDistinctDisplayFrames 2 -LabelledPlayFrames 2 -SourceDifference known-differ | ConvertTo-Json -Compress")
         self.assertIn("the app presented 2 distinct frames across them and the source frames are known to differ", out["reason"])
+        # adversary pass 1 A1 (its input verbatim): the same class on the whole-freeze and waiver branches, which return before the repeat count is looked at. 6 repeats
+        # over 6 judged frames cannot be true (an adjacent repeat needs a predecessor: at most 5), so a source claim beside it is not quoted either; the verdict stays.
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 6 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["counted"]), ("FROZEN_DISPLAY", False), out["reason"])
+        self.assertNotIn("known to differ", out["reason"])
+        self.assertIn("the source difference supplied beside a repeat count they cannot hold is not quoted", out["reason"])
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 6 "
+                                  "-SourceDifference known-identical | ConvertTo-Json -Compress")
+        self.assertEqual((out["verdict"], out["counted"]), ("OK", True), out["reason"])
+        self.assertIsNone(out["reason"], "no static-clip waiver text beside a repeat count the judged frames cannot hold")
+        # a repeat count the frames can hold (5 of 6 over one picture) keeps both claims
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 "
+                                  "-SourceDifference known-differ | ConvertTo-Json -Compress")
+        self.assertIn("the source frames are known to differ", out["reason"])
+        proc, out = run_pwsh_json(f"{base}-PlayFrames 6 -DistinctContentHashes 1 -AppDistinctDisplayFrames 6 -LabelledPlayFrames 6 -RepeatedPlayFrames 5 "
+                                  "-SourceDifference known-identical | ConvertTo-Json -Compress")
+        self.assertIn("the app records the source frames as identical", out["reason"])
 
     def test_the_visual_gate_reason_never_outruns_the_labelled_frame_count(self) -> None:
         """UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R1C-REASON-RESIDUE-1 r2 (sol r1c pass A1-A3, their inputs verbatim): -LabelledPlayFrames is how many judged frames carry

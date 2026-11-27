@@ -4391,10 +4391,17 @@ function Get-DvVisualVerdict {
     # sol r1c pass 2 A1: a known source difference (either value) needs a valid label on EVERY judged frame (the <2 branch above says the same), so beside a labelled
     # count under PlayFrames the tuple disagrees and no reason claims a known source difference, a repeat or a cause on it
     $sourceIncoherent = ($SourceDifference -ne 'unknown' -and $null -ne $labelledCount -and $labelledCount -lt $PlayFrames)
+    # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 adversary pass 1 A1: a repeat count over what the judged frames can hold (N - D adjacent repeats over D pictures, N - 1 when D cannot
+    # be true, L - 1 over L labelled frames) is a tuple no judged set produces, so the whole-freeze reason and the known-identical waiver (which return before the
+    # repeat branch below) claim no source difference beside it either; the PARTIAL_FREEZE branch below keeps its own, stricter N - 2 bound for an out-of-range D
+    $repeatHold = $(if ($DistinctContentHashes -ge 1 -and $DistinctContentHashes -le $PlayFrames) { $PlayFrames - $DistinctContentHashes } else { $PlayFrames - 1 })
+    if ($null -ne $labelledCount) { $repeatHold = [Math]::Min($repeatHold, [Math]::Max(0, $labelledCount - 1)) }
+    $repeatOverHold = ($RepeatedPlayFrames -gt $repeatHold)
     if ($DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-differ') {
         # R4-IMPOSSIBLE-REPEAT-RESIDUE-1 (key3 r4 H1): and a source claim beside an app count this same reason calls impossible is not quoted either
         $differText = $(if ($sourceIncoherent) { "the source difference supplied disagrees with the $labelledCount labelled of the $PlayFrames judged frames and is not quoted" }
                         elseif (-not $appCountFits) { 'the source difference supplied beside it is not quoted' }
+                        elseif ($repeatOverHold) { 'the source difference supplied beside a repeat count they cannot hold is not quoted' }
                         else { 'the source frames are known to differ' })
         return [pscustomobject]@{ verdict = 'FROZEN_DISPLAY'; counted = $false; reason = "the $PlayFrames play frames show ONE picture while the app presented $appFramesText across them and $differText" }
     }
@@ -4433,7 +4440,7 @@ function Get-DvVisualVerdict {
         return [pscustomobject]@{ verdict = 'VISUAL_DIVERGENCE'; counted = $true; reason = "the playback-path frame is $PlayVsPausedMeanAbsDiff (per-channel mean absolute difference, 0..255) from its paused full-quality re-render; the threshold is $Threshold" }
     }
     # one picture over source frames the app itself records as identical: the frozen check was waived on its word, so the receipt says so
-    $waivedReason = $(if ($appCountFits -and -not $sourceIncoherent -and $DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
+    $waivedReason = $(if ($appCountFits -and -not $sourceIncoherent -and -not $repeatOverHold -and $DistinctContentHashes -eq 1 -and $AppDistinctDisplayFrames -gt 1 -and $SourceDifference -ceq 'known-identical') { 'one picture; the app records the source frames as identical: a static clip' } else { $null })
     # VISUAL-GATE-EXPOSURE-FLOOR-1: last, so every other verdict keeps its precedence; counted, a flag and never an exclusion
     if ($null -ne $ExposureBand -and $null -ne $ExposureMedianLuma -and $null -ne $ExposureMedianNearBlackFraction -and $null -ne $ExposureMedianClippedFraction) {
         # compared UNROUNDED; the reason rounds to 6 places for display (a median 0.000434 against a cap of 0.00042 is over, and reads as 0.000434)
