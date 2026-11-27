@@ -11765,6 +11765,22 @@ class VisualCaptureVenueHelperTests(unittest.TestCase):
             self.assertEqual(proc.stdout.strip().splitlines()[-1], "play-unbound-0.png,visual-capture-request.json,visual.json",
                              "the uncopied burst image's slot is empty, never the older image")
 
+    def test_r6_r9_sol_a1_fix2_a_refused_burst_slot_is_never_cleaned_up(self) -> None:
+        # R6-BURST-CUTOFF-RESIDUE-1 r9 fix 2 (sol A1 on 5040821c), its input: forwarded=true, a fresh source visual.json and play-first-unbound-0.png, and the
+        # destination visual\play-first-unbound-0.png an EMPTY DIRECTORY. Assert-AttrCudaWritableFileSlot refuses it (ATTRCUDA_SLOT_OCCUPIED); 5040821c's catch
+        # swallowed that refusal, deleted the directory with Remove-Item and published on. The refusal now stands and the refused object is untouched.
+        with tempfile.TemporaryDirectory(prefix="vis-pub-r9a1-") as d:
+            src = Path(d, "src")
+            src.mkdir()
+            for name in ("play-first-unbound-0.png", "play-unbound-0.png", "visual.json"):
+                Path(src, name).write_bytes(b"new")
+            slot = Path(d, "pub", "visual", "play-first-unbound-0.png")
+            slot.mkdir(parents=True)
+            proc = self.run_module(f"[void](Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}')")
+            self.assertTrue(slot.is_dir(), "the refused directory is untouched: " + proc.stdout + proc.stderr)
+            self.assertNotEqual(proc.returncode, 0, "the slot refusal stands")
+            self.assertIn("ATTRCUDA_SLOT_OCCUPIED", proc.stdout + proc.stderr)
+
     def test_the_visual_tail_is_cut_off_the_presentmon_window_and_never_extends_it(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-pm-") as d:
             Path(d, "visual.json").write_text(json.dumps({"tail_begin_utc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
@@ -22995,6 +23011,22 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
             out = self.metrics(None, app=self.app_json(rows[1], rows[2]), criteria=crit)
             self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
             self.assertTrue(out["v"]["pass"], out)
+
+    def test_r6_r9_sol_a2_fix2_the_close_frame_before_a_later_target_is_never_credited_over(self) -> None:
+        """A2 (sol on 5040821c), its input: the default PB (last measured 477, target 479, maxJump 1, repeats 0, backward 0) with bound burst rows (index, ms,
+        frame, serial) = (0, 4, 477, 484), (1, 34, 478, 485), (2, 64, 479, 486). The close's own paint serial (483) is not on record, so 477 on 484 may be a
+        re-present: 5040821c rejected only frames below 477, credited 478 and 479 and passed every-frame over the repeat. No credit now. (control) 478 then
+        479 after it still credits both."""
+        crit = self.BOTH + [{"metric": "conformRepeats", "op": "eq", "value": 0}]
+        rows = (self.play(0, kind="play_first_unbound", tail_elapsed_ms=4, display_frame=477, serial=484, painted_serial=484),
+                self.play(1, kind="play_first_unbound", tail_elapsed_ms=34, display_frame=478, serial=485, painted_serial=485),
+                self.play(2, kind="play_first_unbound", tail_elapsed_ms=64, display_frame=479, serial=486, painted_serial=486))
+        out = self.metrics(None, app=self.app_json(*rows), criteria=crit)
+        self.assert_no_credit(out, 2)
+        self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
+        with self.subTest(case="(control) 478 then 479"):
+            out = self.metrics(None, app=self.app_json(rows[1], rows[2]), criteria=crit)
+            self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
 
     def test_r4r_r4_the_play_first_unbound_burst_before_the_first_forced_paint_is_credited(self) -> None:
         """R4: the app's play_first_unbound burst (index 0, play-first-unbound-0.png, forced_paints_before=0, saved, Play active, label-bound, a 16-hex source_id,

@@ -8133,6 +8133,17 @@ function Get-DvTailInFlightCredit {
     if ($behind.Count -gt 0) {
         return (& $no "TAIL_CREDIT_PAINT_ORDER: a qualifying capture shows display frame $(Get-DvProp $behind[0] 'displayFrame') (serial $(Get-DvProp $behind[0] 'serial') at $(Get-DvProp $behind[0] 'tailElapsedMs') ms), earlier than frame $closeFrame, the last painted at the measured close, so the tail shows a backward paint across the close and is not credited")
     }
+    # r9 fix 2 (sol A2 on 5040821c): a capture of the close frame itself BEFORE a later in-flight frame. The measured close's own paint serial is not on
+    # record, so the capture's serial cannot show it is that same paint rather than a re-present on a new serial (477/483 at the close, then 477/484,
+    # 478/485, 479/486: a repeat the measured conformRepeats never saw). Fail closed: no credit
+    $closeShown = @($byTime | Where-Object { [int64](Get-DvProp $_ 'displayFrame') -eq $closeFrame } | Select-Object -First 1)
+    if ($closeShown.Count -gt 0) {
+        $closeMs = [double](Get-DvProp $closeShown[0] 'tailElapsedMs')
+        $after = @($byTime | Where-Object { [double](Get-DvProp $_ 'tailElapsedMs') -gt $closeMs -and [int64](Get-DvProp $_ 'displayFrame') -gt $closeFrame } | Select-Object -First 1)
+        if ($after.Count -gt 0) {
+            return (& $no "TAIL_CREDIT_PAINT_ORDER: a qualifying capture shows display frame $closeFrame, the last painted at the measured close (serial $(Get-DvProp $closeShown[0] 'serial') at $closeMs ms), before display frame $(Get-DvProp $after[0] 'displayFrame'); the close's own paint serial is not on record, so a re-present of frame $closeFrame (a repeat the measured line never saw) cannot be ruled out and the tail is not credited")
+        }
+    }
     $lastShownFrame = [int64](@($byTime | ForEach-Object { [int64](Get-DvProp $_ 'displayFrame') }) | Measure-Object -Maximum).Maximum   # (r6, A3: the held end frame)
     for ($i = 1; $i -lt $byTime.Count; $i++) {
         $prev = $byTime[$i - 1]; $cur = $byTime[$i]
