@@ -425,8 +425,12 @@ function Invoke-ProbeWithin([string]$ScriptText, $Argument) {
         catch { return [pscustomobject]@{ answered = $false; value = @(); error = $_.Exception.Message } }
     }
     if ($bound -le 0) { $script:ProbeUnanswered = $true; return [pscustomobject]@{ answered = $false; value = @(); error = 'no time is left before -DeadlineUtc for it' } }
-    $r = & (Get-Module VenueChain) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } $ScriptText $Argument $bound
-    if (-not $r.answered -and [string]$r.error -like 'no answer in*') { $script:ProbeUnanswered = $true }   # a stall (the worker is abandoned); a worker that threw is not one
+    # R4-DEADLINE-RESIDUE-1 r3 (adversary 4829e999 A1, introduced by the first r3 draft): the bound above was sampled BEFORE the worker started, and a read that waits its full -TimeoutSec after a slow
+    # startup (a descheduled caller, a busy host) ends past the deadline. The call's end is fixed on its own clock, started with the sample: the wait is the time left to it once the worker runs, and an
+    # answer seen after it is never acted on (-EndIsBoundEnd: the end is the end of the bound itself, as VenueChain's own bounded reads pass it).
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $r = & (Get-Module VenueChain) { param($t, $a, $s, $c) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s -Clock $c -EndSec $s -EndIsBoundEnd } $ScriptText $Argument $bound $clock
+    if (-not $r.answered -and [string]$r.error -match '^(no answer in|an answer seen)') { $script:ProbeUnanswered = $true }   # a stall, or an answer that came too late (the worker is abandoned or its answer dropped); a worker that threw is not one
     $r
 }
 # the batch.log probe, one text for the worker and the inline call: 'plain' when batch.log is absent or a one-name file that is no link, else 'other'. The file identity is read through the

@@ -9831,6 +9831,27 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertNotIn("LEG_PLAN_REFUSED", log.read_text(encoding="utf-8") if log.exists() else "", "a probe that did not answer leaves batch.log unwritten (the share may hold it)")
         self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
 
+    def test_artifact_preflight_r4_deadline_a4_a_slow_worker_startup_is_taken_out_of_the_probes_wait(self) -> None:
+        # adversary 4829e999 A1: the probe's bound was sampled BEFORE the worker started and Invoke-VenueBoundedRead was given no clock, so a worker that took 4 s to start (here VenueChain's
+        # pre-wait test seam) was then waited for the whole bound again and the refusal ended 2 s after -DeadlineUtc. The mirror sets the deadline 6 s away right before the batch.log probe (a bound of
+        # 4 s), stalls the probe 40 s and delays the wait 4 s: the call's end is its own clock's now, so the wait is what is left of the bound and the run ends before the deadline.
+        seam = "            $script:deadline = [DateTime]::UtcNow.AddSeconds(6); [Console]::Error.WriteLine('DVT_DEADLINE_UTC=' + $script:deadline.ToString('o')); & (Get-Module VenueChain) { $script:VenueTestPreWaitDelayMs = 4000 }   # TEST FIXTURE\n"
+        call = "            $probe = Invoke-ProbeWithin $script:LogProbeScriptText @{ path = $batchLog; delayMs = (Get-RunDirReadSeamMs) }\n"
+        stall_anchor = "if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }\n"
+        self._mirror_with_bad_sidecar(runner_patches=((call, seam + call), (stall_anchor, "[Threading.Thread]::Sleep(40000)   # TEST FIXTURE: the share that holds batch.log answers 40 s late\n" + stall_anchor)))
+        self.plan_runner = self.runner
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "bad arm!", self.commit_a)]), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=90)))
+        ended = datetime.now(timezone.utc)
+        out = r.stdout[-2000:] + r.stderr[-3000:]
+        stamp = re.search(r"DVT_DEADLINE_UTC=(\S+)", r.stderr)
+        self.assertIsNotNone(stamp, out)
+        deadline = datetime.fromisoformat(stamp.group(1).replace("Z", "+00:00"))
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=BAD_ARM item=1 ", r.stderr, out)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after the deadline (the worker's startup was waited for on top of the bound). " + out)
+
     def test_artifact_preflight_r4_deadline_a4_without_a_deadline_the_probe_runs_inline_and_the_refusal_is_logged(self) -> None:
         # No -DeadlineUtc: nothing to bound a probe to ($script:deadline is then a 6 h default), so the plain probe answers and the refusal reaches batch.log, as before. The plan_cmd default
         # -DeadlineUtc pair is dropped from the command.
