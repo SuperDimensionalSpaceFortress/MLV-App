@@ -13296,9 +13296,11 @@ void MainWindow::playbackHandling(int timeDiff)
             return;
         }
         // r1 fix iteration 1 (adversary A1 on 57d1ab08): nor does one long-gap drop-frame tick carry it past the required frames
-        // (timeDiff feeds only that tick's request, fps x timeDiff / 1000, at the same fps)
+        // (timeDiff feeds only that tick's request, fps x timeDiff / 1000, at the same fps). Iteration 2 (pass 2 A1 on 8bfb3448):
+        // the travel owed is measured from m_newPosDropMode, the position that tick advances from and feeds the counter.
         timeDiff = playback_frame_range::pacedMeasuredHoldTickMs( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(), pacedHoldArmed,
-                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames, timeDiff, getPlaybackFramerate() );
+                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames, m_newPosDropMode, timeDiff,
+                getPlaybackFramerate() );
 
         // CUDA-HEADROOM-1: unpaced, present -> early advance -> render -> present never yields to the smoke's stop check
         // (r1 venue: Reached at 480 frames, seen at 615). Once the required source frames are consumed, hold.

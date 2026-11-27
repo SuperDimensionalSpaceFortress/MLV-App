@@ -1015,7 +1015,8 @@ TEST(PlaybackUnpacedWiring, APacedPlayHoldsAtItsRequiredFramesOnlyWhileTheMeasur
     // at the fps of the drop-frame request it feeds (timeDiff's only reader in playbackHandling)
     const QString tickCap = QStringLiteral(
         "        timeDiff = playback_frame_range::pacedMeasuredHoldTickMs( m_automationPacingIsolated, mlvappPlaybackUnpacedRequested(), pacedHoldArmed,\n"
-        "                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames, timeDiff, getPlaybackFramerate() );\n");
+        "                m_playbackSmokeTargetPresentedFrames, m_sourceAdvance.consumed(), m_playRequiredSourceFrames, m_newPosDropMode, timeDiff,\n"
+        "                getPlaybackFramerate() );\n");
     ASSERT_EQ(1, source.count(tickCap));
     ASSERT_EQ(1, source.count(QStringLiteral("playback_frame_range::pacedMeasuredHoldTickMs(")));
     const int capAt = handling.indexOf(tickCap);

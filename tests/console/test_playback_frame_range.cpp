@@ -4862,9 +4862,11 @@ namespace paced_starvation_model
 {
 // Receipt 8bcdb433 (Bachelor M16-1457 native fullscreen, paced): required 1499 of a 2859-frame clip, and the measured loop's
 // stop check starved -- its last check before the clip end came at frame ~1400, the next only at the clip end (2858). The model
-// runs one engine tick per step (advancing consumed by `step` unless the hold says no, never past the clip) and the measured
-// loop's stop check only at the scheduled ticks; the check that sees Reached stops the loop, which disarms the hold, and the
-// tail ticks after it run disarmed.
+// runs the drop-frame engine's tick as playbackHandling does (engineTick: the paced hold, else the capped span's request at the
+// pace fps, fed to the real SourceFrameAdvanceCounter from the fractional position, never past the clip's last frame) and the
+// measured loop's stop check only at the scheduled ticks; the check that sees Reached stops the loop, which disarms the hold,
+// and the tail ticks after it run disarmed. r1 fix iteration 2 (adversary pass 2 A1 on 8bfb3448): the model's ticks are real
+// requests (1.02 and 3 frames per tick at 60 fps), so a crossing tick is capped the way the engine's is.
 struct Run
 {
     int64_t consumedAtStop = -1;   // consumed at the check that stopped the loop (-1: never stopped)
@@ -4874,22 +4876,37 @@ struct Run
 };
 static constexpr int64_t kRequired = 1499;
 static constexpr int64_t kClipFrames = 2859;
-inline Run run( int64_t step, bool unpaced, int64_t targetPresentedFrames, int64_t tailTicks )
+static constexpr double kFps = 60.0;
+// false = held (no advance)
+inline bool engineTick( playback_frame_range::SourceFrameAdvanceCounter &counter, double &position, int timeDiffMs, double fps,
+                        bool unpaced, bool armed, int64_t target, int64_t required, int *tickMsOut = nullptr )
+{
+    if( playback_frame_range::pacedMeasuredHoldReached( true, unpaced, armed, target, counter.consumed(), required ) ) return false;
+    const int tickMs = playback_frame_range::pacedMeasuredHoldTickMs( true, unpaced, armed, target, counter.consumed(), required,
+                                                                      position, timeDiffMs, fps );
+    if( tickMsOut ) *tickMsOut = tickMs;
+    const double before = position;
+    position += fps * static_cast<double>( tickMs ) / 1000.0;
+    if( position > static_cast<double>( kClipFrames - 1 ) ) position = static_cast<double>( kClipFrames - 1 );
+    counter.noteEngineTick( before, position, false );
+    return true;
+}
+inline Run run( int timeDiffMs, bool unpaced, int64_t targetPresentedFrames, int64_t tailTicks )
 {
     static constexpr int64_t kChecks[] = { 50, 400, 900, 1400, 2858 };
     Run r;
-    int64_t consumed = 1;   // the counter counts the start frame
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 0 );   // the counter counts the start frame
+    double position = 0.0;
     bool armed = true;
     size_t nextCheck = 0;
     for( int64_t tick = 0; tick <= 2858 && !r.loopStopped; ++tick )
     {
-        if( playback_frame_range::pacedMeasuredHoldReached( true, unpaced, armed, targetPresentedFrames, consumed, kRequired ) )
-            ++r.heldTicks;
-        else
-            consumed = consumed + step < kClipFrames ? consumed + step : kClipFrames;
+        if( !engineTick( counter, position, timeDiffMs, kFps, unpaced, armed, targetPresentedFrames, kRequired ) ) ++r.heldTicks;
         if( nextCheck < sizeof( kChecks ) / sizeof( kChecks[0] ) && tick == kChecks[nextCheck] )
         {
             ++nextCheck;
+            const int64_t consumed = counter.consumed();
             const playback_frame_range::PlayStopState state = consumed >= kRequired
                 ? playback_frame_range::PlayStopState::Reached : playback_frame_range::PlayStopState::Continue;
             if( playback_frame_range::measuredPlayLoopShouldStop( state, false, targetPresentedFrames, 0, kRequired, true, consumed ) )
@@ -4901,11 +4918,8 @@ inline Run run( int64_t step, bool unpaced, int64_t targetPresentedFrames, int64
     }
     armed = false;   // the loop's exit disarms the hold
     for( int64_t tick = 0; tick < tailTicks; ++tick )
-    {
-        if( !playback_frame_range::pacedMeasuredHoldReached( true, unpaced, armed, targetPresentedFrames, consumed, kRequired ) )
-            consumed = consumed + step < kClipFrames ? consumed + step : kClipFrames;
-    }
-    r.consumedAfterTail = consumed;
+        engineTick( counter, position, timeDiffMs, kFps, unpaced, armed, targetPresentedFrames, kRequired );
+    r.consumedAfterTail = counter.consumed();
     return r;
 }
 }
@@ -4913,102 +4927,112 @@ inline Run run( int64_t step, bool unpaced, int64_t targetPresentedFrames, int64
 TEST( PlaybackPacedMeasuredHold, AStarvedStopCheckSeesTheRequiredFrameAndTheTailPlaysOnOnceDisarmed )
 {
     using namespace paced_starvation_model;
-    for( const int64_t step : { int64_t( 1 ), int64_t( 3 ) } )   // one frame per tick, and a drop-frame step of 3
+    for( const int timeDiffMs : { 17, 50 } )   // 1.02 frames per tick, and a drop-frame step of 3, at 60 fps
     {
-        const Run r = run( step, false, 0, 180 );
+        const Run r = run( timeDiffMs, false, 0, 180 );
         ASSERT_TRUE( r.loopStopped );
-        // RED on fbd46832 (no paced hold): the check at 2858 saw the clip end, consumed 2859
-        ASSERT_TRUE( r.consumedAtStop >= kRequired );
-        ASSERT_TRUE( r.consumedAtStop < kRequired + 3 );
+        // RED on fbd46832 (no paced hold): the check at 2858 (or 900) saw the timeline far past the window, up to the clip end
+        ASSERT_EQ( kRequired, r.consumedAtStop );   // r1 iteration 2: exactly the required frames, the crossing tick capped
         ASSERT_TRUE( r.heldTicks > 0 );
         ASSERT_TRUE( playback_frame_range::measuredPlayLoopShouldStop( playback_frame_range::PlayStopState::Reached, false, 0, 0,
                                                                        kRequired, true, r.consumedAtStop ) );
-        // disarmed, the timeline advances again: the visual-capture tail plays
-        ASSERT_TRUE( r.consumedAfterTail > r.consumedAtStop );
-        ASSERT_EQ( r.consumedAtStop + 180 * step, r.consumedAfterTail );
+        // disarmed, the timeline advances again at the paced request: the visual-capture tail plays
+        const int64_t tailFrames = static_cast<int64_t>( 180.0 * kFps * timeDiffMs / 1000.0 );
+        ASSERT_TRUE( r.consumedAfterTail >= r.consumedAtStop + tailFrames - 1 );
+        ASSERT_TRUE( r.consumedAfterTail <= r.consumedAtStop + tailFrames + 1 );
     }
 }
 
 // r1 fix iteration 1 (adversary A1 on 57d1ab08): the hold runs before a tick, so a drop-frame tick after a long GUI gap asked for
 // fps x timeDiff / 1000 frames and carried the timeline past the requirement in one step (required 1500, consumed 1499, 1000 ms at
-// 60 fps: 1559). The tick's span is capped while the paced hold applies; the model applies a tick the way the engine does (the
-// request at the same fps, the slider on the floor of the position, the counter counting the start frame).
-namespace paced_tick_model
-{
-inline int64_t tick( double &position, int64_t startFrame, int timeDiffMs, double fps, bool unpaced, bool armed, int64_t target,
-                     int64_t required, int64_t *tickMsOut = nullptr )
-{
-    const int64_t consumed = static_cast<int64_t>( std::floor( position ) ) - startFrame + 1;
-    if( playback_frame_range::pacedMeasuredHoldReached( true, unpaced, armed, target, consumed, required ) ) return consumed;
-    const int tickMs = playback_frame_range::pacedMeasuredHoldTickMs( true, unpaced, armed, target, consumed, required, timeDiffMs, fps );
-    if( tickMsOut ) *tickMsOut = tickMs;
-    position += fps * static_cast<double>( tickMs ) / 1000.0;
-    return static_cast<int64_t>( std::floor( position ) ) - startFrame + 1;
-}
-}
-
+// 60 fps: 1559). The tick's span is capped while the paced hold applies; engineTick applies a tick the way the engine does (the
+// request at the same fps from the fractional position, the real counter fed from that position, the start frame counted).
+// r1 fix iteration 2 (adversary pass 2 A1 on 8bfb3448): from a fractional position (1498.99) a whole-frame shortfall still landed
+// on 1500.01, consumed required + 1; the travel owed is measured from the position, so every crossing lands on required exactly.
 TEST( PlaybackPacedMeasuredHold, R1A1ALongGapDropFrameTickNeverCarriesTheTimelinePastTheRequiredFrames )
 {
-    using paced_tick_model::tick;
-    // the adversary's input: 60 fps, required 1500, position 1498 (consumed 1499, start 0), one 1000 ms tick
+    using paced_starvation_model::engineTick;
+    using playback_frame_range::SourceFrameAdvanceCounter;
+    const auto counterAt = []( double position )   // consumed counted from start frame 0 up to the playhead's position
     {
-        double position = 1498.0;
-        const int64_t after = tick( position, 0, 1000, 60.0, false, true, 0, 1500 );
-        ASSERT_TRUE( after >= 1500 );          // the tick still reaches the requirement ...
-        ASSERT_TRUE( after < 1502 );           // ... RED on 57d1ab08 (no cap): 1559
-        const int64_t held = tick( position, 0, 1000, 60.0, false, true, 0, 1500 );
-        ASSERT_EQ( after, held );              // and the next tick holds there
+        SourceFrameAdvanceCounter counter;
+        counter.begin( 0 );
+        counter.noteEngineTick( 0.0, position, false );
+        return counter;
+    };
+    // the adversaries' inputs: 60 fps, required 1500, one 1000 ms tick, from position 1498 (pass 1) and 1498.99 (pass 2), both
+    // consumed 1499
+    for( const double start : { 1498.0, 1498.99 } )
+    {
+        SourceFrameAdvanceCounter counter = counterAt( start );
+        ASSERT_EQ( 1499, counter.consumed() );
+        double position = start;
+        ASSERT_TRUE( engineTick( counter, position, 1000, 60.0, false, true, 0, 1500 ) );
+        ASSERT_EQ( 1500, counter.consumed() );   // RED on 57d1ab08 (no cap): 1559 / 1560; on 8bfb3448 from 1498.99: 1501
+        const double heldAt = position;
+        ASSERT_TRUE( !engineTick( counter, position, 1000, 60.0, false, true, 0, 1500 ) );   // the next tick holds there
+        ASSERT_EQ( 1500, counter.consumed() );
+        ASSERT_TRUE( position == heldAt );
     }
-    // the class: any gap, any start short of the requirement, the paced fps of the venue clips
+    // the class: any gap, any start short of the requirement (whole and fractional, just under a frame boundary), the paced fps of
+    // the venue clips: the requirement is reached, exactly
     for( const double fps : { 23.976, 25.0, 29.97, 59.94, 60.0, 120.0 } )
         for( const int gapMs : { 1, 8, 17, 33, 100, 250, 1000, 5000, 22000 } )
-            for( const double startPos : { 1450.0, 1490.5, 1497.0, 1497.99, 1498.0, 1498.5 } )
+            for( const double start : { 1450.0, 1490.5, 1497.0, 1497.99, 1498.0, 1498.5, 1498.99, 1498.999999 } )
             {
-                double position = startPos;
-                int64_t consumed = static_cast<int64_t>( std::floor( position ) ) + 1;
-                for( int t = 0; t < 4000 && consumed < 1500; ++t ) consumed = tick( position, 0, gapMs, fps, false, true, 0, 1500 );
-                ASSERT_TRUE( consumed >= 1500 );
-                ASSERT_TRUE( consumed < 1502 );
+                SourceFrameAdvanceCounter counter = counterAt( start );
+                double position = start;
+                for( int t = 0; t < 4000 && counter.consumed() < 1500; ++t )
+                    engineTick( counter, position, gapMs, fps, false, true, 0, 1500 );
+                ASSERT_EQ( 1500, counter.consumed() );
+                ASSERT_TRUE( !engineTick( counter, position, gapMs, fps, false, true, 0, 1500 ) );
             }
     // unchanged whenever the paced hold does not apply, and before the crossing: the span passes through untouched
     for( const int gapMs : { 17, 1000 } )
     {
-        int64_t tickMs = -1;
+        int tickMs = -1;
+        SourceFrameAdvanceCounter counter = counterAt( 1498.0 );
         double position = 1498.0;
-        tick( position, 0, gapMs, 60.0, false, false, 0, 1500, &tickMs );   // not armed (the tail after the loop)
+        engineTick( counter, position, gapMs, 60.0, false, false, 0, 1500, &tickMs );   // not armed (the tail after the loop)
         ASSERT_EQ( gapMs, tickMs );
+        counter = counterAt( 1498.0 );
         position = 1498.0;
-        tick( position, 0, gapMs, 60.0, true, true, 0, 1500, &tickMs );     // unpaced: CUDA-HEADROOM-1's hold, unchanged
+        engineTick( counter, position, gapMs, 60.0, true, true, 0, 1500, &tickMs );     // unpaced: CUDA-HEADROOM-1's hold, unchanged
         ASSERT_EQ( gapMs, tickMs );
+        counter = counterAt( 1498.0 );
         position = 1498.0;
-        tick( position, 0, gapMs, 60.0, false, true, 480, 1500, &tickMs );  // pinned
+        engineTick( counter, position, gapMs, 60.0, false, true, 480, 1500, &tickMs );  // pinned
         ASSERT_EQ( gapMs, tickMs );
     }
-    ASSERT_EQ( 17, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 100, 1500, 17, 60.0 ) );   // far from it
-    ASSERT_EQ( 1000, playback_frame_range::pacedMeasuredHoldTickMs( false, false, true, 0, 1499, 1500, 1000, 60.0 ) );
-    ASSERT_EQ( 1000, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 0, 1000, 60.0 ) );
-    ASSERT_EQ( 1000, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1000, 0.0 ) );
-    ASSERT_EQ( 1000, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1000,
-                                                                    std::numeric_limits<double>::quiet_NaN() ) );
-    ASSERT_EQ( 0, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 0, 60.0 ) );
-    ASSERT_EQ( 17, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1000, 60.0 ) );
+    using playback_frame_range::pacedMeasuredHoldTickMs;
+    ASSERT_EQ( 17, pacedMeasuredHoldTickMs( true, false, true, 0, 100, 1500, 99.0, 17, 60.0 ) );   // far from it
+    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( false, false, true, 0, 1499, 1500, 1498.0, 1000, 60.0 ) );
+    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 0, 1498.0, 1000, 60.0 ) );
+    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 1000, 0.0 ) );
+    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 1000, std::numeric_limits<double>::quiet_NaN() ) );
+    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, std::numeric_limits<double>::quiet_NaN(), 1000, 60.0 ) );
+    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, std::numeric_limits<double>::infinity(), 1000, 60.0 ) );
+    ASSERT_EQ( 0, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 0, 60.0 ) );
+    ASSERT_EQ( 17, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 1000, 60.0 ) );
+    ASSERT_EQ( 1, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.99, 1000, 60.0 ) );   // 0.01 frame owed
+    ASSERT_EQ( 9, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.5, 1000, 60.0 ) );    // 0.5 frame owed
     // no overflow at the int64 extremes: the shortfall is formed exactly, and a span shorter than it passes through
-    ASSERT_EQ( 1000, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, std::numeric_limits<int64_t>::min(),
-                                                                    std::numeric_limits<int64_t>::max(), 1000, 60.0 ) );
-    ASSERT_EQ( 1, playback_frame_range::pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1000, 1.0e9 ) );
+    ASSERT_EQ( 1000, pacedMeasuredHoldTickMs( true, false, true, 0, std::numeric_limits<int64_t>::min(),
+                                              std::numeric_limits<int64_t>::max(), 0.0, 1000, 60.0 ) );
+    ASSERT_EQ( 1, pacedMeasuredHoldTickMs( true, false, true, 0, 1499, 1500, 1498.0, 1000, 1.0e9 ) );
 }
 
 TEST( PlaybackPacedMeasuredHold, APinnedOrUnpacedRunIsNeverHeldByThePacedHold )
 {
     using namespace paced_starvation_model;
-    for( const int64_t step : { int64_t( 1 ), int64_t( 3 ) } )
+    for( const int timeDiffMs : { 17, 50 } )
     {
-        const Run unpaced = run( step, true, 0, 0 );
+        const Run unpaced = run( timeDiffMs, true, 0, 0 );
         ASSERT_EQ( 0, unpaced.heldTicks );
         // the model has no unpaced hold (CUDA-HEADROOM-1's, unchanged), so the starved check sees the timeline far past the window
         ASSERT_TRUE( unpaced.loopStopped );
         ASSERT_TRUE( unpaced.consumedAtStop > kRequired + 1000 );
-        const Run pinned = run( step, false, 480, 0 );
+        const Run pinned = run( timeDiffMs, false, 480, 0 );
         ASSERT_EQ( 0, pinned.heldTicks );
         ASSERT_TRUE( pinned.consumedAtStop < 0 || pinned.consumedAtStop > kRequired + 3 );
     }

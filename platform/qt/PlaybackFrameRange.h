@@ -1452,19 +1452,31 @@ inline bool pacedMeasuredHoldReached( bool automationIsolated, bool unpacedReque
 // r1 fix iteration 1 (adversary A1 on 57d1ab08): the hold above runs BEFORE a tick, so one drop-frame tick that asks for
 // fps x timeDiff / 1000 frames after a long GUI gap (1000 ms at 60 fps: 60 frames) carried the timeline from 1499 to 1559 consumed
 // before the hold saw it. While the same paced hold applies and is not yet reached, the tick's span (ms) is capped at the time the
-// frames still short of the requirement take at the request's fps (rounded up: the tick reaches the requirement, at most a
-// fraction of a frame past it). Anything else -- not armed, pinned, unpaced, no requirement, an unknown fps, a span already short
-// enough -- returns timeDiffMs unchanged, so paced cadence before the crossing is untouched.
+// TRAVEL still short of the requirement takes at the request's fps, rounded up. r1 fix iteration 2 (adversary pass 2 A1 on
+// 8bfb3448): that travel is measured from the tick's start position, the fractional drop-frame position the source-frame counter
+// is fed from (SourceFrameAdvanceCounter credits floor( position + 1e-9 )): (required - consumed) frames less the fraction already
+// travelled into the current frame. From 1498.99 a whole-frame shortfall asked for 1.02 frames and landed on 1500.01 (consumed
+// required + 1); now it asks for 0.06 and lands on 1499.05 (consumed == required). The tick then ends at most fps / 1000 frames
+// past the frame boundary that completes the requirement, never on the frame after it (fps below 1000); a playhead below the
+// counter's high-water mark (a backward seek) only lands short, and the next tick asks again. Anything else -- not armed,
+// pinned, unpaced, no requirement, an unknown fps or position, a span already short enough -- returns timeDiffMs unchanged, so
+// paced cadence before the crossing is untouched.
 inline int pacedMeasuredHoldTickMs( bool automationIsolated, bool unpacedRequested, bool armedForOpenSession,
                                     int64_t targetPresentedFrames, int64_t consumedSourceFrames, int64_t requiredSourceFrames,
-                                    int timeDiffMs, double requestFps )
+                                    double tickStartPosition, int timeDiffMs, double requestFps )
 {
     if( !( automationIsolated && !unpacedRequested && armedForOpenSession && targetPresentedFrames <= 0 && requiredSourceFrames > 0 )
-     || consumedSourceFrames >= requiredSourceFrames || timeDiffMs <= 0 || !( requestFps > 0.0 ) || !std::isfinite( requestFps ) )
+     || consumedSourceFrames >= requiredSourceFrames || timeDiffMs <= 0 || !( requestFps > 0.0 ) || !std::isfinite( requestFps )
+     || !std::isfinite( tickStartPosition ) )
         return timeDiffMs;
-    // consumed < required here: the difference is formed in uint64_t, exact for every int64 pair (the signed form overflows)
+    // the fraction of the current frame already travelled, on the counter's own rounding (in [0, 1))
+    double travelled = tickStartPosition - std::floor( tickStartPosition + 1e-9 );
+    if( !( travelled > 0.0 ) ) travelled = 0.0;
+    if( travelled >= 1.0 ) travelled = 0.0;
+    // consumed < required here: the difference is formed in uint64_t, exact for every int64 pair (the signed form overflows);
+    // it is at least 1, so the travel still owed is positive
     const double shortFrames = static_cast<double>( static_cast<uint64_t>( requiredSourceFrames )
-                                                    - static_cast<uint64_t>( consumedSourceFrames ) );
+                                                    - static_cast<uint64_t>( consumedSourceFrames ) ) - travelled;
     const double shortMs = std::ceil( shortFrames * 1000.0 / requestFps );
     return shortMs < static_cast<double>( timeDiffMs ) ? static_cast<int>( shortMs < 1.0 ? 1.0 : shortMs ) : timeDiffMs;
 }
