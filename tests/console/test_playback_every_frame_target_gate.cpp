@@ -242,12 +242,33 @@ bool isIdentifierChar( QChar c )
     return c.isLetterOrNumber() || c == QLatin1Char( '_' );
 }
 
-// The identifier or pp-number that ends right before \a i (empty when \a i follows punctuation or whitespace).
+// skipLineSplices scanned backwards: the position before the splices that end right at \a i.
+int skipLineSplicesBackward( const QString & s, int i )
+{
+    while( i > 0 && s.at( i - 1 ) == QLatin1Char( '\n' ) )
+    {
+        int k = i - 1;
+        if( k > 0 && s.at( k - 1 ) == QLatin1Char( '\r' ) ) --k;
+        while( k > 0 && ( s.at( k - 1 ) == QLatin1Char( ' ' ) || s.at( k - 1 ) == QLatin1Char( '\t' ) ) ) --k;
+        if( k == 0 || s.at( k - 1 ) != QLatin1Char( '\\' ) ) break;
+        i = k - 1;
+    }
+    return i;
+}
+
+// The identifier or pp-number that ends right before \a i (empty when \a i follows punctuation or whitespace), read after
+// splicing (r7, adversary A1 on db994303): `R\` + newline + `"x(` is the raw-string prefix R, and `1\` + newline + `'000` is a
+// digit separator, exactly as the compiler reads them.
 QString tokenBefore( const QString & s, int i )
 {
-    int start = i;
-    while( start > 0 && ( isIdentifierChar( s.at( start - 1 ) ) || s.at( start - 1 ) == QLatin1Char( '.' ) ) ) --start;
-    return s.mid( start, i - start );
+    QString token;
+    int k = skipLineSplicesBackward( s, i );
+    while( k > 0 && ( isIdentifierChar( s.at( k - 1 ) ) || s.at( k - 1 ) == QLatin1Char( '.' ) ) )
+    {
+        token.prepend( s.at( k - 1 ) );
+        k = skipLineSplicesBackward( s, k - 1 );
+    }
+    return token;
 }
 
 QString stripComments( const QString & s )
@@ -924,6 +945,16 @@ TEST( EveryFrameTargetGate, StripCommentsKeepsCodeAfterALiteralThatHoldsAComment
           QStringLiteral( "x = 0x1'F; forbidden_code(); \n" ) },
         { QStringLiteral( "a = b / c; forbidden_code(); // gone\n" ),
           QStringLiteral( "a = b / c; forbidden_code(); \n" ) },
+        // adversary A1 on db994303: a splice between a literal's prefix and its quote (or inside a pp-number) is read after splicing
+        { QStringLiteral( "log(R\\\n\"x(a \" // b)x\"); forbidden_code(); // gone\n" ),
+          QStringLiteral( "log(R\\\n\"x(a \" // b)x\"); forbidden_code(); \n" ) },
+        { QStringLiteral( "log(u8\\\nR\\\r\n\"(a \" // b)\"); forbidden_code(); // gone\n" ),
+          QStringLiteral( "log(u8\\\nR\\\r\n\"(a \" // b)\"); forbidden_code(); \n" ) },
+        { QStringLiteral( "n = 1\\  \n'000; forbidden_code(); // gone '\n" ),
+          QStringLiteral( "n = 1\\  \n'000; forbidden_code(); \n" ) },
+        // a blank before the splice ends the token: `R "x(` is the identifier R and an ordinary string, so `// b)x"` is in it
+        { QStringLiteral( "log(R \\\n\"x(a // b)x\"); forbidden_code(); // gone\n" ),
+          QStringLiteral( "log(R \\\n\"x(a // b)x\"); forbidden_code(); \n" ) },
     };
     for( const Case & item : cases )
     {
