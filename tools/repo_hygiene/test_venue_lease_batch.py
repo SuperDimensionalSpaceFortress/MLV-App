@@ -9836,7 +9836,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # pre-wait test seam) was then waited for the whole bound again and the refusal ended 2 s after -DeadlineUtc. The mirror sets the deadline 6 s away right before the batch.log probe (a bound of
         # 4 s), stalls the probe 40 s and delays the wait 4 s: the call's end is its own clock's now, so the wait is what is left of the bound and the run ends before the deadline.
         seam = "            $script:deadline = [DateTime]::UtcNow.AddSeconds(6); [Console]::Error.WriteLine('DVT_DEADLINE_UTC=' + $script:deadline.ToString('o')); & (Get-Module VenueChain) { $script:VenueTestPreWaitDelayMs = 4000 }   # TEST FIXTURE\n"
-        call = "            $probe = Invoke-ProbeWithin $script:LogProbeScriptText @{ path = $batchLog; delayMs = (Get-RunDirReadSeamMs) }\n"
+        call = "            $probe = Invoke-ProbeWithin $script:LogProbeBlock @{ path = $batchLog; delayMs = (Get-RunDirReadSeamMs) }\n"
         stall_anchor = "if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }\n"
         self._mirror_with_bad_sidecar(runner_patches=((call, seam + call), (stall_anchor, "[Threading.Thread]::Sleep(40000)   # TEST FIXTURE: the share that holds batch.log answers 40 s late\n" + stall_anchor)))
         self.plan_runner = self.runner
@@ -9871,8 +9871,13 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         source = RUNNER.read_text(encoding="utf-8")
         m = re.search(r"^function Get-ProbeBoundSec \{.*?^\}\r?\n.*?^function Invoke-ProbeWithin\(.*?^\}\r?\n", source, re.S | re.M)
         self.assertIsNotNone(m, "the probe helpers moved: update this case")
+        # (adversary 8bb8cadc A1) the call's clock starts BEFORE the time left is sampled, so a caller descheduled between the two ends its wait earlier, never later; (adversary 8bb8cadc A2) the inline form
+        # is a { } literal run with `&`, never a string run at run time: the launch-site census (test_retire_lane_worktree.py, UNRESOLVED_EXECUTED_SITES) counts this file's executed strings exactly
+        within = m.group(0)[m.group(0).index("function Invoke-ProbeWithin("):]
+        self.assertLess(within.index("[Diagnostics.Stopwatch]::StartNew()"), within.index("$bound = Get-ProbeBoundSec"), "the clock must start before the sample")
+        self.assertNotIn("[scriptblock]::Create", source.split("function Get-ProbeBoundSec", 1)[1].split("function Stop-PlanRefused", 1)[0], "the probe helpers run no string built at run time")
         script = ("$DeadlineUtc = ''; $script:ProbeUnanswered = $false\n" + m.group(0) +
-                  "\n$r = Invoke-ProbeWithin 'param($a) $a.x * 2' @{ x = 21 }\n"
+                  "\n$r = Invoke-ProbeWithin { param($a) $a.x * 2 } @{ x = 21 }\n"
                   "ConvertTo-Json -Compress -InputObject @{ answered = $r.answered; value = @($r.value)[-1]; unanswered = $script:ProbeUnanswered; noBound = ($null -eq (Get-ProbeBoundSec)) }\n")
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)

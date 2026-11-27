@@ -416,37 +416,41 @@ function Get-ProbeBoundSec {
     if ($room -lt 1.0) { return 0.0 }
     [Math]::Min(600.0, $room)
 }
-function Invoke-ProbeWithin([string]$ScriptText, $Argument) {
+function Invoke-ProbeWithin($Probe, $Argument) {
+    # $Probe: a { } LITERAL of this file (run inline without -DeadlineUtc, and handed to the worker as its text with it) or, for the one probe that is built at run time, the worker's text alone.
     # [pscustomobject]@{ answered; value; error }: the probe's output, or no answer (the bound ended, no room was left, or the worker threw)
+    # R4-DEADLINE-RESIDUE-1 r3 (adversary 4829e999 A1, then 8bb8cadc A1): the call's end is fixed on its own clock, and that clock starts BEFORE the time left is sampled, so a caller
+    # descheduled between the two can only end the wait EARLIER than the sample says, never later. The worker's startup is inside the wait (Invoke-VenueBoundedRead takes the time left to the end
+    # on this clock, not the whole bound again), and an answer seen after the end is never acted on (-EndIsBoundEnd: the end is the end of the bound itself, as VenueChain's own bounded reads pass it).
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     $bound = Get-ProbeBoundSec
     # no -DeadlineUtc: the plain inline probe. This branch comes FIRST: `$null -le 0` is TRUE, so the test below read "no deadline" as "no time left"
     if ($null -eq $bound) {
-        try { return [pscustomobject]@{ answered = $true; value = @(& ([scriptblock]::Create($ScriptText)) $Argument); error = $null } }
+        if ($Probe -isnot [scriptblock]) { return [pscustomobject]@{ answered = $false; value = @(); error = 'a probe given as text has no inline form' } }
+        try { return [pscustomobject]@{ answered = $true; value = @(& $Probe $Argument); error = $null } }
         catch { return [pscustomobject]@{ answered = $false; value = @(); error = $_.Exception.Message } }
     }
     if ($bound -le 0) { $script:ProbeUnanswered = $true; return [pscustomobject]@{ answered = $false; value = @(); error = 'no time is left before -DeadlineUtc for it' } }
-    # R4-DEADLINE-RESIDUE-1 r3 (adversary 4829e999 A1, introduced by the first r3 draft): the bound above was sampled BEFORE the worker started, and a read that waits its full -TimeoutSec after a slow
-    # startup (a descheduled caller, a busy host) ends past the deadline. The call's end is fixed on its own clock, started with the sample: the wait is the time left to it once the worker runs, and an
-    # answer seen after it is never acted on (-EndIsBoundEnd: the end is the end of the bound itself, as VenueChain's own bounded reads pass it).
-    $clock = [Diagnostics.Stopwatch]::StartNew()
-    $r = & (Get-Module VenueChain) { param($t, $a, $s, $c) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s -Clock $c -EndSec $s -EndIsBoundEnd } $ScriptText $Argument $bound $clock
+    $text = $(if ($Probe -is [scriptblock]) { $Probe.ToString() } else { [string]$Probe })
+    $r = & (Get-Module VenueChain) { param($t, $a, $s, $c) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s -Clock $c -EndSec $s -EndIsBoundEnd } $text $Argument $bound $clock
     if (-not $r.answered -and [string]$r.error -match '^(no answer in|an answer seen)') { $script:ProbeUnanswered = $true }   # a stall, or an answer that came too late (the worker is abandoned or its answer dropped); a worker that threw is not one
     $r
 }
-# the batch.log probe, one text for the worker and the inline call: 'plain' when batch.log is absent or a one-name file that is no link, else 'other'. The file identity is read through the
-# compiled type Get-PhysicalPath loaded (assemblies are process-wide, so the worker sees it); $A.delayMs is the offline -GuardReadDelay seam (0 in production).
-$script:LogProbeScriptText = @'
-$A = $args[0]
-$batchLog = $A.path
-if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }
-if (-not (Test-Path -LiteralPath $batchLog)) { return 'plain' }
-if (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-    [uint32]$links = 0
-    $null = [VenueLeaseBatchFinalPath]::Identity([IO.Path]::GetFullPath($batchLog), [ref]$links)
-    if ([int]$links -le 1) { return 'plain' }
+# the batch.log probe, one { } literal for the worker (its text) and the inline call: 'plain' when batch.log is absent or a one-name file that is no link, else 'other'. The file identity is read through
+# the compiled type Get-PhysicalPath loaded (assemblies are process-wide, so the worker sees it); $A.delayMs is the offline -GuardReadDelay seam (0 in production). A literal, never a string run at
+# run time: the launch-site census (tests/coordination/test_retire_lane_worktree.py, UNRESOLVED_EXECUTED_SITES) classifies this file's executed strings one by one.
+$script:LogProbeBlock = {
+    param($A)
+    $batchLog = $A.path
+    if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }
+    if (-not (Test-Path -LiteralPath $batchLog)) { return 'plain' }
+    if (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        [uint32]$links = 0
+        $null = [VenueLeaseBatchFinalPath]::Identity([IO.Path]::GetFullPath($batchLog), [ref]$links)
+        if ([int]$links -le 1) { return 'plain' }
+    }
+    'other'
 }
-'other'
-'@
 function Get-RunDirReadSeamMs {
     # Wait-RunDirReadSeam's own condition, as the delay the probe worker sleeps (the same stderr line, said once here); 0 in production
     $d = $script:guardDelaySeam
@@ -496,7 +500,7 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
         if ($DeadlineUtc) {
             # R4-DEADLINE-RESIDUE-1 r3 (adversary ef31edb1 A4): the 3 s test above ADMITS the probe, it does not bound it. With more than 3 s left a stalled probe still ran to its own end,
             # past -DeadlineUtc. It runs on a worker given up on at the time left less 2 s (Invoke-ProbeWithin); no answer leaves batch.log unwritten and every later line on stderr.
-            $probe = Invoke-ProbeWithin $script:LogProbeScriptText @{ path = $batchLog; delayMs = (Get-RunDirReadSeamMs) }
+            $probe = Invoke-ProbeWithin $script:LogProbeBlock @{ path = $batchLog; delayMs = (Get-RunDirReadSeamMs) }
             if (-not $probe.answered) { if ($script:ProbeUnanswered) { $script:RunOutputAliased = $true } }   # a stall: the share may hold -RunDir; a probe that threw only leaves batch.log unwritten, as before
             elseif (@($probe.value)[-1] -ceq 'plain') { $logPlain = $true }
         } else {
