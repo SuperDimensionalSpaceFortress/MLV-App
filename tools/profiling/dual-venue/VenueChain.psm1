@@ -1320,22 +1320,30 @@ function Invoke-VenueBoundedRead {
             return [pscustomobject]@{ answered = $false; value = @(); error = "the caller's absolute end passed during the worker's setup; nothing was started" }
         }
         $async = $ps.BeginInvoke()
+        # adversary-677afe0a.json A1: -TimeoutSec is measured on this clock, started before any sample, so no stall between a sample and the wait is ever granted again
+        $waitClock = [Diagnostics.Stopwatch]::StartNew()
         if ($script:VenueTestPreWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreWaitDelayMs) }
         # r13 (Grok G20 on #814): $endCut = the caller's end, not -TimeoutSec, set the wait (as the nightly's capCut), so the message reports the wait actually given
         $waitSec = $TimeoutSec; $endCut = $false
         if ($null -ne $Clock) { $toEnd = $EndSec - $Clock.Elapsed.TotalSeconds; if ($toEnd -lt $waitSec) { $waitSec = [Math]::Max(0.0, $toEnd); $endCut = $true } }
         if ($script:VenueTestPostWaitSampleDelayMs -gt 0) { $stallMs = $script:VenueTestPostWaitSampleDelayMs; $script:VenueTestPostWaitSampleDelayMs = 0; [Threading.Thread]::Sleep($stallMs) }
         $done = $false; $utcCut = $false
-        if (-not $hasUtc) { $done = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec)) }
+        if (-not $hasUtc -and $null -eq $Clock) { $done = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Max(0.0, $TimeoutSec - $waitClock.Elapsed.TotalSeconds))) }
         else {
-            # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1: the same stopwatch bound ($waitSec from $waitClock's start), cut to the UTC end's left, read again after every slice
-            $waitClock = [Diagnostics.Stopwatch]::StartNew()
+            # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1: the wait ends at the earliest of -TimeoutSec (on $waitClock), the caller's end (-EndSec on ITS -Clock) and the UTC end, every one
+            # re-read LIVE before every slice (adversary-677afe0a.json A1 and its sibling, the stopwatch-only wait: a remainder sampled once and waited for later was granted again in full
+            # after a stall between the two), so a stall or a wall-clock step costs at most one slice
             while ($true) {
-                $utcLeft = Get-VenueUtcLeftSec -DeadlineUtc $EndUtc
-                if ($utcLeft -le 0) { $utcCut = $true; break }
-                $swLeft = $waitSec - $waitClock.Elapsed.TotalSeconds
-                if ($swLeft -le 0) { break }
-                if ($async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Max(0.0, [Math]::Min([Math]::Min($swLeft, $utcLeft), $script:VenueUtcWaitSliceSec))))) { $done = $true; break }
+                $left = $TimeoutSec - $waitClock.Elapsed.TotalSeconds
+                if ($null -ne $Clock) { $left = [Math]::Min($left, $EndSec - $Clock.Elapsed.TotalSeconds) }
+                if ($hasUtc) {
+                    $utcLeft = Get-VenueUtcLeftSec -DeadlineUtc $EndUtc
+                    if ($utcLeft -le 0) { $utcCut = $true; $done = $async.AsyncWaitHandle.WaitOne(0); break }
+                    $left = [Math]::Min($left, $utcLeft)
+                }
+                # an end already passed still looks once (WaitOne(0), as the single wait did): a worker that HAS answered is then judged by the late-answer checks below, and disposed
+                if (-not ($left -gt 0)) { $done = $async.AsyncWaitHandle.WaitOne(0); break }
+                if ($async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min($left, $script:VenueUtcWaitSliceSec)))) { $done = $true; break }
             }
         }
         if (-not $done) {
