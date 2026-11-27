@@ -1372,6 +1372,53 @@ class HostLoadWaitHonoursUtcDeadlineTests(unittest.TestCase):
                 self.assertEqual(got["VALUE"], "", got)
                 self.assertIn("absolute end", got["ERR"], got)
 
+    def test_adv3_a1_an_answer_seen_after_the_reads_own_bound_is_never_acted_on(self) -> None:
+        # adversary-48578eab.json A1 (introduced), its input: VenueTestPostWaitSampleDelayMs=1500 (the caller stalls 1.5 s right after the wait's sample), a worker that answers 42 after
+        # 1.1 s, -TimeoutSec 1, a running -Clock with -EndSec 20, -EndUtc U0+60 s. The read's OWN bound (1 s on its wait clock) has run out when the loop looks; its last look
+        # (WaitOne(0)) found the finished worker, and the late checks read only the optional caller ends, so 42 was returned as answered. Each row leaves out one or both optional
+        # clocks (the no-clock row is pass-2 ADVISORY A2's path): an answer seen after the read's own bound is never acted on, on every path.
+        rows = (
+            ("clock+utc", "-Clock $sw -EndSec 20 -EndUtc ([DateTime]::UtcNow.AddSeconds(60))"),
+            ("clock-only", "-Clock $sw -EndSec 20"),
+            ("utc-only", "-EndUtc ([DateTime]::UtcNow.AddSeconds(60))"),
+            ("no-clock", ""),
+        )
+        for label, extra in rows:
+            with self.subTest(row=label):
+                body = (
+                    "$vc = Get-Module VenueChain; "
+                    "& $vc { $script:VenueTestPostWaitSampleDelayMs = 1500 }; "
+                    "$r = & $vc { param($x) $sw = [Diagnostics.Stopwatch]::StartNew(); "
+                    "Invoke-Expression ('Invoke-VenueBoundedRead -ScriptText ''param($a) [Threading.Thread]::Sleep(1100); 42'' -Argument 0 -TimeoutSec 1 ' + $x) } "
+                    f"'{extra}'; "
+                    "Write-Output ('ANSWERED=' + $r.answered); Write-Output ('VALUE=' + (@($r.value) -join ',')); Write-Output ('ERR=' + $r.error); "
+                    "Complete-VenueProcess -ExitCode 0")
+                p = run_ps(body)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+                self.assertEqual(got["ANSWERED"], "False", f"an answer seen after the read's own 1 s bound was acted on: {got}")
+                self.assertEqual(got["VALUE"], "", got)
+                self.assertIn("read's own bound", got["ERR"], got)
+
+    def test_adv3_a2_a_job_result_seen_after_its_own_bound_reads_unknown(self) -> None:
+        # adversary-9bc903a3.json ADVISORY A2 (the no-clock path, closed by the A1 fix): Get-VenueJobResult -TimeoutSec 1 reads a result.json that is there at once, but the caller stalls
+        # 1.5 s after the wait's sample. RED on 48578eab: FOUND, acted on past its own bound. It reads UNKNOWN, typed.
+        with tempfile.TemporaryDirectory() as d:
+            (Path(d) / "outbox").mkdir()
+            (Path(d) / "outbox" / "job1.result.json").write_text('{"status":"done"}', encoding="utf-8")
+            p = run_ps(
+                "$vc = Get-Module VenueChain; & $vc { $script:VenueTestPostWaitSampleDelayMs = 1500 }; "
+                f"$r = Get-VenueJobResult -AgentShare '{d}' -JobId 'job1' -TimeoutSec 1; "
+                "Write-Output ('STATE=' + $r.state); Write-Output ('ERR=' + $r.error); "
+                "& $vc { $script:VenueTestPostWaitSampleDelayMs = 0 }; "
+                f"Write-Output ('CONTROL=' + (Get-VenueJobResult -AgentShare '{d}' -JobId 'job1' -TimeoutSec 1).state); "
+                "Complete-VenueProcess -ExitCode 0")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+        self.assertEqual(got["STATE"], "UNKNOWN", f"a job result seen after the read's own bound was acted on: {got}")
+        self.assertIn("read's own bound", got["ERR"], got)
+        self.assertEqual(got["CONTROL"], "FOUND", f"control: no stall, the same read is found: {got}")
+
     def test_d_the_bounded_read_is_handed_the_absolute_end(self) -> None:
         # structural pin: Read-VenueFileBytesBounded forwards -EndUtc into Invoke-VenueBoundedRead's wait (the one wait both host-load reads, and so the chain, batch and baseline, use)
         import re
