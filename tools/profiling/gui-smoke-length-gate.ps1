@@ -196,41 +196,17 @@ function Get-GuiSmokeClipLength {
     # The probed parts, in the app's order: .M00 .. .M98 up to the first number missing. Any other extension is opened alone.
     $probed = @()
     if ([IO.Path]::GetExtension($Path) -ieq $script:GuiSmokeFirstPartExtension) {
-        if ($first.fileCount -le 1) {
-            # An under-declaring first part: exactly the NAME the app probes, the path with its last two characters replaced by
-            # the two-digit number (strcpy(&filename[strlen(filename) - 2], seq_name)), so it keeps the first part's own case. The
-            # file system answers whether that name opens, as fopen does: any case on a case-insensitive volume (the venues'
-            # NTFS), the exact case on a case-sensitive one (adversary e8eeaee1 A1). A directory of that name is not a part.
-            $stem = $Path.Substring(0, $Path.Length - 2)
-            $number = 0
-            while ($number -lt 99) {
-                $candidate = $stem + $number.ToString('00', [Globalization.CultureInfo]::InvariantCulture)
-                if (-not [IO.File]::Exists($candidate)) { break }
-                $probed += $candidate
-                $number++
-            }
-        } else {
-            # A header that declares the set keeps the listing rule it had before this card (one BaseName, case-sensitive; an
-            # .M<nn> extension in any case), so a declared set reads exactly as it did; only a gap now ends it, as in the app.
-            $dir = Split-Path -Parent $Path
-            if ([string]::IsNullOrEmpty($dir)) { $dir = '.' }
-            $base = [IO.Path]::GetFileNameWithoutExtension($Path)
-            $byNumber = @{}
-            try {
-                $siblings = @(Get-ChildItem -LiteralPath $dir -File -ErrorAction Stop | Where-Object {
-                    $_.BaseName -ceq $base -and $_.Extension -match '^\.M[0-9][0-9]$'
-                })
-            } catch {
-                # A listing that fails would hide every part of the declared set: fail closed.
-                return (& $unknown 'spanned_set_unreadable')
-            }
-            foreach ($sibling in $siblings) {
-                $number = [int]$sibling.Extension.Substring(2)
-                if ($byNumber.ContainsKey($number)) { return (& $unknown 'spanned_set_mismatch') }   # .M00 and .m00 on a case-sensitive volume
-                $byNumber[$number] = $sibling.FullName
-            }
-            $number = 0
-            while ($number -lt 99 -and $byNumber.ContainsKey($number)) { $probed += $byNumber[$number]; $number++ }
+        # Exactly the NAME the app probes, whatever the header declares: the path with its last two characters replaced by the
+        # two-digit number (strcpy(&filename[strlen(filename) - 2], seq_name)), so it keeps the first part's own case and base.
+        # The file system answers whether that name opens, as fopen does: any case on a case-insensitive volume (the venues'
+        # NTFS), only the exact case on a case-sensitive one (adversary e8eeaee1 / f408901c A1). A directory is not a part.
+        $stem = $Path.Substring(0, $Path.Length - 2)
+        $number = 0
+        while ($number -lt 99) {
+            $candidate = $stem + $number.ToString('00', [Globalization.CultureInfo]::InvariantCulture)
+            if (-not [IO.File]::Exists($candidate)) { break }
+            $probed += $candidate
+            $number++
         }
     }
     if ($first.fileCount -gt 1) {
@@ -963,20 +939,29 @@ function Get-GuiSmokeLoopVerdict {
             $failures += "INVALID_LOOPED: the playback timeline wrapped (wrapped=$wrapped wrap_count=$wrapCount total_frames=$totalFrames clip_seconds=$clipSeconds); a looped short clip is never playback evidence."
         }
         # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1: the measured Play must stop at its window. An absent or unreadable field adds
-        # nothing here: the source-frame oracle below already fails it. The arithmetic is in doubles, so no counter, however
-        # large, can overflow an [int64] cast and skip the check (adversary e8eeaee1 A2: a 9e15 counter is an overrun).
+        # nothing here: the source-frame oracle below already fails it. No [int64] cast, so no counter, however large, can overflow
+        # and skip the check (adversary e8eeaee1 A2: a 9e15 counter is an overrun); a value is read as [decimal], exact to 28
+        # digits, so the difference stays exact past 2^53 (f408901c A2), and only a value beyond decimal range falls back to a double.
         $overranWindow = $false
-        $frameNumber = { param($v) $d = 0.0
-            if ($null -ne $v -and $v -isnot [bool] -and
-                [double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d) -and
-                -not [double]::IsNaN($d) -and -not [double]::IsInfinity($d)) { $d } else { $null } }
+        $frameNumber = { param($v) $m = [decimal]0; $d = 0.0
+            if ($null -eq $v -or $v -is [bool]) { $null }
+            elseif ([decimal]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$m)) { $m }
+            elseif ([double]::TryParse([string]$v, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$d) -and
+                    -not [double]::IsNaN($d) -and -not [double]::IsInfinity($d)) { $d }
+            else { $null } }
         $overrunAdvanced = & $frameNumber (& $prop 'source_advanced')
         $overrunRequired = & $frameNumber (& $prop 'required_source_frames')
         $overrunFps = & $frameNumber (& $prop 'native_fps')
+        # One numeric type for all three: PowerShell turns a decimal-and-double operation into decimal, which overflows.
+        if (@($overrunAdvanced, $overrunRequired, $overrunFps | Where-Object { $_ -is [double] }).Count -gt 0) {
+            if ($null -ne $overrunAdvanced) { $overrunAdvanced = [double]$overrunAdvanced }
+            if ($null -ne $overrunRequired) { $overrunRequired = [double]$overrunRequired }
+            if ($null -ne $overrunFps) { $overrunFps = [double]$overrunFps }
+        }
         if ($RequireWindowStop -and $null -ne $overrunAdvanced -and $null -ne $overrunRequired -and $null -ne $overrunFps -and
             $overrunRequired -ge 1 -and $overrunFps -gt 0) {
             $tolerance = [Math]::Ceiling($script:GuiSmokePlayOverrunToleranceSeconds * $overrunFps)
-            $overrun = [double]$overrunAdvanced - [double]$overrunRequired
+            $overrun = $overrunAdvanced - $overrunRequired
             if ($overrun -gt $tolerance) {
                 $overranWindow = $true
                 $overrunReason = & $prop 'reason'
@@ -985,7 +970,7 @@ function Get-GuiSmokeLoopVerdict {
                 if ($null -ne $overrunReason) { $overrunContext += "reason=$overrunReason" }
                 if ($null -ne $overrunElapsed) { $overrunContext += "elapsed_ms=$overrunElapsed" }
                 $overrunTail = if ($overrunContext.Count -gt 0) { " ($($overrunContext -join ' '))" } else { '' }
-                $whole = { param($v) ([double]$v).ToString('0', [Globalization.CultureInfo]::InvariantCulture) }
+                $whole = { param($v) $(if ($v -is [decimal]) { $v } else { [double]$v }).ToString('0', [Globalization.CultureInfo]::InvariantCulture) }
                 $failures += "PLAY_OVERRAN_WINDOW: the measured Play ran past its window: source_advanced=$(& $whole $overrunAdvanced) required_source_frames=$(& $whole $overrunRequired) overrun=$(& $whole $overrun) source frames, over tolerance=$(& $whole $tolerance) frames ($($script:GuiSmokePlayOverrunToleranceSeconds) s at native_fps=$overrunFps)$overrunTail; the receipt does not measure the requested window."
             }
         }
