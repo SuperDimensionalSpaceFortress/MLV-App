@@ -1346,6 +1346,8 @@ function Invoke-VenueBoundedRead {
                 if ($async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds([Math]::Min($left, $script:VenueUtcWaitSliceSec)))) { $done = $true; break }
             }
         }
+        # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r2 (adversary-48578eab.json A1, and pass-2 ADVISORY A2 on the no-clock path): when the answer was SEEN, on the read's own clock, sampled at the wake
+        $seenSec = $waitClock.Elapsed.TotalSeconds
         if (-not $done) {
             $abandoned = $true
             $script:VenueAbandonedReads++
@@ -1353,6 +1355,11 @@ function Invoke-VenueBoundedRead {
             if ($utcCut) { return [pscustomobject]@{ answered = $false; value = @(); error = "no answer before the caller's absolute end ($([Math]::Round($waitClock.Elapsed.TotalSeconds, 2)) s into the wait)" } }
             return [pscustomobject]@{ answered = $false; value = @()
                 error ="no answer in $([Math]::Round($waitSec, 2)) s$(if ($endCut -and -not $EndIsBoundEnd) { " (the call's end cut the $([Math]::Round($TimeoutSec, 2)) s bound short)" })" }
+        }
+        # r2 (adversary-48578eab.json A1): the read's OWN bound is an end like the caller's. After a stall the last look (WaitOne(0), or the no-clock wait's remainder clamped at 0) can find a
+        # worker that finished after -TimeoutSec ran out on $waitClock; that answer is never acted on, on every path (with or without -Clock/-EndSec and -EndUtc). The worker finished, so it is disposed.
+        if (($ownLate = $seenSec - $TimeoutSec) -gt 0) {
+            return [pscustomobject]@{ answered = $false; value = @(); error = "an answer seen $([Math]::Round($ownLate, 2)) s after the read's own bound ($([Math]::Round($TimeoutSec, 2)) s) is never acted on" }
         }
         # r12 fix iteration (adversary A2 on 09421b77): a caller descheduled past its fixed end finds the worker done and WaitOne(0) true; an answer the caller
         # sees only after -EndSec is never acted on (the worker finished, so it is disposed as usual)
