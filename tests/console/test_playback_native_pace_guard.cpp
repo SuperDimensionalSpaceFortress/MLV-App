@@ -1013,7 +1013,7 @@ TEST(PlaybackUnpacedWiring, APacedPlayHoldsAtItsRequiredFramesOnlyWhileTheMeasur
     ASSERT_TRUE(unpacedComment > pacedAt);
     // r2 (hub ruling; r1 adversary A1 / A2 on 21b6d81e): no millisecond cap -- timeDiff is not rewritten. Right after the hold the
     // same armed scope is read once, outside the CUDA-HEADROOM-1 region...
-    ASSERT_EQ(0, source.count(QStringLiteral("pacedMeasuredHoldTickMs")));
+    ASSERT_FALSE(source.contains(QStringLiteral("pacedMeasuredHoldTickMs")));
     ASSERT_EQ(0, handling.count(QRegularExpression(QStringLiteral("\\btimeDiff\\s*=(?!=)"))));
     const QString clampScope = QStringLiteral(
         "        const bool pacedHoldClampArmed = playback_frame_range::pacedMeasuredHoldApplies( m_automationPacingIsolated,\n"
