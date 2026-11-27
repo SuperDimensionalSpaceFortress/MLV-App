@@ -835,6 +835,40 @@ class CounterWritePinTests(unittest.TestCase):
                 self.assert_caught(self.inject_in_smoke(statement), "unreviewed use of m_sourceAdvance")
         self.assertEqual(PINNED_COUNTER_READS, {"MainWindow::finishPlaybackSmokeTelemetry": 1, "MainWindow::playbackHandling": 1})
 
+    def test_r3_fix1_a_macro_over_a_counter_pin_token_fails(self) -> None:
+        """GUI-SMOKE-PACED-STOP-STARVATION-1 r3 fix iteration 1 (adversary A1 on ab3873f1, and A2, its pre-existing sibling): a #define over a
+        token of a pinned counter read turned the read into a write and still scanned clean -- before playbackHandling,
+        `#define pacedMeasuredHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)` (zeroes the high-water mark through the landing's
+        argument); before finishPlaybackSmokeTelemetry, `#define highWater highWater += 1500`. Any #define of a counter-pin identifier, in any
+        scanned source, fails; the real sources define none."""
+        from tools.repo_hygiene import app_play_scan   # getattr: the RED run on the pre-fix scanner reaches the adversary rows
+        COUNTER_MACRO_IDENTIFIERS = getattr(app_play_scan, "COUNTER_MACRO_IDENTIFIERS", frozenset())
+        HEADER_SOURCE = app_play_scan.HEADER_SOURCE
+        self.assertEqual(scan_app_play_sources(self.sources), [])
+        needle = "#define of"
+        adversary = (
+            ("A1: the landing call rewritten", "void MainWindow::playbackHandling(",
+             "#define pacedMeasuredHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)"),
+            ("A2: the conform line's member rewritten", "void MainWindow::finishPlaybackSmokeTelemetry(",
+             "#define highWater highWater += 1500"),
+        )
+        for name, anchor, define in adversary:
+            with self.subTest(name):
+                self.assertIn(anchor, self.sources[self.MAIN_WINDOW])
+                self.assert_caught(self.mutated(anchor, define + "\n" + anchor), needle)
+        for identifier in sorted(COUNTER_MACRO_IDENTIFIERS):
+            for path in (self.MAIN_WINDOW, self.MAIN):
+                with self.subTest(f"{identifier} in {path}"):
+                    sources = dict(self.sources)
+                    sources[path] = f"#define {identifier} {identifier}\n" + sources[path]
+                    self.assert_caught(sources, needle)
+        with self.subTest("a spaced directive in the header"):
+            sources = dict(self.sources)
+            sources[HEADER_SOURCE] = "  #  define consumed() highWater\n"
+            self.assert_caught(sources, needle)
+        self.assertTrue({"m_sourceAdvance", "highWater", "armed", "startFrame", "consumed", "pacedMeasuredHoldLanding"}
+                        <= COUNTER_MACRO_IDENTIFIERS)
+
     LANDING_CALL = ("dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,\n"
                     "                        m_sourceAdvance.highWater, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );")
 

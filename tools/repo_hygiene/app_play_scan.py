@@ -983,6 +983,7 @@ def scan_app_play_sources(sources: dict[str, str]) -> list[str]:
             problems.append(f"missing Loop-off at an automation entry: {marker}")
     problems.extend(_scan_stop_sites(main_blank, main_keep))
     problems.extend(_scan_counter_writes(main_blank, main_keep))
+    problems.extend(_scan_counter_macros(sources, main_blank))
     problems.extend(_scan_budget_writes(main_blank))
     problems.extend(_scan_verdict_latch(main_blank))
     problems.extend(_scan_header_members(sources.get(HEADER_SOURCE, "")))
@@ -1098,6 +1099,31 @@ _REQ_USE = re.compile(r"\bm_playRequiredSourceFrames\b")
 _REQ_WRITE_AFTER = re.compile(_WRITE_OP)
 _REQ_ASSIGN_OK = re.compile(r"\s*=\s*verdict\.requiredFrames\s*;")
 _ESCAPE_BEFORE = re.compile(r"(?:(?<!&)&\s*(?:\w+\s*=\s*)?|\b(?:swap|exchange|move)\s*\(\s*|\+\+\s*|--\s*)$")
+
+
+# GUI-SMOKE-PACED-STOP-STARVATION-1 r3 fix iteration 1 (adversary A1 on ab3873f1, and A2, its pre-existing sibling at the conform line): a macro
+# over a token of a reviewed or free counter read turns the read into a write while the text still matches --
+# `#define pacedMeasuredHoldLanding(a,b,c,d,e) pacedMeasuredHoldLanding(a,b,(c)=0,d,e)` zeroed the high-water mark through the landing's
+# pinned argument, `#define highWater highWater += 1500` moved it through the conform line's. As for the Space binding (_DEFINE above): any
+# #define of an identifier the counter pins rely on -- the counter and the requirement, every counter member, the pinned read expressions'
+# tokens, the required write's `verdict.requiredFrames` -- fails, in any scanned source (the header MainWindow.cpp includes too). A macro
+# BODY that uses the counter is already an unreviewed use (directive lines are scanned like code).
+COUNTER_MACRO_IDENTIFIERS = frozenset({
+    "m_sourceAdvance", "m_playRequiredSourceFrames", "SourceFrameAdvanceCounter", "playback_frame_range",
+    "armed", "startFrame", "highWater", "forwardSteps", "wrapOrBackwardTicks", "beginsIgnored", "externalJumpRebases",
+    "begin", "noteEngineTick", "consumed",
+    "pacedMeasuredHoldLanding", "sourcePositionBeforeDropTick", "dropFrameTick", "verdict", "requiredFrames"})
+
+
+def _scan_counter_macros(sources: dict[str, str], main_blank: str) -> list[str]:
+    problems: list[str] = []
+    for path, text in sources.items():
+        blank = main_blank if path == "platform/qt/MainWindow.cpp" else strip_cpp(text)[0]
+        for match in _DEFINE.finditer(blank):
+            if match.group(1) in COUNTER_MACRO_IDENTIFIERS:
+                problems.append(f"{path}:{_line_of(blank, match.start())}: #define of {match.group(1)}, a token the source-frame "
+                                "counter's pinned reads and writes rely on")
+    return problems
 
 
 def _scan_counter_writes(blank: str, keep: str) -> list[str]:
