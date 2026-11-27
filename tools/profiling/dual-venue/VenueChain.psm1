@@ -329,8 +329,13 @@ function Get-VenueTicketStaleReason {
     if (-not [int]::TryParse([string]$Ticket.ownerPid, [ref]$pidValue) -or $pidValue -le 0) { return 'unreadable' }
     $created = ConvertTo-VenueUtc $Ticket.ownerCreatedUtc
     $beat = ConvertTo-VenueUtc $Ticket.heartbeatUtc
+    if ($null -eq (ConvertTo-VenueUtc $Ticket.createdUtc)) { return 'unreadable' }   # TAIL-1 r2 pass 2 A1: a refresh cannot carry a ticket whose createdUtc is not a time over (Update-VenueTicket answers LOST), so that ticket must not stay live beside its replacement
     $after = 0.0
     if ($null -eq $created -or $null -eq $beat -or -not [double]::TryParse([string]$Ticket.staleAfterSec, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$after)) { return 'unreadable' }
+    # pass 3 A7 + r4 K1: the ceiling is the Int32 range, which is what EVERY writer can publish (a refresh stores the lifetime as an Int32: 1e20 overflowed it to LOST while the census kept the row live). It is NOT 86400: Update-VenueTicket -StaleAfterSec
+    # is an unranged [int], and the chain publishes Get-VenueTicketProbeStaleSec's value through it (87630 for -ProbeAdmissionWaitSec 86400; up to 259740 at the operands' maxima), so a live, freshly heartbeated probing ticket read 'unreadable' and was reaped.
+    if (-not [double]::IsFinite($after) -or $after -le 0 -or $after -gt [double][int]::MaxValue) { return 'unreadable' }
+    # TAIL-1 r2 (pre-existing: pass 10 A11): the JSON string NaN or Infinity parses, and NaN / Infinity made "heartbeat age greater than the window" false for ever: a lifetime that is not a finite positive number is unreadable
     $started = Get-VenueProcessStartUtc $pidValue
     if ($null -eq $started) { return 'dead-pid' }
     if ($started -ne [DateTime]::MinValue -and [Math]::Abs(($started - $created).TotalSeconds) -gt $script:PidStartToleranceSec) { return 'pid-reused' }
@@ -357,13 +362,17 @@ function Get-VenueTickets {
     The venue's line, oldest ticket first. One row per ticket: name, path, state (LIVE | STALE | BUSY = being rewritten, counts as live), reason, text, ticket (parsed),
     position (1-based among the non-stale tickets; 0 for a stale one), ageSec and heartbeatAgeSec ($null when unreadable).
     #>
-    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $NowUtc = $null)
+    # r4 K3: -ThrowOnListError makes a listing that FAILS (the folder cannot be enumerated, or is gone) throw instead of answering no rows, so a caller can tell a read that failed from a successful read of an empty line
+    param([Parameter(Mandatory)][string]$Venue, [string]$ClaimDir = '', $NowUtc = $null, [switch]$ThrowOnListError)
     $now = Resolve-VenueNow $NowUtc
     $dir = Get-VenueTicketDir -Venue $Venue -ClaimDir $ClaimDir
     $rows = [System.Collections.Generic.List[object]]::new()
     $present = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    if (Test-Path -LiteralPath $dir -PathType Container) {
-        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction SilentlyContinue)) {
+    $listAction = $(if ($ThrowOnListError) { 'Stop' } else { 'SilentlyContinue' })
+    $dirThere = Test-Path -LiteralPath $dir -PathType Container   # ONE check (r4 adversary A1: a second one for the strict listing left a window in which a folder that went away answered no rows without an error)
+    if ($ThrowOnListError -and -not $dirThere) { throw "VENUE_TICKET_LIST_FAILED the ticket folder '$dir' is not readable" }
+    if ($dirThere) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $dir -Filter '*.ticket.json' -File -ErrorAction $listAction)) {
             $m = $script:TicketNameRx.Match($file.Name)
             if (-not $m.Success) { continue }
             [void]$present.Add($file.FullName)
@@ -499,11 +508,16 @@ function Update-VenueTicket {
             $want = [string]$Ticket.nonce
             if ($null -ne $j -and $want -ceq '' -and (Test-VenueAdoptedByName $Ticket $j)) { $want = [string]$j.nonce; try { $Ticket.nonce = $want } catch { $null = $_ } }   # r8 rule 1: a ticket adopted by NAME (its file was busy) takes its nonce from the file, once the file proves to be this owner's
             if ($null -eq $j -or $want -ceq '' -or [string]$j.nonce -cne $want) { return 'LOST' }
-            $fields = [ordered]@{
-                schema = [string]$j.schema; venue = [string]$j.venue; ownerPid = [int]$j.ownerPid; ownerCreatedUtc = (ConvertTo-VenueUtc $j.ownerCreatedUtc).ToString('o'); host = [string]$j.host
-                runDir = [string]$j.runDir; purpose = [string]$j.purpose; createdUtc = (ConvertTo-VenueUtc $j.createdUtc).ToString('o'); heartbeatUtc = $now.ToString('o')
-                staleAfterSec = $(if ($StaleAfterSec -gt 0) { $StaleAfterSec } else { [int]$j.staleAfterSec }); phase = $(if ($storedPhase) { $storedPhase } else { [string]$j.phase }); nonce = [string]$j.nonce
-            }
+            # TAIL-1 r2 (pre-existing: pass 10 A10): a body whose fields cannot be carried over (a createdUtc that is null or not a time) used to throw out of this function, through Request-VenueClaim, instead of ending the ticket's
+            # place: it is answered LOST, so the caller takes a new ticket (the unreadable one is reaped as any ticket nobody refreshes)
+            $fields = $null
+            try {
+                $fields = [ordered]@{
+                    schema = [string]$j.schema; venue = [string]$j.venue; ownerPid = [int]$j.ownerPid; ownerCreatedUtc = (ConvertTo-VenueUtc $j.ownerCreatedUtc).ToString('o'); host = [string]$j.host
+                    runDir = [string]$j.runDir; purpose = [string]$j.purpose; createdUtc = (ConvertTo-VenueUtc $j.createdUtc).ToString('o'); heartbeatUtc = $now.ToString('o')
+                    staleAfterSec = $(if ($StaleAfterSec -gt 0) { $StaleAfterSec } else { [int]$j.staleAfterSec }); phase = $(if ($storedPhase) { $storedPhase } else { [string]$j.phase }); nonce = [string]$j.nonce
+                }
+            } catch { return 'LOST' }
             try { Write-VenueTicketAtomic -Path $Ticket.path -Bytes (ConvertTo-VenueTicketBytes $fields) -Clock $clock -BudgetSec $BudgetSec }   # r7 A6: the budget is asked once more right before the publish
             catch { if (-not (Test-Path -LiteralPath $Ticket.path -PathType Leaf)) { return 'LOST' }; continue }
             return 'OK'
@@ -519,15 +533,19 @@ function Enter-VenueTicketLock {
     # junction spelling of the claim folder all reach the one lock file (a named mutex keyed on the path's spelling did not). A holder that dies releases it with its process; the file is left in place and never listed
     # (it is neither *.ticket.json nor a ticket temp). Works across sessions and over a shared claim folder. The directory must exist (a ticket is in it).
     param([Parameter(Mandatory)][string]$TicketPath, [int]$TimeoutMs = 1000)
+    # TAIL-1 r2 (pre-existing: pass 10 A4, pass 11 A3, r9 A5): the timeout is measured from the CALL, not from after the directory check (which can be slow on a share and used to be free time), and no
+    # attempt starts, and no sleep runs, past it
+    $clock = [Diagnostics.Stopwatch]::StartNew()
     $dir = $null
     try { $dir = [IO.Path]::GetDirectoryName([IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($TicketPath))) } catch { $dir = $null }
     if ([string]::IsNullOrEmpty($dir) -or -not (Test-Path -LiteralPath $dir -PathType Container)) { return $null }
     $lockPath = Join-Path $dir '.ticket.lock'
-    $clock = [Diagnostics.Stopwatch]::StartNew()
     while ($true) {
+        if ($clock.Elapsed.TotalMilliseconds -ge $TimeoutMs) { return $null }   # no attempt starts at or after the timeout, the first one included
         try { return [IO.File]::Open($lockPath, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
         catch { if ($clock.Elapsed.TotalMilliseconds -ge $TimeoutMs) { return $null } }
-        Start-Sleep -Milliseconds 15
+        $napMs = [int][Math]::Floor([Math]::Min(15.0, [Math]::Max(0.0, $TimeoutMs - $clock.Elapsed.TotalMilliseconds)))   # never past what is left of the timeout
+        if ($napMs -gt 0) { Start-Sleep -Milliseconds $napMs }
         if ($clock.Elapsed.TotalMilliseconds -ge $TimeoutMs) { return $null }   # r8 rule 6: no attempt starts after the timeout (the budget of an update): the lock may have been released during the sleep
     }
 }
@@ -641,6 +659,15 @@ function Request-VenueClaim {
     }
     $now = Resolve-VenueNow $NowUtc
     $t = $Ticket
+    # TAIL-1 A13: a claim a give-back could not let go of (the ticket names its nonce) is let go of FIRST, before the ticket work and before any new attempt, so it never stays behind a QUEUED answer. An answer that leaves it
+    # standing (BUSY again) keeps the name for the next poll.
+    if ($null -ne $t -and $null -ne $t.PSObject.Properties['pendingReleaseNonce'] -and [string]$t.pendingReleaseNonce) {
+        $pendingAnswer = ''; try { $pendingAnswer = [string](Release-VenueClaim -Venue $Venue -Nonce ([string]$t.pendingReleaseNonce) -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $pendingAnswer = 'ERROR' }
+        if ($pendingAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { $t.pendingReleaseNonce = '' }
+    }
+    # TAIL-1 r2 A2: the name that is still standing is carried across a ticket that is re-taken below (the flip answering LOST replaces $t by a new ticket, which would drop it: BUSY then LOST left the claim with no name)
+    $carryPending = ''
+    if ($null -ne $t -and $null -ne $t.PSObject.Properties['pendingReleaseNonce']) { $carryPending = [string]$t.pendingReleaseNonce }
     # r7 adversary A7: one place in the line per owner. A ticket this owner already made for this same run and purpose, whose creating call was given up on by the caller after the file was written (so the
     # caller holds no reference to it), is taken over here instead of being queued behind by a second, later ticket of the same owner. It then goes through the same flip to waiting as any ticket.
     if ($null -eq $t) { $t = Find-VenueOwnTicket -Venue $Venue -ClaimDir $ClaimDir -RunDir $RunDir -Purpose $Purpose -OwnerPid $OwnerPid -NowUtc $now }
@@ -669,7 +696,10 @@ function Request-VenueClaim {
             }
         }
     }
-    if ($null -eq $t) { $t = New-VenueTicket -Venue $Venue -RunDir $RunDir -Purpose $Purpose -StaleAfterSec $TicketStaleAfterSec -ClaimDir $ClaimDir -OwnerPid $OwnerPid -NowUtc $now }
+    if ($null -eq $t) {
+        $t = New-VenueTicket -Venue $Venue -RunDir $RunDir -Purpose $Purpose -StaleAfterSec $TicketStaleAfterSec -ClaimDir $ClaimDir -OwnerPid $OwnerPid -NowUtc $now
+        if ($carryPending) { $t | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue $carryPending -Force }   # TAIL-1 r2 A2: the replacement ticket names the claim that is still to be let go of
+    }
     $removed = [System.Collections.Generic.List[object]]::new()
     Remove-VenueOrphanTicketTemps -Venue $Venue -ClaimDir $ClaimDir   # G8: best-effort reap of temps an earlier writer died on
     $line = Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $now
@@ -703,16 +733,34 @@ function Request-VenueClaim {
             if ($headAfter.Count -gt 0 -and $headAfter[0].name -cne $t.name) {
                 $back = ''
                 for ($giveBack = 1; $giveBack -le 5; $giveBack++) {
-                    $back = [string](Release-VenueClaim -Venue $Venue -Nonce $r.claim.nonce -ClaimDir $ClaimDir)
+                    # TAIL-1 r2 A10 (pre-existing): a release that THROWS (the delete is refused: no DELETE right, a policy) is a release that did not let go, i.e. BUSY like any other: it used to leave the loop through the catch
+                    # below and fall through to the grant being handed to a caller that is not the head
+                    try { $back = [string](Release-VenueClaim -Venue $Venue -Nonce $r.claim.nonce -ClaimDir $ClaimDir) } catch { $back = 'BUSY' }
                     if ($back -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { break }
                     Start-Sleep -Milliseconds (100 * $giveBack)
                 }
                 if ($back -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) {
                     $seen = $null; try { $seen = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seen = $null }
                     # r8 rule 7 (adversary r7 pass 3 A11): the queue returned is the census made AFTER the give-back, so the place returned is the caller's in that census (the snapshot's place could be one past it)
-                    $myAfter = @($after | Where-Object { $_.name -ceq $t.name })
-                    return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $after; position = $(if ($myAfter.Count -gt 0) { [int]$myAfter[0].position } else { $position }); staleTickets = @($removed); note = '' }
+                    # TAIL-1 r2 A8 (pre-existing): the give-back can take most of a second (its retries sleep), and a ticket can be reaped in it, so the census made BEFORE the release is read again AFTER it; one that cannot be made keeps the earlier
+                    # pass 3 A4: classified at the caller's clock seam (-NowUtc; null = the real time NOW, not the time this request began).
+                    # r4 K3 (replaces pass 3 A5's "an empty answer is a failed read"): a listing that FAILED throws (-ThrowOnListError) and keeps the earlier census; a SUCCESSFUL listing that finds no live ticket is an empty line (queue 0, place 0),
+                    # not the earlier queue the tickets have since left
+                    $afterRelease = $after
+                    try { $afterRelease = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $NowUtc -ThrowOnListError | Where-Object { $_.state -cne 'STALE' }) } catch { $afterRelease = $after }
+                    $myAfter = @($afterRelease | Where-Object { $_.name -ceq $t.name })
+                    return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seen) { $seen.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $afterRelease; position = $(if ($myAfter.Count -gt 0) { [int]$myAfter[0].position } else { 0 }); staleTickets = @($removed); note = '' }
                 }
+                # TAIL-1 A13 (= #878 sol r10 B1; replaces r7 A3's "kept as a grant"): five BUSY give-backs did not let go, and handing the claim over would hand a caller a claim owed to an OLDER ready ticket. The answer is QUEUED;
+                # the claim that could not be given back is named on the ticket (pendingReleaseNonce), so it is not leaked, and the next poll made with this ticket lets go of it before anything else (the top of this function).
+                $t | Add-Member -NotePropertyName pendingReleaseNonce -NotePropertyValue ([string]$r.claim.nonce) -Force
+                $seenBusy = $null; try { $seenBusy = Get-VenueClaim -Venue $Venue -ClaimDir $ClaimDir } catch { $seenBusy = $null }
+                # pass 3 A4 + r4 K3: the same fresh census as the released case (the five tries sleep for 1.5 s, in which a ticket can be reaped), with the same rule: a failed listing keeps the earlier census, a successful empty one is an empty line
+                $afterBusy = $after
+                try { $afterBusy = @(Get-VenueTickets -Venue $Venue -ClaimDir $ClaimDir -NowUtc $NowUtc -ThrowOnListError | Where-Object { $_.state -cne 'STALE' }) } catch { $afterBusy = $after }
+                $myBusy = @($afterBusy | Where-Object { $_.name -ceq $t.name })
+                return [pscustomobject]@{ granted = $false; state = 'QUEUED'; claim = $(if ($seenBusy) { $seenBusy.claim }); path = $r.path; broken = @($r.broken); ticket = $t; queue = $afterBusy; position = $(if ($myBusy.Count -gt 0) { [int]$myBusy[0].position } else { 0 }); staleTickets = @($removed)
+                    note = "CLAIM_GIVE_BACK_BUSY ticket=$($t.name) (the claim was granted behind an older ready ticket and could not be given back in 5 tries; queued, the next poll lets go of it)" }
             }
         } catch { $null = $_ }
         # r7 pass 2 A2: the census above can take long (a slow claim folder) and a short claim can expire meanwhile and be replaced: a grant that is more than 2 s old is checked to still name this owner before it
@@ -807,6 +855,67 @@ function Release-VenueClaim {
         'CHANGED' { 'NOT_OURS' }
         default { $_ }
     }
+}
+
+function Invoke-VenueLateRelease {
+    <#
+    .SYNOPSIS
+    VENUE-FIFO-ADVERSARY-TAIL-1: the release of a claim granted at or after -DeadlineUtc, as ONE seam (the retry loop, and the one final single-open probe at the end of the reserve), so a sweep can drive it
+    with an injected clock. -Call is { param([int]$MaxAttempts, [double]$TimeoutSec) } and answers RELEASED | ABSENT | NOT_OURS | BUSY | NO_ANSWER | ERROR; -Clock answers the seconds since the retry began;
+    -Sleep takes milliseconds. Returns @{ answer; tries; probed; endSec }.
+    TAIL-1 (pass 11 A1, Grok G15/A1b): every call, the in-flight one and the final probe, is handed a time limit (-TimeoutSec) and the default -Call runs it on a bounded worker (Invoke-VenueBoundedRead:
+    abandoned and counted when it does not answer, so Complete-VenueProcess exits at once). A full call may run to what is left of -BoundSec plus -CallCapSec (the worker's start-up and one healthy call);
+    the probe to -ProbeCapSec. A call that never returns therefore ends this function by BoundSec + CallCapSec + ProbeCapSec at the latest.
+    #>
+    # TAIL-1 r2 A6 (+ pass 2 A2): a cap that is not a finite number of seconds, is negative, or is over an hour is REFUSED (a NaN bound used to bind and die in an integer conversion before the probe, and so did one of 3,000,000 s);
+    # a cap under one second is HONOURED (below)
+    param([Parameter(Mandatory)][string]$Venue, [Parameter(Mandatory)][string]$Nonce, [string]$ClaimDir = '',
+        [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 -and $_ -le 3600 })][double]$BoundSec = 0.75, [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 -and $_ -le 3600 })][double]$CallCapSec = 1.5, [ValidateScript({ [double]::IsFinite($_) -and $_ -ge 0 -and $_ -le 3600 })][double]$ProbeCapSec = 1.0,
+        [scriptblock]$Call = $null, [scriptblock]$Clock = $null, [scriptblock]$Sleep = $null)
+    $released = @('RELEASED', 'ABSENT', 'NOT_OURS')
+    if ($null -eq $Call) {
+        $modulePath = $MyInvocation.MyCommand.Module.Path
+        $Call = {
+            param([int]$MaxAttempts, [double]$TimeoutSec)
+            # TAIL-1 r2 A3 + A6: ONE elapsed-time bound per call. A stopwatch starts BEFORE the worker does and its end is this call's -TimeoutSec on it (-Clock/-EndSec of Invoke-VenueBoundedRead), so the worker's
+            # start-up is inside the bound, not added before each relative wait, a cap under one second is honoured (the wait is cut to it; -TimeoutSec itself only has to satisfy the worker's 1 s floor), and an
+            # answer seen after the end is never acted on.
+            $callClock = [Diagnostics.Stopwatch]::StartNew()
+            $w = Invoke-VenueBoundedRead -TimeoutSec ([Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))) -Clock $callClock -EndSec $TimeoutSec -EndIsBoundEnd -Argument @{ m = $modulePath; v = $Venue; n = $Nonce; d = $ClaimDir; k = $MaxAttempts } -ScriptText 'param($a) $ErrorActionPreference = ''Stop''; Import-Module $a.m -Force -DisableNameChecking; Release-VenueClaim -Venue $a.v -Nonce $a.n -ClaimDir $a.d -MaxAttempts $a.k'
+            if ($w.answered -and @($w.value).Count -gt 0) { [string]@($w.value)[-1] } else { 'NO_ANSWER' }
+        }   # no GetNewClosure: a closure is cut off from this module's private Invoke-VenueBoundedRead; the block runs inside this function, so $modulePath, $Venue, $Nonce and $ClaimDir are visible
+    }
+    if ($null -eq $Clock) { $sw = [Diagnostics.Stopwatch]::StartNew(); $Clock = { $sw.Elapsed.TotalSeconds }.GetNewClosure() }
+    if ($null -eq $Sleep) { $Sleep = { param([int]$Ms) Start-Sleep -Milliseconds $Ms } }
+    $answer = ''; $tries = 0; $probed = $false; $anyUnanswered = $false   # pass 3 A3: $anyUnanswered = some call did not answer (NO_ANSWER / ERROR), even when the probe after it did (BUSY)
+    for ($try = 1; $try -le 5; $try++) {
+        # r10 (adversary A1): the clock is asked again after the sleep: one clamped to the end of the reserve (or woken late) must not start a try, which would run a whole release call past it
+        if ($try -gt 1 -and (& $Clock) -ge $BoundSec) { break }
+        $tries++
+        try { $answer = [string](& $Call 5 ([Math]::Max(0.0, $BoundSec - (& $Clock)) + $CallCapSec)) } catch { $answer = 'ERROR' }
+        if ($answer -cin @('NO_ANSWER', 'ERROR')) { $anyUnanswered = $true }
+        if ($answer -cin $released) { break }
+        $left = $BoundSec - (& $Clock)
+        if ($try -ge 5 -or $left -le 0) { break }
+        & $Sleep ([int][Math]::Ceiling([Math]::Min([double](100 * $try), [double]($left * 1000))))   # rounded UP: a sleep cut short by the cast would wake just before the bound and start a try inside it
+    }
+    if ($answer -cnotin $released) {
+        # TAIL-1 r2 A7: the fifth try can end well before the bound when the calls are instant (tries at 0, 0.1, 0.3, 0.6, 1.0 s on a 2 s bound), and the probe then ran at 1.0 s, so a reader that lets go at 1.2 s was missed:
+        # the probe is made at the END of the reserve, as the comment above says, never earlier
+        $untilBound = $BoundSec - (& $Clock)
+        if ($untilBound -gt 0) { & $Sleep ([int][Math]::Ceiling($untilBound * 1000.0)) }
+        # pass 2 A3: the whole function has ONE end (bound + the call's cap + the probe's cap). A worker's start-up can use the time itself (a descheduled thread), so the probe is given only what is left of that end and
+        # is not started at all when none is
+        $hardEnd = $BoundSec + $CallCapSec + $ProbeCapSec
+        $probeSec = [Math]::Min($ProbeCapSec, $hardEnd - (& $Clock))
+        if ($probeSec -le 0) { $answer = 'NO_ANSWER'; $anyUnanswered = $true }
+        else {
+            $probed = $true
+            try { $answer = [string](& $Call 1 $probeSec) } catch { $answer = 'ERROR' }
+            if ($answer -cin @('NO_ANSWER', 'ERROR')) { $anyUnanswered = $true }
+        }
+    }
+    [pscustomobject]@{ answer = $answer; tries = $tries; probed = $probed; anyUnanswered = $anyUnanswered; endSec = (& $Clock) }
 }
 
 function ConvertFrom-VenueGateLog {
@@ -1257,6 +1366,11 @@ function Invoke-VenueBoundedRead {
     # finite number is REFUSED, typed, before the worker starts. NaN skipped both the clamp (NaN -lt x is false: the full -TimeoutSec wait) and the late-answer rejection
     # (Elapsed - NaN -gt 0 is false), so an answer past the caller's end was acted on.
     if (-not [double]::IsFinite($EndSec)) { throw "VENUE_BUDGET_ENDPOINT_NONFINITE -EndSec is $($EndSec.ToString([Globalization.CultureInfo]::InvariantCulture)); a budget endpoint that is not a finite number is refused, never read as a wait wider than the caller's end" }
+    # TAIL-1 r2 pass 3 A2: a call whose fixed end has ALREADY passed (the caller was descheduled between starting its clock and calling here, or its cap is 0) starts no worker at all: BeginInvoke used to submit the release or the create
+    # before the expired wait was computed, so the worker could change the file while the caller reported NO_ANSWER. Not abandoned, not counted: nothing was sent.
+    if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -le 0) {
+        return [pscustomobject]@{ answered = $false; value = @(); error = 'the call''s end had passed before its worker was started, so nothing was sent' }
+    }
     $ps = [powershell]::Create()
     $abandoned = $false
     try {
@@ -2052,7 +2166,7 @@ function Get-VenueDriverScriptMissing {
     return ''
 }
 
-Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim,
+Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing, Get-VenueMainRoot, Get-VenueClaimPath, Get-VenueClaim, Get-VenueClaimStaleReason, Request-VenueClaim, Release-VenueClaim, Invoke-VenueLateRelease,
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,

@@ -171,10 +171,71 @@ $deadline = $(if ($DeadlineUtc) { [DateTimeOffset]::Parse($DeadlineUtc, [Globali
 $pwshExe = [Environment]::ProcessPath
 if (-not $Purpose) { $Purpose = "Invoke-VenueChain $(Split-Path -Leaf $RunDir)" }
 
-function L([string]$Message) {
-    $line = "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message"
-    Add-Content -LiteralPath $ChainLog -Value $line
-    Write-Output $line
+function L([string]$Message, [switch]$Raw, [switch]$Flush, [double]$FlushSec = 5.0) {
+    # TAIL-1 r5 (sol r4 B1): chain.log is the chain's record, never its control. A log another handle holds against writes (a reader with FileShare.Read, a scan) made Add-Content throw, and under
+    # ErrorActionPreference Stop that throw ended the chain wherever the line was: at a ticket close before the final nonce retry, at the chain-end retry, or at CHAIN_RESULT itself. The line goes to stdout
+    # FIRST; a failed append is said on stderr as CHAIN_LOG_WRITE_FAILED and the chain goes on. (r5 adversary A5: no retry.) -Raw writes $Message as it is (the CHAIN_RESULT line has no time stamp).
+    # TAIL-1 r6 (sol r5 B1): an append that STALLS (a share that stops answering) held the control thread at the close, before the chain-end nonce retry, and at CHAIN_RESULT before the exit. No append
+    # is made on this thread any more. The line is queued, and the queued lines are appended, in order, by ONE short write pipeline at a time on a writer runspace of their own (opened on the first line).
+    # While a write is in flight the next lines wait behind it in the queue and the caller goes on; each later call starts the next write once the one before has ended. Nothing runs on the runspace
+    # between writes, so only a write that is still stalled can keep the process alive at its end. -Flush writes what is queued and waits at most -FlushSec in all; it returns $false when a write did
+    # not end in it (CHAIN_LOG_FLUSH_TIMEOUT on stderr), and the caller then ends the process at once. Kept self-contained: the tests lift this function from the script by name.
+    if (-not $Flush) {
+        $line = $(if ($Raw) { $Message } else { "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $Message" })
+        Write-Output $line
+    }
+    $w = $script:chainLogWriter
+    if ($null -eq $w) {
+        if ($Flush) { return $true }
+        try {
+            $logRs = [runspacefactory]::CreateRunspace()
+            $logRs.ThreadOptions = [System.Management.Automation.Runspaces.PSThreadOptions]::UseNewThread   # each write on a thread of its own that ends with it
+            $logRs.Open()
+            $w = [pscustomobject]@{ runspace = $logRs; path = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ChainLog); pending = [System.Collections.Generic.List[string]]::new(); ps = $null; async = $null }
+            $script:chainLogWriter = $w
+        } catch {
+            try { [Console]::Error.WriteLine("CHAIN_LOG_WRITE_FAILED path=$ChainLog error=the log writer could not be started: $($_.Exception.Message) line=$line") } catch { $null = $_ }
+            return
+        }
+    }
+    if (-not $Flush) { $w.pending.Add($line) }
+    $flushClock = [Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        if ($null -ne $w.ps) {
+            if (-not $w.async.IsCompleted) {
+                if (-not $Flush) { return }   # a write is in flight: this line waits behind it; the caller never does
+                $left = $FlushSec - $flushClock.Elapsed.TotalSeconds
+                if ($left -le 0 -or -not $w.async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($left))) {
+                    try { [Console]::Error.WriteLine("CHAIN_LOG_FLUSH_TIMEOUT path=$($w.path) queued=$($w.pending.Count) waitedSec=$FlushSec (a chain.log write did not end; every line is on stdout)") } catch { $null = $_ }
+                    return $false
+                }
+            }
+            try { $null = $w.ps.EndInvoke($w.async) } catch { $null = $_ }   # the write says its own failures on stderr
+            try { $w.ps.Dispose() } catch { $null = $_ }
+            $w.ps = $null; $w.async = $null
+        }
+        if ($w.pending.Count -eq 0) { if ($Flush) { return $true }; return }
+        $batch = $w.pending.ToArray(); $w.pending.Clear()
+        try {
+            $logPs = [powershell]::Create(); $logPs.Runspace = $w.runspace
+            [void]$logPs.AddScript({
+                param($Lines, $ChainLog)
+                foreach ($line in $Lines) {
+                    try { Add-Content -LiteralPath $ChainLog -Value $line -ErrorAction Stop }
+                    catch { try { [Console]::Error.WriteLine("CHAIN_LOG_WRITE_FAILED path=$ChainLog error=$($_.Exception.Message) line=$line") } catch { $null = $_ } }
+                }
+            }.ToString()).AddArgument($batch).AddArgument($w.path)
+            $w.async = $logPs.BeginInvoke(); $w.ps = $logPs
+        } catch {
+            foreach ($lost in $batch) { try { [Console]::Error.WriteLine("CHAIN_LOG_WRITE_FAILED path=$($w.path) error=the write could not be started: $($_.Exception.Message) line=$lost") } catch { $null = $_ } }
+        }
+        if (-not $Flush) { return }
+    }
+}
+# TAIL-1 r6 (sol r5 B1): a chain that ends on an unhandled error still hands its queued lines to chain.log, bounded, before it stops as it always did; a write that is still stalled then cannot hold the exit
+trap {
+    if ($null -ne $script:chainLogWriter -and -not (L -Flush)) { try { [Console]::Error.WriteLine("CHAIN_ABORTED $($_.Exception.Message)") } catch { $null = $_ }; [Console]::Out.Flush(); [Console]::Error.Flush(); [Environment]::Exit(1) }
+    break
 }
 # DV-PLANNED-SPEC-HASH-BIND-R9-RESIDUE-1 r2 (adversary pass 2 A2): a diagnostic written from a catch is best-effort too: a stderr that cannot be written (closed or disposed by the
 # caller) never replaces the observed result, CHAIN_RESULT or the next leg.
@@ -309,11 +370,39 @@ $ticketPollStaleSec = [Math]::Max(10, 3 * $ClaimPollSec)
 $ticketProbeStaleSec = Get-VenueTicketProbeStaleSec -QuietMaxWaitSec $QuietMaxWaitSec -AdmissionWaitSec $ProbeAdmissionWaitSec -MarginSec $ticketPollStaleSec
 
 function Close-LegTicket([string]$LegName, [string]$Event, [string]$Why) {
-    if ($null -eq $script:ticket) { return }
-    $r = Remove-VenueTicket -Ticket $script:ticket
-    L "$Event leg=$LegName ticket=$($script:ticket.name) result=$r reason=$Why keeps=$($script:ticketKeeps)/$TicketKeepMax"
-    $script:ticket = $null
-    $script:ticketKeeps = 0
+    # TAIL-1 r2 pass 3 A6 + r4 K2: a claim a give-back could not let go of (A13: its nonce is on the ticket) is let go of BEFORE the ticket is removed and the object dropped. A release that is not an answer of "let go" (BUSY: a reader holds the
+    # claim file; ERROR: it threw) leaves the claim standing behind this live pid, so its nonce is KEPT in $script:strandedClaimNonces, outliving the ticket, and is tried again at every later close (even one with no ticket left) and at the chain's end.
+    # Kept inline (no helper): the tests lift this function from the script by name, alone.
+    if ($null -eq $script:strandedClaimNonces) { $script:strandedClaimNonces = [System.Collections.Generic.List[string]]::new() }
+    if ($null -ne $script:ticket -and $null -ne $script:ticket.PSObject.Properties['pendingReleaseNonce'] -and [string]$script:ticket.pendingReleaseNonce -and -not $script:strandedClaimNonces.Contains([string]$script:ticket.pendingReleaseNonce)) {
+        $script:strandedClaimNonces.Add([string]$script:ticket.pendingReleaseNonce)
+    }
+    # r5 adversary pass 2 A1: an append can STALL on a share, so every diagnostic line of the close is collected and written only after every release and the ticket's removal and reset (below)
+    $closeLines = [System.Collections.Generic.List[string]]::new()
+    foreach ($strandedNonce in @($script:strandedClaimNonces)) {
+        $pendingRel = ''; try { $pendingRel = [string](Release-VenueClaim -Venue $Venue -Nonce $strandedNonce -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $pendingRel = 'ERROR' }
+        if ($pendingRel -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) {
+            [void]$script:strandedClaimNonces.Remove($strandedNonce)
+            $closeLines.Add("CLAIM_PENDING_RELEASE leg=$LegName nonce=$strandedNonce result=$pendingRel (a claim a give-back could not let go of, released as the ticket ends)")
+        }
+        else { $closeLines.Add("CLAIM_PENDING_RELEASE_NOT_RELEASED leg=$LegName nonce=$strandedNonce result=$pendingRel (the claim is STILL STANDING behind this chain; its nonce is kept and tried again at the next ticket close and at the chain's end)") }
+    }
+    try {
+        if ($null -ne $script:ticket) {
+            # TAIL-1 r5 (sol r4 B1): a held chain.log made the TICKET_ENDED line throw after the ticket file was gone, the object still set, so the chain ended before its final nonce retry and CHAIN_RESULT. The object
+            # is dropped in a finally, before any line (r5 adversary A5). (A removal that itself throws still ends the chain as before: its live ticket must not outlast it in the line.)
+            $r = 'ERROR'; $endedName = [string]$script:ticket.name; $endedKeeps = $script:ticketKeeps
+            try { $r = [string](Remove-VenueTicket -Ticket $script:ticket) }
+            finally {
+                $script:ticket = $null
+                $script:ticketKeeps = 0
+                $closeLines.Add("$Event leg=$LegName ticket=$endedName result=$r reason=$Why keeps=$endedKeeps/$TicketKeepMax")
+            }
+        }
+    }
+    finally {
+        foreach ($closeLine in $closeLines) { try { L $closeLine } catch { $null = $_ } }   # r4 adversary A5 / r7 A15: a line that cannot be written never aborts the close
+    }
 }
 
 # SUPPLEMENTARY LEGS (header item 6). Everything below is best-effort and OUTSIDE the chain's verdicts: its results go to $suppResults only (never $results, $exitCode, $stopReason or the
@@ -373,7 +462,7 @@ function Invoke-SupplementaryCore([object]$Leg, [string]$Trigger) {
     if ($built.state -ceq 'NOT_STAGED') { Write-SuppSkip $Leg $Trigger 'BUILD_NOT_STAGED' "no staged build manifest for $($SourceCommit.Substring(0, 12)) at $($built.path); the chain stages and builds nothing" $true; return }
     # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: a staged manifest whose cached exe/dll/zip is absent or differs from its digest would fail in the leg job after the claim and the probe
     if ($built.artifactProblem) { $ap = $built.artifactProblem -split ' ', 2; Write-SuppSkip $Leg $Trigger $ap[0] "$($ap[1])" $true; return }
-    $req = Request-VenueClaim -Venue $suppVenue -RunDir $RunDir -Purpose "$Purpose supplementary leg $($Leg.name)" -TtlSec ([Math]::Max(60, [Math]::Min($SupplementaryMaxSec, $remainSec) + $suppProbeStaleSec)) -ClaimDir $ClaimDir
+    $req = Request-VenueClaim -Venue $suppVenue -RunDir $RunDir -Purpose "$Purpose supplementary leg $($Leg.name)" -TtlSec ([Math]::Max(60, [Math]::Min($SupplementaryMaxSec, $remainSec) + $suppProbeStaleSec)) -ClaimDir $ClaimDir -UseTicket:$false -Ticket $null   # TAIL-1 pass 11 A6: the supplementary request never takes a ticket, whatever the caller's ambient defaults are (r2 A1: -Ticket bound to $null as well)
     foreach ($b in $req.broken) { L "CLAIM_STALE_BROKEN venue=$suppVenue reason=$($b.reason) ownerPid=$($b.claim.ownerPid) runDir=$($b.claim.runDir) expiresUtc=$($b.claim.expiresUtc)" }
     if (-not $req.granted) { Write-SuppSkip $Leg $Trigger 'UM_BUSY' "claim state=$($req.state)" $false; return }
     $t0s = [DateTime]::UtcNow
@@ -507,6 +596,7 @@ foreach ($leg in $plan) {
         while ($true) {
             $rq = @{ Venue = $Venue; RunDir = $RunDir; Purpose = "$Purpose leg $($leg.name)"; TtlSec = $ClaimTtlSec; ClaimDir = $ClaimDir }
             if (-not $NoTicket) { $rq['UseTicket'] = $true; $rq['TicketStaleAfterSec'] = $ticketPollStaleSec; if ($ticket) { $rq['Ticket'] = $ticket } }
+            else { $rq['UseTicket'] = $false; $rq['Ticket'] = $null }   # TAIL-1 pass 11 A6: an explicit opt-out is BOUND to false, never left to a caller's $PSDefaultParameterValues (r2 A1: -Ticket bound to $null too)
             $req = Request-VenueClaim @rq
             if ($req.ticket -and ($null -eq $ticket -or $req.ticket.name -cne $ticket.name)) { L "TICKET_TAKEN leg=$($leg.name) ticket=$($req.ticket.name) runDir=$RunDir pid=$PID$(if ($ticket) { ' (the earlier ticket was lost: back of the line)' })" }
             if ($req.ticket) { if ($null -eq $ticket -or $req.ticket.name -cne $ticket.name) { $ticketKeeps = 0 }; $ticket = $req.ticket }   # a new place in the line starts a new keep count
@@ -642,6 +732,17 @@ foreach ($leg in $plan) {
     }
 }
 
+# TAIL-1 r4 K2: the last attempt at a claim a give-back could not let go of and no close has since released (a reader held the claim file through every earlier try); whatever still stands is recorded by its nonce, never dropped silently
+if ($null -ne $script:strandedClaimNonces) {
+    $endLines = [System.Collections.Generic.List[string]]::new()   # r5 adversary pass 2 A1: every release first, then the lines (an append can stall on a share)
+    foreach ($strandedNonce in @($script:strandedClaimNonces)) {
+        $strandedAnswer = ''; try { $strandedAnswer = [string](Release-VenueClaim -Venue $Venue -Nonce $strandedNonce -ClaimDir $ClaimDir -MaxAttempts 3) } catch { $strandedAnswer = 'ERROR' }
+        if ($strandedAnswer -cin @('RELEASED', 'ABSENT', 'NOT_OURS')) { [void]$script:strandedClaimNonces.Remove($strandedNonce); $endLines.Add("CLAIM_PENDING_RELEASE leg=chain-end nonce=$strandedNonce result=$strandedAnswer (released as the chain ends)") }
+        else { $endLines.Add("CLAIM_PENDING_RELEASE_NOT_RELEASED leg=chain-end nonce=$strandedNonce result=$strandedAnswer (the claim is STILL STANDING; it breaks as dead-pid when this process exits, or at its expiry)") }
+    }
+    foreach ($endLine in $endLines) { try { L $endLine } catch { $null = $_ } }
+}
+
 $summary = [ordered]@{
     schema = 'mlv-app/venue-chain-result/v1'; venue = $Venue; runDir = $RunDir; startedUtc = $t0.ToString('o'); finishedUtc = [DateTime]::UtcNow.ToString('o')
     exitCode = $exitCode; stopReason = $stopReason; legs = @($results)
@@ -650,7 +751,10 @@ $summary = [ordered]@{
 }
 if ($streakStop) { $summary['unhealthyStop'] = $streakStop }
 $resultLine = 'CHAIN_RESULT=' + ($summary | ConvertTo-Json -Compress -Depth 6)
-Add-Content -LiteralPath $ChainLog -Value $resultLine
-Write-Output $resultLine
+L $resultLine -Raw   # TAIL-1 r5 B1: through L, which never throws and (r6) never appends on this thread, so a held or stalled chain.log cannot keep the typed result from stdout or the exit code
+
+# TAIL-1 r6 (sol r5 B1): the queued lines are handed to chain.log for at most 5 s; a writer that does not finish in it (an append stalled on a share) is left behind and the process exits now
+$logFlushed = L -Flush
 Complete-VenueProcess -ExitCode $exitCode   # a share read abandoned at its timeout would otherwise keep this process alive until it ends
+if (-not $logFlushed) { [Console]::Out.Flush(); [Console]::Error.Flush(); [Environment]::Exit($exitCode) }
 exit $exitCode

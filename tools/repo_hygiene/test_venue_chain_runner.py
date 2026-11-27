@@ -31,6 +31,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, cross_tree_modules, sibling_modules
+# VENUE-FIFO-ADVERSARY-TAIL-1 r8: every subprocess.run of this file is run_tree_bounded (the same call; on Windows a timeout kills the whole tree), and a chain Popen
+# whose pipe is read only at communicate() is a DrainedPopen (two chains run at once: one waited on while the other's pipe filled), see venue_fixture_modules
+from tools.repo_hygiene.venue_fixture_modules import DrainedPopen, run_tree_bounded
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -187,7 +190,7 @@ def utc_iso(dt: datetime) -> str:
 
 
 def pwsh_text(command: str) -> str:
-    return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=60, check=True).stdout.strip()
+    return run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=60, check=True).stdout.strip()
 
 
 def process_start_iso(pid: int) -> str:
@@ -231,7 +234,7 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
     def import_copy(self, folder: Path) -> subprocess.CompletedProcess:
         script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
                   "& (Get-Module VenueChain) { (Get-Command ConvertFrom-VenueJsonRawIdentity).Module.Path }")
-        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        return run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
 
     def test_ci_b1_the_derived_sibling_set_names_the_raw_json_module(self) -> None:
         self.assertIn("VenueRawJson.psm1", [p.name for p in sibling_modules(MODULE)])
@@ -260,7 +263,7 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
             scratch.write_text(scratch.read_text(encoding="utf-8").replace("function Get-AttrCudaBuildManifestClaimSha256 {", "function Get-AttrCudaBuildManifestClaimSha256 {\n" + marker, 1), encoding="utf-8")
             script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
                       "& (Get-Module VenueChain) { Get-VenueClaimShapeSource }")
-            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn(marker, r.stdout, "the scratch module read the predicate from somewhere other than its own scratch tree")
 
@@ -274,10 +277,13 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
             shutil.copy2(MODULE, folder / MODULE.name)
             script = (f"$ErrorActionPreference = 'Stop'; Import-Module '{folder / MODULE.name}' -Force -DisableNameChecking\n"
                       "& (Get-Module VenueChain) { Get-VenueClaimShapeSource }")
-            r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+            r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
             self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertIn("VENUE_CLAIM_PREDICATE_UNREADABLE", r.stdout + r.stderr)
-            self.assertIn("AttrCudaArtifacts.psm1", r.stdout + r.stderr)
+            # TAIL-1 r6 (sol r5 H1): pwsh wraps a long error line at the console width, which can split a token (a long temp path put the wrap inside the file name); the tokens are matched with every
+            # whitespace run removed (with the "| " gutter ConciseView puts at the start of each continued line), so the check no longer depends on where the line was wrapped
+            unwrapped = re.sub(r"\s+(?:\|\s+)?", "", r.stdout + r.stderr)
+            self.assertIn("VENUE_CLAIM_PREDICATE_UNREADABLE", unwrapped, r.stdout + r.stderr)
+            self.assertIn("AttrCudaArtifacts.psm1", unwrapped, r.stdout + r.stderr)
 
     def test_ci_b1_control_a_scratch_copy_without_its_siblings_stops_on_the_import(self) -> None:
         # the failure the hosted run hit: with only the module copied, the import stops before any mutation under test
@@ -329,7 +335,7 @@ class VenueChainRunnerTests(unittest.TestCase):
                 "-CooldownSec", "0", "-ClaimPollSec", "1", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)), *extra]
 
     def run_chain(self, run_dir: Path, specs: list[Path], *extra: str, env: dict | None = None, runner: Path = RUNNER, deadline_sec: int = 120, quiet: Path | None = None) -> subprocess.CompletedProcess:
-        return subprocess.run(self.chain_args(run_dir, specs, *extra, runner=runner, deadline_sec=deadline_sec, quiet=quiet), capture_output=True, text=True, timeout=300, env=env or self.env())
+        return run_tree_bounded(self.chain_args(run_dir, specs, *extra, runner=runner, deadline_sec=deadline_sec, quiet=quiet), capture_output=True, text=True, timeout=300, env=env or self.env())
 
     def leg_calls(self) -> list[str]:
         return self.leg_log.read_text(encoding="utf-8").splitlines() if self.leg_log.exists() else []
@@ -369,8 +375,8 @@ class VenueChainRunnerTests(unittest.TestCase):
         b = root / "fleet-runs" / "lane-B" / "tools" / "chain-b.ps1"   # a chain*.ps1 under fleet-runs: what waiter A's scan matches
         b.write_text(OLD_WAITER_B, encoding="utf-8")
         base = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File"]
-        pa = subprocess.Popen([*base, str(a), "-Root", str(root), "-Self", "lane-A", "-MaxSec", "10"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-        pb = subprocess.Popen([*base, str(b), "-Root", str(root), "-Self", "lane-B", "-MaxSec", "10"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        pa = DrainedPopen([*base, str(a), "-Root", str(root), "-Self", "lane-A", "-MaxSec", "10"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        pb = DrainedPopen([*base, str(b), "-Root", str(root), "-Self", "lane-B", "-MaxSec", "10"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         out_a, _ = pa.communicate(timeout=120)
         out_b, _ = pb.communicate(timeout=120)
         # each saw the other as the venue owner, and neither ever ran its leg
@@ -379,11 +385,51 @@ class VenueChainRunnerTests(unittest.TestCase):
         self.assertIn("LANES blocking=1", out_b)
         self.assertNotIn("LEG_RAN", out_a + out_b)
 
+    def test_tail1_r5_b1_a_chain_log_held_against_writes_never_ends_the_chain_before_its_result(self) -> None:
+        # VENUE-FIFO-ADVERSARY-TAIL-1 r5 (sol r4 B1, class sweep): every chain.log write went through Add-Content under ErrorActionPreference Stop, so a log another handle held against writes (FileShare.Read
+        # only, as a reader or a scan holds it) ended the chain at the first line it wrote: at a ticket close before the final nonce retry, or at CHAIN_RESULT. The log is held for the whole run here; the
+        # chain must still run its leg, end 0 and print its typed CHAIN_RESULT, and say on stderr that the log could not be written.
+        import ctypes
+        from ctypes import wintypes
+        rd = self.case / "lane-held-log"
+        rd.mkdir(parents=True)
+        log = rd / "chain.log"
+        log.write_text("", encoding="utf-8")
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateFileW.restype = wintypes.HANDLE
+        k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        h = k32.CreateFileW(str(log), 0x80000000, 0x1, None, 3, 0x80, None)   # GENERIC_READ, FILE_SHARE_READ only, OPEN_EXISTING
+        self.assertNotEqual(h, wintypes.HANDLE(-1).value, f"the fixture could not hold the log: {ctypes.get_last_error()}")
+        try:
+            r = self.run_chain(rd, [self.specs[0]])
+        finally:
+            k32.CloseHandle(h)
+        self.assertEqual(r.returncode, 0, f"a held chain.log ended the chain (exit {r.returncode}):\n{r.stdout}\n{r.stderr}")
+        res = chain_result(r.stdout)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN"], r.stdout)
+        self.assertIn("CHAIN_LOG_WRITE_FAILED", r.stderr, f"the unwritten log lines were not said on stderr:\n{r.stderr}")
+
+    def test_tail1_r6_b1_a_stalled_chain_result_append_never_holds_the_process_exit(self) -> None:
+        # TAIL-1 r6 (sol r5 B1, second half of its row): the CHAIN_RESULT append STALLS (90 s here: a share that stops answering). r5 put the result on stdout first, but the append still held the process
+        # exit for as long as it stalled. Only that append is made to stall (a copy of the runner). Expected: exit 0 with the typed CHAIN_RESULT, inside a bound far under the stall, and the flush timeout said on stderr.
+        anchor = "try { Add-Content -LiteralPath $ChainLog -Value $line -ErrorAction Stop }"
+        runner = self.mutated_runner(anchor, "if ($line -like 'CHAIN_RESULT=*') { [Threading.Thread]::Sleep(90000) }; " + anchor, count=1)
+        rd = self.case / "lane-stalled-log"
+        t0 = time.monotonic()
+        r = self.run_chain(rd, [self.specs[0]], runner=runner)
+        took = time.monotonic() - t0
+        self.assertEqual(r.returncode, 0, f"exit {r.returncode}:\n{r.stdout}\n{r.stderr}")
+        res = chain_result(r.stdout)
+        self.assertEqual([l["status"] for l in res["legs"]], ["RAN"], r.stdout)
+        self.assertLess(took, 60.0, f"a stalled CHAIN_RESULT append held the chain's exit for {took:.1f} s (the stall is 90 s):\n{r.stderr}")
+        self.assertIn("CHAIN_LOG_FLUSH_TIMEOUT", r.stderr, f"the writer that did not finish was not said on stderr:\n{r.stderr}")
+
     def test_two_concurrent_chains_never_deadlock_and_the_second_runs_after_the_first_releases(self) -> None:
         rd_a, rd_b = self.case / "lane-A", self.case / "lane-B"
         env = self.env(FAKE_QUIET_SLEEP_PRE="1", FAKE_LEG_SLEEP="5")
-        pa = subprocess.Popen(self.chain_args(rd_a, [self.specs[0]]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
-        pb = subprocess.Popen(self.chain_args(rd_b, [self.specs[1]]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        pa = DrainedPopen(self.chain_args(rd_a, [self.specs[0]]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+        pb = DrainedPopen(self.chain_args(rd_b, [self.specs[1]]), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
         out_a, _ = pa.communicate(timeout=240)
         out_b, _ = pb.communicate(timeout=240)
         self.assertEqual((pa.returncode, pb.returncode), (0, 0), out_a + "\n----\n" + out_b)
@@ -626,7 +672,7 @@ class VenueChainRunnerTests(unittest.TestCase):
     def test_live_claim_released_by_its_owner_lets_the_waiter_run(self) -> None:
         self.write_claim(os.getpid(), process_start_iso(os.getpid()), datetime.now(timezone.utc) + timedelta(hours=3))
         rd = self.case / "lane-R"
-        p = subprocess.Popen(self.chain_args(rd, [self.specs[0]], deadline_sec=90), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env())
+        p = DrainedPopen(self.chain_args(rd, [self.specs[0]], deadline_sec=90), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env())
         t0 = time.time()
         while time.time() - t0 < 60 and not ((rd / "chain.log").exists() and "CLAIM_HELD" in (rd / "chain.log").read_text(encoding="utf-8")):
             time.sleep(0.25)
@@ -668,7 +714,7 @@ class VenueChainRunnerTests(unittest.TestCase):
     def table(self, now: str, *extra: str) -> tuple[dict, dict]:
         a, b = self.case / "a-gate.log", self.case / "b-gate.log"
         a.write_text(self.GATE_A, encoding="utf-8"); b.write_text(self.GATE_B, encoding="utf-8")
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-QuietRateTable", "-Venue", "bachelor",
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(RUNNER), "-QuietRateTable", "-Venue", "bachelor",
                             "-GateLogPath", f"{a},{b}", "-NowUtc", now, *extra], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         rows = {}
@@ -980,7 +1026,7 @@ class VenueChainRunnerTests(unittest.TestCase):
         cmd = (f"Import-Module '{MODULE}' -Force -DisableNameChecking; "
                f"$a = Get-VenueDriverScriptMissing -Path @('{present}'); $b = Get-VenueDriverScriptMissing -Path @('{present}', '{gone}'); "
                "\"A=[$a]\"; \"B=[$b]\"")
-        r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
+        r = run_tree_bounded(["pwsh", "-NoProfile", "-NonInteractive", "-Command", cmd], capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("A=[]", r.stdout)
         self.assertIn(f"B=[VENUE_DRIVER_SCRIPT_MISSING path={gone}]", r.stdout)
@@ -1112,7 +1158,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
                 "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)), *extra]
 
     def run_chain(self, run_dir: Path, specs: list[Path], *extra: str, env: dict | None = None, runner: Path = RUNNER, share: Path | None = None, venue: str = "bachelor") -> subprocess.CompletedProcess:
-        return subprocess.run(self.chain_args(run_dir, specs, *extra, runner=runner, share=share, venue=venue), capture_output=True, text=True, timeout=300, env=env or self.env())
+        return run_tree_bounded(self.chain_args(run_dir, specs, *extra, runner=runner, share=share, venue=venue), capture_output=True, text=True, timeout=300, env=env or self.env())
 
     def starts(self) -> list[tuple[str, str, str]]:
         """(leaf, venue, manifest8) per START, in order."""
@@ -1274,7 +1320,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
                                       "runDir": "C:\\elsewhere\\lane-OTHER", "purpose": "fixture", "claimedUtc": utc_iso(datetime.now(timezone.utc)),
                                       "expiresUtc": utc_iso(datetime.now(timezone.utc) + timedelta(hours=3)), "nonce": "b-fixture"}), encoding="utf-8")
         rd = self.case / "lane-LINE"
-        p = subprocess.Popen(self.chain_args(rd, self.specs[:1], "-SupplementaryHeldSec", "2"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env())
+        p = DrainedPopen(self.chain_args(rd, self.specs[:1], "-SupplementaryHeldSec", "2"), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=self.env())
         t0 = time.time()
         while time.time() - t0 < 90 and not any(" SUPPLEMENTARY_RAN " in l for l in (self.chain_log(rd) if (rd / "chain.log").exists() else [])):
             time.sleep(0.25)
@@ -1666,7 +1712,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         rd = self.case / "lane-REALLEG"
         args = self.chain_args(rd, [spec], "-SupplementaryHeldSec", "0", "-TestSupplementaryCapSec", "10")
         args[args.index("-LegScript") + 1] = str(wrapper)
-        r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=self.env(DVE_STUB=str(stub_cfg), FAKE_UM_STUB_LOG=str(um_log), FAKE_UM_SHARE=str(self.um_share)))
+        r = run_tree_bounded(args, capture_output=True, text=True, timeout=300, env=self.env(DVE_STUB=str(stub_cfg), FAKE_UM_STUB_LOG=str(um_log), FAKE_UM_SHARE=str(self.um_share)))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         sup = chain_result(r.stdout)["supplementary"]
         leg_out = next(rd.glob("leg-*-ultra-magnus-supplementary.out.txt"), None)
@@ -1704,7 +1750,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
             "Complete-VenueProcess -ExitCode 7\nexit 7\n", encoding="utf-8")
         # monotonic clocks on both sides (adversary A1 on 128b768e): a clock that steps back during a 13 s stall would shrink `inside` and `elapsed` together
         t0 = time.monotonic()
-        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=90)
+        r = run_tree_bounded([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(script)], capture_output=True, text=True, timeout=90)
         elapsed = time.monotonic() - t0
         lines = r.stdout.splitlines()
         # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r13 (adversary A1 on 5fe750fa, Grok G20): the read is given what is left of the 2 s bound on the call's clock, and
