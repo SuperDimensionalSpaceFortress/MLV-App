@@ -1352,6 +1352,26 @@ class HostLoadWaitHonoursUtcDeadlineTests(unittest.TestCase):
         self.assertEqual(got["STATE"], "unknown/True", got)
         self.assertLess(int(got["MS"]), 4200, f"the wait outlived the caller's 3 s stopwatch end by the stall after its sample: {got}")
 
+    def test_adv2_a1_a_utc_end_seen_passed_in_the_wait_is_final_even_when_the_clock_recovers(self) -> None:
+        # adversary-9bc903a3.json A1 (introduced), its input: Invoke-VenueBoundedRead -ScriptText 'param($a) 42' -Argument 0 -TimeoutSec 20, a running -Clock with -EndSec 20, -EndUtc U0+60 s;
+        # the worker has answered before the loop looks (VenueTestPreWaitDelayMs 500); the UTC reads are U0 at entry and setup, U0+120 s at the loop's check, then U0 again (a clock read
+        # that steps back, or one throw/null read that then recovers). RED on 9bc903a3: the loop saw the end passed, but WaitOne(0) found the answer, the recovered clock passed the
+        # answer check, and 42 was returned as answered. An end once seen passed is final: no answer.
+        for label, third in (("step", "[DateTime]::UtcNow.AddSeconds(120)"), ("throw", "throw 'no wall clock'"), ("null", "$null")):
+            with self.subTest(third_read=label):
+                body = (
+                    "$vc = Get-Module VenueChain; "
+                    f"& $vc {{ $script:n = 0; $script:VenueTestPreWaitDelayMs = 500; $script:VenueTestUtcNowScript = {{ $script:n++; if ($script:n -eq 3) {{ {third} }} else {{ [DateTime]::UtcNow }} }} }}; "
+                    "$r = & $vc { $sw = [Diagnostics.Stopwatch]::StartNew(); Invoke-VenueBoundedRead -ScriptText 'param($a) 42' -Argument 0 -TimeoutSec 20 -Clock $sw -EndSec 20 -EndUtc ([DateTime]::UtcNow.AddSeconds(60)) }; "
+                    "Write-Output ('ANSWERED=' + $r.answered); Write-Output ('VALUE=' + (@($r.value) -join ',')); Write-Output ('ERR=' + $r.error); Write-Output ('READS=' + (& $vc { $script:n })); "
+                    "Complete-VenueProcess -ExitCode 0")
+                p = run_ps(body)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                got = dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+                self.assertEqual(got["ANSWERED"], "False", f"an answer seen after the wait saw the UTC end passed was acted on: {got}")
+                self.assertEqual(got["VALUE"], "", got)
+                self.assertIn("absolute end", got["ERR"], got)
+
     def test_d_the_bounded_read_is_handed_the_absolute_end(self) -> None:
         # structural pin: Read-VenueFileBytesBounded forwards -EndUtc into Invoke-VenueBoundedRead's wait (the one wait both host-load reads, and so the chain, batch and baseline, use)
         import re
