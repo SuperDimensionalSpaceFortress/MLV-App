@@ -1491,6 +1491,9 @@ inline double pacedMeasuredHoldLanding( double tickStartPosition, const DropFram
     const double completingFrame = std::max( markFloor, std::floor( tickStartPosition + 1e-9 ) ) + owed;
     if( !( std::floor( tick.position + 1e-9 ) >= completingFrame ) ) return tick.position;
     const double insideFrame = completingFrame + 0.5;
+    // r2 (adversary advisory A2 on 8b386cb9): past 2^52 a half frame (and past 2^53 a whole one) is not representable, so the span
+    // collapses and the clamp could hand back the start position (no progress); there it passes the tick through unchanged
+    if( !( insideFrame > completingFrame ) || !( completingFrame > tickStartPosition ) ) return tick.position;
     if( tick.position < completingFrame ) return completingFrame;   // the epsilon band: counted as the frame, rendered as the one before
     return tick.position > insideFrame ? insideFrame : tick.position;
 }

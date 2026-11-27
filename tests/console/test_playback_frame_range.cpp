@@ -5195,6 +5195,9 @@ TEST( PlaybackPacedMeasuredHold, R2TheCrossingTickLandsInsideTheCompletingFrameA
                                            std::numeric_limits<int64_t>::max() ) == 1000.0 );
     ASSERT_TRUE( pacedMeasuredHoldLanding( 0.0, tickTo( 1000.0 ), std::numeric_limits<int64_t>::min(),
                                            std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max() ) == 1000.0 );
+    // r2 advisory A2 (on 8b386cb9): at 2^53 the half-frame span is not representable; the tick passes through, never back to its start
+    ASSERT_TRUE( pacedMeasuredHoldLanding( 9007199254740992.0, tickTo( 9007199254740994.0 ), 9007199254740992LL, 1, 2 )
+                 == 9007199254740994.0 );
 }
 
 TEST( PlaybackPacedMeasuredHold, APinnedOrUnpacedRunIsNeverHeldByThePacedHold )
