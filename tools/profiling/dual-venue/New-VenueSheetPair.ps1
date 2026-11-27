@@ -35,8 +35,10 @@ param(
 $ErrorActionPreference = 'Stop'
 Import-Module (Join-Path $PSScriptRoot 'DualVenueRunner.psm1') -Force
 
-$cuda = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CudaReceipt).Path) | ConvertFrom-Json
-$cpu = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CpuReceipt).Path) | ConvertFrom-Json
+$cudaText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CudaReceipt).Path)
+$cpuText = [IO.File]::ReadAllText((Resolve-Path -LiteralPath $CpuReceipt).Path)
+$cuda = $cudaText | ConvertFrom-Json
+$cpu = $cpuText | ConvertFrom-Json
 
 if ($cuda.subject.backend -ne 'cuda' -or $cpu.subject.backend -ne 'cpu') { throw 'PAIR_BACKENDS_WRONG the first receipt must be the cuda backend and the second the cpu backend' }
 # The sheet is owner footage: it may only be written where it stays local.
@@ -53,7 +55,8 @@ foreach ($r in $cuda, $cpu) {
     if ($r.outcome -ne 'PASS' -and $r.outcome -ne 'FAIL') { throw "PAIR_RECEIPT_INCOMPLETE receipt $($r.receiptId) is $($r.outcome), not PASS/FAIL" }
     # The evidence-bearing validator: the receipt's admission is re-derived from the committed blobs and its run from the hashed
     # evidence files (a receipt whose evidence is absent is INCOMPLETE). Nothing the receipt says about itself is believed.
-    $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot
+    # the TEXT too (R3-RESIDUE-1 A1): ConvertFrom-Json keeps only the last of two same-name members, so a duplicate `venue` is visible only in the text
+    $validity = Test-DvReceiptValid -Receipt $r -RepoRoot $repoRoot -ReceiptText $(if ([object]::ReferenceEquals($r, $cuda)) { $cudaText } else { $cpuText })
     if ($validity.status -cne 'ADVISORY') { throw "PAIR_RECEIPT_$($validity.status) receipt $($r.receiptId) is not valid evidence: $(@($validity.reasons) -join '; ')" }
     # The leg type is the COMMITTED spec's (found by the validator), not a field of the receipt: only a look leg has a sheet to pair.
     if ([string]$validity.legType -cne 'look') { throw "PAIR_NOT_A_LOOK_LEG receipt $($r.receiptId) is not a LOOK leg per its committed leg spec; only a look leg's frames can be paired" }
@@ -119,7 +122,7 @@ $record = [ordered]@{
     advisory = $true
     evidenceStatus = 'ADVISORY'
     advisoryNote = 'both receipts re-derive from committed consent and hashed run evidence, but no venue-held anchor exists (VENUE_ANCHOR_ABSENT): a diagnostic sheet, never a PASS'
-    unbound = @('subject.clipContentSha256', 'venue.hostName', 'venue.gpuNames')
+    unbound = @('subject.clipContentSha256', 'venue.hostName', 'venue.gpuNames', 'venue.displayPath')   # displayPath: VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2
     localOnly = 'never committed, attached to a PR, published to the bus or as an artifact'
     cudaReceiptId = $cuda.receiptId; cpuReceiptId = $cpu.receiptId
     # The scale each side asked for and rendered at (re-derived by the validator above): a pair whose sides rendered at different scales shows a SCALE difference

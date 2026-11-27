@@ -341,7 +341,8 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
     # the receipt's own hashed run log through Get-DvMatrixRow, which refuses a log that no longer hashes to the receipt.
     $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null; identity = $null }
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
-    try { $rc = [IO.File]::ReadAllText($ReceiptPath) | ConvertFrom-Json } catch { return $f }
+    $rcText = ''
+    try { $rcText = [IO.File]::ReadAllText($ReceiptPath); $rc = $rcText | ConvertFrom-Json } catch { return $f }
     # The receipt must be the one THIS run's leg wrote, not a stale or foreign file the chain's path happens to name: its receiptId is its file name, its legId / venue /
     # buildManifestSha256 are the planned ones, and it started after this run did (the hub VM stamps it on the same clock). Anything else is `identity`: not validated, no figure.
     $idProblems = [System.Collections.Generic.List[string]]::new()
@@ -376,7 +377,7 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend) {
             if (-not $vr.ok) { throw "validator exit $($vr.exit) timedOut=$($vr.timedOut)" }
             $vr.stdout | ConvertFrom-Json
         }
-        else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo }
+        else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo -ReceiptText $rcText }   # the TEXT too: ConvertFrom-Json keeps only the last of two same-name members (R3-RESIDUE-1 A1)
     } catch { $null }
     $f.verification = $(if ($v -and [string]$v.status) { [ordered]@{ status = [string]$v.status; valid = [bool]$v.valid; reasons = @($v.reasons | Select-Object -First 3) } } else { [ordered]@{ status = 'VALIDATOR_ERROR'; valid = $false; reasons = @() } })
     if ($f.verification.status -cnotin @('ADVISORY', 'NO_SIGNAL', 'VERIFIED', 'VERIFIED_OFFLINE_TEST')) { $f.rejected = $f.verification.status; return $f }
