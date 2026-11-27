@@ -1232,6 +1232,9 @@ $script:VenueTestUtcNowScript = $null
 # VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1 (sol r7 A1 on #906): a bounded read handed an absolute UTC end waits in slices of at most this many seconds and re-reads both clocks between
 # them, so a wall-clock step inside the wait is seen within one slice (a single WaitOne sized at the start cannot see a step that comes later).
 $script:VenueUtcWaitSliceSec = 0.25
+# Test-only (VENUE-HOSTLOAD-WAIT-UTC-DEADLINE-1 r1, adversary-677afe0a.json A1): ONE stall in Invoke-VenueBoundedRead right after the wait's remainder is sampled and before the wait starts,
+# as a caller descheduled there is. It clears itself once used. Production leaves it 0.
+$script:VenueTestPostWaitSampleDelayMs = 0
 # Test-only (VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r2, adversary-7efea617.json A4): Read-VenueFileBytesBounded's worker sleeps this many ms before it reads, as a share that
 # answers late does. Production leaves it 0.
 $script:VenueTestFileReadDelayMs = 0
@@ -1321,6 +1324,7 @@ function Invoke-VenueBoundedRead {
         # r13 (Grok G20 on #814): $endCut = the caller's end, not -TimeoutSec, set the wait (as the nightly's capCut), so the message reports the wait actually given
         $waitSec = $TimeoutSec; $endCut = $false
         if ($null -ne $Clock) { $toEnd = $EndSec - $Clock.Elapsed.TotalSeconds; if ($toEnd -lt $waitSec) { $waitSec = [Math]::Max(0.0, $toEnd); $endCut = $true } }
+        if ($script:VenueTestPostWaitSampleDelayMs -gt 0) { $stallMs = $script:VenueTestPostWaitSampleDelayMs; $script:VenueTestPostWaitSampleDelayMs = 0; [Threading.Thread]::Sleep($stallMs) }
         $done = $false; $utcCut = $false
         if (-not $hasUtc) { $done = $async.AsyncWaitHandle.WaitOne([TimeSpan]::FromSeconds($waitSec)) }
         else {

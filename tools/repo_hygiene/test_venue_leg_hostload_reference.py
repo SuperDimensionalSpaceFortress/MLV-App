@@ -1322,6 +1322,36 @@ class HostLoadWaitHonoursUtcDeadlineTests(unittest.TestCase):
         self.assertEqual(got["CLEAN"], "quiet", p.stdout)
         self.assertEqual((got["THROW"], got["NULL"], got["STEP"]), ("unknown", "unknown", "unknown"), p.stdout)
 
+    def _stall_after_sample(self, deadline_arg: str) -> dict:
+        import hashlib
+        with tempfile.TemporaryDirectory() as d:
+            quiet = json.dumps({"hostLoad": QUIET})
+            sha = hashlib.sha256(quiet.encode("utf-8")).hexdigest()
+            rid = "d2d2d2d2-d2d2-4d2d-8d2d-d2d2d2d2d2d2"
+            path = self.write_leg(Path(d), rid, {"receiptId": rid, "outcome": "PASS", "evidence": {"resultJsonSha256": sha}}, {"hostLoad": QUIET})
+            p = run_ps(
+                "$vc = Get-Module VenueChain; & $vc { $script:VenueTestFileReadDelayMs = 30000; $script:VenueTestPostWaitSampleDelayMs = 2000 }; "
+                f"$t = [Diagnostics.Stopwatch]::StartNew(); $r = Get-VenueLegHostLoad -ReceiptPath '{path}' -PlannedLegType 'playback' -ReadTimeoutSec 3 {deadline_arg}; $ms = $t.ElapsedMilliseconds; "
+                "Write-Output ('STATE=' + $r.state + '/' + $r.provisional); Write-Output ('MS=' + $ms); Write-Output ('WHY=' + ($r.reason -replace '\\s+', ' ')); "
+                "Complete-VenueProcess -ExitCode 0")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return dict(l.split("=", 1) for l in p.stdout.splitlines() if "=" in l)
+
+    def test_adv_a1_a_caller_stalled_after_the_wait_sample_still_ends_at_its_stopwatch_end_with_a_utc_end(self) -> None:
+        # adversary-677afe0a.json A1 (introduced), its input scaled under the 2 s sleep rule: -ReadTimeoutSec 3 (the input's 20), a far -CallDeadlineUtc (60 s), the receipt read never answers,
+        # the caller stalls 2 s (the input's 8) right after the wait's remainder is sampled (the seam VenueTestPostWaitSampleDelayMs). RED on 677afe0a: the sliced wait started a NEW stopwatch
+        # after the stall and still granted the whole sampled remainder, so it ended ~2 s past the caller's 3 s end (MS ~5000). The wait is held to the caller's own clock: ~3 s.
+        got = self._stall_after_sample("-CallDeadlineUtc ([DateTime]::UtcNow.AddSeconds(60))")
+        self.assertEqual(got["STATE"], "unknown/True", got)
+        self.assertLess(int(got["MS"]), 4200, f"the wait outlived the caller's 3 s stopwatch end by the stall after its sample: {got}")
+
+    def test_adv_a1_sibling_the_stopwatch_only_wait_is_held_to_the_callers_clock_too(self) -> None:
+        # adversary-677afe0a.json A1 sibling VenueChain.psm1:1325 (the wait with a caller clock and no UTC end: the baseline's and the leg's own host-load read): the same stall after the
+        # same sample. RED on 677afe0a: the single WaitOne took the remainder sampled before the stall (MS ~5000).
+        got = self._stall_after_sample("")
+        self.assertEqual(got["STATE"], "unknown/True", got)
+        self.assertLess(int(got["MS"]), 4200, f"the wait outlived the caller's 3 s stopwatch end by the stall after its sample: {got}")
+
     def test_d_the_bounded_read_is_handed_the_absolute_end(self) -> None:
         # structural pin: Read-VenueFileBytesBounded forwards -EndUtc into Invoke-VenueBoundedRead's wait (the one wait both host-load reads, and so the chain, batch and baseline, use)
         import re
