@@ -7303,7 +7303,8 @@ function New-DvDisplayStateProbeText {
     the probe already made (`$gpus`, `$gpuErr`), the Windows build and the last boot time from the Win32_OperatingSystem read it already made (`$os`), the
     hotfix count from ONE Win32_QuickFixEngineering read with its own -OperationTimeoutSec, and the UBR from HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion
     (Win32_OperatingSystem carries no UBR). No process, no write, no network, no elevation. Every read is inside the job's own deadline (Submit-VenueJob
-    -TimeoutSec 120) and the fragment adds its own 30 s budget on top: a read that has no budget left is `DEADLINE`, one that throws is `CIM_ERROR` (or
+    -TimeoutSec 120). The fragment's own 30 s budget gates the START of each of its two reads (a local registry read cannot be preempted, so it is skipped,
+    not interrupted, and the CIM read also carries its own -OperationTimeoutSec of at most 15 s): a read that has no budget left is `DEADLINE`, one that throws is `CIM_ERROR` (or
     `CIM_TIMEOUT` for a timed-out operation), one that returns nothing is `CIM_EMPTY`, a registry read that fails is `REGISTRY_ERROR`, and a video controller
     that reports no current mode is `NO_ACTIVE_OUTPUT`. The whole fragment is inside one try: a failure anywhere leaves `displayState` null (the writer types every
     field NOT_REPORTED) and never fails the probe. A single-quoted here-string, so the fragment reaches the venue exactly as written. Expects `$probe`, `$os`,
@@ -7329,7 +7330,9 @@ try {
     $dsGpus = @($gpus)
     $dsActive = @($dsGpus | Where-Object { [int]$_.CurrentHorizontalResolution -gt 0 -and [int]$_.CurrentVerticalResolution -gt 0 -and [int]$_.CurrentRefreshRate -gt 0 })
     $dsAdapterWhy = $null
-    if ($dsGpus.Count -eq 0) { $dsAdapterWhy = $(if (@($gpuErr).Count -gt 0) { Get-DsFailReason (@($gpuErr)[0].Exception) } else { 'CIM_EMPTY' }) }
+    # An error recorded beside returned controllers (a timeout midway, say) makes the enumeration incomplete: it is typed, never published as a partial list.
+    if (@($gpuErr).Count -gt 0) { $dsAdapterWhy = Get-DsFailReason (@($gpuErr)[0].Exception) }
+    elseif ($dsGpus.Count -eq 0) { $dsAdapterWhy = 'CIM_EMPTY' }
     elseif ($dsActive.Count -eq 0) { $dsAdapterWhy = 'NO_ACTIVE_OUTPUT' }
     $ds = [ordered]@{}
     if ($null -ne $dsAdapterWhy) {
@@ -7346,10 +7349,15 @@ try {
     }
     $build = $(if ($null -ne $os) { [string]$os.BuildNumber } else { '' })
     $ds.windowsBuild = $(if ($build.Length -gt 0) { New-DsReading $build $null } else { New-DsReading $null 'CIM_EMPTY' })
-    try {
-        $ubr = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name 'UBR' -ErrorAction Stop).UBR
-        $ds.windowsUbr = $(if ($ubr -is [int] -and $ubr -ge 0) { New-DsReading $ubr $null } else { New-DsReading $null 'REGISTRY_ERROR' })
-    } catch { $ds.windowsUbr = New-DsReading $null 'REGISTRY_ERROR' }
+    # The budget gates the START of every read (adversary pass sol r1 A3). The registry read is a local in-process call that cannot be preempted, so a spent
+    # budget skips it (DEADLINE); the CIM read below additionally carries its own -OperationTimeoutSec.
+    if ($dsBudgetSec - $dsClock.Elapsed.TotalSeconds -lt 1) { $ds.windowsUbr = New-DsReading $null 'DEADLINE' }
+    else {
+        try {
+            $ubr = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name 'UBR' -ErrorAction Stop).UBR
+            $ds.windowsUbr = $(if ($ubr -is [int] -and $ubr -ge 0) { New-DsReading $ubr $null } else { New-DsReading $null 'REGISTRY_ERROR' })
+        } catch { $ds.windowsUbr = New-DsReading $null 'REGISTRY_ERROR' }
+    }
     $ds.lastBootUtc = $(if ($null -ne $os -and $os.LastBootUpTime -is [datetime]) { New-DsReading ($os.LastBootUpTime.ToUniversalTime().ToString('yyyy-MM-dd\THH:mm:ss\Z', $dsInvariant)) $null } else { New-DsReading $null 'CIM_EMPTY' })
     $dsLeft = $dsBudgetSec - $dsClock.Elapsed.TotalSeconds
     if ($dsLeft -lt 1) { $ds.hotfixCount = New-DsReading $null 'DEADLINE' }
@@ -8131,18 +8139,19 @@ function Read-DvDisplayReading {
             'displayAdapterDriverDate' {
                 $s = $(if ($v.ValueKind -eq $string) { [string]$v.GetString() } else { '' })
                 $d = [datetime]::MinValue
-                if ($s -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}$' -or -not [datetime]::TryParseExact($s, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return (& $bad 'value is not a yyyy-MM-dd date') }
+                if ($s -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}\z' -or -not [datetime]::TryParseExact($s, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return (& $bad 'value is not a yyyy-MM-dd date') }
                 $value = $s
             }
             'lastBootUtc' {
                 $s = $(if ($v.ValueKind -eq $string) { [string]$v.GetString() } else { '' })
                 $d = [datetime]::MinValue
-                if ($s -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' -or -not [datetime]::TryParseExact($s, "yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return (& $bad 'value is not a yyyy-MM-ddTHH:mm:ssZ time') }
+                if ($s -notmatch '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\z' -or -not [datetime]::TryParseExact($s, "yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$d)) { return (& $bad 'value is not a yyyy-MM-ddTHH:mm:ssZ time') }
                 $value = $s
             }
             'windowsBuild' {
                 $s = $(if ($v.ValueKind -eq $string) { [string]$v.GetString() } else { '' })
-                if ($s -notmatch '^[0-9]{1,10}$') { return (& $bad 'value is not a build number') }
+                # \z, never $: a `$` anchor also accepts a trailing LF (adversary pass sol r1 A1)
+                if ($s -notmatch '^[0-9]{1,10}\z') { return (& $bad 'value is not a build number') }
                 $value = $s
             }
             { $_ -in @('windowsUbr', 'hotfixCount') } {

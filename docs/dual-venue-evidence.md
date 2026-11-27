@@ -813,10 +813,13 @@ times out or returns nothing is a typed unknown, never a guess and never a missi
 | `windowsBuild` | digits | `Win32_OperatingSystem.BuildNumber` |
 | `windowsUbr` | int | the registry value `HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\UBR` (CIM carries no UBR; an in-process read-only registry read) |
 | `lastBootUtc` | `yyyy-MM-ddTHH:mm:ssZ` | `Win32_OperatingSystem.LastBootUpTime`, in UTC |
-| `hotfixCount` | int | the number of `Win32_QuickFixEngineering` records: the one new CIM read, with its own `-OperationTimeoutSec` (at most 15 s, inside a 30 s budget for the whole fragment, inside the probe job's own 120 s deadline) |
+| `hotfixCount` | int | the number of `Win32_QuickFixEngineering` records: the one new CIM read, with its own `-OperationTimeoutSec` (at most 15 s; a 30 s budget gates the start of each of the fragment's two reads, this and the UBR; all inside the probe job's own 120 s deadline) |
 
 The adapter, display, build and boot readings reuse the `Win32_VideoController` and `Win32_OperatingSystem` reads the probe already made. A video-controller
-read that errors keeps its error (`-ErrorVariable`), so a failed read is typed `CIM_ERROR` or `CIM_TIMEOUT` and not `CIM_EMPTY`.
+read that errors keeps its error (`-ErrorVariable`), so a failed read is typed `CIM_ERROR` or `CIM_TIMEOUT` and not `CIM_EMPTY`; an error recorded beside
+returned controllers makes the enumeration incomplete, so the four adapter readings carry the failure and never a partial list. **Known limit (OPEN, not
+introduced here):** the block's `adapters` list keeps its v2 rule (empty is malformed: a sample with no video controller is a failed read), so when the
+controller read returns no controller at all the whole block is not written and the receipt reads `NO_SIGNAL`, with the OS readings lost with it.
 
 Typed unknown reasons: `CIM_ERROR` (the read threw), `CIM_TIMEOUT` (the operation timed out), `CIM_EMPTY` (it returned nothing, or a record without the
 property; an empty hotfix list is never read as "zero hotfixes"), `NO_ACTIVE_OUTPUT` (no controller reports a current mode), `REGISTRY_ERROR` (the UBR

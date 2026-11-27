@@ -1089,9 +1089,10 @@ def run_fragment(scenarios: list[dict]) -> list[dict]:
             "    'timeout' { throw [System.TimeoutException]::new('the operation timed out') }\n"
             "    'empty' { } } }\n"
             "function Get-ItemProperty { [CmdletBinding()] param([string]$LiteralPath, [string]$Name)\n"
+            "  $script:regCalled = $true\n"
             "  switch ($script:reg) { 'ok' { [pscustomobject]@{ UBR = 10075 } } 'text' { [pscustomobject]@{ UBR = 'not a number' } } 'throw' { throw 'no such value' } } }\n"
             "function Invoke-Scenario($s) {\n"
-            "  $script:seen = $null; $script:quick = [string]$s.quick; $script:reg = [string]$s.reg\n"
+            "  $script:seen = $null; $script:regCalled = $false; $script:quick = [string]$s.quick; $script:reg = [string]$s.reg\n"
             "  if ($null -ne $s.budget) { $dsBudgetSec = [double]$s.budget }\n"
             "  $inv = [Globalization.CultureInfo]::InvariantCulture\n"
             "  $probe = [ordered]@{}\n"
@@ -1105,7 +1106,7 @@ def run_fragment(scenarios: list[dict]) -> list[dict]:
             "  if ($s.gpuErr -eq 'error') { $gpuErr = @([System.Management.Automation.ErrorRecord]::new([System.InvalidOperationException]::new('x'), 'e', [System.Management.Automation.ErrorCategory]::InvalidOperation, $null)) }\n"
             "  . ([scriptblock]::Create($fragment))\n"
             "  $wrap = [ordered]@{ gpuNames = @('Probe Adapter'); driverVersion = '1.0'; displayDevice = 'D'; displayState = $probe.displayState }\n"
-            "  [ordered]@{ line = ('DVE_PROBE=' + ($wrap | ConvertTo-Json -Compress -Depth 6)); seen = $script:seen }\n"
+            "  [ordered]@{ line = ('DVE_PROBE=' + ($wrap | ConvertTo-Json -Compress -Depth 6)); seen = $script:seen; regCalled = $script:regCalled }\n"
             "}\n"
             f"$doc = [System.Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText('{psq(cases)}'))\n"
             "$out = @(foreach ($e in $doc.RootElement.EnumerateArray()) { Invoke-Scenario ($e.GetRawText() | ConvertFrom-Json) })\n"
@@ -1136,7 +1137,8 @@ class DisplayStateFragmentTests(unittest.TestCase):
         def sc(**over):
             return dict(SCENARIO_OK, **over)
         cls.names = ["healthy", "no-controller-error", "no-controller-timeout", "no-controller-empty", "no-active-mode", "quick-throws", "quick-times-out",
-                     "quick-empty", "registry-throws", "registry-text", "no-budget", "no-os", "no-driver-date", "two-active"]
+                     "quick-empty", "registry-throws", "registry-text", "no-budget", "no-os", "no-driver-date", "two-active",
+                     "partial-then-timeout", "headless-only-then-error", "partial-then-error-active"]
         cls.rows = run_fragment([
             sc(),
             sc(gpus=[], gpuErr="error"),
@@ -1152,6 +1154,10 @@ class DisplayStateFragmentTests(unittest.TestCase):
             sc(os=None),
             sc(gpus=[dict(INTEL, date=None)]),
             sc(gpus=[INTEL, dict(INTEL, name="Second Adapter", w=1920, h=1080, hz=60)]),
+            # adversary pass sol r1 A4: the enumeration returned objects AND recorded an error: the result is incomplete, so it is never published
+            sc(gpus=[NVIDIA_HEADLESS], gpuErr="timeout"),
+            sc(gpus=[NVIDIA_HEADLESS], gpuErr="error"),
+            sc(gpus=[INTEL], gpuErr="error"),
         ])
         cls.states = {n: state_of(r["line"]) for n, r in zip(cls.names, cls.rows)}
 
@@ -1196,8 +1202,19 @@ class DisplayStateFragmentTests(unittest.TestCase):
         self.assertTrue(1 <= seen <= 15, f"the hotfix read's operation timeout is {seen} s; it must be 1..15")
 
     def test_a_read_with_no_budget_left_is_never_started(self) -> None:
-        self.unknown("no-budget", "hotfixCount", why="DEADLINE")
-        self.assertIsNone(self.rows[self.names.index("no-budget")]["seen"], "the CIM class was read although the budget was spent")
+        self.unknown("no-budget", "hotfixCount", "windowsUbr", why="DEADLINE")
+        row = self.rows[self.names.index("no-budget")]
+        self.assertIsNone(row["seen"], "the CIM class was read although the budget was spent")
+        self.assertFalse(row["regCalled"], "adversary pass sol r1 A3: the registry was read although the budget was spent")
+
+    def test_an_error_beside_returned_controllers_is_never_published_as_display_state(self) -> None:
+        """adversary pass sol r1 A4: a controller enumeration that returned objects but also recorded an error (a timeout, say) is incomplete: the four
+        adapter readings carry the failure, not NO_ACTIVE_OUTPUT and not a partial list. The OS readings are untouched."""
+        adapter_fields = ("displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate", "displays")
+        self.unknown("partial-then-timeout", *adapter_fields, why="CIM_TIMEOUT")
+        self.unknown("headless-only-then-error", *adapter_fields, why="CIM_ERROR")
+        self.unknown("partial-then-error-active", *adapter_fields, why="CIM_ERROR")
+        self.assertEqual(self.states["partial-then-error-active"]["windowsBuild"], GOOD_STATE["windowsBuild"])
 
     def test_the_registry_ubr_failing_or_not_a_number_is_a_typed_unknown(self) -> None:
         self.unknown("registry-throws", "windowsUbr", why="REGISTRY_ERROR")
@@ -1285,7 +1302,8 @@ class DisplayStateWriterTests(unittest.TestCase):
             "displays": [{"value": [], "unknown": None}, {"value": [{"adapter": "x", "width": 0, "height": 1, "refreshHz": 1}], "unknown": None},
                          {"value": [{"adapter": "x", "width": 1, "height": 1}], "unknown": None}, {"value": "1920x1080", "unknown": None},
                          {"value": [{"adapter": "x", "width": 1.5, "height": 1, "refreshHz": 1}], "unknown": None}],
-            "windowsBuild": [{"value": 26200, "unknown": None}, {"value": "26200.1", "unknown": None}],
+            # adversary pass sol r1 A1: a trailing LF is not a digit (a `$`-anchored match accepts it)
+            "windowsBuild": [{"value": 26200, "unknown": None}, {"value": "26200.1", "unknown": None}, {"value": "26200\n", "unknown": None}],
             "windowsUbr": [{"value": -1, "unknown": None}, {"value": "10075", "unknown": None}, {"value": 1.5, "unknown": None}],
             "lastBootUtc": [{"value": "2026-11-21 07:12:09", "unknown": None}, {"value": "2026-11-21T07:12:09+00:00", "unknown": None}],
             "hotfixCount": [{"value": -3, "unknown": None}, {"value": True, "unknown": None}],
@@ -1447,6 +1465,8 @@ class DisplayStateReaderTests(unittest.TestCase):
             ("displayAdapterName", {"value": None, "unknown": "GUESS"}), ("displayAdapterName", {"value": "x"}), ("displayAdapterName", {"value": "x", "unknown": None, "why": "y"}),
             ("displayAdapterName", "x"), ("displayAdapterName", {"value": "", "unknown": None}), ("displayAdapterName", {"value": "a?b", "unknown": None}),
             ("displayAdapterDriverDate", {"value": "2024-02-30", "unknown": None}), ("lastBootUtc", {"value": "2026-11-21T07:12:09", "unknown": None}),
+            ("windowsBuild", {"value": "26200\n", "unknown": None}), ("displayAdapterDriverDate", {"value": "2024-05-14\n", "unknown": None}),
+            ("lastBootUtc", {"value": "2026-11-21T07:12:09Z\n", "unknown": None}),
             ("windowsBuild", {"value": "", "unknown": None}), ("windowsUbr", {"value": -1, "unknown": None}), ("windowsUbr", {"value": 1.5, "unknown": None}),
             ("windowsUbr", {"value": "10075", "unknown": None}), ("hotfixCount", {"value": 2147483648, "unknown": None}),
             ("displays", {"value": [], "unknown": None}), ("displays", {"value": [{"adapter": "x", "width": 0, "height": 1, "refreshHz": 1}], "unknown": None}),
