@@ -241,8 +241,13 @@ and the nonce the app echoed on its summary line (`observedRunNonce`) (`TAIL_VIS
 session number and a millisecond `tail_begin_utc`); the hashed run log's
 one `gui_smoke.visual_capture.begin` record must carry the measured session and the same `tail_begin_utc` as visual.json, and the
 log carries no `gui_smoke.visual_capture.clip_changed` record. Any dropped or replaced prepared result (`prep_stale_drops`,
-`prep_generation_drops`, `prep_replaced_*` non-zero, or a `playback_prep.invalidate_generation` drop logged after the begin record)
-or a non-zero or absent `paint_wait_escapes` refuses the credit. Typed
+`prep_generation_drops`, `prep_replaced_*` non-zero, or a `playback_prep.invalidate_generation` record logged between the begin record
+and the app's one `gui_smoke.visual_capture.burst_end` record) or a non-zero or absent `paint_wait_escapes` refuses the credit.
+R6-BURST-CUTOFF-RESIDUE-1 r4: `burst_end` is never trace-only. It carries the presentation-generation, stale-drop, generation-drop and
+replaced-before/after deltas since the tail began, and any non-zero delta refuses the credit. A missing, duplicated, other-session or
+unreadable `burst_end` also refuses. An invalidation after `burst_end`, such as the normal play-stop, comes after every burst capture,
+so it does not refuse. The burst capture's start is decided inside the capture function, after its HWND, DC and DIB setup and
+immediately before PrintWindow (`captureStartGate`). Typed
 refusals: `TAIL_CREDIT_PREP_DROPPED`, `TAIL_CREDIT_PAINT_WAIT_ESCAPES`, `TAIL_VISUAL_NONCE_ABSENT`, `TAIL_VISUAL_NONCE_MISMATCH`,
 `TAIL_VISUAL_NOT_THIS_RUN`, `TAIL_VISUAL_FILE_AMBIGUOUS`, `TAIL_CREDIT_PAINT_ORDER`, `TAIL_VISUAL_UNREADABLE` (the validator re-throws
 it as `DVE_EVIDENCE_VALIDATION_IO`). A credit the criteria were judged with must appear in the receipt's `outcomeDetail`

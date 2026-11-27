@@ -10562,6 +10562,25 @@ class VisualCaptureObserverPaintTests(unittest.TestCase):
                 self.assertIsNone(f["sha256"], f)
 
     @requires_windows_imaging
+    def test_r6_r4_pass2_sol_a2_lf_suffixed_unforced_files_never_switch_the_freeze_gate_to_forced_rows(self) -> None:
+        """r4 pass 2, sol A2 on b3713c24, its input: the forced-first stuck fixture with one LF appended to every play_unbound row's file. b3713c24's `\\z`
+        filter dropped all six unforced rows, so the gate judged the six moving forced pictures (OK). The rows stay collected with no pixels."""
+        with tempfile.TemporaryDirectory(prefix="vis-r6-p2a2-") as d:
+            art = Path(d) / "artifacts"
+            dest = art / "visual"
+            write_stateful_visual_captures(dest, "forced-first", "stuck")
+            visual = json.loads((dest / "visual.json").read_text(encoding="utf-8"))
+            for row in visual["frames"]:
+                if row.get("kind") == "play_unbound":
+                    row["file"] = row["file"] + "\n"
+            (dest / "visual.json").write_text(json.dumps(visual), encoding="utf-8")
+            proc, out = run_pwsh_json(f"Read-DvVisualCaptures -Requested $true -ArtifactsDir '{art}' -EvidenceDir '{Path(d) / 'evidence'}' -LegId 'unit-leg' -Header 'unit' "
+                                      "| ConvertTo-Json -Depth 8 -Compress")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(out["frozenJudgedOn"], "play_unbound", out)
+            self.assertNotEqual(out["verdict"], "OK", out["reason"])
+
+    @requires_windows_imaging
     def test_the_visual_reader_says_ok_over_a_healthy_display_on_the_r3_order(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-r3-healthy-") as d:
             _, out = self.read(d, "forced-first", "healthy")
@@ -22082,28 +22101,32 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         string and accepted as the launcher's nonce; only a JSON string is a nonce."""
         late = self.play(0, forced_paints_before=6, tail_elapsed_ms=1625)
         first = self.play(0, kind="play_first_unbound", tail_elapsed_ms=4)
-        doc = self.app_json(first, late)
+        # r4 pass 2 (sol A1 on b3713c24), its input: the locked PNG is now a burst row with an UNBOUND label (painted_serial 483, label_bound false),
+        # and an eligible burst row 1 follows it; b3713c24 read row 0 before checking its label and refused the whole tail
+        unbound = self.play(1, kind="play_first_unbound", tail_elapsed_ms=2, serial=484, painted_serial=483, label_bound=False)
+        doc = self.app_json(first, late, unbound)
         raw = json.dumps(doc).encode("utf-8")
         with tempfile.TemporaryDirectory() as d:
             vis = Path(d) / "visual"
             vis.mkdir()
             (vis / "app-visual.json").write_bytes(raw)
             rec = []
-            for row in (first, late):
+            for row in (first, late, unbound):
                 body = self.png_bytes(row["index"])
                 (vis / f"{self.LEG}-{row['kind'].replace('_', '-')}-{row['index']}.png").write_bytes(body)
                 rec.append({"kind": row["kind"], "index": row["index"], "sha256": hashlib.sha256(body).hexdigest()})
             proc, out = run_pwsh_json(
                 "$rec = @($env:DVE_REC | ConvertFrom-Json)\n"
                 "$lock = [IO.File]::Open((Join-Path $env:DVE_DIR ('visual\\' + $env:DVE_LEG + '-play-unbound-0.png')), 'Open', 'Read', 'None')\n"
-                "try { $vis = Get-DvTailVisualEvidence -EvidenceDir $env:DVE_DIR -LegId $env:DVE_LEG -ExpectedSha256 $env:DVE_SHA -RecordedFrames $rec } finally { $lock.Dispose() }\n"
+                "$lock2 = [IO.File]::Open((Join-Path $env:DVE_DIR ('visual\\' + $env:DVE_LEG + '-play-first-unbound-1.png')), 'Open', 'Read', 'None')\n"
+                "try { $vis = Get-DvTailVisualEvidence -EvidenceDir $env:DVE_DIR -LegId $env:DVE_LEG -ExpectedSha256 $env:DVE_SHA -RecordedFrames $rec } finally { $lock.Dispose(); $lock2.Dispose() }\n"
                 "$result = '{\"evidence\":{\"runNonce\":12345678901234567890123456789012,\"runLogSnapshot\":{\"sha256\":\"00\"}}}' | ConvertFrom-Json\n"
                 "$pb = Get-DvPlaybackEvidence -Summary $null -EvidenceManifest $null -ResultJson $result -LogText '' -LogSha256 '' -ExpectedClipId 'M16-1243'\n"
                 "[ordered]@{ refused = $vis.refused; frames = @($vis.frames).Count; nonce = $pb.expectedRunNonce } | ConvertTo-Json -Compress",
                 DVE_DIR=d, DVE_LEG=self.LEG, DVE_SHA=hashlib.sha256(raw).hexdigest(), DVE_REC=json.dumps(rec))
         self.assertIsNotNone(out, proc.stdout + proc.stderr)
         self.assertIsNone(out["refused"], out)
-        self.assertEqual(out["frames"], 2, out)
+        self.assertEqual(out["frames"], 3, out)
         self.assertIsNone(out["nonce"], out)
 
     def test_r4r_r4_the_play_first_unbound_burst_before_the_first_forced_paint_is_credited(self) -> None:

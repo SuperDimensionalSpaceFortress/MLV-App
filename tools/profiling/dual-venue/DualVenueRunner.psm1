@@ -4797,7 +4797,9 @@ function Read-DvVisualCaptures {
         # below judges play_unbound (or play) only, so these rows never enter it
         # (sol A6 on 560c9642: the kind is matched ordinally; a culture compare ignores a NUL)
         if (@(@('play', 'play_unbound', 'play_first_unbound', 'stop_unbound', 'stop', 'paused_unbound', 'paused') | Where-Object { [string]::Equals($kind, $_, [StringComparison]::Ordinal) }).Count -ne 1 -or
-            $file -cnotmatch '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png\z') { continue }
+            $file -cnotmatch '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$') { continue }
+        # (r4 pass 2, sol A2 on b3713c24: the base's `$` is kept on purpose. It admits a final LF, so such a row stays collected, and the own-name
+        # check below refuses its pixels. `\z` dropped every such unforced row, and the freeze gate fell back to the forced ones.)
         $isPlayKind = @(@('play', 'play_unbound', 'play_first_unbound') | Where-Object { [string]::Equals($kind, $_, [StringComparison]::Ordinal) }).Count -eq 1
         # R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A5 on 560c9642): kind and file were checked independently, so a play_unbound row naming play-first-unbound-0.png
         # copied burst pixels under a late-play name into the frozen check. The row is still collected (skipping it would let the freeze gate fall back to
@@ -7823,8 +7825,17 @@ function Get-DvTailVisualEvidence {
             # r4 adversary fix 2 (A3 on b6c53917): only an unforced play PNG can supply credit, so only it is read (a locked forced play PNG is no tail evidence I/O).
             # R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A8 on 560c9642): and only when no forced paint preceded it (forced_paints_before = JSON integer 0): a late
             # play_unbound PNG after six forced paints can never be credited, so a lock on it is no tail evidence I/O either
+            # r4 pass 2 (sol A1 on b3713c24): and only when EVERY other row-level credit condition holds (label-bound with equal integer serials, a
+            # paint-path basis, a 16-hex source_id, Play active, a display frame and a tail time): a row the credit would refuse anyway is never read.
             $forcedRaw = Get-DvProp $row 'forced_paints_before'
-            $mayCredit = (($forcedRaw -is [int]) -or ($forcedRaw -is [long])) -and [int64]$forcedRaw -eq 0
+            $boundRaw = Get-DvProp $row 'label_bound'; $validRaw = Get-DvProp $row 'painted_serial_valid'
+            $serialRaw = Get-DvProp $row 'serial'; $paintedRaw = Get-DvProp $row 'painted_serial'
+            $basisRaw = Get-DvProp $row 'label_bound_basis'; $sourceRaw = Get-DvProp $row 'source_id'
+            $mayCredit = (($forcedRaw -is [int]) -or ($forcedRaw -is [long])) -and [int64]$forcedRaw -eq 0 -and
+                         ($boundRaw -is [bool]) -and $boundRaw -and ($validRaw -is [bool]) -and $validRaw -and
+                         (($serialRaw -is [int]) -or ($serialRaw -is [long])) -and (($paintedRaw -is [int]) -or ($paintedRaw -is [long])) -and ([int64]$serialRaw -eq [int64]$paintedRaw) -and
+                         ($basisRaw -is [string]) -and (@($script:TailCreditPaintBases | Where-Object { [string]::Equals($basisRaw, $_, [StringComparison]::Ordinal) }).Count -eq 1) -and
+                         ($sourceRaw -is [string]) -and ($sourceRaw -cmatch '^[0-9a-f]{16}\z') -and ($active -is [bool]) -and $active -and $null -ne $display -and $tailOk
             if ($isUnforcedPlay -and $mayCredit -and (($saved -is [bool]) -and $saved) -and (Test-Path -LiteralPath $png -PathType Leaf)) {
                 try { $pngBytes = [IO.File]::ReadAllBytes($png) } catch { return (& $unreadable $png $_) }   # r4 (A7): typed, never $null
                 $recordedSha = $null
