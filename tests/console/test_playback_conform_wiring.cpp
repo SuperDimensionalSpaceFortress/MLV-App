@@ -146,8 +146,9 @@ TEST(PlaybackConformWiring, DropFrameGrantUsesPlaybackRateForBothInputs)
 {
     const QString body = playbackHandlingBody(mainWindowSource());
     ASSERT_FALSE(body.isEmpty());
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r6 (sol r5 S1): the same playback rate and tick, through the finite-request helper
     ASSERT_TRUE(body.contains(QStringLiteral(
-        "m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),")));
+        "m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),")));
 }
 
 // HFR-NATIVE-60FPS-FULLRES-1 r24 (key3 B1 M-HFR-CONFORM-SKIP): the drop-frame tick applies the grant through
@@ -157,17 +158,30 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
 {
     const QString body = playbackHandlingBody(mainWindowSource());
     ASSERT_FALSE(body.isEmpty());
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1 iteration 2 (adversary pass 2 A2 on 7de55386): the conform shaping and its target
+    // gate read the CORRECTED start (dropFrameCorrectedStart), the position the delta moves from; the tick still reads the stale
+    // position, so it reports (and MainWindow records) the correction
     const QString call = QStringLiteral(
         "playback_frame_range::advanceDropFrameTick(\n"
         "                        m_newPosDropMode,\n"
         "                        playback_frame_range::conformDropFrameDelta(\n"
-        "                            m_newPosDropMode,\n"
-        "                            m_playbackPaceGuard.grant( getPlaybackFramerate() * (double)timeDiff / 1000.0, paceNowMs, playbackPaceGuardFps() ),\n"
+        "                            dropFrameStart,\n"
+        "                            m_playbackPaceGuard.grant( playback_fps_meter::dropFrameRequestFrames( getPlaybackFramerate(), timeDiff ), paceNowMs, playbackPaceGuardFps() ),\n"
         "                            playbackConformActive(), m_conformDropDebtFrames,\n"
         "                            playback_frame_range::conformTargetShown(\n"
-        "                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), m_newPosDropMode,\n"
-        "                                conformAcceptedTargetPresentPending(), conformTargetPresentOutstanding() ) ),");
+        "                                m_lastPresentedPlaybackFrame, conformDisplayedPlaybackFrame(), dropFrameStart,\n"
+        "                                conformAcceptedTargetPresentPending( dropFrameStart ), conformTargetPresentOutstanding( dropFrameStart ) ) ),");
     ASSERT_EQ(1, countOccurrences(body, call));
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (adversary pass 3 A2 on c4fa34c3): the two pending-present answers are asked about
+    // the corrected target too; neither reads the stale m_newPosDropMode (a fold to 40 with a ready lookahead 40 must hold the tick)
+    ASSERT_EQ(0, countOccurrences(body, QStringLiteral("conformAcceptedTargetPresentPending()")));
+    ASSERT_EQ(0, countOccurrences(body, QStringLiteral("conformTargetPresentOutstanding()")));
+    const int startAt = body.indexOf(QStringLiteral(
+        "const double dropFrameStart = playback_frame_range::dropFrameCorrectedStart(\n"
+        "                    m_newPosDropMode, ui->spinBoxCutIn->value(), ui->spinBoxCutOut->value(), ui->actionLoop->isChecked(),\n"
+        "                    playbackConformActive() );"));
+    ASSERT_TRUE(startAt >= 0);
+    ASSERT_TRUE(body.indexOf(call) > startAt);
     // r32 (adversary A1 on 2e0a3985): under conform a Loop wrap waits until the cut's last frame was presented
     // (advanceDropFrameTick's presentLastFrame; PlaybackConformDropFrame.R32* pin the arithmetic)
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral(
@@ -239,9 +253,11 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
         ASSERT_TRUE(windowAt > acceptedAt);
         ASSERT_TRUE(src.indexOf(QStringLiteral("const bool predictiveGpuTexNrEarlyAdvance ="), acceptedAt) > windowAt);
         // the pending present: the dispatch window, or the non-inline prep queue still holding the accepted target
-        const int pending = src.indexOf(QStringLiteral("bool MainWindow::conformAcceptedTargetPresentPending()"));
+        const int pending = src.indexOf(QStringLiteral("bool MainWindow::conformAcceptedTargetPresentPending( double position )"));
         ASSERT_TRUE(pending > 0);
         const QString pendingBody = src.mid(pending, src.indexOf(QStringLiteral("\n}\n"), pending) - pending);
+        ASSERT_TRUE(pendingBody.contains(QStringLiteral("const long long target = static_cast<long long>( position );")));
+        ASSERT_FALSE(pendingBody.contains(QStringLiteral("m_newPosDropMode")));
         ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( target < 0 || m_lastPresentedPlaybackFrame != target ) return false;")));
         ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( m_playbackPresentDispatchFrame == target ) return true;")));
         ASSERT_TRUE(pendingBody.contains(QStringLiteral("if( m_lastDisplayedPlaybackFrame == target && conformDisplayedFramePaintPending() ) return true;")));
@@ -259,9 +275,11 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     ASSERT_TRUE(drawReady.indexOf(QStringLiteral("const bool predictiveGpuTexNrEarlyAdvance ="), accepted) > accepted);
     // fix iteration 1 (adversary A1 on d98be193): the hold needs a present that is still coming -- a render in flight for the
     // target or a lookahead request or slot for it in the active generation; nothing outstanding never holds
-    const int outstanding = drawReady.indexOf(QStringLiteral("bool MainWindow::conformTargetPresentOutstanding()"));
+    const int outstanding = drawReady.indexOf(QStringLiteral("bool MainWindow::conformTargetPresentOutstanding( double position )"));
     ASSERT_TRUE(outstanding > 0);
     const QString outstandingBody = drawReady.mid(outstanding, drawReady.indexOf(QStringLiteral("\n}\n"), outstanding) - outstanding);
+    ASSERT_TRUE(outstandingBody.contains(QStringLiteral("const int target = static_cast<int>( position );")));
+    ASSERT_FALSE(outstandingBody.contains(QStringLiteral("m_newPosDropMode")));
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("if( !m_pRenderThread || !playbackConformActive() ) return false;")));
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("if( renderThreadBusyForPlaybackAdvance( target ) ) return true;")));
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("m_pRenderThread->hasPlaybackLookaheadRequest(")));
@@ -296,8 +314,11 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     ASSERT_EQ(1, countOccurrences(body, QStringLiteral("playback_frame_range::conformDropFrameDelta(")));
     // the recorders read the tick's own position, after the quantisation
     const int at = body.indexOf(call);
-    ASSERT_TRUE(body.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.position - sourcePositionBeforeDropTick"), at) > at);
-    ASSERT_TRUE(body.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick, dropFrameTick.position, dropFrameTick.wrapped );"), at) > at);
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1 r8 iteration 1 (pass 14 A1 on a2983bf2): the granted share is the tick's applied delta
+    ASSERT_TRUE(body.indexOf(QStringLiteral("const double grantedDropFrames = dropFrameTick.appliedFrames;"), at) > at);
+    // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the counter reads the start the delta applied from (a correction is not footage)
+    // (iteration 1, adversary pass 1 A1 on fc9e3e93: and skips only a tick that lapped, never a zero-lap fold)
+    ASSERT_TRUE(body.indexOf(QStringLiteral("m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart, dropFrameTick.position, dropFrameLapped );"), at) > at);
 }
 
 TEST(PlaybackConformWiring, SlipHistogramMovesUsePlaybackRate)

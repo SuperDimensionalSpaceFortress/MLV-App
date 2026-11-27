@@ -46,6 +46,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_export_dimensions.cpp \
     $$REPO_ROOT/tests/console/test_export_process.cpp \
     $$REPO_ROOT/tests/console/test_playback_frame_range.cpp \
+    $$REPO_ROOT/tests/console/test_playback_outer_last_frame_dispatch.cpp \
     $$REPO_ROOT/tests/console/test_automation_settings.cpp \
     $$REPO_ROOT/tests/console/test_hub_host_playback_guard.cpp \
     $$REPO_ROOT/tests/console/test_playback_quality_settings.cpp \

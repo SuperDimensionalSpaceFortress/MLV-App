@@ -3309,10 +3309,12 @@ TEST( PlaybackConformDropFrame, R32FixIteration2TheEngineOwnsTheConformedWrapFro
     using playback_frame_range::outerLastFrameBranchHandlesTick;
     ASSERT_FALSE( outerLastFrameBranchHandlesTick( 718, 720, true, true, true ) );    // not on the last frame: never
     ASSERT_FALSE( outerLastFrameBranchHandlesTick( 719, 720, true, true, true ) );    // conform + drop + loop: the engine's
-    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, true, true, false ) );    // no conform: unchanged
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1 (sol r10, pass8-A1 / pass9-A1): every Drop Frame Loop tick
+    // is the engine's, with or without conform and past the last frame too (its correction contract folds the start, no lap)
+    ASSERT_FALSE( outerLastFrameBranchHandlesTick( 719, 720, true, true, false ) );   // no conform: the engine's (r1)
     ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, false, true, true ) );    // normal (whole-frame) mode: unchanged
     ASSERT_TRUE( outerLastFrameBranchHandlesTick( 719, 720, true, false, true ) );    // no Loop: stop on the last frame
-    ASSERT_TRUE( outerLastFrameBranchHandlesTick( 900, 720, true, true, true ) );     // Cut Out moved below the playhead: cut-in
+    ASSERT_FALSE( outerLastFrameBranchHandlesTick( 900, 720, true, true, true ) );    // Cut Out moved below the playhead: the engine corrects it (r1)
     // A1's input: 718 painted, 718.8 + 0.24 -> 719.04 (719 now requested). 719 is accepted but its paint is withheld: while it is
     // not on screen no conformed tick crosses into the wrap (the debt is carried), and the outer branch does not wrap either.
     const int cutIn = 1, cutOut = 720;
@@ -3441,19 +3443,24 @@ TEST( PlaybackConformDropFrame, R33B1TheGenuineOutOfRangeRepairIsKept )
     const CutRange full = normalizeCutRange( 1, 720, 720, true );
     const CutRange trimmed = normalizeCutRange( 101, 460, 720, true );
     bool out = false;
-    // without conform the pre-r33 rule is unchanged: past the last frame is out and truncated (719.04 -> 719)
-    ASSERT_EQ( 719.0, normalizeDropFramePosition( 719.04, full, 720, false, &out ) );
+    // without conform past the last frame is still OUT. PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r2 (adversary
+    // pass 11 A1 on 6ff14cd4): a position on the clip's final source frame [719, 720) is inside the clip, so it keeps its fraction
+    // like any position above the cut (r1), and the engine's Loop fold reads its whole phase (was truncated to 719, folding onto 0)
+    ASSERT_EQ( 719.04, normalizeDropFramePosition( 719.04, full, 720, false, &out ) );
     ASSERT_TRUE( out );
+    ASSERT_NEAR( 0.04, playback_frame_range::advanceDropFrameTick( 719.04, 0.0, 1, 720, true, false ).correctedStart, 1e-9 );
     // at or past the conformed wrap bound: out, repaired (a position the engine never holds)
     ASSERT_EQ( 719.0, normalizeDropFramePosition( 720.0, full, 720, true, &out ) );
     ASSERT_TRUE( out );
     ASSERT_EQ( 719.0, normalizeDropFramePosition( 900.6, full, 720, true, &out ) );
     ASSERT_TRUE( out );
     // a trimmed cut: Cut Out moved below the playhead (500.3 > 459 + 1) is out; the repair clamps to the CLIP, as before, and the
-    // outer last-frame branch then takes it back to cut-in
-    ASSERT_EQ( 500.0, normalizeDropFramePosition( 500.3, trimmed, 720, true, &out ) );
+    // drop-frame engine then corrects it into the cut (PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r1: the
+    // outer last-frame branch no longer takes a Drop Frame Loop tick back to cut-in). r1 (adversary pass 10 A1 on 87a6d64b): above
+    // the cut and inside the clip the fraction is kept, so the engine's fold reads the start's whole phase (was 500.0)
+    ASSERT_EQ( 500.3, normalizeDropFramePosition( 500.3, trimmed, 720, true, &out ) );
     ASSERT_TRUE( out );
-    ASSERT_TRUE( playback_frame_range::outerLastFrameBranchHandlesTick( 500, 460, true, true, true ) );
+    ASSERT_FALSE( playback_frame_range::outerLastFrameBranchHandlesTick( 500, 460, true, true, true ) );
     // below the cut's first frame: out, truncated (the pre-r33 repair)
     ASSERT_EQ( 50.0, normalizeDropFramePosition( 50.7, trimmed, 720, true, &out ) );
     ASSERT_TRUE( out );
@@ -4902,6 +4909,152 @@ TEST( PlaybackMeasuredLoopExit, R9TheAdmissionJudgesThePlayedCutRangeAndTheStart
     ASSERT_EQ( 0, outsideFirst.repeats );
 }
 
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r1: the engine records a position correction beside its wraps, but a correction is not a
+// replay: replayCount() and wrapped() never read it.
+TEST( PlaybackFrameRange, R1AnEngineCorrectionIsRecordedButIsNotAReplay )
+{
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    recorder.noteEngineCorrection( 22 );
+    ASSERT_EQ( 1, recorder.engineCorrections );                         // 4279b9ee stub: 0
+    ASSERT_EQ( 1, static_cast<int>( recorder.engineCorrectionRecords.size() ) );
+    ASSERT_EQ( 22, recorder.engineCorrectionRecords[0].rebaseFrame );
+    ASSERT_EQ( 0, recorder.engineCorrectionRecords[0].wrapsBefore );
+    ASSERT_EQ( 0, recorder.replayCount() );
+    ASSERT_FALSE( recorder.wrapped() );
+    recorder.noteEngineWrap( 49, 2 );
+    recorder.noteEngineCorrection( 2 );
+    ASSERT_EQ( 2, recorder.engineCorrections );
+    ASSERT_EQ( 2, recorder.engineCorrectionRecords[1].wrapsBefore );   // wraps 0 and 1 came before it
+    ASSERT_EQ( 2, recorder.replayCount() );                             // the two laps only
+}
+
+// r1: the correction count is stamped and consumed like the wrap count (presentationLoopWraps is a generic counter). A frame requested
+// before the correction and presented after it does not take it; the landing requested after it does, once.
+TEST( PlaybackFrameRange, R1ACorrectionBelongsToTheLandingRequestedAfterIt )
+{
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    int consumed = 0;
+    const int stampBefore = recorder.engineCorrections;                 // 0: in flight before the correction
+    recorder.noteEngineCorrection( 40 );
+    const int stampAfter = recorder.engineCorrections;
+    ASSERT_EQ( 1, stampAfter );
+    ASSERT_EQ( 0, presentationLoopWraps( recorder.engineCorrections, stampBefore, consumed, true ) );
+    ASSERT_EQ( 1, presentationLoopWraps( recorder.engineCorrections, stampAfter, consumed, true ) );
+    ASSERT_EQ( 0, presentationLoopWraps( recorder.engineCorrections, stampAfter, consumed, true ) );
+    // the hand-off of that landing rebases to 40 and keeps only the wraps made after the correction
+    recorder.noteEngineWrap( 9, 1 );                                    // a lap before a second correction
+    recorder.noteEngineCorrection( 2 );
+    recorder.noteEngineWrap( 49, 1 );                                   // a lap after it
+    const playback_frame_range::PaintCreditHandOff handOff = playback_frame_range::paintCreditHandOff( recorder, 0, 2, 1, 1 );
+    ASSERT_TRUE( handOff.rebase );                                      // stub: false
+    ASSERT_EQ( 2, handOff.rebaseFrame );
+    ASSERT_EQ( 49LL, (long long)handOff.wrapsWidth );                   // stub: 58
+    // two corrections crossed: the last one wins
+    const playback_frame_range::PaintCreditHandOff both = playback_frame_range::paintCreditHandOff( recorder, 0, 2, 0, 2 );
+    ASSERT_EQ( 2, both.rebaseFrame );
+    ASSERT_EQ( 49LL, (long long)both.wrapsWidth );
+    // none crossed: no rebase, every crossed wrap's width
+    const playback_frame_range::PaintCreditHandOff none = playback_frame_range::paintCreditHandOff( recorder, 0, 2, 2, 0 );
+    ASSERT_FALSE( none.rebase );
+    ASSERT_EQ( 58LL, (long long)none.wrapsWidth );
+}
+
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (r1 adversary pass 2 A1): the hand-off counts the crossed wraps the engine made AFTER the
+// rebase, which the slip histogram reads as the landing's lap (a wrap, never slips from the rebase frame).
+TEST( PlaybackFrameRange, R2TheHandOffCountsTheWrapsMadeAfterTheRebase )
+{
+    playback_frame_range::PlaybackWrapRecorder recorder;
+    recorder.noteEngineWrap( 9, 1 );                                    // a lap before the correction
+    recorder.noteEngineCorrection( 2 );
+    recorder.noteEngineWrap( 49, 1 );                                   // a lap after it
+    const playback_frame_range::PaintCreditHandOff lapped = playback_frame_range::paintCreditHandOff( recorder, 0, 2, 0, 1 );
+    ASSERT_TRUE( lapped.rebase );
+    ASSERT_EQ( 1, lapped.wrapsAfterRebase );                            // stub: 0
+    ASSERT_EQ( 49LL, (long long)lapped.wrapsWidth );
+    // a correction made after every crossed wrap: no lap after the rebase
+    playback_frame_range::PlaybackWrapRecorder after;
+    after.noteEngineWrap( 49, 1 );
+    after.noteEngineCorrection( 22 );
+    const playback_frame_range::PaintCreditHandOff flat = playback_frame_range::paintCreditHandOff( after, 0, 1, 0, 1 );
+    ASSERT_TRUE( flat.rebase );
+    ASSERT_EQ( 0, flat.wrapsAfterRebase );
+    ASSERT_EQ( 0LL, (long long)flat.wrapsWidth );
+    // no correction crossed: no rebase, nothing after it
+    const playback_frame_range::PaintCreditHandOff none = playback_frame_range::paintCreditHandOff( recorder, 0, 2, 1, 0 );
+    ASSERT_FALSE( none.rebase );
+    ASSERT_EQ( 0, none.wrapsAfterRebase );
+}
+
+// r1 (pass 17 A2 control): the source-frame counter is fed the CORRECTED start. Cut 41..1000, Loop, armed at 10, a 1.2-frame tick:
+// the start folds to 40, the counter rebases its high-water mark there and counts the real step 40 -> 41.2 (one frame), never 30.
+TEST( PlaybackFrameRange, R1TheSourceFrameCounterRebasesAtTheCorrectedStart )
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 10.0, 1.2, 41, 1000, true );
+    ASSERT_TRUE( tick.corrected );                                      // 4279b9ee: false
+    ASSERT_TRUE( tick.correctedStart == 40.0 );
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 10 );
+    counter.noteEngineTick( tick.correctedStart, tick.position, tick.wrapped );
+    ASSERT_EQ( 41LL, (long long)counter.highWater );
+    ASSERT_EQ( 1LL, (long long)counter.forwardSteps );
+    ASSERT_EQ( 1, counter.externalJumpRebases );
+    ASSERT_EQ( 2LL, (long long)counter.consumed() );
+}
+
+// r1 iteration 1 (adversary pass 1 A1 on fc9e3e93, introduced major): a 200-frame clip, Drop Frame and Loop on, conform off, cut 1..50,
+// slider 10, stale drop position 120, the counter begun at 10; an ordinary 50 ms tick at 24 fps grants 1.2 frames. The fold to 22 is a
+// correction with no lap, so the tick is not a lap for its readers: the counter counts the real step 22 -> 23.2 (consumed 2, fc9e3e93: 1),
+// and the startup skip count of a 134 ms tick granting 3.216 frames (22 -> 25.216) books its 2 skipped frames (fc9e3e93: 0).
+TEST( PlaybackFrameRange, R1Iter1AZeroLapFoldIsNotALapForTheTicksReaders )
+{
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( 120.0, 1.2, 1, 50, true );
+    ASSERT_TRUE( tick.corrected );
+    ASSERT_TRUE( tick.correctedStart == 22.0 );
+    ASSERT_EQ( 0, tick.wrapLaps );
+    ASSERT_FALSE( playback_frame_range::dropFrameTickLapped( tick ) );   // fc9e3e93: true (tick.wrapped)
+    playback_frame_range::SourceFrameAdvanceCounter counter;
+    counter.begin( 10 );
+    counter.noteEngineTick( tick.correctedStart, tick.position, playback_frame_range::dropFrameTickLapped( tick ) );
+    ASSERT_EQ( 0, counter.wrapOrBackwardTicks );                       // fc9e3e93: 1
+    ASSERT_EQ( 2LL, (long long)counter.consumed() );                   // fc9e3e93: 1
+    // the startup sibling: MainWindow counts a tick's skipped frames unless it lapped
+    const playback_frame_range::DropFrameTickResult burst = playback_frame_range::advanceDropFrameTick( 120.0, 3.216, 1, 50, true );
+    const int skipped = playback_frame_range::dropFrameTickLapped( burst )
+        ? 0 : playback_native_pace::skippedFrames( burst.correctedStart, burst.position );
+    ASSERT_EQ( 2, skipped );                                            // fc9e3e93: 0
+    // controls: a lap the delta crosses from the folded start IS a lap (100 + 60 on cut 1..50: one 49-frame lap), and an in-cut
+    // wrap is one, as before
+    ASSERT_TRUE( playback_frame_range::dropFrameTickLapped( playback_frame_range::advanceDropFrameTick( 100.0, 60.0, 1, 50, true ) ) );
+    ASSERT_TRUE( playback_frame_range::dropFrameTickLapped( playback_frame_range::advanceDropFrameTick( 48.9, 0.192, 1, 50, true ) ) );
+    ASSERT_FALSE( playback_frame_range::dropFrameTickLapped( playback_frame_range::advanceDropFrameTick( 10.0, 0.192, 1, 50, true ) ) );
+}
+
+// r1 iteration 2 (adversary pass 2 A2 on 7de55386, introduced major): 60 fps conformed to 25, Drop Frame and Loop on, stale position
+// 10.75, slider and displayed frame 10, no pending present or debt; Cut In raised to 41 (Cut Out 50); a 60 ms tick with 1.5 frames.
+// MainWindow's route: the conform shaping and its target gate read the start the delta moves from. From the corrected 40 the grant
+// crosses one integer, so it is applied whole: 41.5, no debt. 7de55386 shaped it from 10.75 (two integers: 0.5 now, 1.0 debt) and
+// the fold then landed on 40.5.
+TEST( PlaybackFrameRange, R1Iter2ConformShapesTheGrantFromTheCorrectedStart )
+{
+    const double stale = 10.75;
+    const double start = playback_frame_range::dropFrameCorrectedStart( stale, 41, 50, true, true );
+    ASSERT_TRUE( start == 40.0 );                                       // 7de55386 (MainWindow read m_newPosDropMode): 10.75
+    double debt = 0.0;
+    const bool shown = playback_frame_range::conformTargetShown( 10, 10, start, false, false );
+    ASSERT_TRUE( shown );
+    const double delta = playback_frame_range::conformDropFrameDelta( start, 1.5, true, debt, shown );
+    const playback_frame_range::DropFrameTickResult tick = playback_frame_range::advanceDropFrameTick( stale, delta, 41, 50, true, true );
+    ASSERT_TRUE( tick.corrected );
+    ASSERT_TRUE( tick.correctedStart == start );
+    ASSERT_NEAR( 41.5, tick.position, 1e-12 );                          // 7de55386: 40.5
+    ASSERT_NEAR( 0.0, debt, 1e-12 );                                    // 7de55386: 1.0
+    // the helper is the tick's own corrected start for every kind: above-cut fold, clamp, in-cut and NaN
+    ASSERT_TRUE( playback_frame_range::dropFrameCorrectedStart( 120.0, 1, 50, true, false ) == 22.0 );
+    ASSERT_TRUE( playback_frame_range::dropFrameCorrectedStart( 100.0, 1, 50, false, false ) == 49.0 );
+    ASSERT_TRUE( playback_frame_range::dropFrameCorrectedStart( 10.5, 1, 50, true, false ) == 10.5 );
+    ASSERT_TRUE( std::isnan( playback_frame_range::dropFrameCorrectedStart( std::nan( "" ), 1, 50, true, false ) ) );
+}
+
 // GUI-SMOKE-ARG-RANGE-OVERFLOW-1 (#881, Grok G7): inputs the GUI cannot produce must still give the mathematically correct
 // answer with no signed overflow. The inputs go through a volatile so the compiler cannot fold the old UB away at compile time.
 namespace
@@ -5054,4 +5207,92 @@ TEST( PlaybackFrameRangeArgOverflow, MainRefusesSecondsOutOfRangeFirst )
     ASSERT_TRUE( refusal.contains( QStringLiteral( "parser.value(secondsOpt).trimmed()" ) ) );       // RED: raw token
     ASSERT_TRUE( refusal.contains( QStringLiteral( "at most 2147483647" ) ) );                       // RED: 2147483.647
     ASSERT_FALSE( source.contains( QStringLiteral( "at most 2147483.647" ) ) );
+}
+
+// PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r3 (adversary pass 4 A1 on b30cd3a1, carried OPEN by r2): a ONE-FRAME Loop cut (Cut In =
+// Cut Out = 41, conform off: loop width 0) still corrects a start outside its frame [40, 41) onto that frame, before the delta. The
+// `loopWidth > 0` guard skipped both folds, so a playhead at 10 advanced to 10.192 and a stale 100 to 100.192 with a lap. After the
+// correction the tick is exactly the one a start ON the frame makes (its zero-width lap is the in-cut start's own, the base's,
+// DROP-FRAME-ZERO-WIDTH-LOOP-STALE-LAP-1): the stale distance adds nothing.
+TEST( PlaybackFrameRange, R3AOneFrameLoopCutCorrectsAStartOutsideItsFrame )
+{
+    using playback_frame_range::advanceDropFrameTick;
+    const playback_frame_range::DropFrameTickResult onFrame = advanceDropFrameTick( 40.0, 0.192, 41, 41, true, false );
+    ASSERT_FALSE( onFrame.corrected );                                   // control: a start on the cut's frame is not corrected
+    const playback_frame_range::DropFrameTickResult below = advanceDropFrameTick( 10.0, 0.192, 41, 41, true, false );
+    ASSERT_TRUE( below.corrected );                                      // 2a3371ff: false
+    ASSERT_TRUE( below.correctedStart == 40.0 );                         // 2a3371ff: 10
+    ASSERT_TRUE( below.foldedFrames == -30.0 );
+    ASSERT_TRUE( below.position == 40.0 );                               // 2a3371ff: 10.192; iteration 2 holds (pass 7 A2)
+    ASSERT_TRUE( below.appliedFrames == 0.0 );
+    ASSERT_EQ( onFrame.wrapLaps, below.wrapLaps );
+    const playback_frame_range::DropFrameTickResult stale = advanceDropFrameTick( 100.0, 0.192, 41, 41, true, false );
+    ASSERT_TRUE( stale.corrected );                                      // 2a3371ff: false
+    ASSERT_TRUE( stale.correctedStart == 40.0 );
+    ASSERT_TRUE( stale.foldedFrames == 60.0 );
+    ASSERT_TRUE( stale.position == 40.0 );                               // 2a3371ff: 100.192
+    ASSERT_EQ( onFrame.wrapLaps, stale.wrapLaps );
+    ASSERT_EQ( onFrame.wrapWidth, stale.wrapWidth );
+    // inside the frame (40.5) is not corrected; neither is NaN; +-inf are corrected onto the frame
+    ASSERT_FALSE( advanceDropFrameTick( 40.5, 0.192, 41, 41, true, false ).corrected );
+    ASSERT_FALSE( advanceDropFrameTick( std::nan( "" ), 0.192, 41, 41, true, false ).corrected );
+    ASSERT_TRUE( advanceDropFrameTick( -HUGE_VAL, 0.0, 41, 41, true, false ).correctedStart == 40.0 );
+    ASSERT_TRUE( advanceDropFrameTick( HUGE_VAL, 0.0, 41, 41, true, false ).correctedStart == 40.0 );
+    // the conform-side helper reads the same start
+    ASSERT_TRUE( playback_frame_range::dropFrameCorrectedStart( 10.0, 41, 41, true, false ) == 40.0 );
+    // a width-1 cut is unchanged: the r1 below-cut fold already owned it (conformed 41..41 with presentLastFrame)
+    ASSERT_TRUE( advanceDropFrameTick( 10.0, 0.0, 41, 41, true, true ).correctedStart == 40.0 );
+}
+
+// r3 iteration 1 (adversary pass 6 A1 on f8d80862): a zero-width Loop cut has no lap. A correction with nothing applied records no
+// lap (10 + 0 on cut 41..41 corrected onto 40 recorded one zero-width lap, and MainWindow an engine wrap), and neither does any
+// tick on that cut: a zero-width lap moves nothing back, so the base's one per tick from 40 was never a wrap
+// (DROP-FRAME-ZERO-WIDTH-LOOP-STALE-LAP-1).
+TEST( PlaybackFrameRange, R3Iter1AZeroWidthLoopCutNeverLaps )
+{
+    using playback_frame_range::advanceDropFrameTick;
+    const playback_frame_range::DropFrameTickResult corrected = advanceDropFrameTick( 10.0, 0.0, 41, 41, true, false );
+    ASSERT_TRUE( corrected.corrected );
+    ASSERT_TRUE( corrected.position == 40.0 );
+    ASSERT_TRUE( corrected.appliedFrames == 0.0 );
+    ASSERT_EQ( 0, corrected.wrapLaps );                                  // f8d80862: 1
+    ASSERT_FALSE( corrected.wrapped );                                   // f8d80862: true
+    ASSERT_FALSE( playback_frame_range::dropFrameTickLapped( corrected ) );
+    const playback_frame_range::DropFrameTickResult stale = advanceDropFrameTick( 100.0, 0.192, 41, 41, true, false );
+    ASSERT_EQ( 0, stale.wrapLaps );                                      // f8d80862: 1
+    ASSERT_FALSE( stale.wrapped );
+    ASSERT_TRUE( stale.position == 40.0 );                               // iteration 2 holds (pass 7 A2)
+    ASSERT_TRUE( stale.appliedFrames == 0.0 );
+    const playback_frame_range::DropFrameTickResult onFrame = advanceDropFrameTick( 40.0, 0.192, 41, 41, true, false );
+    ASSERT_EQ( 0, onFrame.wrapLaps );                                    // 2a3371ff and f8d80862: 1
+    ASSERT_FALSE( onFrame.wrapped );
+    ASSERT_TRUE( onFrame.position == 40.0 );
+}
+
+// r3 iteration 2 (adversary pass 7 A2 on 506b35d4, its input verbatim): a zero-width Loop cut HOLDS its one source frame. A cut edited
+// to 41..41 under a playhead at 10 with three frames granted corrected to 40 and then advanced to 43, past the clip's last frame (41
+// frames: 0..40), with appliedFrames 3 crediting source consumption, the present trace and the histogram. The tick applies nothing.
+TEST( PlaybackFrameRange, R3Iter2AZeroWidthLoopCutHoldsItsFrame )
+{
+    using playback_frame_range::advanceDropFrameTick;
+    const playback_frame_range::DropFrameTickResult t = advanceDropFrameTick( 10.0, 3.0, 41, 41, true, false );
+    ASSERT_TRUE( t.corrected );
+    ASSERT_TRUE( t.correctedStart == 40.0 );
+    ASSERT_TRUE( t.position == 40.0 );                                   // 506b35d4: 43
+    ASSERT_TRUE( t.appliedFrames == 0.0 );                               // 506b35d4: 3
+    ASSERT_EQ( 0, t.wrapLaps );
+    ASSERT_FALSE( t.wrapped );
+    // an in-frame start holds where it is (no correction), whatever the grant, an infinite one included
+    const playback_frame_range::DropFrameTickResult in = advanceDropFrameTick( 40.5, 7.0, 41, 41, true, false );
+    ASSERT_FALSE( in.corrected );
+    ASSERT_TRUE( in.position == 40.5 );                                  // 506b35d4: 47.5
+    ASSERT_TRUE( in.appliedFrames == 0.0 );
+    ASSERT_TRUE( advanceDropFrameTick( 40.0, HUGE_VAL, 41, 41, true, false ).position == 40.0 );
+    // NaN stays NaN (the base's NaN handling), and a width-1 cut still advances (control)
+    ASSERT_TRUE( std::isnan( advanceDropFrameTick( std::nan( "" ), 1.0, 41, 41, true, false ).position ) );
+    ASSERT_NEAR( 40.5, advanceDropFrameTick( 40.0, 0.5, 41, 41, true, true ).appliedFrames + 40.0, 1e-12 );
+    // a width-1 cut still laps (control: conformed 41..41 from its one position 40 plus one frame)
+    const playback_frame_range::DropFrameTickResult one = advanceDropFrameTick( 40.0, 1.0, 41, 41, true, true );
+    ASSERT_EQ( 1, one.wrapLaps );
+    ASSERT_TRUE( one.position == 40.0 );
 }

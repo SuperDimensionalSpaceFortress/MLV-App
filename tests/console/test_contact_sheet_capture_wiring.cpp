@@ -708,8 +708,11 @@ TEST(ContactSheetCaptureWiring, WrapFlagExistsResetsPerSessionAndIsSetWhenTheTim
         QStringLiteral("void MainWindow::notePlaybackSmokePresentedFrame("),
         QStringLiteral("void MainWindow::noteContactSheetPresentedFrame("));
     ASSERT_FALSE(noteBody.isEmpty());
+    // PLAYBACK-FPS-METER-MONOTONIC-CLOCK-1-R10-OUTER-BRANCH-RESIDUE-1 r2 (adversary pass 11 A2): the call is
+    // presentedTransitionInfersLoopWrap, which keeps isContactSheetLoopWrapTransition's decision and drops it for a
+    // presentation that landed an engine correction.
     const int wrapCheckAt = noteBody.indexOf(
-        QStringLiteral("playback_frame_range::isContactSheetLoopWrapTransition("));
+        QStringLiteral("playback_frame_range::presentedTransitionInfersLoopWrap("));
     const int setWrappedAt = noteBody.indexOf(QStringLiteral("m_playbackSmokeWrapped = true;"), wrapCheckAt);
     const int overwriteLastFrameAt = noteBody.indexOf(
         QStringLiteral("m_playbackSmokeLastPresentedFrame = static_cast<int>( displayFrame );"));
@@ -732,17 +735,23 @@ TEST(ContactSheetCaptureWiring, LoopWrapDetectionIsQualifiedByLoopStateAndJumpSi
     // A bare "went backward" test also fires for a backward scrub or stress seek with Loop off,
     // or to an arbitrary earlier frame -- the call must pass the live Loop state and both cut
     // spinboxes so the pure helper can require an actual loop-width-sized jump.
+    // r2 (adversary pass 11 A2): through presentedTransitionInfersLoopWrap, handed the corrections this presentation crossed.
     const int callAt = noteBody.indexOf(
-        QStringLiteral("playback_frame_range::isContactSheetLoopWrapTransition("));
+        QStringLiteral("playback_frame_range::presentedTransitionInfersLoopWrap("));
     ASSERT_TRUE(callAt >= 0);
     const QString callBlock = noteBody.mid(callAt, 400);
     ASSERT_TRUE(callBlock.contains(QStringLiteral("ui->actionLoop->isChecked()")));
     ASSERT_TRUE(callBlock.contains(QStringLiteral("ui->spinBoxCutIn->value() - 1")));
     ASSERT_TRUE(callBlock.contains(QStringLiteral("ui->spinBoxCutOut->value() - 1")));
     ASSERT_TRUE(callBlock.contains(QStringLiteral("m_playbackSmokeLastPresentedFrame")));
+    ASSERT_TRUE(callBlock.contains(QStringLiteral("sourceAdvanceCorrections )")));
+    // the count is computed before the decision reads it
+    const int correctionsAt = noteBody.indexOf(QStringLiteral("const int sourceAdvanceCorrections ="));
+    ASSERT_TRUE(correctionsAt >= 0 && correctionsAt < callAt);
 
     const QString header = readRepoFile(QStringLiteral("platform/qt/PlaybackFrameRange.h"));
     ASSERT_TRUE(header.contains(QStringLiteral("inline bool isContactSheetLoopWrapTransition(")));
+    ASSERT_TRUE(header.contains(QStringLiteral("inline bool presentedTransitionInfersLoopWrap(")));
     // The un-qualified pre-round-2 shape must actually be gone, not just supplemented.
     ASSERT_FALSE(noteBody.contains(
         QStringLiteral("static_cast<int>( displayFrame ) < m_playbackSmokeLastPresentedFrame")));

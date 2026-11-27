@@ -3186,7 +3186,7 @@ class AppPlayGateStaticClassTests(unittest.TestCase):
             "the engine tick stops feeding the counter (non-drop)":
                 self._mutated("m_sourceAdvance.noteEngineTick( sourcePositionBeforeTick,", "(void)( sourcePositionBeforeTick,"),
             "the engine tick stops feeding the counter (drop-frame)":
-                self._mutated("m_sourceAdvance.noteEngineTick( sourcePositionBeforeDropTick,", "(void)( sourcePositionBeforeDropTick,"),
+                self._mutated("m_sourceAdvance.noteEngineTick( dropFrameTick.correctedStart,", "(void)( dropFrameTick.correctedStart,"),
             "getFramerate reads the persisted override again":
                 self._mutated("if( m_fpsOverride && !m_automationPacingIsolated ) return m_frameRate;",
                               "if( m_fpsOverride ) return m_frameRate;"),
