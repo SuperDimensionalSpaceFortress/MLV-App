@@ -1079,6 +1079,9 @@ def run_fragment(scenarios: list[dict]) -> list[dict]:
         cases = Path(d) / "scenarios.json"
         cases.write_text(json.dumps(scenarios, ensure_ascii=True), encoding="utf-8")
         script = (
+            # adversary pass sol r2 A2: a CimException reports a WBEM timeout in its ErrorData (error_Code 0x80041069 = 2147749993) while NativeErrorCode reads `Failed`
+            "class FakeCimException : System.Exception { [string]$NativeErrorCode = 'Failed'; [object]$ErrorData\n"
+            "  FakeCimException([string]$m, [object]$data) : base($m) { $this.ErrorData = $data } }\n"
             f"Import-Module '{psq(MODULE)}' -Force\n"
             "$fragment = New-DvDisplayStateProbeText\n"
             "function Get-CimInstance { [CmdletBinding()] param([string]$ClassName, [int]$OperationTimeoutSec)\n"
@@ -1087,6 +1090,7 @@ def run_fragment(scenarios: list[dict]) -> list[dict]:
             "    'ok' { 1..5 | ForEach-Object { [pscustomobject]@{ HotFixID = \"KB$_\" } } }\n"
             "    'throw' { throw 'the CIM provider failed' }\n"
             "    'timeout' { throw [System.TimeoutException]::new('the operation timed out') }\n"
+            "    'wbem-timeout' { throw [FakeCimException]::new('The WS-Management service cannot complete the operation', [pscustomobject]@{ error_Code = [uint32]2147749993; CIMStatusCode = 1 }) }\n"
             "    'empty' { } } }\n"
             "function Get-ItemProperty { [CmdletBinding()] param([string]$LiteralPath, [string]$Name)\n"
             "  $script:regCalled = $true\n"
@@ -1103,6 +1107,7 @@ def run_fragment(scenarios: list[dict]) -> list[dict]:
             "      CurrentHorizontalResolution = $_.w; CurrentVerticalResolution = $_.h; CurrentRefreshRate = $_.hz } })\n"
             "  $gpuErr = @()\n"
             "  if ($s.gpuErr -eq 'timeout') { $gpuErr = @([System.Management.Automation.ErrorRecord]::new([System.TimeoutException]::new('t'), 'e', [System.Management.Automation.ErrorCategory]::OperationTimeout, $null)) }\n"
+            "  if ($s.gpuErr -eq 'wbem-timeout') { $gpuErr = @([System.Management.Automation.ErrorRecord]::new([FakeCimException]::new('x', [pscustomobject]@{ error_Code = [uint32]2147749993 }), 'e', [System.Management.Automation.ErrorCategory]::OperationTimeout, $null)) }\n"
             "  if ($s.gpuErr -eq 'error') { $gpuErr = @([System.Management.Automation.ErrorRecord]::new([System.InvalidOperationException]::new('x'), 'e', [System.Management.Automation.ErrorCategory]::InvalidOperation, $null)) }\n"
             "  . ([scriptblock]::Create($fragment))\n"
             "  $wrap = [ordered]@{ gpuNames = @('Probe Adapter'); driverVersion = '1.0'; displayDevice = 'D'; displayState = $probe.displayState }\n"
@@ -1138,7 +1143,8 @@ class DisplayStateFragmentTests(unittest.TestCase):
             return dict(SCENARIO_OK, **over)
         cls.names = ["healthy", "no-controller-error", "no-controller-timeout", "no-controller-empty", "no-active-mode", "quick-throws", "quick-times-out",
                      "quick-empty", "registry-throws", "registry-text", "no-budget", "no-os", "no-driver-date", "two-active",
-                     "partial-then-timeout", "headless-only-then-error", "partial-then-error-active"]
+                     "partial-then-timeout", "headless-only-then-error", "partial-then-error-active",
+                     "wbem-quick-timeout", "wbem-controller-timeout", "refresh-sentinel", "width-sentinel", "budget-override-60"]
         cls.rows = run_fragment([
             sc(),
             sc(gpus=[], gpuErr="error"),
@@ -1158,6 +1164,12 @@ class DisplayStateFragmentTests(unittest.TestCase):
             sc(gpus=[NVIDIA_HEADLESS], gpuErr="timeout"),
             sc(gpus=[NVIDIA_HEADLESS], gpuErr="error"),
             sc(gpus=[INTEL], gpuErr="error"),
+            sc(quick="wbem-timeout"),
+            sc(gpus=[], gpuErr="wbem-timeout"),
+            # adversary pass sol r2 A1: uint32 0xFFFFFFFF is the documented "optimal refresh rate" sentinel; a signed conversion of it throws
+            sc(gpus=[dict(INTEL, hz=4294967295)]),
+            sc(gpus=[dict(INTEL, w=4294967295)]),
+            sc(budget=60),
         ])
         cls.states = {n: state_of(r["line"]) for n, r in zip(cls.names, cls.rows)}
 
@@ -1206,6 +1218,30 @@ class DisplayStateFragmentTests(unittest.TestCase):
         row = self.rows[self.names.index("no-budget")]
         self.assertIsNone(row["seen"], "the CIM class was read although the budget was spent")
         self.assertFalse(row["regCalled"], "adversary pass sol r1 A3: the registry was read although the budget was spent")
+
+    def test_a_wbem_timeout_carried_in_the_error_data_is_cim_timeout(self) -> None:
+        """adversary pass sol r2 A2: NativeErrorCode reads `Failed` and there is no TimeoutException; the timeout is in ErrorData.error_Code (0x80041069)."""
+        self.unknown("wbem-quick-timeout", "hotfixCount", why="CIM_TIMEOUT")
+        self.unknown("wbem-controller-timeout", "displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate", "displays", why="CIM_TIMEOUT")
+
+    def test_an_out_of_range_controller_number_never_nulls_the_whole_state(self) -> None:
+        """adversary pass sol r2 A1: a refresh rate of 4294967295 (uint32 sentinel) must not make a signed conversion throw and drop all eight readings."""
+        got = self.states["refresh-sentinel"]
+        for f in ("displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate"):
+            self.assertEqual(got[f], GOOD_STATE[f], f)
+        self.assertEqual(got["displays"], {"value": None, "unknown": "CIM_EMPTY"}, "an active controller with no usable refresh rate lists no guessed display")
+        for f in ("windowsBuild", "windowsUbr", "lastBootUtc", "hotfixCount"):
+            self.assertEqual(got[f], GOOD_STATE[f], f)
+        wide = self.states["width-sentinel"]
+        self.unknown("width-sentinel", "displayAdapterName", "displays", why="NO_ACTIVE_OUTPUT")
+        self.assertEqual(wide["windowsBuild"], GOOD_STATE["windowsBuild"])
+
+    def test_the_test_override_cannot_widen_the_budget_past_30_seconds(self) -> None:
+        """adversary pass sol r2 A4 (minor): a pre-set budget above 30 s is clamped to 30."""
+        text = MODULE.read_text(encoding="utf-8")
+        frag = re.search(r"function New-DvDisplayStateProbeText \{.*?^\}", text, re.S | re.M).group(0)
+        self.assertRegex(frag, r"\$dsBudgetSec -gt 30\) \{ \$dsBudgetSec = 30 \}")
+        self.assertEqual(self.states["budget-override-60"], GOOD_STATE)
 
     def test_an_error_beside_returned_controllers_is_never_published_as_display_state(self) -> None:
         """adversary pass sol r1 A4: a controller enumeration that returned objects but also recorded an error (a timeout, say) is incomplete: the four

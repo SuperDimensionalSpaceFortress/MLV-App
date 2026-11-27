@@ -7315,20 +7315,36 @@ function New-DvDisplayStateProbeText {
 $probe.displayState = $null
 try {
     $dsClock = [Diagnostics.Stopwatch]::StartNew()
-    if ($null -eq $dsBudgetSec) { $dsBudgetSec = 30 }   # a test may pre-set a smaller budget; the job never does
+    if ($null -eq $dsBudgetSec -or $dsBudgetSec -gt 30) { $dsBudgetSec = 30 }   # a test may pre-set a SMALLER budget; the job never does
     function Get-DsFailReason($ex) {
+        # A CimException can carry a timeout in three places: a TimeoutException, NativeErrorCode TimedOut, or ErrorData.error_Code 0x80041069 (WBEM_E_TIMED_OUT) with
+        # NativeErrorCode reading Failed (adversary pass sol r2 A2). Any of them, anywhere in the exception chain, is a timeout.
         for ($x = $ex; $null -ne $x; $x = $x.InnerException) {
             if ($x -is [System.TimeoutException]) { return 'CIM_TIMEOUT' }
             $code = $null
             try { $code = [string]$x.NativeErrorCode } catch { $code = $null }
             if ($code -eq 'TimedOut') { return 'CIM_TIMEOUT' }
+            $wbem = $null
+            try { $wbem = [uint32]$x.ErrorData.error_Code } catch { $wbem = $null }
+            if ($wbem -eq 2147749993) { return 'CIM_TIMEOUT' }
         }
         'CIM_ERROR'
+    }
+    # A controller's mode numbers are uint32 and may hold a sentinel (0xFFFFFFFF = "optimal refresh rate"): a number is usable only inside 1..Int32.MaxValue,
+    # compared as a long, so no signed conversion can throw (adversary pass sol r2 A1).
+    function Get-DsModeNumber($v) {
+        if ($null -eq $v) { return 0 }
+        $n = 0L
+        if (-not [long]::TryParse(([string]$v), [ref]$n)) { return 0 }
+        if ($n -lt 1 -or $n -gt [int]::MaxValue) { return 0 }
+        [int]$n
     }
     function New-DsReading($value, $why) { [ordered]@{ value = $value; unknown = $why } }
     $dsInvariant = [Globalization.CultureInfo]::InvariantCulture
     $dsGpus = @($gpus)
-    $dsActive = @($dsGpus | Where-Object { [int]$_.CurrentHorizontalResolution -gt 0 -and [int]$_.CurrentVerticalResolution -gt 0 -and [int]$_.CurrentRefreshRate -gt 0 })
+    # Active = a usable resolution. A usable refresh rate is needed only to LIST the display: an active controller without one makes `displays` unknown (CIM_EMPTY),
+    # never a guessed or partial list, and never an exception that drops the other readings.
+    $dsActive = @($dsGpus | Where-Object { (Get-DsModeNumber $_.CurrentHorizontalResolution) -gt 0 -and (Get-DsModeNumber $_.CurrentVerticalResolution) -gt 0 })
     $dsAdapterWhy = $null
     # An error recorded beside returned controllers (a timeout midway, say) makes the enumeration incomplete: it is typed, never published as a partial list.
     if (@($gpuErr).Count -gt 0) { $dsAdapterWhy = Get-DsFailReason (@($gpuErr)[0].Exception) }
@@ -7338,14 +7354,19 @@ try {
     if ($null -ne $dsAdapterWhy) {
         foreach ($f in @('displayAdapterName', 'displayAdapterDriverVersion', 'displayAdapterDriverDate', 'displays')) { $ds[$f] = New-DsReading $null $dsAdapterWhy }
     } else {
+      try {   # a failure here types the four adapter readings and never drops the OS readings below
         $first = $dsActive[0]
         $name = [string]$first.Name
         $ds.displayAdapterName = $(if ($name.Length -gt 0) { New-DsReading $name $null } else { New-DsReading $null 'CIM_EMPTY' })
         $ver = [string]$first.DriverVersion
         $ds.displayAdapterDriverVersion = $(if ($ver.Length -gt 0) { New-DsReading $ver $null } else { New-DsReading $null 'CIM_EMPTY' })
         $ds.displayAdapterDriverDate = $(if ($first.DriverDate -is [datetime]) { New-DsReading ($first.DriverDate.ToString('yyyy-MM-dd', $dsInvariant)) $null } else { New-DsReading $null 'CIM_EMPTY' })
-        $ds.displays = New-DsReading ([object[]]@($dsActive | Select-Object -First 64 | ForEach-Object {
-            [ordered]@{ adapter = [string]$_.Name; width = [int]$_.CurrentHorizontalResolution; height = [int]$_.CurrentVerticalResolution; refreshHz = [int]$_.CurrentRefreshRate } })) $null
+        if (@($dsActive | Where-Object { (Get-DsModeNumber $_.CurrentRefreshRate) -lt 1 }).Count -gt 0) { $ds.displays = New-DsReading $null 'CIM_EMPTY' }
+        else {
+            $ds.displays = New-DsReading ([object[]]@($dsActive | Select-Object -First 64 | ForEach-Object {
+                [ordered]@{ adapter = [string]$_.Name; width = (Get-DsModeNumber $_.CurrentHorizontalResolution); height = (Get-DsModeNumber $_.CurrentVerticalResolution); refreshHz = (Get-DsModeNumber $_.CurrentRefreshRate) } })) $null
+        }
+      } catch { foreach ($f in @('displayAdapterName', 'displayAdapterDriverVersion', 'displayAdapterDriverDate', 'displays')) { $ds[$f] = New-DsReading $null 'CIM_ERROR' } }
     }
     $build = $(if ($null -ne $os) { [string]$os.BuildNumber } else { '' })
     $ds.windowsBuild = $(if ($build.Length -gt 0) { New-DsReading $build $null } else { New-DsReading $null 'CIM_EMPTY' })
@@ -8079,7 +8100,7 @@ function Read-DvDisplayReading {
     <#
     .SYNOPSIS
     VENUE-LEG-DISPLAY-STATE-FIELDS-1: the ONE rule for one `displayState` reading, shared by the strict reader (Read-DvDisplayState) and the lenient writer
-    (ConvertTo-DvDisplayStateFromProbe). A reading is an object with exactly the members `value` and `unknown` (any letter case, none doubled): `unknown` is
+    (ConvertTo-DvDisplayStateFromProbe). A reading is an object with exactly the members `value` and `unknown` (exact spelling: a case variant beside the real member is a doubled member, one alone is an unknown member): `unknown` is
     $null with a typed `value`, or one of $script:DisplayStateUnknownReasons with a null `value`. Value types by field: displayAdapterName / DriverVersion
     non-empty text; displayAdapterDriverDate yyyy-MM-dd; windowsBuild digits; lastBootUtc yyyy-MM-ddTHH:mm:ssZ; windowsUbr / hotfixCount a non-negative
     int32; displays a list of 1 to 64 objects { adapter; width; height; refreshHz } (positive ints). A text carrying U+FFFD or `?` is refused (the marks of a
@@ -8185,8 +8206,8 @@ function Read-DvDisplayReading {
 }
 
 function Read-DvDisplayState {
-    # VENUE-LEG-DISPLAY-STATE-FIELDS-1: the STRICT reading of a v3 block's `displayState`: an object holding each of $script:DisplayStateFields exactly once (any
-    # letter case, none doubled, no unknown member), each a reading Read-DvDisplayReading accepts. Returns [pscustomobject]@{ ok; why; state } (state is [ordered]).
+    # VENUE-LEG-DISPLAY-STATE-FIELDS-1: the STRICT reading of a v3 block's `displayState`: an object holding each of $script:DisplayStateFields exactly once (exact
+    # spelling: a case variant beside the real field is a doubled field, one alone an unknown field), each a reading Read-DvDisplayReading accepts. Returns [pscustomobject]@{ ok; why; state } (state is [ordered]).
     param([System.Text.Json.JsonElement]$Element)
     $bad = { param($why) [pscustomobject]@{ ok = $false; why = $why; state = $null } }
     try {
