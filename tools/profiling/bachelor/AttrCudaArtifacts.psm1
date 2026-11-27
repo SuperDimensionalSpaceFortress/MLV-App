@@ -5246,7 +5246,8 @@ function Wait-AttrCudaProcessTreeGone {
     # started before this call can never read less than it, so the larger of the two changes nothing for a real clock and a clock that stands still cannot hold the wait open ('clock-not-advancing').
     $clockSeen = @{ unreadable = $false; ownWon = $false }
     $elapsedMs = { $own = $ownStopwatch.Elapsed.TotalMilliseconds; if ($null -eq $Clock) { return $own }; $read = @(try { & $Clock } catch { $clockSeen['unreadable'] = $true }); $v = $(if ($read.Count -eq 1) { $read[0] } else { $null })
-        if (-not ($v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [single] -or $v -is [decimal]) -or [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { $clockSeen['unreadable'] = $true; return 1e15 }
+        # (adversary A3 on 1c3c94f9) a block that wrote a number and THEN threw is unreadable too, and once unreadable the clock stays spent: the flag is checked before the value
+        if ($clockSeen['unreadable'] -or -not ($v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [single] -or $v -is [decimal]) -or [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { $clockSeen['unreadable'] = $true; return 1e15 }
         $clockSeen['ownWon'] = ($own -gt [double]$v); [Math]::Max([double]$v, $own) }
     # r3 fix 2 (adversary A2 advisory on 6b788356): every snapshot field is read through PSObject.Properties, so a snapshot missing one (under strict mode) is an
     # unknown tree, never a throw. r5b fix (adversary A4 on 2420b65f): a property getter that throws is read inside the same guard.

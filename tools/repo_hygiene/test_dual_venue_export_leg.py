@@ -5146,6 +5146,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
             "  $w = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Clock { $global:real.Elapsed.TotalMilliseconds } -Scan { if ($k -eq 'real') { @($sys + @((Row 100 4 $t))) } else { @($sys) } }\n"
             "  $o[$k] = [ordered]@{ confirmed = $w.confirmed; why = $w.error; ms = $sw.Elapsed.TotalMilliseconds; survivors = @($w.survivors) }\n"
             "}\n"
+            # adversary A3 on 1c3c94f9: a clock block that writes a number and THEN throws left that number in the read, so an empty scan confirmed before the throw was ever counted
+            "$global:n = 0; $w = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Clock { 0.0; throw 'clock-down' } -Scan { $global:n++; @($sys) }\n"
+            "$o['valueThenThrow'] = [ordered]@{ confirmed = $w.confirmed; why = $w.error; scans = $global:n }\n"
             "$o | ConvertTo-Json -Compress -Depth 4")
         try:
             got = self.snapshot_and_wait(body, timeout=180)
@@ -5163,6 +5166,9 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertGreater(got["real"]["ms"], 90, f"control: a real clock scans until only the floor is left: {got}")
         self.assertLess(got["real"]["ms"], 3000, got)
         self.assertIs(got["gone"]["confirmed"], True, f"control: a real clock with the tree gone confirms: {got}")
+        self.assertIs(got["valueThenThrow"]["confirmed"], False, f"adversary A3: a clock that throws after writing a number is unreadable, even with the tree gone: {got}")
+        self.assertEqual(got["valueThenThrow"]["why"], "clock-unreadable", got)
+        self.assertEqual(got["valueThenThrow"]["scans"], 0, f"no scan is granted on an unreadable clock: {got}")
 
     def test_r5_sol_r4_b3_a_row_with_no_pid_is_unreadable_evidence_wherever_its_parent_is(self) -> None:
         """r5 (sol r4 B3 on eb70c475). The sol literal: a valid snapshot of root 100 at T (no members, baseline process 400 older than T); the wait's scan holds baseline 400 and
