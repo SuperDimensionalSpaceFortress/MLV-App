@@ -7342,17 +7342,26 @@ try {
     function New-DsReading($value, $why) { [ordered]@{ value = $value; unknown = $why } }
     $dsInvariant = [Globalization.CultureInfo]::InvariantCulture
     $dsGpus = @($gpus)
-    # Active = a usable resolution. A usable refresh rate is needed only to LIST the display: an active controller without one makes `displays` unknown (CIM_EMPTY),
-    # never a guessed or partial list, and never an exception that drops the other readings.
-    $dsActive = @($dsGpus | Where-Object { (Get-DsModeNumber $_.CurrentHorizontalResolution) -gt 0 -and (Get-DsModeNumber $_.CurrentVerticalResolution) -gt 0 })
+    # Active = a usable current mode: width, height AND refresh rate all usable (the docs' rule; adversary pass sol r3 A1). The display-driving adapter is the FIRST
+    # active controller, and `displays` lists every active controller, so a controller with a resolution but no usable refresh (a sentinel, 0) is skipped, never
+    # chosen as the adapter and never an exception that drops the other readings.
+    $dsActive = @($dsGpus | Where-Object { (Get-DsModeNumber $_.CurrentHorizontalResolution) -gt 0 -and (Get-DsModeNumber $_.CurrentVerticalResolution) -gt 0 -and (Get-DsModeNumber $_.CurrentRefreshRate) -gt 0 })
+    $dsWithResolution = @($dsGpus | Where-Object { (Get-DsModeNumber $_.CurrentHorizontalResolution) -gt 0 -and (Get-DsModeNumber $_.CurrentVerticalResolution) -gt 0 })
     $dsAdapterWhy = $null
+    $dsDisplaysWhy = $null
     # An error recorded beside returned controllers (a timeout midway, say) makes the enumeration incomplete: it is typed, never published as a partial list.
-    if (@($gpuErr).Count -gt 0) { $dsAdapterWhy = Get-DsFailReason (@($gpuErr)[0].Exception) }
-    elseif ($dsGpus.Count -eq 0) { $dsAdapterWhy = 'CIM_EMPTY' }
-    elseif ($dsActive.Count -eq 0) { $dsAdapterWhy = 'NO_ACTIVE_OUTPUT' }
+    if (@($gpuErr).Count -gt 0) { $dsAdapterWhy = Get-DsFailReason (@($gpuErr)[0].Exception); $dsDisplaysWhy = $dsAdapterWhy }
+    elseif ($dsGpus.Count -eq 0) { $dsAdapterWhy = 'CIM_EMPTY'; $dsDisplaysWhy = 'CIM_EMPTY' }
+    elseif ($dsActive.Count -eq 0) {
+        # No controller has a usable mode. The adapter readings are NO_ACTIVE_OUTPUT. `displays` is CIM_EMPTY when a controller did report a resolution but no usable
+        # refresh (a mode exists and cannot be listed, never a guessed list) and NO_ACTIVE_OUTPUT when no controller reports even a resolution.
+        $dsAdapterWhy = 'NO_ACTIVE_OUTPUT'
+        $dsDisplaysWhy = $(if ($dsWithResolution.Count -gt 0) { 'CIM_EMPTY' } else { 'NO_ACTIVE_OUTPUT' })
+    }
     $ds = [ordered]@{}
     if ($null -ne $dsAdapterWhy) {
-        foreach ($f in @('displayAdapterName', 'displayAdapterDriverVersion', 'displayAdapterDriverDate', 'displays')) { $ds[$f] = New-DsReading $null $dsAdapterWhy }
+        foreach ($f in @('displayAdapterName', 'displayAdapterDriverVersion', 'displayAdapterDriverDate')) { $ds[$f] = New-DsReading $null $dsAdapterWhy }
+        $ds.displays = New-DsReading $null $dsDisplaysWhy
     } else {
       try {   # a failure here types the four adapter readings and never drops the OS readings below
         $first = $dsActive[0]
@@ -7361,11 +7370,8 @@ try {
         $ver = [string]$first.DriverVersion
         $ds.displayAdapterDriverVersion = $(if ($ver.Length -gt 0) { New-DsReading $ver $null } else { New-DsReading $null 'CIM_EMPTY' })
         $ds.displayAdapterDriverDate = $(if ($first.DriverDate -is [datetime]) { New-DsReading ($first.DriverDate.ToString('yyyy-MM-dd', $dsInvariant)) $null } else { New-DsReading $null 'CIM_EMPTY' })
-        if (@($dsActive | Where-Object { (Get-DsModeNumber $_.CurrentRefreshRate) -lt 1 }).Count -gt 0) { $ds.displays = New-DsReading $null 'CIM_EMPTY' }
-        else {
-            $ds.displays = New-DsReading ([object[]]@($dsActive | Select-Object -First 64 | ForEach-Object {
-                [ordered]@{ adapter = [string]$_.Name; width = (Get-DsModeNumber $_.CurrentHorizontalResolution); height = (Get-DsModeNumber $_.CurrentVerticalResolution); refreshHz = (Get-DsModeNumber $_.CurrentRefreshRate) } })) $null
-        }
+        $ds.displays = New-DsReading ([object[]]@($dsActive | Select-Object -First 64 | ForEach-Object {
+            [ordered]@{ adapter = [string]$_.Name; width = (Get-DsModeNumber $_.CurrentHorizontalResolution); height = (Get-DsModeNumber $_.CurrentVerticalResolution); refreshHz = (Get-DsModeNumber $_.CurrentRefreshRate) } })) $null
       } catch { foreach ($f in @('displayAdapterName', 'displayAdapterDriverVersion', 'displayAdapterDriverDate', 'displays')) { $ds[$f] = New-DsReading $null 'CIM_ERROR' } }
     }
     $build = $(if ($null -ne $os) { [string]$os.BuildNumber } else { '' })

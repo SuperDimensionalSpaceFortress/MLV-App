@@ -806,10 +806,10 @@ times out or returns nothing is a typed unknown, never a guess and never a missi
 
 | `displayState` field | Value | Source |
 |---|---|---|
-| `displayAdapterName` | text | `Win32_VideoController.Name` of the first controller that reports a current mode (width, height and refresh all above 0): the adapter driving a display (a headless render adapter is skipped) |
+| `displayAdapterName` | text | `Win32_VideoController.Name` of the first controller that reports a current mode (width, height and refresh each a whole number from 1 to 2147483647; a null, a 0 or the uint32 sentinel 4294967295 is not usable, so a controller with a resolution and no usable refresh is skipped, like a headless render adapter): the adapter driving a display |
 | `displayAdapterDriverVersion` | text | the same controller's `DriverVersion` |
 | `displayAdapterDriverDate` | `yyyy-MM-dd` | the same controller's `DriverDate` (the calendar date as reported) |
-| `displays` | 1 to 64 of `{ adapter; width; height; refreshHz }` | every controller with a current mode: `CurrentHorizontalResolution`, `CurrentVerticalResolution`, `CurrentRefreshRate` |
+| `displays` | 1 to 64 of `{ adapter; width; height; refreshHz }` | every controller with a current mode (the same rule as the adapter's): `CurrentHorizontalResolution`, `CurrentVerticalResolution`, `CurrentRefreshRate` |
 | `windowsBuild` | digits | `Win32_OperatingSystem.BuildNumber` |
 | `windowsUbr` | int | the registry value `HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\UBR` (CIM carries no UBR; an in-process read-only registry read) |
 | `lastBootUtc` | `yyyy-MM-ddTHH:mm:ssZ` | `Win32_OperatingSystem.LastBootUpTime`, in UTC |
@@ -822,7 +822,7 @@ introduced here):** the block's `adapters` list keeps its v2 rule (empty is malf
 controller read returns no controller at all the whole block is not written and the receipt reads `NO_SIGNAL`, with the OS readings lost with it.
 
 Typed unknown reasons: `CIM_ERROR` (the read threw), `CIM_TIMEOUT` (the operation timed out), `CIM_EMPTY` (it returned nothing, or a record without the
-property; an empty hotfix list is never read as "zero hotfixes"), `NO_ACTIVE_OUTPUT` (no controller reports a current mode), `REGISTRY_ERROR` (the UBR
+property; an empty hotfix list is never read as "zero hotfixes"), `NO_ACTIVE_OUTPUT` (no controller reports a current mode: the three adapter readings; `displays` too, unless a controller did report a resolution and no usable refresh, when `displays` is `CIM_EMPTY` and no list is guessed), `REGISTRY_ERROR` (the UBR
 value is missing or not a number), `DEADLINE` (the fragment's budget was spent before the read started, so the read was never made), `NOT_REPORTED` (the probe
 carried no such reading: an older probe, or the fragment's own catch-all left `displayState` null) and `MALFORMED` (the probe reported the reading in a shape the
 reader's rule refuses). Any failure inside the fragment leaves `displayState` null and never fails the probe or the leg.

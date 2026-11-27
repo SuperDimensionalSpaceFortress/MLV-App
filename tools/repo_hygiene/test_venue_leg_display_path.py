@@ -1144,7 +1144,8 @@ class DisplayStateFragmentTests(unittest.TestCase):
         cls.names = ["healthy", "no-controller-error", "no-controller-timeout", "no-controller-empty", "no-active-mode", "quick-throws", "quick-times-out",
                      "quick-empty", "registry-throws", "registry-text", "no-budget", "no-os", "no-driver-date", "two-active",
                      "partial-then-timeout", "headless-only-then-error", "partial-then-error-active",
-                     "wbem-quick-timeout", "wbem-controller-timeout", "refresh-sentinel", "width-sentinel", "budget-override-60"]
+                     "wbem-quick-timeout", "wbem-controller-timeout", "refresh-sentinel", "width-sentinel", "budget-override-60",
+                     "no-refresh-first-then-good", "sentinel-first-then-good", "no-refresh-only", "no-refresh-then-no-resolution"]
         cls.rows = run_fragment([
             sc(),
             sc(gpus=[], gpuErr="error"),
@@ -1170,6 +1171,11 @@ class DisplayStateFragmentTests(unittest.TestCase):
             sc(gpus=[dict(INTEL, hz=4294967295)]),
             sc(gpus=[dict(INTEL, w=4294967295)]),
             sc(budget=60),
+            # adversary pass sol r3 A1: the active controller needs width, height AND refresh (the docs' rule), so a first controller with no usable refresh is skipped
+            sc(gpus=[dict(INTEL, name="A", ver="1", date="20240101", w=1920, h=1080, hz=0), dict(INTEL, name="B", ver="2", date="20240201", w=3840, h=2400, hz=60)]),
+            sc(gpus=[dict(INTEL, name="A", ver="1", date="20240101", w=1920, h=1080, hz=4294967295), dict(INTEL, name="B", ver="2", date="20240201", w=3840, h=2400, hz=60)]),
+            sc(gpus=[dict(INTEL, hz=0)]),
+            sc(gpus=[dict(INTEL, hz=0), NVIDIA_HEADLESS]),
         ])
         cls.states = {n: state_of(r["line"]) for n, r in zip(cls.names, cls.rows)}
 
@@ -1227,14 +1233,33 @@ class DisplayStateFragmentTests(unittest.TestCase):
     def test_an_out_of_range_controller_number_never_nulls_the_whole_state(self) -> None:
         """adversary pass sol r2 A1: a refresh rate of 4294967295 (uint32 sentinel) must not make a signed conversion throw and drop all eight readings."""
         got = self.states["refresh-sentinel"]
-        for f in ("displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate"):
-            self.assertEqual(got[f], GOOD_STATE[f], f)
-        self.assertEqual(got["displays"], {"value": None, "unknown": "CIM_EMPTY"}, "an active controller with no usable refresh rate lists no guessed display")
+        # adversary pass sol r3 A1: a controller with no usable refresh is not an active controller (the docs' rule), so no adapter is chosen from it
+        self.unknown("refresh-sentinel", "displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate", why="NO_ACTIVE_OUTPUT")
+        self.assertEqual(got["displays"], {"value": None, "unknown": "CIM_EMPTY"}, "a controller with a resolution and no usable refresh rate lists no guessed display")
         for f in ("windowsBuild", "windowsUbr", "lastBootUtc", "hotfixCount"):
             self.assertEqual(got[f], GOOD_STATE[f], f)
         wide = self.states["width-sentinel"]
         self.unknown("width-sentinel", "displayAdapterName", "displays", why="NO_ACTIVE_OUTPUT")
         self.assertEqual(wide["windowsBuild"], GOOD_STATE["windowsBuild"])
+
+    def test_the_active_controller_is_the_first_with_width_height_and_refresh_all_usable(self) -> None:
+        """adversary pass sol r3 A1: [A: 1920x1080 refresh 0] then [B: 3840x2400 @60] publishes B's name, driver, date and mode, as docs/dual-venue-evidence.md says."""
+        for name in ("no-refresh-first-then-good", "sentinel-first-then-good"):
+            got = self.states[name]
+            self.assertEqual(got["displayAdapterName"], {"value": "B", "unknown": None}, name)
+            self.assertEqual(got["displayAdapterDriverVersion"], {"value": "2", "unknown": None}, name)
+            self.assertEqual(got["displayAdapterDriverDate"], {"value": "2024-02-01", "unknown": None}, name)
+            self.assertEqual(got["displays"], {"value": [{"adapter": "B", "width": 3840, "height": 2400, "refreshHz": 60}], "unknown": None}, name)
+            for f in ("windowsBuild", "windowsUbr", "lastBootUtc", "hotfixCount"):
+                self.assertEqual(got[f], GOOD_STATE[f], f"{name}: {f}")
+
+    def test_a_sample_whose_controllers_have_no_usable_refresh_is_typed_not_guessed(self) -> None:
+        """hub ruling 20261127T0957Z: an all-no-refresh sample is NO_ACTIVE_OUTPUT for the adapter fields and CIM_EMPTY for `displays`; a sample whose only other
+        controller reports no resolution at all reads the same."""
+        for name in ("no-refresh-only", "no-refresh-then-no-resolution"):
+            self.unknown(name, "displayAdapterName", "displayAdapterDriverVersion", "displayAdapterDriverDate", why="NO_ACTIVE_OUTPUT")
+            self.unknown(name, "displays", why="CIM_EMPTY")
+            self.assertEqual(self.states[name]["windowsBuild"], GOOD_STATE["windowsBuild"])
 
     def test_the_test_override_cannot_widen_the_budget_past_30_seconds(self) -> None:
         """adversary pass sol r2 A4 (minor): a pre-set budget above 30 s is clamped to 30."""
