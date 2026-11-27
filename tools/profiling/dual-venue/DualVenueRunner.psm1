@@ -7105,7 +7105,10 @@ function Test-DvReceiptValid {
                 $validatorCriteriaMetrics = Get-DvCriteriaMetrics -Metrics $metrics -Playback $derived -Visual $tailVisual
                 # R6-BURST-CUTOFF-RESIDUE-1 r6 (sol A1 on 9df7d35f): the throw fires only when the criteria asked the tail for a credit (a target unpainted at the
                 # measured close); a fully painted run never reads its tail, so an unreadable tail PNG cannot invalidate it
-                if ($tailUnreadable -ne '' -and $null -ne $validatorCriteriaMetrics.PSObject.Properties['conformTailUnpaintedAtCloseFrames']) { throw "DVE_TAIL_VISUAL_UNREADABLE the post-close tail evidence '$tailUnreadable' could not be re-read: $([string](Get-DvProp $tailVisual 'refused'))" }
+                # r6 fix 2 (sol A1 on 806d496b): and only when that credit's own reason IS the unreadable tail (Get-DvTailInFlightCredit returns the reader's refusal
+                # only after every playback gate passed); a credit an earlier gate refused (TAIL_CREDIT_PREP_DROPPED, ...) never needed the file
+                $tailNote = [string](Get-DvProp $validatorCriteriaMetrics 'conformTailInFlightCreditNote')
+                if ($tailUnreadable -ne '' -and $null -ne $validatorCriteriaMetrics.PSObject.Properties['conformTailUnpaintedAtCloseFrames'] -and $tailNote.StartsWith('TAIL_VISUAL_UNREADABLE', [StringComparison]::Ordinal)) { throw "DVE_TAIL_VISUAL_UNREADABLE the post-close tail evidence '$tailUnreadable' could not be re-read: $([string](Get-DvProp $tailVisual 'refused'))" }
                 $verdict = Test-DvCriteria -Criteria $criteria -Metrics $validatorCriteriaMetrics
                 # r4 (adversary A8 on eabccd6c): a tail credit the criteria were judged with is on record in the stored outcomeDetail (Invoke-VenueLeg.ps1 appends
                 # Get-DvTailCreditDetail; the writer may only PREFIX it, ADVISORY), so a receipt that drops the suffix is refused, whatever its outcome

@@ -2997,7 +2997,10 @@ function Publish-AttrCudaVisualCaptures {
     [void](Publish-AttrCudaText -Path (Join-Path $pubDir 'visual-capture-request.json') -Value ($Record | ConvertTo-Json -Depth 4))
     if ($Record['forwarded'] -and $SourceDir -and (Test-Path -LiteralPath $SourceDir -PathType Container)) {
         Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
-            [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination (Join-Path $pubDir $_.Name))
+            # R6-BURST-CUTOFF-RESIDUE-1 r6 (sol A2 on 806d496b): a play-first-unbound burst image is optional evidence; one the job cannot copy (held with
+            # FileShare.None) is left out (the runner reads that row as not captured), never a throw that loses the measured job's RESULT line
+            if ($_.Name -match '^play-first-unbound-\d+\.png$') { try { [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination (Join-Path $pubDir $_.Name)) } catch { $null = $_ } }
+            else { [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination (Join-Path $pubDir $_.Name)) }
         }
     }
     return $pubDir

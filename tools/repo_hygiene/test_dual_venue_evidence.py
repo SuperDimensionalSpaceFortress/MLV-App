@@ -11636,6 +11636,31 @@ class VisualCaptureVenueHelperTests(unittest.TestCase):
             self.assertEqual(proc.stdout.strip().splitlines()[-1],
                              "play-first-unbound-0.png,play-first-unbound-3.png,play-unbound-0.png,visual-capture-request.json,visual.json")
 
+    def test_r6_r6_sol_a2_a_locked_burst_image_never_throws_out_of_the_visual_publish(self) -> None:
+        # R6-BURST-CUTOFF-RESIDUE-1 r6 (sol A2 on 806d496b), its input: forwarded=true, play-first-unbound-0.png held with FileShare.None while the job (under
+        # ErrorActionPreference=Stop) publishes. 806d496b's copy threw and the measured job lost its RESULT line; the burst image is now left out and the rest
+        # is published. (guard) A locked non-burst image still throws, as on the base.
+        with tempfile.TemporaryDirectory(prefix="vis-pub-r6-") as d:
+            src = Path(d, "src")
+            src.mkdir()
+            Path(d, "pub").mkdir()
+            for name in ("play-first-unbound-0.png", "play-unbound-0.png", "visual.json"):
+                Path(src, name).write_bytes(b"x")
+            proc = self.run_module(f"$lock = [IO.File]::Open('{Path(src, 'play-first-unbound-0.png')}', 'Open', 'Read', 'None'); "
+                                   f"try {{ $pub = Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}' }} finally {{ $lock.Dispose() }}; "
+                                   "(Get-ChildItem -LiteralPath $pub -File | ForEach-Object Name | Sort-Object) -join ','")
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.strip().splitlines()[-1], "play-unbound-0.png,visual-capture-request.json,visual.json")
+        with tempfile.TemporaryDirectory(prefix="vis-pub-r6g-") as d:
+            src = Path(d, "src")
+            src.mkdir()
+            Path(d, "pub").mkdir()
+            for name in ("play-unbound-0.png", "visual.json"):
+                Path(src, name).write_bytes(b"x")
+            proc = self.run_module(f"$lock = [IO.File]::Open('{Path(src, 'play-unbound-0.png')}', 'Open', 'Read', 'None'); "
+                                   f"try {{ [void](Publish-AttrCudaVisualCaptures -Record ([ordered]@{{ forwarded = $true }}) -SourceDir '{src}' -PubRoot '{Path(d, 'pub')}') }} finally {{ $lock.Dispose() }}")
+            self.assertNotEqual(proc.returncode, 0, "(guard) a locked non-burst image keeps the base's throw")
+
     def test_the_visual_tail_is_cut_off_the_presentmon_window_and_never_extends_it(self) -> None:
         with tempfile.TemporaryDirectory(prefix="vis-pm-") as d:
             Path(d, "visual.json").write_text(json.dumps({"tail_begin_utc": "2026-10-13T22:00:00.000Z"}), encoding="utf-8")
@@ -22140,7 +22165,9 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
         raw = json.dumps(self.app_json(first)).encode("utf-8")
         painted = {**self.PB, "conformLastFrame": 479, "conformSourceAdvanced": 478, "conformPresented": 479}
         results = {}
-        for name, pb in (("fully painted", painted), ("(control) one target held", {**self.PB, **self.HELD})):
+        # r6 fix 2 (sol A1 on 806d496b): a held target whose credit an earlier gate refuses (a prepared result dropped) never needed the file either
+        dropped = {**self.PB, **self.HELD, "prepStaleDrops": 1, "prepGenerationDrops": 1}
+        for name, pb in (("fully painted", painted), ("(control) one target held", {**self.PB, **self.HELD}), ("held, prep dropped", dropped)):
             with tempfile.TemporaryDirectory() as d:
                 vis = Path(d) / "visual"
                 vis.mkdir()
@@ -22153,18 +22180,21 @@ class EveryFrameTailInFlightVsNeverPaintedTests(unittest.TestCase):
                     "$lock = [IO.File]::Open((Join-Path $env:DVE_DIR ('visual\\' + $env:DVE_LEG + '-play-first-unbound-0.png')), 'Open', 'Read', 'None')\n"
                     "try { $vis = Get-DvTailVisualEvidence -EvidenceDir $env:DVE_DIR -LegId $env:DVE_LEG -ExpectedSha256 $env:DVE_SHA -RecordedFrames $rec } finally { $lock.Dispose() }\n"
                     "$m = Get-DvCriteriaMetrics -Metrics ([pscustomobject]@{ rows = 5 }) -Playback $pb -Visual $vis\n"
-                    "[ordered]@{ unreadable = [string]$vis.unreadablePath; asked = ($null -ne $m.PSObject.Properties['conformTailUnpaintedAtCloseFrames']) } | ConvertTo-Json -Compress",
+                    "[ordered]@{ unreadable = [string]$vis.unreadablePath; asked = ($null -ne $m.PSObject.Properties['conformTailUnpaintedAtCloseFrames'])\n"
+                    "            note = ([string]$m.conformTailInFlightCreditNote).Split(':')[0] } | ConvertTo-Json -Compress",
                     DVE_DIR=d, DVE_LEG=self.LEG, DVE_SHA=hashlib.sha256(raw).hexdigest(), DVE_REC=json.dumps(rec), DVE_PB=json.dumps(pb))
             self.assertIsNotNone(out, proc.stdout + proc.stderr)
             self.assertTrue(out["unreadable"].endswith("play-first-unbound-0.png"), out)
-            results[name] = out["asked"]
-        self.assertEqual(results, {"fully painted": False, "(control) one target held": True}, results)
+            results[name] = (out["asked"], out["note"] if out["asked"] else "")
+        self.assertEqual(results, {"fully painted": (False, ""), "(control) one target held": (True, "TAIL_VISUAL_UNREADABLE"),
+                                   "held, prep dropped": (True, "TAIL_CREDIT_PREP_DROPPED")}, results)
         # the validator throws only on that condition, after the criteria metrics are derived
         mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
         start = mod.index("$tailVisual = Get-DvTailVisualEvidence -EvidenceDir $ev.dir")
         block = mod[start:mod.index("$verdict = Test-DvCriteria -Criteria $criteria -Metrics $validatorCriteriaMetrics", start)]
         self.assertLess(block.index("$validatorCriteriaMetrics = Get-DvCriteriaMetrics"), block.index("throw \"DVE_TAIL_VISUAL_UNREADABLE"), block)
-        self.assertIn("if ($tailUnreadable -ne '' -and $null -ne $validatorCriteriaMetrics.PSObject.Properties['conformTailUnpaintedAtCloseFrames']) { throw", block)
+        self.assertIn("if ($tailUnreadable -ne '' -and $null -ne $validatorCriteriaMetrics.PSObject.Properties['conformTailUnpaintedAtCloseFrames'] -and "
+                      "$tailNote.StartsWith('TAIL_VISUAL_UNREADABLE', [StringComparison]::Ordinal)) { throw", block)
 
     def test_r6_r6_sol_a2_a_locked_burst_png_never_throws_out_of_the_visual_collector(self) -> None:
         """A2 (sol on 9df7d35f), its input: a forced-first fixture whose published play-first-unbound-0.png is held with FileShare.None while the collector runs
