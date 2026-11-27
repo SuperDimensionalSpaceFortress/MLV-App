@@ -209,6 +209,10 @@ function Get-AdapterCheckVerdict {
     }
 }
 
+# adversary-ac6205bd.json A2: each smoke result's TEXT is also judged by the venue reader (a repeated member or a singleton root array), and an imported
+# packet's summary.json is refused when it repeats a member
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember -DisableNameChecking
+
 function Get-SmokeSummaryHostLoadFields {
     # PLAYBACK-MEASURE-HOST-LOAD-GATE-1 round 3: this script invokes run-release-gui-smoke.ps1
     # per clip and already parses its JSON output ($result below) for presentedFps etc; that JSON
@@ -217,10 +221,11 @@ function Get-SmokeSummaryHostLoadFields {
     # standalone .ps1 with no shared module, hence the duplicate rather than an import).
     param([object]$HostLoad)
 
-    if ($null -eq $HostLoad) {
+    if ($null -eq $HostLoad -or $HostLoad -is [System.Collections.IList] -or $HostLoad -is [string] -or $HostLoad -is [ValueType]) {
         return [pscustomobject]@{
             provisional = $true
             state = "unknown"
+            collected = $false
             reason = "no hostLoad telemetry recorded in the smoke result"
         }
     }
@@ -234,25 +239,48 @@ function Get-SmokeSummaryHostLoadFields {
     # compare-machine-perf.ps1's Get-PlaybackAbLegHostLoadProvisional for the full cross-file
     # note): clean iff state=="quiet" AND provisional==false; every other combination is
     # provisional.
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): THE ONE STRICT PREDICATE (VenueChain.psm1 Get-VenueReferenceHostLoadRefusal's rule):
+    # clean iff state is exactly 'quiet' (ordinal), provisional a real [bool] $false, and before.collected and after.collected both a real [bool] $true.
+    # Values are assigned directly from PSObject.Properties (never through a function return or an if-expression, which unroll a one-element array).
+    $provisionalRaw = $null; $stateRaw = $null; $beforeCollectedRaw = $null; $afterCollectedRaw = $null
     $provisionalProperty = $HostLoad.PSObject.Properties["provisional"]
-    $provisionalDeclared = if ($null -eq $provisionalProperty -or $null -eq $provisionalProperty.Value) {
-        $true
-    } else {
-        [bool]$provisionalProperty.Value
-    }
+    if ($null -ne $provisionalProperty) { $provisionalRaw = $provisionalProperty.Value }
     $stateProperty = $HostLoad.PSObject.Properties["state"]
-    $state = if ($null -eq $stateProperty -or [string]::IsNullOrWhiteSpace([string]$stateProperty.Value)) {
-        "unknown"
-    } else {
-        [string]$stateProperty.Value
+    if ($null -ne $stateProperty) { $stateRaw = $stateProperty.Value }
+    foreach ($side in 'before', 'after') {
+        $snapProperty = $HostLoad.PSObject.Properties[$side]
+        $snap = $null; if ($null -ne $snapProperty) { $snap = $snapProperty.Value }
+        if ($null -eq $snap -or $snap -is [System.Collections.IList] -or $snap -is [string] -or $snap -is [ValueType]) { continue }
+        $collectedProperty = $snap.PSObject.Properties["collected"]
+        if ($null -eq $collectedProperty) { continue }
+        if ($side -eq 'before') { $beforeCollectedRaw = $collectedProperty.Value } else { $afterCollectedRaw = $collectedProperty.Value }
     }
-    $provisional = ($provisionalDeclared -or $state -ne "quiet")
+    $collectedRaw = ($beforeCollectedRaw -is [bool] -and $beforeCollectedRaw -and $afterCollectedRaw -is [bool] -and $afterCollectedRaw)
+    # adversary-ac6205bd.json A1: every interior (during) sample must be collected too (a present during, null included, must be a list of collected samples)
+    $duringProperty = $HostLoad.PSObject.Properties["during"]
+    if ($null -ne $duringProperty) {
+        $duringRaw = $duringProperty.Value
+        if ($null -eq $duringRaw -or $duringRaw -is [string] -or $duringRaw -isnot [System.Collections.IList]) { $collectedRaw = $false }
+        else {
+            foreach ($duringSample in $duringRaw) {
+                $duringCollected = $null
+                if ($null -ne $duringSample -and $duringSample -isnot [System.Collections.IList] -and $duringSample -isnot [string] -and $duringSample -isnot [ValueType]) {
+                    $duringCollectedProperty = $duringSample.PSObject.Properties["collected"]
+                    if ($null -ne $duringCollectedProperty) { $duringCollected = $duringCollectedProperty.Value }
+                }
+                if (-not ($duringCollected -is [bool] -and $duringCollected)) { $collectedRaw = $false }
+            }
+        }
+    }
+    $provisional = -not ($provisionalRaw -is [bool] -and -not $provisionalRaw -and $stateRaw -is [string] -and [string]::Equals($stateRaw, 'quiet', [StringComparison]::Ordinal) -and $collectedRaw -is [bool] -and $collectedRaw)
+    $state = if ($stateRaw -is [string] -and -not [string]::IsNullOrWhiteSpace($stateRaw)) { $stateRaw } else { "unknown" }
     $reasonProperty = $HostLoad.PSObject.Properties["reason"]
     $reason = if ($null -eq $reasonProperty) { $null } else { [string]$reasonProperty.Value }
 
     [pscustomobject]@{
         provisional = $provisional
         state = $state
+        collected = $collectedRaw
         reason = $reason
     }
 }
@@ -556,8 +584,23 @@ function Import-EvidencePacket {
     }
 
     if ($importFailures.Count -eq 0) {
-        $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
-        $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A9 sibling): a manifest the parser refuses is a recorded import failure, never a throw
+        $manifest = $null
+        try { $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json }
+        catch { Add-Failure $importFailures ("evidence-packet-manifest.json could not be parsed: " + ($_.Exception.Message -replace '\s+', ' ')) }
+        # adversary-c2bbe5f8.json A5: a summary that cannot be read is a recorded import failure (the scanner below then reads '' as unparsable)
+        $summaryText = ''
+        try { $summaryText = [string](Get-Content -LiteralPath $summaryPath -Raw) }
+        catch { Add-Failure $importFailures ("summary.json could not be read: " + ($_.Exception.Message -replace '\s+', ' ')) }
+        # adversary-ac6205bd.json A2: a repeated member anywhere (e.g. "hostLoadCollected":false,"hostLoadCollected":true in a clip record) keeps the last
+        # value in the parsed object, so the packet is refused rather than read
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A9): the scanner adjudicates BEFORE the object parse, and a parse refusal
+        # (case-variant keys: KeysWithDifferentCasingInJsonString) is a recorded import failure, never a throw that loses the import result.
+        $summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All } catch { '<unparsable>' }
+        if ($summaryDuplicate) { Add-Failure $importFailures "summary.json repeats the member $summaryDuplicate; a repeated member is never read as evidence." }
+        $summary = $null
+        try { $summary = $summaryText | ConvertFrom-Json }
+        catch { Add-Failure $importFailures ("summary.json could not be parsed: " + ($_.Exception.Message -replace '\s+', ' ')) }
 
         if ($manifest.schema -ne "mlvapp-ultramagnus-p3-evidence-packet.v1") {
             Add-Failure $importFailures "Unexpected evidence manifest schema: $($manifest.schema)"
@@ -590,9 +633,21 @@ function Import-EvidencePacket {
             Add-Failure $importFailures "Evidence source worktree was dirty: $($sourceDirtyEntries -join '; ')"
         }
 
-        foreach ($file in @($manifest.files)) {
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-88890049.json A2): a manifest that did not parse (null) lists no artifact (@($null) is one null
+        # entry, whose empty relativePath named the extraction directory and threw at the hash), and an entry with no relativePath, or one that names a
+        # directory, is a recorded failure, never a throw that loses the import result
+        # adversary-c2bbe5f8.json A3: skipping a null entry must never let a packet with no checked artifact succeed: a null entry is a recorded failure,
+        # and a manifest that lists no artifact at all is refused (the base could never succeed on one either: its null entry threw at the hash)
+        $manifestFiles = @($manifest.files)
+        if (@($manifestFiles | Where-Object { $null -eq $_ }).Count -gt 0) { Add-Failure $importFailures "The manifest lists a null artifact entry." }
+        if (@($manifestFiles | Where-Object { $null -ne $_ }).Count -eq 0) { Add-Failure $importFailures "The manifest lists no artifact; a packet with no checked artifact is not proof." }
+        foreach ($file in @(@($manifest.files) | Where-Object { $null -ne $_ })) {
+            if ([string]::IsNullOrWhiteSpace([string]$file.relativePath)) {
+                Add-Failure $importFailures "The manifest lists an artifact with no relativePath."
+                continue
+            }
             $artifactPath = Join-Path $extractRoot ([string]$file.relativePath)
-            if (!(Test-Path -LiteralPath $artifactPath)) {
+            if (!(Test-Path -LiteralPath $artifactPath -PathType Leaf)) {
                 Add-Failure $importFailures "Packet missing artifact listed in manifest: $($file.relativePath)"
                 continue
             }
@@ -677,21 +732,16 @@ function Import-EvidencePacket {
                 # (identical at every one of this card's readers -- see compare-machine-perf.ps1's
                 # Get-PlaybackAbLegHostLoadProvisional for the full cross-file note): clean iff
                 # state=="quiet" AND provisional==false; every other combination is provisional.
+                # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the ONE strict predicate on the clip row (hostLoadState exactly 'quiet',
+                # hostLoadProvisional a real [bool] $false, hostLoadCollected a real [bool] $true); values assigned directly, never coerced.
+                $clipHostLoadProvisionalRaw = $null; $clipHostLoadStateRaw = $null; $clipHostLoadCollectedRaw = $null
                 $clipHostLoadProvisionalProperty = $clip.PSObject.Properties["hostLoadProvisional"]
-                $clipHostLoadProvisionalDeclared = if ($null -eq $clipHostLoadProvisionalProperty -or
-                    $null -eq $clipHostLoadProvisionalProperty.Value) {
-                    $true
-                } else {
-                    [bool]$clipHostLoadProvisionalProperty.Value
-                }
+                if ($null -ne $clipHostLoadProvisionalProperty) { $clipHostLoadProvisionalRaw = $clipHostLoadProvisionalProperty.Value }
                 $clipHostLoadStateProperty = $clip.PSObject.Properties["hostLoadState"]
-                $clipHostLoadState = if ($null -eq $clipHostLoadStateProperty -or
-                    [string]::IsNullOrWhiteSpace([string]$clipHostLoadStateProperty.Value)) {
-                    "unknown"
-                } else {
-                    [string]$clipHostLoadStateProperty.Value
-                }
-                $clipHostLoadProvisional = ($clipHostLoadProvisionalDeclared -or $clipHostLoadState -ne "quiet")
+                if ($null -ne $clipHostLoadStateProperty) { $clipHostLoadStateRaw = $clipHostLoadStateProperty.Value }
+                $clipHostLoadCollectedProperty = $clip.PSObject.Properties["hostLoadCollected"]
+                if ($null -ne $clipHostLoadCollectedProperty) { $clipHostLoadCollectedRaw = $clipHostLoadCollectedProperty.Value }
+                $clipHostLoadProvisional = -not ($clipHostLoadProvisionalRaw -is [bool] -and -not $clipHostLoadProvisionalRaw -and $clipHostLoadStateRaw -is [string] -and [string]::Equals($clipHostLoadStateRaw, 'quiet', [StringComparison]::Ordinal) -and $clipHostLoadCollectedRaw -is [bool] -and $clipHostLoadCollectedRaw)
                 if ($clipHostLoadProvisional) {
                     Add-Failure $importFailures "$clipName host load was PROVISIONAL or unrecorded (hostLoadProvisional=$clipHostLoadProvisional); an fps number measured under provisional host load is not proof of speed, regardless of the floor."
                 }
@@ -1144,8 +1194,24 @@ exit `$LASTEXITCODE
         $textureAmazeWallMsValues = [System.Collections.Generic.List[double]]::new()
         $texturePostMsValues = [System.Collections.Generic.List[double]]::new()
 
+        $resultTextStanding = $null
         if (Test-Path -LiteralPath $clipOutput) {
-            $result = Get-Content -LiteralPath $clipOutput -Raw | ConvertFrom-Json
+            # adversary-ac6205bd.json A2/A5: one BOM-aware read, parsed with -NoEnumerate (a singleton root stays an array); the same text is judged by
+            # VenueChain.psm1 ConvertFrom-VenueSmokeResultText (repeated member, root not one object, uncollected sample) below, beside the block reader
+            # adversary-c2bbe5f8.json A5: a result that cannot be read is a recorded clip failure (and reads unknown below), never a throw that loses the row
+            $resultText = ''
+            try {
+                $resultBytes = [IO.File]::ReadAllBytes($clipOutput)
+                $resultText = [IO.StreamReader]::new([IO.MemoryStream]::new($resultBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd()
+            }
+            catch { Add-Failure $clipFailures ("The smoke result JSON could not be read: " + ($_.Exception.Message -replace '\s+', ' ')) }
+            $resultTextStanding = ConvertFrom-VenueSmokeResultText -Text $resultText
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A9): a text the object parser refuses (hostLoad beside HostLoad,
+            # malformed JSON) is a recorded clip failure, never a throw: the object reads null and the text reader's refusal still reaches the row.
+            $result = $null
+            try { $result = ConvertFrom-Json -InputObject $resultText -NoEnumerate }
+            catch { Add-Failure $clipFailures ("The smoke result JSON could not be parsed: " + ($_.Exception.Message -replace '\s+', ' ')) }
+            if ($result -is [System.Collections.IList]) { Add-Failure $clipFailures "The smoke result JSON is not one object."; $result = $null }
             if (-not $result.validation.ok) {
                 Add-Failure $clipFailures ("Wrapper validation failed: " + (($result.validation.failures | ForEach-Object { [string]$_ }) -join "; "))
             }
@@ -1264,7 +1330,21 @@ exit `$LASTEXITCODE
         # that dragged presented_fps under the hard floor was recorded as a genuine clipFailures
         # entry, conflating "we couldn't get a clean signal" with "the build is broken", exactly
         # backwards from this card's own rule that host load MARKS, never fails, a run.
-        $hostLoadFields = Get-SmokeSummaryHostLoadFields -HostLoad $(if ($result) { $result.hostLoad } else { $null })
+        $hostLoadFields = Get-SmokeSummaryHostLoadFields -HostLoad $(if ($result) { , $result.hostLoad } else { $null })
+        # adversary-ac6205bd.json A2: the smoke result's TEXT must read clean too (a repeated member keeps the last value in the parsed object)
+        if ($null -ne $resultTextStanding) {
+            $textProvisionalRaw = $resultTextStanding.provisional; $textStateRaw = $resultTextStanding.state; $textCollectedRaw = $resultTextStanding.collected
+            $textProvisional = -not ($textProvisionalRaw -is [bool] -and -not $textProvisionalRaw -and $textStateRaw -is [string] -and [string]::Equals($textStateRaw, 'quiet', [StringComparison]::Ordinal) -and $textCollectedRaw -is [bool] -and $textCollectedRaw)
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A8): collected reports snapshot collection only (both readers must see
+            # every snapshot collected), never forced false because the run was provisional: an exceeded, fully collected clip keeps collected=true.
+            $bothCollected = ($hostLoadFields.collected -is [bool] -and $hostLoadFields.collected -and $textCollectedRaw -is [bool] -and $textCollectedRaw)
+            if ($textProvisional) {
+                $hostLoadFields = [pscustomobject]@{ provisional = $true; state = $(if ([string]$textStateRaw) { [string]$textStateRaw } else { 'unknown' }); collected = $bothCollected; reason = "smoke result text: $($resultTextStanding.reason)" }
+            }
+            else {
+                $hostLoadFields = [pscustomobject]@{ provisional = $hostLoadFields.provisional; state = $hostLoadFields.state; collected = $bothCollected; reason = $hostLoadFields.reason }
+            }
+        }
 
         if ($receiptRawFixesEnabled) {
             if ($noReadbackFrames -le 0) {
@@ -1394,6 +1474,7 @@ exit `$LASTEXITCODE
             timelineFps = if ($result) { $result.log.summary.timeline_fps } else { $null }
             hostLoadProvisional = $hostLoadFields.provisional
             hostLoadState = $hostLoadFields.state
+            hostLoadCollected = $hostLoadFields.collected
             hostLoadReason = $hostLoadFields.reason
             gpuTextureNoReadbackFrames = $noReadbackFrames
             gpuTextureReadbackFrames = $textureReadbackFrames

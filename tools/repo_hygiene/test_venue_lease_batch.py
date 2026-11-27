@@ -493,12 +493,39 @@ $rp = Join-Path $rdir "$id.json"; Set-Content -LiteralPath $rp -Value '{}'
 $edir = Join-Path (Join-Path (Split-Path -Parent $rroot) 'evidence') $id; New-Item -ItemType Directory -Force -Path $edir | Out-Null
 $pre = Pick $env:FAKE_LEG_PRELOADS $k '5'
 if ($pre -ne 'none') { Set-Content -LiteralPath (Join-Path $edir 'summary.json') -Value ('{"cpuQuiescence":{"timeMeanPercent":' + $pre + '}}') }
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: FAKE_LEG_HOSTLOADS per call = the smoke result.json's hostLoad: quiet (default) | cim (the 2026-11-21 a134532e shape:
+# before/after collected=false CimException, state unknown, provisional true) | missing (a result.json with no hostLoad block) | none (no result.json)
+$hlMode = Pick $env:FAKE_LEG_HOSTLOADS $k 'quiet'
+# r6 (sol r5 B2): expshape = a CIM-failed result.json and, in the receipt slot, a receipt shaped like an export receipt that binds nothing
+$hlBlock = switch ($hlMode) {
+    { $_ -in 'cim', 'expshape' } { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true,"reason":"Host load telemetry could not be collected"}' }
+    'missing' { $null }
+    default { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false,"reason":"quiet"}' }
+}
+if ($hlMode -ne 'none') {
+    $resPath = Join-Path $edir 'result.json'
+    Set-Content -LiteralPath $resPath -Value ('{"schema":"mlvapp-gui-smoke-result.v2"' + $(if ($hlBlock) { ',"hostLoad":' + $hlBlock }) + '}')
+    # like the real leg, the receipt binds the smoke result it was written from (evidence.resultJsonSha256; adversary-b0c05520.json A1)
+    Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $resPath -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
+}
+if ($hlMode -eq 'expshape') { Set-Content -LiteralPath $rp -Value ('{"schema":"mlv-app/dual-venue-receipt/v1","scale":null,"display":null,"evidence":{},"export":{"format":"prores","receiptSha256":"' + ('0' * 64) + '","verdict":null}}') }
 # r4 (adversary r4 A1): FAKE_LEG_TAIL_SLEEP = the leg child's own work after its agent job ended (its receipt, its evidence), before it exits
 if ($env:FAKE_LEG_TAIL_SLEEP) { Start-Sleep -Seconds ([int]$env:FAKE_LEG_TAIL_SLEEP) }
 # r6 (adversary-848f6559.json A1): FAKE_LEG_EXIT per call = the child exits with that code AFTER its agent job's result landed (a receipt write denied, Invoke-VenueLeg.ps1:314)
 $legExit = [int](Pick $env:FAKE_LEG_EXIT $k '0'); if ($legExit -ne 0) { exit $legExit }
 "DVE_OUTCOME=$(if ($legMode -eq 'unresolved') { 'UNRESOLVED' } else { Pick $env:FAKE_LEG_OUTCOMES $k 'PASS' })"
 "DVE_RECEIPT_PATH=$rp"
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (A5): like the real leg, the sha256 of the receipt bytes it wrote; FAKE_LEG_SWAP_RECEIPT per call = 1 then swaps in a
+# quiet receipt + result.json pair that binds itself (the adversary's input), which the batch must read unknown
+"DVE_RECEIPT_SHA256=$((Get-FileHash -LiteralPath $rp -Algorithm SHA256).Hash)"
+# R2-NARROW-1 r2 (adversary-7c5bfe86.json A5): FAKE_LEG_STDERR_SHA per call = 1 then writes a DVE_RECEIPT_SHA256 line of zeroes to STDERR, after the real one on stdout
+if ((Pick $env:FAKE_LEG_STDERR_SHA $k '0') -eq '1') { [Console]::Error.WriteLine('DVE_RECEIPT_SHA256=' + ('0' * 64)) }
+# (adversary-baf2e69a.json A3) FAKE_LEG_STDERR_PATH per call = 1 then writes a DVE_RECEIPT_PATH line naming ANOTHER receipt to STDERR
+if ((Pick $env:FAKE_LEG_STDERR_PATH $k '0') -eq '1') { [Console]::Error.WriteLine('DVE_RECEIPT_PATH=' + (Join-Path $rdir 'another-receipt.json')) }
+if ((Pick $env:FAKE_LEG_SWAP_RECEIPT $k '0') -eq '1') {
+    $swapRes = Join-Path $edir 'result.json'; Set-Content -LiteralPath $swapRes -Value '{"schema":"mlvapp-gui-smoke-result.v2","hostLoad":{"state":"quiet","provisional":false,"before":{"collected":true},"after":{"collected":true}}}'
+    Set-Content -LiteralPath $rp -Value ('{"evidence":{"resultJsonSha256":"' + (Get-FileHash -LiteralPath $swapRes -Algorithm SHA256).Hash.ToLowerInvariant() + '"}}')
+}
 exit 0
 """
 
@@ -892,6 +919,84 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual(list((self.share / "notafter").iterdir()), [], "the open's sidecar was left behind")
         self.assertIsNone(b["claimRenew"]["lost"], b["claimRenew"])
         self.assertIn(f" BATCH_OPEN_LIVENESS batch=1 job=lease-batch-open-", log)
+
+    # ---------------------------------------------------------------- VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1
+    def test_a_leg_whose_smoke_host_load_is_unknown_is_recorded_but_never_counted(self) -> None:
+        # The 2026-11-21 a134532e shape: pre-load 5 % (QUIET_PRELOAD_OK by the pre-load alone), but the smoke's hostLoad was not collected
+        # (CimException): state unknown, provisional true. RED: the leg counted, and no row or line said its host-load state.
+        r = self.run_batch(self.specs[:3], FAKE_LEG_HOSTLOADS="cim,quiet,missing")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        got = [(l["status"], l["class"], l["counted"], l.get("hostLoadState"), l.get("hostLoadProvisional")) for l in b["legs"]]
+        self.assertEqual(got, [("RAN", "HOSTLOAD_PROVISIONAL", False, "unknown", True), ("RAN", "QUIET_PRELOAD_OK", True, "quiet", False),
+                               ("RAN", "HOSTLOAD_PROVISIONAL", False, "unknown", True)], b["legs"])
+        self.assertEqual((b["legsRan"], b["legsCounted"]), (3, 1), "a provisional leg is recorded as run, never counted")
+        res = batch_result(r.stdout)
+        self.assertEqual((res["ran"], res["counted"]), (3, 1))
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8")
+        rid = Path(b["legs"][0]["receipt"]).stem
+        self.assertIn(f"REFERENCE_PROVISIONAL leg={rid} reason=hostload-unknown", log)
+        self.assertIn("class=HOSTLOAD_PROVISIONAL counted=False", log)
+        self.assertIn("hostLoadState=unknown hostLoadProvisional=True", log)
+        self.assertIn("hostLoadState=quiet hostLoadProvisional=False", log)
+
+    def test_a_provisional_host_load_is_named_whatever_the_preload_class(self) -> None:
+        # adversary-b0c05520.json A5, its input: pre-load 31 % (QUIET_PRELOAD_HIGH) and a CIM-failed smoke host load. The class stays the pre-load's
+        # (already uncounted), and the typed REFERENCE_PROVISIONAL line is still printed. RED: the line was printed only for HOSTLOAD_PROVISIONAL.
+        r = self.run_batch(self.specs[:1], FAKE_LEG_PRELOADS="31", FAKE_LEG_HOSTLOADS="cim")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("QUIET_PRELOAD_HIGH", False, "unknown", True), l)
+        self.assertIn(f"REFERENCE_PROVISIONAL leg={Path(l['receipt']).stem} reason=hostload-unknown", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    def test_r6_b2_an_export_shaped_receipt_in_a_playback_leg_is_never_counted(self) -> None:
+        # sol r5 B2, its input: a playback leg whose receipt slot holds the production schema shaped as an export receipt (scale/display null, prores,
+        # 64 zeroes, verdict null, no identity, no playback hashes), a CIM-failed smoke result and pre-load 5. RED: not-applicable, QUIET_PRELOAD_OK, counted.
+        r = self.run_batch(self.specs[:1], FAKE_LEG_HOSTLOADS="expshape")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("HOSTLOAD_PROVISIONAL", False, "unknown", True), l)
+        self.assertIn(f"REFERENCE_PROVISIONAL leg={Path(l['receipt']).stem} reason=hostload-unknown", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
+
+    def test_residue_r2_a5_a_receipt_and_result_swapped_in_together_after_the_leg_is_never_counted(self) -> None:
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2, adversary-07b6a932.json A5, its input: an uncollected smoke result, pre-load 5, and after the child printed its
+        # receipt path a quiet receipt + result.json pair that binds itself replaces both. RED: QUIET_PRELOAD_OK, counted.
+        r = self.run_batch(self.specs[:1], FAKE_LEG_HOSTLOADS="cim", FAKE_LEG_SWAP_RECEIPT="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("HOSTLOAD_PROVISIONAL", False, "unknown", True), l)
+
+    def test_r2n1_a5_a_receipt_sha_line_on_stderr_never_replaces_the_one_the_leg_published_on_stdout(self) -> None:
+        # adversary-7c5bfe86.json A5 (R2-NARROW-1 r2), its input: a qualifying quiet leg (pre-load 5, collected quiet host load) whose child prints the true DVE_RECEIPT_SHA256 on stdout and then
+        # a DVE_RECEIPT_SHA256 line of 64 zeroes on STDERR. RED on 7c5bfe86: stdout and stderr were read together, the last line won, the true hash was discarded, the genuine receipt was refused and the
+        # leg was HOSTLOAD_PROVISIONAL (uncounted). The hash is now taken from the child's stdout alone (as Invoke-VenueChain does), so the leg is counted.
+        r = self.run_batch(self.specs[:1], FAKE_LEG_STDERR_SHA="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("QUIET_PRELOAD_OK", True, "quiet", False), l)
+
+    def test_r2n1_pass1_a3_a_receipt_path_line_on_stderr_never_replaces_the_one_the_leg_published_on_stdout(self) -> None:
+        # adversary-baf2e69a.json A3, its input: a qualifying quiet leg whose child prints DVE_RECEIPT_PATH and DVE_RECEIPT_SHA256 for its own receipt on stdout and then a DVE_RECEIPT_PATH line naming ANOTHER
+        # receipt on STDERR. RED on baf2e69a: the sha came from stdout but the path from stdout and stderr together (the last line won), so the host-load read was asked for the wrong path with the right
+        # digest, refused the pair, and a genuinely quiet counted leg became HOSTLOAD_PROVISIONAL. The path and the hash now come from the same stream, the child's stdout.
+        r = self.run_batch(self.specs[:1], FAKE_LEG_STDERR_PATH="1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("QUIET_PRELOAD_OK", True, "quiet", False), l)
+        self.assertNotIn("another-receipt", str(l["receipt"]))
+
+    def test_a_quiet_host_load_leaves_todays_counting_unchanged(self) -> None:
+        r = self.run_batch(self.specs[:1])
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        [b] = self.batches()
+        [l] = b["legs"]
+        self.assertEqual((l["class"], l["counted"], l["hostLoadState"], l["hostLoadProvisional"]), ("QUIET_PRELOAD_OK", True, "quiet", False), l)
+        self.assertNotIn("REFERENCE_PROVISIONAL", (self.run_dir / "batch.log").read_text(encoding="utf-8"))
 
     # ---------------------------------------------------------------- in-lease retry
     def test_a_busy_probe_is_retried_inside_the_same_lease(self) -> None:
@@ -3803,6 +3908,16 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 p.write_text(json.dumps({**base, **extra}), encoding="utf-8")
                 self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(p, "B", a)]), "LEG_SPEC_INVALID item=2 ")
 
+    def test_r2n1_a7_plan_a_spec_the_strict_reader_cannot_type_is_refused_before_the_claim_and_the_lease(self) -> None:
+        # adversary-7c5bfe86.json A7 (R2-NARROW-1 r2), the -LegPlan route (Get-LegSpecRefusal): a spec declaring legType twice (both shapes valid by the last member) is refused whole-plan, typed, before any claim
+        a = self.commit_a
+        base = json.dumps({"schema": "mlv-app/dual-venue-leg/v1", "card": "TEST-CARD", "legId": "fx-bad", "backends": ["cpu"], "scaleFactor": 1})
+        for case, tail in (("dup-speed-speed", ', "legType": "speed", "legType": "speed"}'), ("dup-export-speed", ', "legType": "export", "legType": "speed"}')):
+            with self.subTest(case=case):
+                p = self.case / "fx-bad.json"
+                p.write_text(base[:-1] + tail, encoding="utf-8")
+                self.assert_whole_plan_refused(self.write_plan([self.item(self.specs[0], "A", a), self.item(p, "B", a)]), "LEG_SPEC_INVALID item=2 ")
+
     def test_r4_a1_a_valid_opt_out_and_scale_still_run(self) -> None:
         # the added preflight is the leg process's own predicates, no stricter: a well-formed opt-out, scale and playSeconds are accepted
         p = self.case / "fx-ok.json"
@@ -5716,6 +5831,25 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 for p in (self.events, self.claim_path):
                     p.unlink(missing_ok=True)
                 spec = self.case / f"shape-{case}.json"
+                spec.write_text(text, encoding="utf-8")
+                r = self.run_batch([spec])
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
+                self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+                self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_r2n1_a7_a_spec_the_strict_reader_cannot_type_is_refused_before_the_claim(self) -> None:
+        # adversary-7c5bfe86.json A7 (R2-NARROW-1 r2), its input: a leg spec that declares `legType` twice. The shape check and the export budget read it last-wins (ConvertFrom-Json keeps the
+        # LAST member), the strict reader (Get-VenuePlannedLegType: a repeated member in any spelling is 'unknown') refuses to type it, so one set of bytes was planned as one thing and classified as
+        # another. RED on 7c5bfe86: the batch took a claim and ran the leg. The set planner already refuses such bytes (DVE_LEGSET_INVALID); the scalar and plan routes now refuse them too, typed,
+        # before any claim.
+        base = self._valid_leg_spec_text()
+        # (the schema's legType enum is speed | look | export; both cases are valid shapes by the last member, so only the strict reader tells them apart from a clean spec)
+        for case, text in (("dup-speed-speed", base[:-1] + ', "legType": "speed", "legType": "speed"}'), ("dup-export-speed", base[:-1] + ', "legType": "export", "legType": "speed"}')):
+            with self.subTest(case=case):
+                for p in (self.events, self.claim_path):
+                    p.unlink(missing_ok=True)
+                spec = self.case / f"dup-{case}.json"
                 spec.write_text(text, encoding="utf-8")
                 r = self.run_batch([spec])
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)

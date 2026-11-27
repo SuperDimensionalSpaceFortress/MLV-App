@@ -32,6 +32,9 @@ if (@($InputPath).Count -eq 0) {
     throw "At least one input JSON/profile/field-log path is required."
 }
 
+# adversary-ac6205bd.json A2: the venue reader's duplicate-member scan (System.Text.Json)
+Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function Find-VenueJsonDuplicateMember -DisableNameChecking
+
 function Read-JsonRecords {
     param([string]$Path)
 
@@ -45,6 +48,12 @@ function Read-JsonRecords {
         throw "Input JSON is empty: $resolved"
     }
 
+    # adversary-ac6205bd.json A2: ConvertFrom-Json keeps the LAST of two same-named members ("hostLoadCollected":false,"hostLoadCollected":true reads
+    # true), so a record that repeats a member anywhere is refused, never compared (a JSONL file is checked line by line below)
+    $wholeDuplicate = $null
+    $wholeParses = $true
+    try { $wholeDuplicate = Find-VenueJsonDuplicateMember -Text $raw -All } catch { $wholeParses = $false }
+    if ($wholeDuplicate) { throw "Input JSON repeats the member $wholeDuplicate in ${resolved}; a repeated member is never read as evidence." }
     # r14 (sol r13 B4, adversary r14 A2): a repeated key is refused, never collapsed to its last value. A text that parses as ONE JSON document is checked whole (and the refusal is thrown
     # outside the try, so it is not mistaken for a JSONL file); a JSONL text is checked line by line below.
     $wholeParsed = $false
@@ -58,7 +67,7 @@ function Read-JsonRecords {
         Assert-FpsJsonNoRepeatedKey $raw $resolved
     }
     try {
-        if (-not $wholeParsed) { throw 'not one JSON document' }
+        if (-not ($wholeParses -and $wholeParsed)) { throw 'not one JSON document' }
         return @([pscustomobject]@{
             source = $resolved
             json = $wholeJson
@@ -72,6 +81,12 @@ function Read-JsonRecords {
             if ([string]::IsNullOrWhiteSpace($line)) {
                 continue
             }
+            $lineDuplicate = $null
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A2): a line the strict scanner cannot read (a comment between two
+            # repeated members, a trailing comma: ConvertFrom-Json accepts both and keeps the LAST value) is refused, never parsed by the looser reader.
+            try { $lineDuplicate = Find-VenueJsonDuplicateMember -Text $line -All }
+            catch { throw "Input JSONL line ${lineNumber} in ${resolved} is not strict JSON, so its members cannot be proved unique: $($_.Exception.Message -replace '\s+', ' ')" }
+            if ($lineDuplicate) { throw "Input JSONL repeats the member $lineDuplicate in ${resolved} at line ${lineNumber}; a repeated member is never read as evidence." }
             try {
                 Assert-FpsJsonNoRepeatedKey $line "${resolved}:$lineNumber"
                 $records += [pscustomobject]@{
@@ -468,19 +483,18 @@ function Get-PlaybackAbLegHostLoadProvisional {
     if ($null -eq $Leg) {
         return $true
     }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (sol r6 B1): the ONE strict predicate (state exactly 'quiet' ordinal, provisional a real [bool]
+    # $false, hostLoadCollected a real [bool] $true); [bool] coercion read provisional 0 / [false] as clean, -ne read 'QUIET' as quiet, and an
+    # uncollected leg was never checked. Values are assigned directly from PSObject.Properties, never coerced.
+    if ($Leg -is [System.Collections.IList]) { return $true }
+    $legProvisionalRaw = $null; $legStateRaw = $null; $legCollectedRaw = $null
     $provisionalProperty = $Leg.PSObject.Properties["hostLoadProvisional"]
-    $provisionalDeclared = if ($null -eq $provisionalProperty -or $null -eq $provisionalProperty.Value) {
-        $true
-    } else {
-        [bool]$provisionalProperty.Value
-    }
+    if ($null -ne $provisionalProperty) { $legProvisionalRaw = $provisionalProperty.Value }
     $stateProperty = $Leg.PSObject.Properties["hostLoadState"]
-    $state = if ($null -eq $stateProperty -or [string]::IsNullOrWhiteSpace([string]$stateProperty.Value)) {
-        "unknown"
-    } else {
-        [string]$stateProperty.Value
-    }
-    ($provisionalDeclared -or $state -ne "quiet")
+    if ($null -ne $stateProperty) { $legStateRaw = $stateProperty.Value }
+    $collectedProperty = $Leg.PSObject.Properties["hostLoadCollected"]
+    if ($null -ne $collectedProperty) { $legCollectedRaw = $collectedProperty.Value }
+    -not ($legProvisionalRaw -is [bool] -and -not $legProvisionalRaw -and $legStateRaw -is [string] -and [string]::Equals($legStateRaw, 'quiet', [StringComparison]::Ordinal) -and $legCollectedRaw -is [bool] -and $legCollectedRaw)
 }
 
 function Get-PlaybackAbHostLoadRefusal {
@@ -492,7 +506,7 @@ function Get-PlaybackAbHostLoadRefusal {
 
     # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A6, sibling): same leg choice as Get-PlaybackAbFpsArmRefusal below: a record with a speedCompare judges its candidateSpeed leg, and a missing one
     # reads as provisional (Get-PlaybackAbLegHostLoadProvisional treats a null leg as provisional), never as the ordinary candidate.
-    # r6 (adversary pass 5 A3): the leg is ASSIGNED inside each branch. `$x = if (...) { $Record.candidateSpeed }` unrolls a one-element array into the leg inside it, so a malformed
+    # r6 (adversary pass 5 A3) and adversary-7efea617.json A3: the leg is ASSIGNED inside each branch. `$x = if (...) { $Record.candidateSpeed }` unrolls a one-element array into the leg inside it, so a malformed
     # container the direct readers refuse was judged as that leg; an assignment keeps the container whole.
     if ($Record.speedCompare) { $candidateLeg = $Record.candidateSpeed } else { $candidateLeg = $Record.candidate }
     $baselineProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $Record.baseline

@@ -88,9 +88,29 @@ $legs = foreach ($s in $specs) {
                 playback = [ordered]@{ sourceAdvanced = 600; requiredSourceFrames = 600; nativeFps = 23.976; paceFps = 23.976 }
                 display = [ordered]@{ requestedMode = 'fullscreen' }; scale = [ordered]@{ requestedScale = 1 } }
             if ($idm -ceq 'nobackend') { $rc.subject.Remove('backend') }
+            # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: like the real leg, the receipt binds its smoke result (<root parent>\evidence\<receiptId>\result.json). FAKE_HOSTLOAD:
+            # quiet (default) | cim (the 2026-11-21 a134532e CimException shape) | none (no smoke result bound)
+            $hlm = $(if ($env:FAKE_HOSTLOAD) { $env:FAKE_HOSTLOAD } else { 'quiet' })
+            if ($hlm -cne 'none') {
+                $hlb = $(if ($hlm -ceq 'cim') { '{"before":{"collected":false,"error":"collection failed: CimException"},"after":{"collected":false,"error":"collection failed: CimException"},"state":"unknown","provisional":true}' }
+                         else { '{"before":{"collected":true},"after":{"collected":true},"state":"quiet","provisional":false}' })
+                $ed = Join-Path $env:FAKE_ROOT "evidence\$($rc.receiptId)"
+                New-Item -ItemType Directory -Force -Path $ed | Out-Null
+                $rb = [Text.UTF8Encoding]::new($false).GetBytes('{"schema":"mlvapp-gui-smoke-result.v2","hostLoad":' + $hlb + '}')
+                [IO.File]::WriteAllBytes((Join-Path $ed 'result.json'), $rb)
+                $rc['evidence'] = [ordered]@{ resultJsonSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rb)).ToLowerInvariant() }
+            }
             Set-Content -LiteralPath $rp -Value ($rc | ConvertTo-Json -Depth 8)
+            # adversary-7efea617.json A2: like the real chain row (Invoke-VenueChain.ps1 receiptSha256), the row carries the sha256 of the receipt bytes the leg published;
+            # FAKE_CHAIN_NO_PUBLISHED_SHA=1 leaves the member out, as a legacy chain row does
+            $rsha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([IO.File]::ReadAllBytes($rp))).ToLowerInvariant()
             if ($mode -ceq 'noreceipt') { Remove-Item -LiteralPath $rp -Force }
-            [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = $outc; legExit = 0; receipt = $rp }
+            $row = [ordered]@{ name = $name; spec = $s; backend = $Backend; status = 'RAN'; verdict = 'QUIET'; outcome = $outc; legExit = 0; receipt = $rp }
+            if ($env:FAKE_CHAIN_NO_PUBLISHED_SHA -cne '1') { $row['receiptSha256'] = $rsha }
+            # FAKE_CHAIN_HL_REFUSED=1: the row as the real chain writes it when it skipped the host-load read at its deadline (class HOSTLOAD_PROVISIONAL, the unknown provisional standing),
+            # over a result.json that is still quiet and hash-bound: the baseline must carry that refusal, never re-read the standing and promote the row
+            if ($env:FAKE_CHAIN_HL_REFUSED -ceq '1') { $row['class'] = 'HOSTLOAD_PROVISIONAL'; $row['hostLoadState'] = 'unknown'; $row['hostLoadProvisional'] = $true }
+            [pscustomobject]$row
         }
         { $_ -ceq 'legfail' -or ($_ -ceq 'ranfail' -and $n -gt 1) } { [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'LEG_FAILED'; verdict = 'QUIET'; outcome = 'INVALID'; printedOutcome = 'PASS'; legExit = 5; receipt = $null } }
         default { [pscustomobject]@{ name = $name; spec = $s; backend = $Backend; status = 'NOT_RUN'; verdict = 'DEADLINE'; reason = 'deadline-before-leg' } }
@@ -762,6 +782,85 @@ class VenueBaselineTests(unittest.TestCase):
         self.assertIn("reason=OK", p.stdout)
         res = self.result(p.stdout)
         self.assertEqual((res["reason"], res["rowsAppended"], res["measuredRows"]), ("OK", 4, 4), res)
+
+    def test_hostload_r3_a_provisional_or_unknown_ran_row_is_never_measured(self) -> None:
+        """VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1, its literal): the baseline counted a RAN row with a rate whatever its host load. A row whose hash-bound
+        smoke result says CimException (or that binds none) is recorded with hostLoadState / hostLoadProvisional and a REFERENCE_PROVISIONAL line, never measured."""
+        for mode in ("cim", "none"):
+            with self.subTest(hostload=mode):
+                self.trend.unlink(missing_ok=True)
+                p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD=mode)
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                self.assertIn("reason=NO_MEASUREMENT", p.stdout)
+                self.assertIn("REFERENCE_PROVISIONAL leg=rcpt-", p.stdout)
+                res = self.result(p.stdout)
+                self.assertEqual((res["rowsAppended"], res["measuredRows"]), (4, 0), res)
+                rows = [json.loads(l) for l in self.trend.read_text(encoding="utf-8").splitlines() if l.strip()]
+                self.assertEqual({(r["status"], r["hostLoadState"], r["hostLoadProvisional"]) for r in rows}, {("RAN", "unknown", True)}, rows)
+        # row (c): the quiet control is still counted and says so
+        self.trend.unlink(missing_ok=True)
+        p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet")
+        res = self.result(p.stdout)
+        self.assertEqual((res["reason"], res["measuredRows"]), ("OK", 4), res)
+        self.assertNotIn("REFERENCE_PROVISIONAL", p.stdout)
+        rows = [json.loads(l) for l in self.trend.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertEqual({(r["hostLoadState"], r["hostLoadProvisional"]) for r in rows}, {("quiet", False)}, rows)
+
+    def test_hostload_r2_a2_a_chain_row_without_a_published_sha_binds_no_host_load(self) -> None:
+        """adversary-7efea617.json A2 (the legacy-row tail), its input: a chain row with NO receiptSha256 member over a quiet, hash-bound smoke result. RED on 7c79d20b: the
+        baseline used the sha256 of its own read as the expectation of that read, so the row read quiet and was measured. With no published sha the standing is unknown and
+        provisional (never measured); the same chain with the member still reads quiet and is measured."""
+        self.trend.unlink(missing_ok=True)
+        p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet", FAKE_CHAIN_NO_PUBLISHED_SHA="1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("REFERENCE_PROVISIONAL leg=rcpt-", p.stdout)
+        res = self.result(p.stdout)
+        self.assertEqual((res["reason"], res["rowsAppended"], res["measuredRows"]), ("NO_MEASUREMENT", 4, 0), res)
+        rows = [json.loads(l) for l in self.trend.read_text(encoding="utf-8").splitlines() if l.strip()]
+        self.assertEqual({(r["status"], r["hostLoadState"], r["hostLoadProvisional"]) for r in rows}, {("RAN", "unknown", True)}, rows)
+        self.trend.unlink(missing_ok=True)
+        p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet")
+        self.assertEqual((self.result(p.stdout)["reason"], self.result(p.stdout)["measuredRows"]), ("OK", 4), p.stdout)
+
+    def test_hostload_mr1_a5_a_receipt_the_row_figures_refused_binds_no_host_load(self) -> None:
+        """adversary-55dcf49e.json A5, its input class: a clean zero-exit chain row with a published sha for its receipt and an unchanged quiet, fully collected result.json, but the
+        receipt is REFUSED by Get-RowFigures (the validator rejects it, as it does a receipt whose evidence manifest is gone; or its identity is not this run's). RED on 55dcf49e: the
+        host-load reader still got that receipt's hash expectations, so the refused row was stamped quiet, provisional=false, collected=true. A refused receipt binds nothing: the row
+        reads unknown, provisional and uncollected. The same chain with an accepted receipt (advisory, no signal) still reads quiet."""
+        refused = [("validator-invalid", {"FAKE_VALIDATOR_MODE": "invalid"}), ("validator-incomplete", {"FAKE_VALIDATOR_MODE": "incomplete"}),
+                   ("validator-unknown-status", {"FAKE_VALIDATOR_MODE": "unknown"}), ("validator-error", {"FAKE_VALIDATOR_MODE": "error"}),
+                   ("identity-wrongid", {"FAKE_VALIDATOR_MODE": "advisory", "FAKE_RECEIPT_IDENTITY": "wrongid"}),
+                   ("identity-wrongleg", {"FAKE_VALIDATOR_MODE": "advisory", "FAKE_RECEIPT_IDENTITY": "wrongleg"})]
+        for label, env in refused:
+            with self.subTest(refused=label):
+                self.trend.unlink(missing_ok=True)
+                p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet", **env)
+                rows = self.trend_rows()
+                self.assertEqual(len(rows), 4, p.stdout + p.stderr)
+                for r in rows:
+                    self.assertEqual((r["hostLoadState"], r["hostLoadProvisional"], r["hostLoadCollected"]), ("unknown", True, False), r)
+        for label, validator in (("advisory", "advisory"), ("nosignal", "nosignal")):
+            with self.subTest(accepted=label):
+                self.trend.unlink(missing_ok=True)
+                self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE=validator, FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet")
+                self.assertEqual({(r["hostLoadState"], r["hostLoadProvisional"], r["hostLoadCollected"]) for r in self.trend_rows()}, {("quiet", False, True)})
+
+    def test_hostload_r4n2_a5_the_chains_host_load_refusal_survives_the_handoff_to_the_baseline_rows(self) -> None:
+        """adversary-6596e055.json A5, its input: the chain skipped the host-load read at its deadline (its row: class HOSTLOAD_PROVISIONAL, hostLoadState unknown, hostLoadProvisional
+        true, receiptSha256 present) over a clean zero-exit chain, an ADVISORY receipt and a result.json that is still quiet and hash-bound. RED on 077be843: the baseline re-read the
+        standing on a fresh 20 s budget, the row became quiet / provisional=false and was counted in measuredRows. The refusal is the chain's to give and the baseline carries it: the rows
+        read unknown, provisional and uncollected, none is measured. The same chain without the refusal still reads quiet."""
+        self.trend.unlink(missing_ok=True)
+        p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet", FAKE_CHAIN_HL_REFUSED="1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("REFERENCE_PROVISIONAL leg=rcpt-", p.stdout)
+        res = self.result(p.stdout)
+        self.assertEqual((res["reason"], res["rowsAppended"], res["measuredRows"]), ("NO_MEASUREMENT", 4, 0), res)
+        rows = self.trend_rows()
+        self.assertEqual({(r["status"], r["hostLoadState"], r["hostLoadProvisional"], r["hostLoadCollected"]) for r in rows}, {("RAN", "unknown", True, False)}, rows)
+        self.trend.unlink(missing_ok=True)
+        p = self.run_with_env(self.args(), FAKE_CHAIN_MODE="ok", FAKE_VALIDATOR_MODE="advisory", FAKE_RECEIPT_OUTCOME="PASS", FAKE_HOSTLOAD="quiet")
+        self.assertEqual((self.result(p.stdout)["reason"], self.result(p.stdout)["measuredRows"]), ("OK", 4), p.stdout)
 
     # F: the receipt read must be the one this run's leg wrote.
     def test_f_a_receipt_that_is_not_the_one_this_run_wrote_yields_no_figures(self) -> None:

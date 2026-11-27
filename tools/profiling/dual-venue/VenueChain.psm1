@@ -1226,6 +1226,31 @@ $script:VenueTestPostClockStartDelayMs = 0
 # NTP/VM-resume step between a caller's own wall-clock sample and this call's is. Production leaves it 0. The lease batch no longer hands a monotonic budget over as an instant at
 # all (-CallBudgetClock/-CallBudgetEndSec), so a step cannot reach its call; -CallDeadlineUtc stays for the nightly, whose own cap is a UTC deadline end to end.
 $script:VenueTestUtcStepSec = 0
+# Test-only (VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r2, adversary-7efea617.json A4): Read-VenueFileBytesBounded's worker sleeps this many ms before it reads, as a share that
+# answers late does. Production leaves it 0.
+$script:VenueTestFileReadDelayMs = 0
+# Test-only (VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2, adversary-6596e055.json A3): Invoke-VenueBoundedRead sleeps this many ms after it created the worker and gave it its script and
+# argument, right before the budget is looked at again and BeginInvoke runs, as a caller descheduled during worker setup does. Production leaves it 0.
+$script:VenueTestPreBeginDelayMs = 0
+# Test-only (VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2, adversary-d10f5241.json A2): Read-VenueFileBytesBounded sleeps this many ms after its read answered and before it judges the answer against
+# -EndUtc, as a caller suspended (or a wall clock stepped) inside the read does. Production leaves it 0.
+$script:VenueTestPostReadDelayMs = 0
+# Test-only (R2-RESIDUE-1 r1, adversary-3be19c39.json A2): Get-VenueLegHostLoad sleeps this many ms after Read-VenueFileBytesBounded handed it its bytes and before it classifies them, as a caller suspended
+# between the read's own end check and the classification is. Production leaves it 0.
+$script:VenueTestPostBytesDelayMs = 0
+$script:VenueTestPostReceiptBytesDelayMs = 0   # the same stall after the RECEIPT read (the export-exemption return acts on that answer)
+# Test-only (R2-NARROW-1 r7, adversary-aab90f89.json A1): Get-VenueLegHostLoad sleeps this many ms after it starts its read stopwatch and before it samples the caller's deadline, as a caller descheduled there is. Production leaves it 0.
+$script:VenueTestPreDeadlineSampleDelayMs = 0
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the worker of Read-VenueFileBytesBounded. It is handed the ABSOLUTE UTC end of the caller's budget (endUtcTicks, 0 = none) and
+# checks it before the existence probe and again before ReadAllBytes, so a read that was started in time still performs no I/O once the end has passed. (No apostrophe in the messages: this is single-quoted text.)
+# Test-only (R2-NARROW-1 r2, adversary-baf2e69a.json A1): Read-VenueFileBytesBounded sleeps this many ms right after it samples the caller's stopwatch, as a caller descheduled there is, and with
+# -VenueTestCaptureWorkerArg set keeps the argument it handed its worker in -VenueTestLastFileWorkerArg. Production leaves them 0 / $false / $null.
+$script:VenueTestReadSampleDelayMs = 0
+$script:VenueTestCaptureWorkerArg = $false
+$script:VenueTestLastFileWorkerArg = $null
+# R2-NARROW-1 r2 (adversary-7c5bfe86.json A4): the worker is handed the caller's STOPWATCH and its end too (clock, clockEndSec), and refuses when EITHER end has passed: a wall clock stepped back after the UTC end
+# was projected leaves that end far in the future, while the stopwatch cannot step.
+$script:VenueFileReadWorkerText = 'param($a) $ErrorActionPreference = ''Stop''; if ($a.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$a.delayMs) }; if (($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) -or ($null -ne $a.clock -and $a.clock.Elapsed.TotalSeconds -ge $a.clockEndSec)) { throw ''the call end had passed before the read started; no file was touched'' }; if ($a.missingOk -and -not (Test-Path -LiteralPath $a.path -PathType Leaf)) { return }; if (($a.endUtcTicks -gt 0 -and [DateTime]::UtcNow.Ticks -ge $a.endUtcTicks) -or ($null -ne $a.clock -and $a.clock.Elapsed.TotalSeconds -ge $a.clockEndSec)) { throw ''the call end passed during the existence probe; the file was not read'' }; ,[IO.File]::ReadAllBytes($a.path)'
 
 function Complete-VenueProcess {
     <#
@@ -1257,11 +1282,24 @@ function Invoke-VenueBoundedRead {
     # finite number is REFUSED, typed, before the worker starts. NaN skipped both the clamp (NaN -lt x is false: the full -TimeoutSec wait) and the late-answer rejection
     # (Elapsed - NaN -gt 0 is false), so an answer past the caller's end was acted on.
     if (-not [double]::IsFinite($EndSec)) { throw "VENUE_BUDGET_ENDPOINT_NONFINITE -EndSec is $($EndSec.ToString([Globalization.CultureInfo]::InvariantCulture)); a budget endpoint that is not a finite number is refused, never read as a wait wider than the caller's end" }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R3-MERGE-RESIDUE-1 r1 (adversary-55dcf49e.json A3): a caller whose budget is already spent starts NO read. The worker used to be launched first and the
+    # clock looked at only afterwards, so a caller descheduled past its end still sent the worker to do the I/O (Test-Path, ReadAllBytes) and merely discarded the answer; the late-answer
+    # check below protects the result, never the I/O. Every caller that hands over -Clock/-EndSec (Read-VenueFileBytesBounded, so Get-VenueLegHostLoad's second read, the chain's and the
+    # batch's host-load reads, and the staged-manifest reads) gets this one check, so no per-site copy can miss it.
+    if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -le 0) {
+        return [pscustomobject]@{ answered = $false; value = @(); error = "no time is left of the caller's budget to start the read (its end passed $([Math]::Round($Clock.Elapsed.TotalSeconds - $EndSec, 2)) s ago); nothing was started" }
+    }
     $ps = [powershell]::Create()
     $abandoned = $false
     try {
         [void]$ps.AddScript($ScriptText)
         [void]$ps.AddArgument($Argument)
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the budget is looked at AGAIN right before BeginInvoke. The check above runs before the worker is created and given
+        # its script and argument; a caller descheduled during that setup used to resume past its end and still start the I/O. (Disposed unstarted by the finally below.)
+        if ($script:VenueTestPreBeginDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreBeginDelayMs) }
+        if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -le 0) {
+            return [pscustomobject]@{ answered = $false; value = @(); error = "no time is left of the caller's budget to start the read (its end passed $([Math]::Round($Clock.Elapsed.TotalSeconds - $EndSec, 2)) s ago, during the worker's setup); nothing was started" }
+        }
         $async = $ps.BeginInvoke()
         if ($script:VenueTestPreWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreWaitDelayMs) }
         # r13 (Grok G20 on #814): $endCut = the caller's end, not -TimeoutSec, set the wait (as the nightly's capCut), so the message reports the wait actually given
@@ -1283,6 +1321,57 @@ function Invoke-VenueBoundedRead {
     } catch {
         [pscustomobject]@{ answered = $false; value = @(); error = $_.Exception.Message }
     } finally { if (-not $abandoned) { $ps.Dispose() } }
+}
+
+function Read-VenueFileBytesBounded {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r2 (adversary-7efea617.json A4): one file's bytes, read on Invoke-VenueBoundedRead's worker and given up on after -TimeoutSec, so a
+    path that stopped answering (a dead share, a stalled disk) costs the caller its bound and never an unbounded wait. Returns the byte array; $null when -MissingIsNull and the file
+    does not exist. A read that fails or does not answer in time THROWS a message that names the leaf and the reason, so the caller's own catch types it.
+    #>
+    # pass 2 (adversary-b3d61554.json A1): -Clock / -EndSec are the CALLER's one budget across every read it makes (Get-VenueLegHostLoad starts one Stopwatch and gives both reads the
+    # same end), so two reads never each get a fresh bound, the wait is cut to what is left of it, and an answer that arrives after the end is never acted on (Invoke-VenueBoundedRead's
+    # own late-answer check). Without them -TimeoutSec alone bounds this one read.
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-ac722a96.json A4): -EndUtc is the caller's ABSOLUTE end (Get-VenueLegHostLoad's -CallDeadlineUtc). The worker's own end is the EARLIER of that and
+    # the one derived from the stopwatch budget (an instant computed from a remainder on a wall clock that was stepped since the caller sampled it would otherwise land past the caller's end), and a
+    # read whose absolute end has already passed on the wall clock starts nothing.
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][double]$TimeoutSec, [switch]$MissingIsNull, [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [DateTime]$EndUtc)
+    # (-VenueTestFileReadDelayMs is a test-only seam: the worker sleeps that long first, as a share that answers late does; production leaves it 0)
+    # pass 2 (A11): $ErrorActionPreference Stop, so a failed read is a terminating error the bounded read reports (its message names the cause), never an empty answer read as "no file"
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A3): the worker is handed the ABSOLUTE UTC end of this read (the wait it is given: -TimeoutSec, cut to what is left of the caller's
+    # -Clock/-EndSec) and refuses to touch the file once it has passed ($script:VenueFileReadWorkerText checks it before the probe and before ReadAllBytes)
+    $boundSec = [Math]::Min(600.0, [Math]::Max(1.0, $TimeoutSec))
+    # R2-NARROW-1 r2 (adversary-7c5bfe86.json A4, and adversary-baf2e69a.json A1): the monotonic end (the caller's stopwatch, or one started now) handed to the worker beside the UTC tick end is derived from
+    # ONE sample of that clock taken here ($entrySec): a remainder measured at one sample and added to a later clock read lands past the real end by however long the caller was descheduled between them
+    $workClock = $(if ($null -ne $Clock) { $Clock } else { [Diagnostics.Stopwatch]::StartNew() })
+    $entrySec = $workClock.Elapsed.TotalSeconds
+    if ($script:VenueTestReadSampleDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestReadSampleDelayMs) }
+    $waitSec = $(if ($null -ne $Clock) { [Math]::Min([double]$boundSec, $EndSec - $entrySec) } else { $boundSec })
+    $workEndSec = $entrySec + [Math]::Max(0.0, $waitSec)
+    $endTicks = [DateTime]::UtcNow.AddSeconds([Math]::Max(0.0, $waitSec)).Ticks
+    if ($PSBoundParameters.ContainsKey('EndUtc')) {
+        $absoluteEnd = $EndUtc.ToUniversalTime()
+        if ($absoluteEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: the caller's absolute end had already passed; nothing was started" }
+        if ($absoluteEnd.Ticks -lt $endTicks) { $endTicks = $absoluteEnd.Ticks }
+    }
+    $workerArg = @{ path = $Path; missingOk = [bool]$MissingIsNull; delayMs = $script:VenueTestFileReadDelayMs; endUtcTicks = $endTicks; clock = $workClock; clockEndSec = $workEndSec }
+    if ($script:VenueTestCaptureWorkerArg) { $script:VenueTestLastFileWorkerArg = $workerArg }
+    $r = $(if ($null -ne $Clock) { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec -Clock $Clock -EndSec $EndSec -EndIsBoundEnd }
+           else { Invoke-VenueBoundedRead -ScriptText $script:VenueFileReadWorkerText -Argument $workerArg -TimeoutSec $boundSec })
+    if (-not $r.answered) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: $($r.error)" }
+    # adversary-d10f5241.json A2: an answer is judged against the ABSOLUTE end when it is OBSERVED too, not only before the read starts: the late-answer check inside Invoke-VenueBoundedRead reads the
+    # stopwatch alone, so a wall clock stepped (or a caller suspended) inside the read let bytes seen after the caller's UTC deadline be acted on and a leg be counted
+    if ($PSBoundParameters.ContainsKey('EndUtc')) {
+        if ($script:VenueTestPostReadDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPostReadDelayMs) }
+        if ($EndUtc.ToUniversalTime().AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) { throw "the read of '$([IO.Path]::GetFileName($Path))' did not finish: an answer seen after the caller's absolute end is never acted on" }
+    }
+    $got = @($r.value)
+    if ($got.Count -eq 0) {
+        if ($MissingIsNull) { return $null }
+        throw "the read of '$([IO.Path]::GetFileName($Path))' returned nothing"
+    }
+    return ,([byte[]]$got[0])
 }
 
 function Get-VenueRemoteJobIds {
@@ -1662,6 +1751,413 @@ function Get-VenueLegPreLoadMean {
         if ($null -eq $q -or $null -eq $q.timeMeanPercent) { return $null }
         [double]$q.timeMeanPercent
     } catch { $null }
+}
+
+function Test-VenueHlObject([object]$O) {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: an object or a dictionary to read members from; never a scalar, a string or a list (adversary-8c2884e9.json A1).
+    if ($null -eq $O -or $O -is [string] -or $O -is [ValueType]) { return $false }
+    if ($O -is [System.Collections.IDictionary]) { return $true }
+    -not ($O -is [Array] -or $O -is [System.Collections.IList])
+}
+
+function Test-VenueOrdinalIn {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r1 (adversary-fd0141e8.json A2): membership by ORDINAL, case-sensitive comparison of printable ASCII only.
+    # PowerShell's -ceq / -cin / -cnotin compare by the current culture, which ignores a soft hyphen (U+00AD) and other ignorable characters, so 'PA<U+00AD>SS' -cin
+    # @('PASS') is true. A token or a member name with any character outside 0x20-0x7E is never in the set, whatever it would collate to.
+    param([object]$Value, [string[]]$Set)
+    if ($Value -isnot [string]) { return $false }
+    foreach ($ch in $Value.ToCharArray()) { if ([int]$ch -lt 0x20 -or [int]$ch -gt 0x7E) { return $false } }
+    foreach ($member in $Set) { if ([string]::Equals($Value, $member, [StringComparison]::Ordinal)) { return $true } }
+    return $false
+}
+
+function Get-VenueHlMember([object]$O, [string]$N) {
+    # The member's value as it is (the unary comma stops the pipeline unrolling a one-element array); a dictionary is read by key (adversary-b0c05520.json A8).
+    if (-not (Test-VenueHlObject $O)) { return $null }
+    if ($O -is [System.Collections.IDictionary]) { if ($O.Contains($N)) { return , $O[$N] }; return $null }
+    $p = $O.PSObject.Properties[$N]
+    if ($null -eq $p) { return $null }
+    , $p.Value
+}
+
+function Test-VenueHlHasMember([object]$O, [string]$N) {
+    # adversary-90151822.json A1: whether the member is there at all, so a member present with a null value is told apart from an absent one.
+    if (-not (Test-VenueHlObject $O)) { return $false }
+    if ($O -is [System.Collections.IDictionary]) { return [bool]$O.Contains($N) }
+    $null -ne $O.PSObject.Properties[$N]
+}
+
+function ConvertFrom-VenueBomBytes([byte[]]$Bytes) {
+    # adversary-ac6205bd.json A5: file bytes decoded by their byte-order mark (UTF-8, UTF-16 LE/BE, UTF-32), as Get-Content and ReadAllText do; no BOM reads
+    # UTF-8. A forced UTF-8 decode turned a UTF-16 smoke result, receipt or spec into replacement characters and NULs (unknown, never its real standing).
+    if ($null -eq $Bytes -or $Bytes.Length -eq 0) { return '' }
+    $reader = [IO.StreamReader]::new([IO.MemoryStream]::new($Bytes), [Text.UTF8Encoding]::new($false), $true)
+    try { $reader.ReadToEnd() } finally { $reader.Dispose() }
+}
+
+function Find-VenueJsonDuplicateMember {
+    # adversary-b0c05520.json A2: ConvertFrom-Json keeps the LAST of two same-named members, so a duplicate could pick a clean value. The first duplicated member
+    # name (case-insensitive, as PowerShell property lookup is) at the root or anywhere under a root hostLoad member, or $null when there is none.
+    # adversary-90151822.json A2: -All walks the whole document (the receipt: a repeated export or evidence member must not pick the export branch or the hash).
+    param([Parameter(Mandatory)][string]$Text, [switch]$All)
+    # R2-NARROW-1 r2 (adversary-7c5bfe86.json A6, adversary-baf2e69a.json A4): JsonDocument.Parse defaults to a depth limit of 64, while the readers' own parsers accept far more (ConvertFrom-Json -Depth 100
+    # for the figure readers, its default 1024 for the venue readers); a valid, duplicate-free document nested 65.. deep threw here and read unknown. The scan accepts the deepest the default reader does (1024);
+    # a document a stricter figure parser refuses is judged unknown by its caller (compare-release-gui-smoke-ab.ps1 records the refusal), and one deeper than any parser accepts is refused by the parsers.
+    $docOptions = [System.Text.Json.JsonDocumentOptions]::new()
+    $docOptions.MaxDepth = 1024
+    $doc = [System.Text.Json.JsonDocument]::Parse($Text, $docOptions)
+    try {
+        $walk = $null
+        $walk = {
+            param($E, [string]$Path, [bool]$Deep)
+            if ($E.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                foreach ($m in $E.EnumerateObject()) {
+                    if (-not $seen.Add($m.Name)) { return "$Path.$($m.Name)" }
+                    if ($Deep -or [string]::Equals($m.Name, 'hostLoad', [StringComparison]::OrdinalIgnoreCase)) { $d = & $walk $m.Value "$Path.$($m.Name)" $true; if ($d) { return $d } }
+                }
+            } elseif ($Deep -and $E.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                $i = 0
+                foreach ($x in $E.EnumerateArray()) { $d = & $walk $x "$Path[$i]" $true; if ($d) { return $d }; $i++ }
+            }
+            $null
+        }
+        & $walk $doc.RootElement '$' ([bool]$All)
+    } finally { $doc.Dispose() }
+}
+
+function ConvertFrom-VenueSmokeHostLoad {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: a leg's standing from its smoke result's hostLoad block (the release GUI smoke writes it: state, provisional, before/after
+    snapshots with collected=). The canonical predicate of PLAYBACK-MEASURE-HOST-LOAD-GATE-1 (compare-release-gui-smoke-ab.ps1 Get-HostLoadComparisonEvidence):
+    clean iff state is exactly 'quiet' AND provisional is the boolean false; every other combination is provisional. Added here: a before or after snapshot
+    whose collected is not the boolean true (2026-11-21 leg a134532e: "collection failed: CimException") reads state 'unknown', never 'quiet' and never blank,
+    and a missing block reads 'unknown'. Returns { state; provisional; collected; reason }. Pure: no file access.
+    #>
+    # r1 (adversary-8c2884e9.json A1): a property value is returned as it is (the comma stops the pipeline unrolling a one-element array, so [false] or [true]
+    # is never read as the boolean inside it), and an array is never an object to read a property from. A2: the state is kept only when it is a plain ASCII
+    # lower-case token (no padding, control or format character); anything else reads 'unknown', and only the exact ordinal 'quiet' is clean.
+    # r1 (adversary-b0c05520.json A3): every interior (during) sample must be collected too; a during that is not a list, or an element that is not a collected
+    # snapshot, is not collected. A8: a dictionary block (ConvertFrom-Json -AsHashtable) is read by its keys.
+    param([AllowNull()][object]$HostLoad)
+    if (-not (Test-VenueHlObject $HostLoad)) {
+        return [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no hostLoad block in the smoke result' }
+    }
+    $errors = @()
+    $collected = $true
+    foreach ($side in 'before', 'after') {
+        $snap = Get-VenueHlMember $HostLoad $side
+        $c = Get-VenueHlMember $snap 'collected'
+        if (-not ($c -is [bool] -and $c)) {
+            $collected = $false
+            $err = Get-VenueHlMember $snap 'error'
+            $errors += "$side not collected$(if ($err) { " ($([string]$err))" })"
+        }
+    }
+    # adversary-90151822.json A1: a during member that is present is judged even when its value is null (the smoke always writes a list, so null is malformed);
+    # only an absent member (older smoke results) is skipped.
+    if (Test-VenueHlHasMember $HostLoad 'during') {
+        $during = Get-VenueHlMember $HostLoad 'during'
+        if ($null -eq $during -or $during -is [string] -or -not ($during -is [System.Collections.IList])) { $collected = $false; $errors += 'during is not a list of snapshots' }
+        else {
+            $bad = 0
+            foreach ($el in $during) { $c = Get-VenueHlMember $el 'collected'; if (-not ($c -is [bool] -and $c)) { $bad++ } }
+            if ($bad -gt 0) { $collected = $false; $errors += "$bad during sample(s) not collected" }
+        }
+    }
+    $stateRaw = Get-VenueHlMember $HostLoad 'state'
+    $state = $(if ($stateRaw -is [string] -and [regex]::IsMatch($stateRaw, '\A[a-z][a-z_-]{0,31}\z')) { $stateRaw } else { 'unknown' })
+    if (-not $collected) { $state = 'unknown' }
+    $prov = Get-VenueHlMember $HostLoad 'provisional'
+    $provisional = (-not ($prov -is [bool] -and -not $prov)) -or (-not [string]::Equals($state, 'quiet', [StringComparison]::Ordinal))
+    $why = Get-VenueHlMember $HostLoad 'reason'
+    $reason = @(@($errors) + @($(if ($why) { [string]$why }))) -join '; '
+    [pscustomobject]@{ state = $state; provisional = [bool]$provisional; collected = [bool]$collected; reason = $reason }
+}
+
+function ConvertFrom-VenueSmokeResultText {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (adversary-de8e3799.json A1): a smoke result.json's host-load standing from its TEXT, read the way Get-VenueLegHostLoad
+    reads it: a leading BOM is dropped; a repeated member at the root or under hostLoad reads 'unknown' (ConvertFrom-Json keeps the last one); the document is
+    parsed with -NoEnumerate, so a root or hostLoad singleton array is never unrolled into a clean object; a root that is not one object reads 'unknown'.
+    The block is then judged by ConvertFrom-VenueSmokeHostLoad. Pure.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Text)
+    $unknown = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'the smoke result could not be read' }
+    try {
+        if ([string]::IsNullOrEmpty($Text)) { return $unknown }
+        if ($Text[0] -eq [char]0xFEFF) { $Text = $Text.Substring(1) }
+        $dup = Find-VenueJsonDuplicateMember -Text $Text
+        if ($dup) { $unknown.reason = "the smoke result repeats the member $dup"; return $unknown }
+        $doc = ConvertFrom-Json -InputObject $Text -NoEnumerate
+        if (-not (Test-VenueHlObject $doc)) { $unknown.reason = 'the smoke result is not one JSON object'; return $unknown }
+        ConvertFrom-VenueSmokeHostLoad -HostLoad (Get-VenueHlMember $doc 'hostLoad')
+    } catch {
+        $unknown.reason = "the smoke result could not be read ($($_.Exception.Message -replace '\s+', ' '))"
+        $unknown
+    }
+}
+
+# VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A4): the typed receipt outcomes, the same list as DualVenueRunner.psm1
+# $script:OutcomeEnum (this module does not import the runner); HostLoadReceiptOutcomeEnumParityTests pins the two lists equal.
+$script:VenueReceiptOutcomeEnum = @('PASS', 'FAIL', 'VENUE_UNHEALTHY', 'VENUE_NOT_QUIESCENT', 'VENUE_HOST_MISMATCH', 'DEVICE_UNAVAILABLE', 'UNRESOLVED', 'RETRACTED', 'INVALID', 'VENUE_TOOLING', 'SCALE_NOT_HONOURED')
+
+function Test-VenueReceiptIsExportLeg([object]$Rc) {
+    # r3 (sol r2 B2): any object-valued export member exempted a playback receipt (export:{} on a playback receipt, or a leg SPEC passed as the receipt). An export
+    # leg is now only a receipt shaped as the shipped writer writes one (Invoke-VenueLeg.ps1 `if ($isExport)`): the receipt schema (New-DvReceipt), scale and display
+    # nulled (a playback receipt always carries both objects), and an export block that names its format and carries real export evidence: the export spec
+    # binding (receiptSha256, 64 hex) or an export verdict (a non-empty string). Anything else is a playback receipt and must bind its smoke result.
+    # r3 adversary-01a12498.json A1: scale:[] / display:[] (not objects) or absent members, any token-shaped format and any non-blank verdict passed. Now scale and
+    # display must be PRESENT and exactly null, the format one the runner ships (DualVenueRunner.psm1 $script:ExportFormats), the spec binding a 64-hex receiptSha256,
+    # the verdict null or an outcome token, and the receipt must bind NO playback evidence (evidence.resultJsonSha256 and logSha256 null or absent: the writer's
+    # export branch never sets them). A receipt that binds a smoke result is a playback leg and its own bound smoke result decides.
+    if (-not (Test-VenueHlObject $Rc)) { return $false }
+    $schema = Get-VenueHlMember $Rc 'schema'
+    if (-not ($schema -is [string] -and [string]::Equals($schema, 'mlv-app/dual-venue-receipt/v1', [StringComparison]::Ordinal))) { return $false }
+    foreach ($n in 'scale', 'display') { if (-not (Test-VenueHlHasMember $Rc $n) -or $null -ne (Get-VenueHlMember $Rc $n)) { return $false } }
+    $evd = Get-VenueHlMember $Rc 'evidence'
+    if ($null -ne $evd -and -not (Test-VenueHlObject $evd)) { return $false }
+    foreach ($n in 'resultJsonSha256', 'logSha256') { if ($null -ne (Get-VenueHlMember $evd $n)) { return $false } }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r1 (adversary-ac6205bd.json A6): NO playback evidence of any kind: a playback block (presentedFps) or a contact-frames
+    # binding is a playback receipt's, never the export writer's, so a receipt carrying either is not an export leg whatever its export block says
+    if ($null -ne (Get-VenueHlMember $Rc 'playback')) { return $false }
+    if ($null -ne (Get-VenueHlMember $evd 'contactFramesJsonSha256')) { return $false }
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A4): the visual capture block and the smoke stdout/stderr bindings are playback
+    # evidence too (Invoke-VenueLeg.ps1 sets receipt.visual only when Get-DvVisualCaptureRequest applies, never for an export leg, and the export branch
+    # completes its receipt before the smoke streams are collected), so a receipt carrying any of them is not an export leg.
+    if ($null -ne (Get-VenueHlMember $Rc 'visual')) { return $false }
+    foreach ($n in 'smokeStderrSha256', 'smokeStdoutSha256') { if ($null -ne (Get-VenueHlMember $evd $n)) { return $false } }
+    # adversary-c2bbe5f8.json A7: an ALLOW-list, not a deny-list. The export branch of Invoke-VenueLeg.ps1 sets only umRunJsonSha256, localEvidenceDir and
+    # summaryJsonSha256 (and umRunOutcome at the run); every other evidence member (evidenceManifestSha256, artifactIndexPath, any name not listed, any case
+    # variant) is a playback binding, so a receipt where one is non-null is not an export leg.
+    if ($null -ne $evd) {
+        $evdNames = $(if ($evd -is [System.Collections.IDictionary]) { @($evd.Keys | ForEach-Object { [string]$_ }) } else { @($evd.PSObject.Properties | ForEach-Object { $_.Name }) })
+        # adversary-fd0141e8.json A2: the allow-list is matched ORDINALLY (a name with a soft hyphen is not 'summaryJsonSha256')
+        foreach ($n in $evdNames) { if (-not (Test-VenueOrdinalIn $n @('summaryJsonSha256', 'umRunJsonSha256', 'localEvidenceDir', 'umRunOutcome')) -and $null -ne (Get-VenueHlMember $evd $n)) { return $false } }
+    }
+    $ex = Get-VenueHlMember $Rc 'export'
+    if (-not (Test-VenueHlObject $ex)) { return $false }
+    $fmt = Get-VenueHlMember $ex 'format'
+    if (-not ($fmt -is [string] -and ([string]::Equals($fmt, 'prores', [StringComparison]::Ordinal) -or [string]::Equals($fmt, 'cdng-lossless', [StringComparison]::Ordinal)))) { return $false }
+    $bind = Get-VenueHlMember $ex 'receiptSha256'
+    if (-not ($bind -is [string] -and [regex]::IsMatch($bind, '\A[0-9a-f]{64}\z'))) { return $false }
+    if (-not (Test-VenueHlHasMember $ex 'verdict')) { return $false }
+    $verdict = Get-VenueHlMember $ex 'verdict'
+    # adversary-ac6205bd.json A6: a non-null verdict is the receipt's own outcome (Invoke-VenueLeg.ps1 writes export.verdict = the export outcome), so an
+    # invented token ('NONEXISTENT' beside outcome PASS) is not an export verdict
+    # (Complete-Receipt may downgrade a PASS/FAIL outcome to INVALID or UNRESOLVED after the verdict is written, so that pair is the writer's too.)
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A4): the outcome and a non-null verdict must be typed receipt outcomes (the
+    # writer's enum, DualVenueRunner.psm1 $script:OutcomeEnum; Write-DvReceipt refuses anything else), never any upper-case token. A null verdict is the
+    # writer's only before the export ran, and that receipt's outcome is never PASS or FAIL (the export branch sets the verdict before it completes a
+    # PASS/FAIL), so a PASS or FAIL beside a null verdict is not the writer's.
+    $outcome = Get-VenueHlMember $Rc 'outcome'
+    # adversary-fd0141e8.json A2: every token comparison here is ORDINAL ASCII (Test-VenueOrdinalIn / String.Equals), never the culture-aware -cin / -ceq
+    if (-not (Test-VenueOrdinalIn $outcome $script:VenueReceiptOutcomeEnum)) { return $false }
+    if ($null -eq $verdict) { return -not (Test-VenueOrdinalIn $outcome @('PASS', 'FAIL')) }
+    if (-not (Test-VenueOrdinalIn $verdict $script:VenueReceiptOutcomeEnum)) { return $false }
+    [string]::Equals($verdict, $outcome, [StringComparison]::Ordinal) -or ((Test-VenueOrdinalIn $outcome @('INVALID', 'UNRESOLVED')) -and (Test-VenueOrdinalIn $verdict @('PASS', 'FAIL')))
+}
+
+function Get-VenuePlannedLegType {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B2): the PLANNED leg type of a leg, read from the leg spec the driver planned it from (never from its receipt):
+    'export' only when the spec is one JSON object, repeats no member, and its legType is exactly the string 'export'; 'playback' for any other readable spec;
+    'unknown' when the spec path is empty, unreadable or not one JSON object, or (with -ExpectSpecSha256) its bytes are not the planned bytes. Only 'export'
+    grants Get-VenueLegHostLoad's export exemption, so an unreadable plan is never exempt.
+    #>
+    # adversary-fa329743.json A3/A4: -SpecText judges the spec text the caller ALREADY read for its plan (its legId, its budget), so no second read can see
+    # other bytes and no extra (unbounded) file read happens; -SpecPath reads the file itself.
+    param([AllowNull()][AllowEmptyString()][string]$SpecPath, [AllowNull()][AllowEmptyString()][string]$ExpectSpecSha256, [AllowNull()][string]$SpecText)
+    try {
+        if ($PSBoundParameters.ContainsKey('SpecText')) {
+            if ([string]::IsNullOrEmpty($SpecText)) { return 'unknown' }
+            $text = $SpecText
+        } else {
+        if ([string]::IsNullOrWhiteSpace($SpecPath) -or -not (Test-Path -LiteralPath $SpecPath -PathType Leaf)) { return 'unknown' }
+        $bytes = [IO.File]::ReadAllBytes($SpecPath)
+        if (-not [string]::IsNullOrEmpty($ExpectSpecSha256)) {
+            $got = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+            if (-not [string]::Equals($got, $ExpectSpecSha256, [StringComparison]::OrdinalIgnoreCase)) { return 'unknown' }
+        }
+        $text = ConvertFrom-VenueBomBytes $bytes
+        }
+        if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+        if (Find-VenueJsonDuplicateMember -Text $text -All) { return 'unknown' }
+        $spec = ConvertFrom-Json -InputObject $text -NoEnumerate
+        if (-not (Test-VenueHlObject $spec)) { return 'unknown' }
+        $lt = Get-VenueHlMember $spec 'legType'
+        if ($lt -is [string] -and [string]::Equals($lt, 'export', [StringComparison]::Ordinal)) { return 'export' }
+        'playback'
+    } catch { 'unknown' }
+}
+
+function Get-VenueLegHostLoad {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the leg's host-load standing, read from the run's own smoke result (<evidence>\<receiptId>\result.json, which Invoke-VenueLeg
+    copies beside summary.json; the same evidence folder Get-VenueLegPreLoadMean reads), never from the receipt file. A playback leg (summary.json at the evidence
+    root) with no result.json, an unreadable one or no hostLoad block is 'unknown' and provisional. An export leg (export\summary.json only) runs no GUI smoke:
+    state 'not-applicable', provisional false, applies false, so its counting is unchanged. Returns ConvertFrom-VenueSmokeHostLoad's object plus applies.
+    #>
+    # r1 (adversary-b0c05520.json A1): the receipt decides, never the folder layout. A receipt whose export block is an object is an export leg; any other
+    # receipt is a playback leg, and its result.json counts only when its bytes hash to the receipt's evidence.resultJsonSha256 (Invoke-VenueLeg.ps1 binds it):
+    # no binding, a mismatch (bytes replaced after publication) or an unreadable receipt is 'unknown'. A2: a duplicated member is 'unknown'.
+    # r3 adversary-01a12498.json A2: a caller that read the receipt's figures earlier passes -ExpectResultJsonSha256 (the evidence.resultJsonSha256 of the receipt
+    # it took the figures from; '' when that receipt bound none). The receipt read here must bind the same value, so a receipt (and its result.json) replaced
+    # between the two reads is 'unknown', never the other receipt's quiet standing. A receiptId that is not the file name is 'unknown' too.
+    # r6 (sol r5 B2): the export exemption is granted ONLY from the PLANNED leg type (-PlannedLegType, from the leg spec the driver planned: Get-VenuePlannedLegType),
+    # never inferred from receipt fields. A receipt shaped like an export receipt in a leg planned as playback (or whose planned type is unreadable or not given)
+    # is read as a playback leg: it must bind its smoke result, or it is 'unknown' and provisional. The receipt shape check still applies on top of the plan.
+    # r6 (adversary-de8e3799.json A4): -ExpectReceiptSha256 is the sha256 of the receipt BYTES the caller took its figures from; the receipt read here must be
+    # those same bytes (so a receipt replaced between the two reads, or a duplicate-bearing receipt the figure read accepted, is 'unknown').
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-R3-ADV-RESIDUE-1 r2 (adversary-7efea617.json A4): each of the two file reads (the receipt, result.json) is given up on after -ReadTimeoutSec
+    # (Read-VenueFileBytesBounded, on Invoke-VenueBoundedRead's worker), so a deadline stop is bounded by what the caller says is left. A caller near a deadline passes what remains;
+    # under 1 s the read is not started and the standing is 'unknown' (uncounted, the safe side). A read not answered in time is 'unknown' with that reason, never a hang.
+    param([string]$ReceiptPath, [AllowNull()][AllowEmptyString()][string]$ExpectResultJsonSha256, [AllowNull()][AllowEmptyString()][string]$PlannedLegType,
+        [AllowNull()][AllowEmptyString()][string]$ExpectReceiptSha256, [double]$ReadTimeoutSec = 20.0, [DateTime]$CallDeadlineUtc)
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A4): -CallDeadlineUtc is the caller's ABSOLUTE end (the chain's and the batch's -DeadlineUtc). The caller used to sample "what is left"
+    # as a number and hand that over, so a caller paused between the sample and this call's own stopwatch read after its deadline. The end is judged HERE, at this call's start, on the wall clock: the
+    # shared budget of the two reads is min(-ReadTimeoutSec, the seconds to that end), and under 1 s to it nothing is started (unknown, provisional, uncounted: the safe side). Absent: -ReadTimeoutSec alone.
+    $unknown = [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'no smoke result.json for the leg'; applies = $true }
+    try {
+        if (-not $ReceiptPath) { return $unknown }
+        if (-not ($ReadTimeoutSec -ge 1.0)) { $unknown.reason = 'no time was left to read the leg''s receipt and smoke result'; return $unknown }
+        # pass 2 (adversary-b3d61554.json A1): ONE budget for both reads (this Stopwatch and the same end), never a fresh bound per read, and an answer past the end is not acted on
+        $readClock = [Diagnostics.Stopwatch]::StartNew()
+        if ($script:VenueTestPreDeadlineSampleDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPreDeadlineSampleDelayMs) }
+        # $budgetSec is an ENDPOINT on $readClock (both reads pass it as -EndSec), never a duration: the earlier of -ReadTimeoutSec (measured from the stopwatch's start) and the stopwatch reading at
+        # which the absolute deadline falls
+        $budgetSec = $ReadTimeoutSec
+        if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) {
+            # R2-NARROW-1 r7 (adversary-aab90f89.json A1, introduced): the stopwatch is sampled BEFORE the wall clock, so the endpoint is that reading plus the seconds still left to the deadline. It used to
+            # take the seconds left as the endpoint itself, which charged the time already on the stopwatch twice: a caller descheduled 7 s after the stopwatch started, with 12 s to its deadline,
+            # got endpoint 5 on a stopwatch at 7 and refused a readable quiet standing with 5 s still left. Sampling the stopwatch first can only land the endpoint at or before the real end (the safe side).
+            $sampleSec = $readClock.Elapsed.TotalSeconds
+            $toDeadline = ($CallDeadlineUtc.ToUniversalTime() - [DateTime]::UtcNow).TotalSeconds
+            if (-not ($toDeadline -ge 1.0)) { $unknown.reason = 'no time was left before the caller''s deadline to read the leg''s receipt and smoke result'; return $unknown }
+            if (($sampleSec + $toDeadline) -lt $budgetSec) { $budgetSec = $sampleSec + $toDeadline }
+        }
+        $endArgs = @{}
+        if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) { $endArgs['EndUtc'] = $CallDeadlineUtc.ToUniversalTime() }
+        # R2-RESIDUE-1 r1 (adversary-3be19c39.json A2): the read's own end check runs before its bytes are handed back, so a caller suspended after it reached the classification (and the export exemption) past
+        # the absolute end and returned a quiet or exempt answer the caller then counted. $pastEnd is asked again right before either of those two answers is returned.
+        $absEnd = $(if ($PSBoundParameters.ContainsKey('CallDeadlineUtc')) { $CallDeadlineUtc.ToUniversalTime() } else { $null })
+        # R2-RESIDUE-1 r2 (adversary-f1221390.json A2): the end is the absolute deadline when one was given AND the shared read budget ($budgetSec on $readClock) always: a call with no -CallDeadlineUtc (the
+        # baseline, the leg's own read) that was suspended after its last read past -ReadTimeoutSec classified and returned quiet or exempt just the same
+        $pastEnd = { ($null -ne $absEnd -and $absEnd.AddSeconds(-$script:VenueTestUtcStepSec) -le [DateTime]::UtcNow) -or $readClock.Elapsed.TotalSeconds -gt $budgetSec }
+        $lateReason = 'an answer classified after the caller''s absolute end or its read budget is never acted on'
+        $rcBytes = Read-VenueFileBytesBounded -Path $ReceiptPath -TimeoutSec $budgetSec -Clock $readClock -EndSec $budgetSec @endArgs
+        if ($script:VenueTestPostReceiptBytesDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPostReceiptBytesDelayMs) }
+        if ($PSBoundParameters.ContainsKey('ExpectReceiptSha256')) {
+            $rcGot = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes))
+            if ([string]::IsNullOrEmpty($ExpectReceiptSha256) -or -not [string]::Equals($rcGot, $ExpectReceiptSha256, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the bytes the figures were read from'; return $unknown }
+        }
+        $rcText = ConvertFrom-VenueBomBytes $rcBytes
+        if ($rcText.Length -gt 0 -and $rcText[0] -eq [char]0xFEFF) { $rcText = $rcText.Substring(1) }
+        # adversary-90151822.json A2: a receipt that repeats a member anywhere is 'unknown' before its export or evidence member is read (the last one would win)
+        $rcDup = Find-VenueJsonDuplicateMember -Text $rcText -All
+        if ($rcDup) { $unknown.reason = "the receipt repeats the member $rcDup"; return $unknown }
+        $rc = ConvertFrom-Json -InputObject $rcText -NoEnumerate
+        if (-not (Test-VenueHlObject $rc)) { $unknown.reason = 'the receipt is not a JSON object'; return $unknown }
+        if (Test-VenueHlHasMember $rc 'receiptId') {
+            $rid = Get-VenueHlMember $rc 'receiptId'
+            if (-not ($rid -is [string] -and [string]::Equals($rid, [IO.Path]::GetFileNameWithoutExtension($ReceiptPath), [StringComparison]::Ordinal))) { $unknown.reason = 'the receipt''s receiptId is not its file name'; return $unknown }
+        }
+        if ($PSBoundParameters.ContainsKey('ExpectResultJsonSha256')) {
+            $boundNow = Get-VenueHlMember (Get-VenueHlMember $rc 'evidence') 'resultJsonSha256'
+            $boundText = $(if ($null -eq $boundNow) { '' } elseif ($boundNow -is [string]) { $boundNow } else { $null })
+            $expectText = $(if ($null -eq $ExpectResultJsonSha256) { '' } else { $ExpectResultJsonSha256 })
+            if ($null -eq $boundText -or -not [string]::Equals($boundText, $expectText, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = 'the receipt is not the one the figures were read from (evidence.resultJsonSha256 changed between reads)'; return $unknown }
+        }
+        $plannedExport = ($PlannedLegType -is [string]) -and [string]::Equals($PlannedLegType, 'export', [StringComparison]::Ordinal)
+        if ($plannedExport -and (Test-VenueReceiptIsExportLeg $rc)) {
+            if (& $pastEnd) { $unknown.reason = $lateReason; return $unknown }
+            return [pscustomobject]@{ state = 'not-applicable'; provisional = $false; collected = $false; reason = 'export leg: no GUI smoke'; applies = $false } }
+        $want = Get-VenueHlMember (Get-VenueHlMember $rc 'evidence') 'resultJsonSha256'
+        if (-not ($want -is [string] -and [regex]::IsMatch($want, '\A[0-9a-fA-F]{64}\z'))) { $unknown.reason = 'the receipt binds no evidence.resultJsonSha256'; return $unknown }
+        $root = Split-Path -Parent (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $ReceiptPath)))
+        $evidence = Join-Path (Join-Path (Split-Path -Parent $root) 'evidence') ([IO.Path]::GetFileNameWithoutExtension($ReceiptPath))
+        $result = Join-Path $evidence 'result.json'
+        $bytes = Read-VenueFileBytesBounded -Path $result -TimeoutSec $budgetSec -MissingIsNull -Clock $readClock -EndSec $budgetSec @endArgs
+        if ($script:VenueTestPostBytesDelayMs -gt 0) { [Threading.Thread]::Sleep($script:VenueTestPostBytesDelayMs) }
+        if ($null -eq $bytes) { return $unknown }
+        $got =[Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+        if (-not [string]::Equals($got, $want, [StringComparison]::OrdinalIgnoreCase)) { $unknown.reason = "result.json does not match the receipt's evidence.resultJsonSha256"; return $unknown }
+        $text = ConvertFrom-VenueBomBytes $bytes
+        if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+        $dup = Find-VenueJsonDuplicateMember -Text $text
+        if ($dup) { $unknown.reason = "result.json repeats the member $dup"; return $unknown }
+        # r1 (adversary-8c2884e9.json A1): -NoEnumerate and no $( ) around the value, so a one-element array (the root or the hostLoad block) is never unrolled
+        $doc = ConvertFrom-Json -InputObject $text -NoEnumerate
+        $hl = $null
+        if (Test-VenueHlObject $doc) { $hl = Get-VenueHlMember $doc 'hostLoad' }
+        $s = ConvertFrom-VenueSmokeHostLoad -HostLoad $hl
+        if (& $pastEnd) { $unknown.reason = $lateReason; return $unknown }
+        $s | Add-Member -NotePropertyName applies -NotePropertyValue $true
+        $s
+    } catch {
+        $unknown.reason = "the smoke result.json could not be read ($($_.Exception.Message -replace '\s+', ' '))"
+        $unknown
+    }
+}
+
+function Limit-VenueHostLoadToDeadline {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R2-NARROW-1 r7 (sol r7 A3): the ONE guard every caller of Get-VenueLegHostLoad applies where it CONSUMES the standing (the chain, the lease batch and
+    # the baseline; it was an inline copy in the first two). A standing a caller sees after its own absolute end is never acted on, whatever the reader returned: the caller can be
+    # suspended after the reader's last check (a standing that passed at 899.9 s of a 900 s cap and is consumed at 901 s must not become a counted row). Past the end it reads
+    # unknown, provisional and uncollected; before it, the standing comes back unchanged.
+    param([AllowNull()][object]$Standing, [Parameter(Mandatory)][DateTime]$DeadlineUtc)
+    if ($DeadlineUtc -le [DateTime]::UtcNow) { return [pscustomobject]@{ state = 'unknown'; provisional = $true; collected = $false; reason = 'the standing was seen after the absolute end (-DeadlineUtc) and is never acted on'; applies = $true } }
+    $Standing
+}
+
+function Get-VenueReferenceHostLoadRefusal {
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the typed line for a leg that must not be counted as a control/reference arm, or $null when it may be.
+    # REFERENCE_PROVISIONAL leg=<id> reason=hostload-<state> (hostload-provisional when the state reads quiet but the leg is provisional).
+    # r1 (adversary-8c2884e9.json A3): nothing is coerced. Only applies that is the boolean false (Get-VenueLegHostLoad's export leg) skips the rule; a leg is
+    # clean only when provisional is the boolean false, collected the boolean true and state the exact ordinal 'quiet' (A2), so a standing that says
+    # provisional=false beside an unknown state or an uncollected snapshot is still refused.
+    param([AllowEmptyString()][AllowNull()][string]$LegId, [AllowNull()][object]$Standing)
+    $applies = Get-VenueHlMember $Standing 'applies'
+    if ($applies -is [bool] -and -not $applies) { return $null }
+    $prov = Get-VenueHlMember $Standing 'provisional'; $coll = Get-VenueHlMember $Standing 'collected'; $st = Get-VenueHlMember $Standing 'state'
+    $state = $(if ($st -is [string] -and [regex]::IsMatch($st, '\A[a-z][a-z_-]{0,31}\z')) { $st } else { 'unknown' })
+    $isQuiet = [string]::Equals($state, 'quiet', [StringComparison]::Ordinal)
+    if ($prov -is [bool] -and -not $prov -and $coll -is [bool] -and $coll -and $isQuiet) { return $null }
+    $why = $(if ($isQuiet) { 'provisional' } else { $state })
+    $id = $(if ([string]::IsNullOrWhiteSpace($LegId)) { 'UNKNOWN' } else { $LegId -replace '\s', '_' })
+    "REFERENCE_PROVISIONAL leg=$id reason=hostload-$why"
+}
+
+function Get-VenueReferenceArmVerdict {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1: the control/reference arm of a comparison, legs given as { legId; hostLoad } (hostLoad = the smoke result's raw hostLoad
+    block). A leg whose host load is provisional or unknown is never COUNTED as the arm: it is listed with its typed REFERENCE_PROVISIONAL line, and the verdict
+    is INCONCLUSIVE (never a pass, never a regression). Every leg stays in legs, a null one included (A4: it is an unknown leg). COUNTED only when every leg is
+    clean and there is at least one. r1 (adversary-8c2884e9.json A3): the block is always judged by ConvertFrom-VenueSmokeHostLoad; a caller-supplied
+    standing (applies / collected fields) is never trusted. Pure.
+    #>
+    param([AllowNull()][AllowEmptyCollection()][object[]]$Legs)
+    $all = [System.Collections.Generic.List[object]]::new(); $counted = [System.Collections.Generic.List[object]]::new(); $refusals = [System.Collections.Generic.List[string]]::new()
+    foreach ($leg in @($Legs)) {
+        # r1 (adversary-b0c05520.json A8): a hashtable leg is read by its keys, as an object leg by its properties
+        $lidV = Get-VenueHlMember $leg 'legId'
+        $lid = $(if ($lidV -is [string]) { $lidV } else { '' })
+        $raw = Get-VenueHlMember $leg 'hostLoad'
+        $s = ConvertFrom-VenueSmokeHostLoad -HostLoad $raw
+        $line = Get-VenueReferenceHostLoadRefusal -LegId $lid -Standing $s
+        $row = [pscustomobject]@{ legId = $lid; hostLoadState = [string]$s.state; hostLoadProvisional = [bool]$s.provisional; counted = ($null -eq $line) }
+        $all.Add($row)
+        if ($null -eq $line) { $counted.Add($row) } else { $refusals.Add($line) }
+    }
+    [pscustomobject]@{
+        verdict = $(if ($refusals.Count -eq 0 -and $all.Count -gt 0) { 'COUNTED' } else { 'INCONCLUSIVE' })
+        refusals = [string[]]$refusals.ToArray(); counted = [object[]]$counted.ToArray(); legs = [object[]]$all.ToArray()
+    }
 }
 
 function Get-VenueLeaseLedgerPath {
@@ -2056,5 +2552,5 @@ Export-ModuleMember -Function New-VenueCapsProbeId, Get-VenueDriverScriptMissing
     Get-VenueTicketDir, New-VenueTicket, Get-VenueTickets, Get-VenueTicketStaleReason, Get-VenueTicketProbeStaleSec, Update-VenueTicket, Remove-VenueTicket, Get-VenueClaimStatus, Format-VenueClaimStatus, Format-VenueTicketQueue,
     ConvertFrom-VenueGateLog, Get-VenueQuietRateTable, Format-VenueQuietRateTable, Select-VenueQuietWindow,
     Get-VenueSupplementarySpecSkip, Get-VenueSupplementaryIdle, Get-VenueStagedBuildManifest, Get-VenueStagedArtifactNames, Get-VenueRemoteJobIds, Get-VenueRemoteJobState, Invoke-VenueBoundedProcess, Complete-VenueProcess,
-    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
+    Get-VenueJobResult, Request-VenueJobCancel, Read-VenueLeaseBatchReceipt, Get-VenueInterleavedLegPlan, Get-VenueLegPreLoadMean, ConvertFrom-VenueSmokeHostLoad, ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember, Get-VenuePlannedLegType, Get-VenueLegHostLoad, Limit-VenueHostLoadToDeadline, Test-VenueReceiptIsExportLeg,Get-VenueReferenceHostLoadRefusal, Get-VenueReferenceArmVerdict, Get-VenueLeaseLedgerPath, Read-VenueLeaseLedger, Add-VenueLeaseLedger, Get-VenueLeaseBudgetWait, Get-VenueRunStartCap, Get-VenueLegPlaySeconds, Get-VenuePlanPlaySeconds, ConvertTo-VenueStartCapTime,Get-VenueLeaseCaps, Resolve-VenueLeaseCaps,
     Get-VenueClaimAgeSec, Update-VenueClaim, Start-VenueKeeper, Stop-VenueKeeper, Start-VenueClaimKeeper, Get-VenueClaimKeeperLoss, New-VenueJobLivenessWrite, Write-VenueJobLiveness, Test-VenueJobLivenessReadback, Start-VenueJobLiveness, Stop-VenueJobLiveness

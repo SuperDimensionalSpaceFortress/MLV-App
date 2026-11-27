@@ -164,6 +164,16 @@ if ($null -ne $setPlan) {
     $pwshExe = (Get-Process -Id $PID).Path
     $rows = [System.Collections.Generic.List[object]]::new()
     $total = @($setPlan.plan).Count
+    # r6 (adversary-de8e3799.json A3): every entry's planned leg type is read HERE, at planning, before any leg runs (a spec replaced later grants nothing)
+    # (adversary-7efea617.json A4: Complete-VenueProcess too, so a bounded read of a receipt or result.json given up on never holds this process at its exit)
+    Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenuePlannedLegType, Complete-VenueProcess -DisableNameChecking -Force
+    $plannedTypes = @{}
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A3): no re-read of the path. The type is the planner's (Get-DvLegSetPlan judged it from the
+    # bytes the child is pinned to by -ExpectSpecSha256); an entry without one reads 'unknown' (never exempt)
+    foreach ($pe in $setPlan.plan) {
+        $pePlanned = $(if ($null -ne $pe.PSObject.Properties['plannedLegType']) { $pe.PSObject.Properties['plannedLegType'].Value } else { $null })
+        $plannedTypes[[string]$pe.seq] = $(if ($pePlanned -is [string] -and ($pePlanned -ceq 'export' -or $pePlanned -ceq 'playback')) { $pePlanned } else { 'unknown' })
+    }
     foreach ($entry in $setPlan.plan) {
         $childArgs = @('-NoProfile', '-File', $PSCommandPath, '-Venue', $Venue, '-LegSpec', $entry.specPath, '-SourceCommit', $SourceCommit,
             '-BuildManifestSha256', $BuildManifestSha256, '-Backend', $entry.backend, '-ReceiptRoot', $ReceiptRoot, '-Actor', $Actor)
@@ -184,11 +194,39 @@ if ($null -ne $setPlan) {
         $childStdout = @($childRaw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | ForEach-Object { [string]$_ })
         $receiptPath = $null
         foreach ($childLine in $childStdout) { if ($childLine -match '^DVE_RECEIPT_PATH=(?<p>.+)$') { $receiptPath = $Matches['p'].Trim() } }
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5 sibling): the sha256 of the receipt bytes the child wrote; the bytes read below must be those
+        $childReceiptSha = ''
+        foreach ($childLine in $childStdout) { if ($childLine -cmatch '^DVE_RECEIPT_SHA256=(?<s>[0-9A-Fa-f]{64})$') { $childReceiptSha = $Matches['s'] } }
         $legReceipt = $null
         if ($receiptPath -and (Test-Path -LiteralPath $receiptPath -PathType Leaf)) {
-            try { $legReceipt = [IO.File]::ReadAllText($receiptPath) | ConvertFrom-Json } catch { $legReceipt = $null }
+            # r6 (adversary-de8e3799.json A4): read the receipt bytes ONCE; the figures come from them and the host-load read is bound to their sha256
+            try { $legReceiptBytes = [IO.File]::ReadAllBytes($receiptPath); $legReceiptSha = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($legReceiptBytes)); $legReceipt = [IO.StreamReader]::new([IO.MemoryStream]::new($legReceiptBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF) | ConvertFrom-Json } catch { $legReceipt = $null; $legReceiptSha = '' }
+            # (a receipt that is not the bytes the child wrote binds no host load: the read below gets '' and is unknown)
+            # adversary-b3d61554.json A5: bytes that are not the ones the child published are not this leg's receipt at all (as the baseline refuses them in Get-RowFigures): no figures and no
+            # outcome are taken from them, so the row reads as a leg with no receipt, never the replacement's PASS and presented fps
+            if (-not [string]::Equals($legReceiptSha, $childReceiptSha, [StringComparison]::OrdinalIgnoreCase)) { $legReceiptSha = ''; $legReceipt = $null }
         }
-        $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt
+        # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): the leg's host-load standing, from its own hash-bound smoke result (the reader the lease batch and the chain
+        # use); a provisional or unknown leg is printed as REFERENCE_PROVISIONAL, its row carries hostLoadState / hostLoadProvisional, and it is never measured.
+        if (-not (Get-Command -Name Get-VenueLegHostLoad -ErrorAction SilentlyContinue)) {
+            Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenuePlannedLegType -DisableNameChecking
+        }
+        if (-not (Get-Command -Name Get-VenuePlannedLegType -ErrorAction SilentlyContinue)) {
+            Import-Module (Join-Path $here 'VenueChain.psm1') -Function Get-VenueLegHostLoad, Get-VenueReferenceHostLoadRefusal, Get-VenuePlannedLegType -DisableNameChecking -Force
+        }
+        # r6 (sol r5 B2): the export exemption comes only from the PLANNED leg type (the planned spec), never from the receipt's shape. (entry.specSha256 is the
+        # LF-normalised Get-DvLegSpecSha256, not a raw-byte hash, so it is not passed as the raw-byte bind; an unreadable spec reads 'unknown', never exempt.)
+        $plannedLegType = $(if ($plannedTypes.ContainsKey([string]$entry.seq)) { [string]$plannedTypes[[string]$entry.seq] } else { 'unknown' })
+        # (adversary-01a12498.json A2: bound to the receipt the row's figures come from, so a receipt swapped between the two reads reads 'unknown')
+        $legHostLoad = $(if ($null -ne $legReceipt) {
+            $boundSha = Get-DvProp (Get-DvProp $legReceipt 'evidence') 'resultJsonSha256'
+            Get-VenueLegHostLoad -ReceiptPath $receiptPath -ExpectResultJsonSha256 $(if ($boundSha -is [string]) { $boundSha } elseif ($null -eq $boundSha) { '' } else { 'not-a-sha' }) -PlannedLegType $plannedLegType -ExpectReceiptSha256 $legReceiptSha
+        } else { $null })
+        $row = Get-DvMatrixRow -PlanEntry $entry -Receipt $legReceipt -HostLoad $legHostLoad
+        if ($null -ne $legReceipt) {
+            $hlRefusal = Get-VenueReferenceHostLoadRefusal -LegId $(if ($row.receiptId) { [string]$row.receiptId } else { [string]$entry.legId }) -Standing $legHostLoad
+            if ($hlRefusal) { Write-Output $hlRefusal; if (-not $row.note) { $row.note = "$hlRefusal (not a measurement)" } }
+        }
         # r7: a child that refused because its spec's bytes are no longer the planned ones wrote no receipt; say so on its own typed line and in its row (outcome SPEC_CHANGED: it did not RUN, so the
         # table's `ran` leaves it out), so it is never read as a leg that merely failed. Classified ONLY by the child's own whole-line stdout record naming THIS entry's planned hash (adversary r7 A1:
         # a path or message that merely quotes the token DVE_LEG_SPEC_CHANGED, e.g. a receipt-write failure under a receipt root of that name, is not it)
@@ -220,11 +258,14 @@ if ($null -ne $setPlan) {
         "card $($setPlan.card), clip $($setPlan.clipId), source $($SourceCommit.Substring(0, 12)), build manifest $($BuildManifestSha256.Substring(0, 12)), $Repeats repeat(s) of $(@($setPlan.cells).Count) cell(s) = $total leg(s), $measured measured.",
         'Rates are read from each leg''s hashed app run log (median over the repeats). Only a PASS or FAIL receipt is a measurement; every other outcome is no signal and shows no numbers. Production receipts are ADVISORY (docs/dual-venue-evidence.md).', '')
     $summaryPath = Join-Path $summaryDir 'summary.md'
-    [IO.File]::WriteAllText($summaryPath, (($head + $table) -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3: every leg's hostLoad.state and provisional, and whether it counted, under the cell table
+    $hostLoadTable = @('', 'Host load per leg (a provisional or unknown leg is recorded, never counted):', '') + @(ConvertTo-DvMatrixHostLoadTable -Rows $rows.ToArray())
+    [IO.File]::WriteAllText($summaryPath, (($head + $table + $hostLoadTable) -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
     $rowsJson = [ordered]@{ schema = 'mlv-app/dual-venue-legset-summary/v1'; legSet = $setPlan.legSet; venue = $Venue; sourceCommit = $SourceCommit; buildManifestSha256 = $BuildManifestSha256; repeats = $Repeats; rows = $rows.ToArray() }
     [IO.File]::WriteAllText((Join-Path $summaryDir 'summary.json'), ($rowsJson | ConvertTo-Json -Depth 6) + "`n", [Text.UTF8Encoding]::new($false))
     Write-Output $table
     Write-Output "DVE_MATRIX_SUMMARY=$summaryPath"
+    Complete-VenueProcess -ExitCode 0   # a host-load read given up on (Get-VenueLegHostLoad's bounded read) is a live thread the host would wait for at exit
     exit 0
 }
 
@@ -359,7 +400,7 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
         # destination itself failing (this second write, or a first write that threw for any other reason) ends the run as DVE_RECEIPT_WRITE_FAILED, exit 2.
         $invalidPrefix = 'DVE_RECEIPT_INVALID '
         $ioPrefix = 'DVE_EVIDENCE_VALIDATION_IO|'
-        if ($Outcome -cin @('PASS', 'FAIL') -and $refusal.StartsWith($invalidPrefix, [StringComparison]::Ordinal)) {
+        if ((Test-DvOrdinalIn $Outcome @('PASS', 'FAIL')) -and $refusal.StartsWith($invalidPrefix, [StringComparison]::Ordinal)) {
             $receipt.outcome = 'INVALID'
             $receipt.outcomeDetail = "INVALID: the job result was $Outcome ($Detail) but the receipt writer refuses it as a ${Outcome}: $($refusal.Substring($invalidPrefix.Length))"
             $Outcome = 'INVALID'
@@ -393,6 +434,9 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
     # PLAYBACK-VISUAL-INSPECTION-1: the visual verdict and the strip a reviewer opens.
     if ($null -ne $receipt['visual']) { Write-Output "DVE_VISUAL=$($receipt['visual'].verdict) STRIP=$(if ($receipt['visual'].stripCopyPath) { $receipt['visual'].stripCopyPath } elseif ($receipt['visual'].stripPath) { $receipt['visual'].stripPath } else { 'none' })" }
     Write-Output "DVE_RECEIPT_PATH=$path"
+    # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A5): the sha256 of the receipt bytes this run wrote; the chain and the batch read the
+    # leg's host load only from those bytes (Get-VenueLegHostLoad -ExpectReceiptSha256), so a receipt and result.json swapped in together read unknown.
+    Write-Output "DVE_RECEIPT_SHA256=$(Get-DvLastWrittenReceiptSha256)"
     exit 0
 }
 
@@ -835,7 +879,7 @@ if ($isExport) {
     $exportCriteria = Get-DvProp (Get-DvProp (Get-DvProp $spec 'criteria') ([string]$role)) 'cpu'
     $exportOutcome = Get-DvExportOutcome -ResultToken $token -ExitCode $exitCode -Evidence $exportEvidence -Criteria $exportCriteria
     $exportFinal = $exportOutcome.outcome; $exportDetail = [string]$exportOutcome.detail
-    if ($exportFinal -cin @('PASS', 'FAIL') -and $identityProblems.Count -gt 0) { $exportFinal = 'INVALID'; $exportDetail = "the job result derives $($exportOutcome.outcome) but the run does not bind: $($identityProblems -join '; ')" }
+    if ((Test-DvOrdinalIn $exportFinal @('PASS', 'FAIL')) -and $identityProblems.Count -gt 0) { $exportFinal = 'INVALID'; $exportDetail = "the job result derives $($exportOutcome.outcome) but the run does not bind: $($identityProblems -join '; ')" }
     $receipt.export.verdict = $exportFinal
     Write-Output ("DVE_EXPORT format={0} framesExported={1} exportFps={2} largestStage={3} problems={4}" -f $spec.export.format, $exportEvidence.metrics.framesExported, $exportEvidence.metrics.exportFps, $exportEvidence.metrics.largestStage, @($exportEvidence.problems).Count)
     Complete-Receipt $exportFinal $exportDetail
