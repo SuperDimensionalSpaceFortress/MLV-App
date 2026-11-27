@@ -1029,7 +1029,7 @@ TEST(PlaybackUnpacedWiring, APacedPlayHoldsAtItsRequiredFramesOnlyWhileTheMeasur
     const QString clamp = QStringLiteral(
         "                if( pacedHoldClampArmed )\n"
         "                    dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,\n"
-        "                                                                                            m_sourceAdvance.consumed(), m_playRequiredSourceFrames );\n");
+        "                        m_sourceAdvance.startFrame, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );\n");
     ASSERT_EQ(1, source.count(clamp));
     ASSERT_EQ(1, source.count(QStringLiteral("playback_frame_range::pacedMeasuredHoldLanding(")));
     ASSERT_EQ(2, handling.count(QStringLiteral("pacedHoldClampArmed")));

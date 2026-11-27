@@ -1464,24 +1464,31 @@ inline bool pacedMeasuredHoldReached( bool automationIsolated, bool unpacedReque
 // truncation (25 fps, 498.79999999998 + 0.2 = 498.9999999999802: the counter credits 499, the slider shows 498, the hold froze one
 // frame short of what it counted). This clamps the ADVANCED POSITION instead, in frames, so it holds at any fps and any span.
 //
-// The frame that completes the requirement is the tick's start frame (on the counter's rounding) plus the frames still owed: the
-// counter's high-water mark is the start frame on forward play, and a playhead above it is rebased to it (an external jump). When
-// the tick lands on or past that frame on the counter's rounding, the landing is clamped into [frame, frame + 0.5], where both
-// roundings agree on the frame: consumed reaches the requirement exactly and the hold freezes ON the rendered frame. A landing
-// already inside that span is returned unchanged (bit for bit). A playhead below the high-water mark (a backward seek) only lands
-// short of the real completing frame, and the next tick asks again; nothing is ever credited past the requirement.
-// Anything else -- a wrap (never counted as footage), a backward or non-finite tick, no requirement, the requirement already met, a
-// landing short of the completing frame -- returns tick.position unchanged. MainWindow calls it only while pacedMeasuredHoldApplies.
-inline double pacedMeasuredHoldLanding( double tickStartPosition, const DropFrameTickResult & tick,
+// The frame that completes the requirement is the counter's high-water mark (after this tick's rebase) plus the frames still owed.
+// MainWindow may read only consumed() and startFrame of the counter (tools/repo_hygiene/app_play_scan.py pins every other use), so
+// the mark is taken as max( startFrame + consumed - 1, the tick's start frame on the counter's rounding ): the mark is
+// startFrame + forwardSteps plus every external jump it was rebased by, and a playhead above it is rebased to the playhead. That is
+// the mark exactly on forward play, after a rebase, and after a backward seek with no earlier rebase (r2 fix iteration 1, adversary
+// A1 on dad594f3: from the tick's start frame alone, a seek back to 0 owed one frame per tick, 3 -> 1.5, and timed out). Only a
+// backward seek after an external forward jump reads below the mark; that lands short, the next tick asks again, and it advances
+// at least the owed frames per tick while below the mark -- nothing is ever credited past the requirement.
+// When the tick lands on or past the completing frame on the counter's rounding, the landing is clamped into [frame, frame + 0.5],
+// where both roundings agree on the frame: consumed reaches the requirement exactly and the hold freezes ON the rendered frame. A
+// landing already inside that span is returned unchanged (bit for bit).
+// Anything else -- a wrap (never counted as footage), a backward or non-finite tick, an unarmed counter (consumed 0), no
+// requirement, the requirement already met, a landing short of the completing frame -- returns tick.position unchanged.
+// MainWindow calls it only while pacedMeasuredHoldApplies.
+inline double pacedMeasuredHoldLanding( double tickStartPosition, const DropFrameTickResult & tick, int64_t counterStartFrame,
                                         int64_t consumedSourceFrames, int64_t requiredSourceFrames )
 {
-    if( tick.wrapped || requiredSourceFrames <= 0 || consumedSourceFrames >= requiredSourceFrames
+    if( tick.wrapped || requiredSourceFrames <= 0 || consumedSourceFrames < 1 || consumedSourceFrames >= requiredSourceFrames
      || !std::isfinite( tickStartPosition ) || !std::isfinite( tick.position ) || !( tick.position >= tickStartPosition ) )
         return tick.position;
-    // consumed < required here: the shortfall is formed in uint64_t, exact for every int64 pair (the signed form overflows), >= 1
+    // 1 <= consumed < required here: the shortfall is formed in uint64_t, exact for every int64 pair (the signed form overflows)
     const double owed = static_cast<double>( static_cast<uint64_t>( requiredSourceFrames )
                                              - static_cast<uint64_t>( consumedSourceFrames ) );
-    const double completingFrame = std::floor( tickStartPosition + 1e-9 ) + owed;
+    const double markFloor = static_cast<double>( counterStartFrame ) + static_cast<double>( consumedSourceFrames - 1 );
+    const double completingFrame = std::max( markFloor, std::floor( tickStartPosition + 1e-9 ) ) + owed;
     if( !( std::floor( tick.position + 1e-9 ) >= completingFrame ) ) return tick.position;
     const double insideFrame = completingFrame + 0.5;
     if( tick.position < completingFrame ) return completingFrame;   // the epsilon band: counted as the frame, rendered as the one before

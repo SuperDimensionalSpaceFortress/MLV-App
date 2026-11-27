@@ -13433,7 +13433,7 @@ void MainWindow::playbackHandling(int timeDiff)
                 // GUI-SMOKE-PACED-STOP-STARVATION-1 r2: the armed paced hold's landing clamp (a strict no-op when it does not apply)
                 if( pacedHoldClampArmed )
                     dropFrameTick.position = playback_frame_range::pacedMeasuredHoldLanding( sourcePositionBeforeDropTick, dropFrameTick,
-                                                                                            m_sourceAdvance.consumed(), m_playRequiredSourceFrames );
+                        m_sourceAdvance.startFrame, m_sourceAdvance.consumed(), m_playRequiredSourceFrames );
                 // slip_summary: the granted share, read back from the tick (a wrap subtracted the cut range width;
                 // the clamp at the last frame without Loop reports what was actually advanced).
                 // r33 (adversary A1 on e0947e37): a tick can wrap more than one lap; each moved the position back by wrapWidth.
