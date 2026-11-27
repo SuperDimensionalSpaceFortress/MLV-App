@@ -369,19 +369,22 @@ function Complete-Receipt([string]$Outcome, [string]$Detail) {
             $receipt.outcomeDetail = "evidence-validation-io: $($parts[1]) $($parts[2]) (the job result was ${Outcome}: $Detail)"
             $Outcome = 'UNRESOLVED'
         } else {
-            Write-Output "DVE_RECEIPT_WRITE_FAILED $refusal"
+            Write-Output "DVE_RECEIPT_WRITE_FAILED $(ConvertTo-DvOneLineText $refusal)"
             exit 2
         }
         try {
             $path = Write-DvReceipt -Receipt $receipt -ReceiptRoot $ReceiptRoot -RepoRoot $RepoRoot -OfflineTestMode:$OfflineTestMode -LegSpecBytes $specBytes
         } catch {
-            Write-Output "DVE_RECEIPT_WRITE_FAILED $($_.Exception.Message)"
+            Write-Output "DVE_RECEIPT_WRITE_FAILED $(ConvertTo-DvOneLineText $_.Exception.Message)"
             exit 2
         }
     }
     Write-Output "DVE_OUTCOME=$Outcome"
     # (the writer relabels an advisory production PASS/FAIL in outcomeDetail and stamps receipt.verification: say so here too)
-    Write-Output "DVE_DETAIL=$($receipt.outcomeDetail)"
+    # UNPACED-VISUAL-MIDPLAY-CAPTURE-1-R2-RESIDUE-1: outcomeDetail quotes outside text (the job's own display.venue, a um-run or exception message, the
+    # visual reason ...), so the printed line goes through the one-line rule (ConvertTo-DvOneLineText): a line break, U+2028 or U+2029 in a detail can never
+    # forge a DVE_OUTCOME / DVE_DETAIL / DVE_RECEIPT_PATH record for a chain or batch reader. The receipt keeps the detail as it is (JSON escapes it).
+    Write-Output "DVE_DETAIL=$(ConvertTo-DvOneLineText $receipt.outcomeDetail)"
     if ($null -ne $receipt['verification']) { Write-Output "DVE_VERIFICATION=$($receipt['verification'].status)" }
     # EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1 r2 (sol r1 B1): the acceptance verdict a readout reports (Get-DvAcceptanceVerdict). DVE_OUTCOME stays the
     # raw outcome the chain records; an advisory (or any not-VERIFIED) PASS/FAIL is NOT_MEASURED here, its criteria failures only diagnostics.
@@ -681,6 +684,14 @@ try {
     $probeRun = Submit-VenueJob -ScriptPath $probeJob -JobId $probeJobId -TimeoutSec 120 -QueueSec 120 -ClaimedExtraSec 60
     Write-NotAfterVerdict $probeRun
     $receipt.evidence.umRunOutcome = $probeRun.umOutcome
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2 r3 (adversary pass A2): the ONE display-path block, copied by its one writer from the probe's own DVE_PROBE line
+    # (read with System.Text.Json; no new venue read, no clock, no wait), BEFORE every refusal below -- the probe that ConvertFrom-DvProbeStdout cannot
+    # parse (an empty member name, say) still carries a sample the writer reads, so the VENUE_UNHEALTHY receipt keeps it. A probe the writer cannot copy as
+    # reported writes no block, so the receipt reads NO_SIGNAL (Read-DvReceiptDisplayPath, the one reader).
+    if ($probeRun.umOutcome -eq 'RECEIPT' -and $null -ne $probeRun.result) {
+        $displayPathBlock = New-DvDisplayPathBlock -ProbeStdout ([string]$probeRun.result.stdout)
+        if ($null -ne $displayPathBlock) { $receipt.venue['displayPath'] = $displayPathBlock }
+    }
     $probe = $null
     if ($probeRun.umOutcome -eq 'RECEIPT' -and $null -ne $probeRun.result) { $probe = ConvertFrom-DvProbeStdout ([string]$probeRun.result.stdout) }
     if ($null -eq $probe) {
@@ -700,6 +711,7 @@ try {
     $receipt.venue.driverVersion = $probe.driverVersion
     $receipt.venue.displayDevice = $probe.displayDevice
     $receipt.venue.instrumentDigests.presentmon = $probe.presentmonSha256
+    # (the display-path block was attached right after the probe returned, above: r3 adversary pass A2)
 
     # P6: one source of truth for which venue a host is.
     Import-Module (Join-Path $here '..\bachelor\AttrCudaArtifacts.psm1') -Force
@@ -1280,8 +1292,9 @@ if ($outcome -in @('PASS', 'FAIL') -and $null -ne $receipt.visual) {
     if ($receipt.visual.verdict -ceq 'FROZEN_DISPLAY') {
         $detail = "INVALID: the job result was $outcome ($detail) but FROZEN_DISPLAY: $($receipt.visual.reason). A leg whose display did not change is not counted, whatever its cadence numbers say"
         $outcome = 'INVALID'
-    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE', 'CAPTURE_UNBOUND', 'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE')) {
+    } elseif ($receipt.visual.verdict -cin @('VISUAL_DIVERGENCE', 'FROZEN_DISPLAY_SUSPECTED', 'VISUAL_ASSESSMENT_UNAVAILABLE', 'CAPTURE_UNBOUND', 'PARTIAL_FREEZE', 'EXPOSURE_OUT_OF_RANGE', 'NOT_A_MOTION_WITNESS')) {
         # VISUAL-GATE-EXPOSURE-FLOOR-1: a picture outside its exposure band (too dark / clipped in BOTH arms passes every other check) is counted and surfaced the same way.
+        # UNPACED-VISUAL-MIDPLAY-CAPTURE-1: so is a strip whose judged play frames carry one display frame (an unpaced Play held its last required frame through the tail).
         # (PLAYBACK-FROZEN-DISPLAY-SOURCE-DIFF-1: a single picture over an unknown source, and a leg with no viewport rectangle, are counted and surfaced like a divergence)
         # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1: an unbound paused-instant capture is surfaced the same way (counted; its difference judges nothing).
         # PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r5: so is a partial freeze over source frames known to differ (counted; the display's paint stopped part-way).
