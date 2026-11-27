@@ -1233,29 +1233,25 @@ $r = Wait-GuiSmokeProcessBounded -Process $s.p -StandardOutputTask $s.o -Standar
         self.assertEqual("process_no_progress", out["outcome"], "a caller that passes no -LifetimeBudgetMs is not judged")
 
     def test_the_probe_returns_no_stall_verdict_once_the_whole_budget_is_spent(self) -> None:
-        # the adversary's input, scaled down: the watch is armed and quiet beyond its window, then a probe that blocks past the whole budget returns
-        out = run_ps(r"""
-$dir = Join-Path $env:GS_TMP 'spentbudget'; New-Item -ItemType Directory -Force -Path $dir | Out-Null
-Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 500) -NoNewline
-$w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs 2000
-$arm = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 20000)
-Start-Sleep -Milliseconds 300
-$w.ProbeDelayMs = 1500
-$stalledWithBudgetLeft = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 20000)
-Stop-GuiSmokeLogProgressWatch -Watch $w
-$w2 = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs 2000
-[void](Test-GuiSmokeLogProgressStalled -Watch $w2 -DeadlineMs 20000)
-Start-Sleep -Milliseconds 300
-$w2.ProbeDelayMs = 1500
-# -2 r1: a deadline 200 ms after this moment, on the watch's launch clock (the old -BudgetRemainingMs 200)
-$stalledPastBudget = [bool](Test-GuiSmokeLogProgressStalled -Watch $w2 -DeadlineMs ([int64](Get-GuiSmokeSinceLaunchMs -LaunchTimestamp $w2.LaunchTimestamp) + 200))
-Stop-GuiSmokeLogProgressWatch -Watch $w2
-[pscustomobject]@{ arm = $arm; armed = [bool]$w.Armed; stalledWithBudgetLeft = $stalledWithBudgetLeft; stalledPastBudget = $stalledPastBudget } | ConvertTo-Json -Compress
-""")
-        self.assertFalse(out["arm"])
-        self.assertTrue(out["armed"])
-        self.assertTrue(out["stalledWithBudgetLeft"], "with budget left a quiet armed watch still reports the stall")
-        self.assertFalse(out["stalledPastBudget"], "a probe that returned after the whole budget was spent must not pass a stall verdict: the whole budget decides")
+        # CI-FLAKE-GUI-SMOKE-STALL-BUDGET-TIMING-2: this test used to arm D as real "now + 200 ms" and let a real 200 ms WaitOne decide whether the
+        # reading after it was at or past D. A loaded hosted runner can return that wait a few ms early against the Stopwatch (floor(D - now) > 0), which
+        # is a stall verdict INSIDE the budget and failed the assertion (hosted windows shard 1/8, run 45628400891). The module's own clock is now
+        # scripted (the seam TheDeadlineIsReachedWithUnderOneMsOfItLeft uses), so each reading is placed exactly: a quiet armed watch, a probe that never
+        # answers, and a reading after the probe wait that is AT or PAST D. No wall-time bound is asserted here.
+        scripted = TheDeadlineIsReachedWithUnderOneMsOfItLeft._scripted
+        # readings: probe start (D - 200), probe wait (D - 200: waits 200 ms), then the landed-result check and verdict (the value under test)
+        for after_wait in ("20000", "20300", "50000"):
+            with self.subTest(reading_after_the_probe_wait=after_wait):
+                out = scripted(self, "19800, 19800, " + after_wait, 20000)
+                # the arming poll's own result (the old test's `$arm`): armed, and no verdict while arming
+                self.assertTrue(out["armed"], "the watch armed before the scripted readings began")
+                self.assertFalse(out["armPollStalled"], "the poll that arms the watch must not return a stall verdict")
+                self.assertTrue(out["started"], "the probe started with budget left")
+                self.assertFalse(out["stalled"], "a probe that returned after the whole budget was spent must not pass a stall verdict: the whole budget decides")
+        # control on the same quiet armed watch: with a whole ms of budget left the stall is still reported
+        control = scripted(self, "19800, 19800, 19999", 20000)
+        self.assertFalse(control["armPollStalled"], "the poll that arms the watch must not return a stall verdict")
+        self.assertTrue(control["stalled"], "with budget left a quiet armed watch still reports the stall")
 
     def test_every_runner_site_that_breaks_on_a_stall_verdict_judges_the_whole_budget(self) -> None:
         wait = _runner_snippet(*_WAIT_REGION)
@@ -1286,11 +1282,17 @@ $dir = Join-Path $env:GS_TMP 'scriptedclock'; New-Item -ItemType Directory -Forc
 Set-Content -LiteralPath (Join-Path $dir 'mlvapp-1.log') -Value ('x' * 500) -NoNewline
 $w = New-GuiSmokeLogProgressWatch -LogRoot $dir -WindowMs 50 -ProbeWaitMs 2000
 # armed on the real clock (P is well under a second after the watch's own launch), so E = P + 50 is long past at every scripted reading below
+$armPollStalled = $false
 for ($i = 0; $i -lt 5 -and (-not $w.Armed -or $null -ne $w.Pending); $i++) {
     if ($null -ne $w.Pending) { [void]$w.Pending.Finished.WaitOne(30000) }
-    [void](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 3600000)
+    $wasArmed = [bool]$w.Armed
+    $pollStalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs 3600000)
+    # the poll(s) that arm the watch return no verdict (P and the verdict share one reading, so E = P + 50 is ahead of it): kept, not discarded
+    if (-not $wasArmed -and $pollStalled) { $armPollStalled = $true }
 }
 if (-not $w.Armed -or $null -ne $w.Pending) { throw 'the arming probe did not finish' }
+# P is pinned to the launch (adversary 2e95fdc8 A2): a parent descheduled during the real arming poll would otherwise credit P late, and E = P + 50 could land past a scripted reading
+$w.LastProgressMs = [int64]0
 # the next probe blocks for the rest of the test: it never answers, as on a stalled share
 $w.ProbeDelayMs = 600000
 $global:ScriptedReadings = [Collections.Generic.Queue[double]]::new()
@@ -1306,7 +1308,7 @@ $global:ScriptedLast = [double]0
 $stalled = [bool](Test-GuiSmokeLogProgressStalled -Watch $w -DeadlineMs %d)
 $started = $null -ne $w.Pending
 Stop-GuiSmokeLogProgressWatch -Watch $w
-[pscustomobject]@{ stalled = $stalled; started = $started } | ConvertTo-Json -Compress
+[pscustomobject]@{ stalled = $stalled; started = $started; armed = [bool]$w.Armed; armPollStalled = $armPollStalled } | ConvertTo-Json -Compress
 """ % (readings, deadline_ms))
 
     def test_a_probe_wait_cut_to_the_deadline_that_ends_half_a_ms_short_of_it_passes_no_stall_verdict(self) -> None:

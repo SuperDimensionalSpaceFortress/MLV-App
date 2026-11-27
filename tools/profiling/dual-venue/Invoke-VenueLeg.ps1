@@ -725,6 +725,14 @@ try {
     $probeRun = Submit-VenueJob -ScriptPath $probeJob -JobId $probeJobId -TimeoutSec 120 -QueueSec 120 -ClaimedExtraSec 60
     Write-NotAfterVerdict $probeRun
     $receipt.evidence.umRunOutcome = $probeRun.umOutcome
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2 r3 (adversary pass A2): the ONE display-path block, copied by its one writer from the probe's own DVE_PROBE line
+    # (read with System.Text.Json; no new venue read, no clock, no wait), BEFORE every refusal below -- the probe that ConvertFrom-DvProbeStdout cannot
+    # parse (an empty member name, say) still carries a sample the writer reads, so the VENUE_UNHEALTHY receipt keeps it. A probe the writer cannot copy as
+    # reported writes no block, so the receipt reads NO_SIGNAL (Read-DvReceiptDisplayPath, the one reader).
+    if ($probeRun.umOutcome -eq 'RECEIPT' -and $null -ne $probeRun.result) {
+        $displayPathBlock = New-DvDisplayPathBlock -ProbeStdout ([string]$probeRun.result.stdout)
+        if ($null -ne $displayPathBlock) { $receipt.venue['displayPath'] = $displayPathBlock }
+    }
     $probe = $null
     if ($probeRun.umOutcome -eq 'RECEIPT' -and $null -ne $probeRun.result) { $probe = ConvertFrom-DvProbeStdout ([string]$probeRun.result.stdout) }
     if ($null -eq $probe) {
@@ -744,6 +752,7 @@ try {
     $receipt.venue.driverVersion = $probe.driverVersion
     $receipt.venue.displayDevice = $probe.displayDevice
     $receipt.venue.instrumentDigests.presentmon = $probe.presentmonSha256
+    # (the display-path block was attached right after the probe returned, above: r3 adversary pass A2)
 
     # P6: one source of truth for which venue a host is.
     Import-Module (Join-Path $here '..\bachelor\AttrCudaArtifacts.psm1') -Force

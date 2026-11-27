@@ -345,7 +345,9 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend, [object]$P
     $f = [ordered]@{ receipt = $null; outcome = $null; fps = $null; drops = $null; stall = $null; verification = $null; rejected = $null; noFigure = $null; identity = $null; resultJsonSha256 = $null; receiptSha256 = $null }
     if (-not $ReceiptPath -or -not (Test-Path -LiteralPath $ReceiptPath -PathType Leaf)) { return $f }
     # r6 (adversary-de8e3799.json A4): the receipt bytes are read ONCE; the figures come from them and the host-load read is bound to their sha256
-    try { $rcBytes = [IO.File]::ReadAllBytes($ReceiptPath); $rc = [IO.StreamReader]::new([IO.MemoryStream]::new($rcBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF) | ConvertFrom-Json; $f.receiptSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes)) } catch { return $f }
+    # (merge with master's R3-RESIDUE-1 A1: the decoded TEXT is kept too, as $rcText, because the validator below takes the text as well as the parsed object)
+    $rcText = ''
+    try { $rcBytes = [IO.File]::ReadAllBytes($ReceiptPath); $rcText = [IO.StreamReader]::new([IO.MemoryStream]::new($rcBytes), [Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF); $rc = $rcText | ConvertFrom-Json; $f.receiptSha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($rcBytes)) } catch { return $f }
     # adversary-7efea617.json A2: -PublishedSha is the sha256 the leg published for its receipt, carried in the chain row ($null only for a chain row that has no
     # such member: a legacy row). When the member is there, the bytes read above must BE those bytes: this read's own hash is never the expectation of itself, so a
     # receipt (and the result.json it binds) replaced between the chain's read and this one is refused as not the leg's, and no figure is taken from it.
@@ -390,7 +392,7 @@ function Get-RowFigures([string]$ReceiptPath, $Leg, [string]$Backend, [object]$P
             if (-not $vr.ok) { throw "validator exit $($vr.exit) timedOut=$($vr.timedOut)" }
             $vr.stdout | ConvertFrom-Json
         }
-        else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo }
+        else { Test-DvReceiptValid -Receipt $rc -RepoRoot $repo -ReceiptText $rcText }   # the TEXT too: ConvertFrom-Json keeps only the last of two same-name members (R3-RESIDUE-1 A1)
     } catch { $null }
     $f.verification = $(if ($v -and [string]$v.status) { [ordered]@{ status = [string]$v.status; valid = [bool]$v.valid; reasons = @($v.reasons | Select-Object -First 3) } } else { [ordered]@{ status = 'VALIDATOR_ERROR'; valid = $false; reasons = @() } })
     if ($f.verification.status -cnotin @('ADVISORY', 'NO_SIGNAL', 'VERIFIED', 'VERIFIED_OFFLINE_TEST')) { $f.rejected = $f.verification.status; return $f }
