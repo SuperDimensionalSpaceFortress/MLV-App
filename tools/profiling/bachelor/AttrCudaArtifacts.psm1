@@ -5110,7 +5110,10 @@ function Get-AttrCudaProcessTreeSnapshot {
         if ($null -ne $Baseline) { foreach ($bk in @($Baseline.Keys)) { if ($null -ne $Baseline[$bk]) { $baseTable[[int64]$bk] = [int64[]]@($Baseline[$bk]) } } }
         if ($baseTable.Count -eq 0) { return (& $unknown 'baseline-unknown') }
         # an entry is (stamp) or (stamp, parent pid): a row is that baseline process only when its pid, stamp AND (when the entry has one) parent pid all match
-        $inBase = { param($BasePid, $BaseTicks, $BaseParent) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid][0] -eq [int64]$BaseTicks) -and (($baseTable[[int64]$BasePid].Count -lt 2) -or (($null -ne $BaseParent) -and ([int64]$baseTable[[int64]$BasePid][1] -eq [int64]$BaseParent))) }
+        # R3 (sol r9 B1 on d35aca43) ORDERING BELT: a process in the listing taken BEFORE the root started was created strictly before it, so a baseline entry whose own stamp is at or after the
+        # root's ($rootTicks, read from the scan before any row is classified) contradicts 'alive before the root' (a stamp that collides with the root's, or a stepped-back clock) and matches nothing:
+        # the row stays unproven (a member), so the kill can only be UNCONFIRMED. The belt only ever removes an outsider; it never adds one, so it cannot confirm a kill.
+        $inBase = { param($BasePid, $BaseTicks, $BaseParent) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and ($null -ne $rootTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid][0] -eq [int64]$BaseTicks) -and ([int64]$BaseTicks -lt [int64]$rootTicks) -and (($baseTable[[int64]$BasePid].Count -lt 2) -or (($null -ne $BaseParent) -and ([int64]$baseTable[[int64]$BasePid][1] -eq [int64]$BaseParent))) }
         # (adversary A3 on 36c22ed2; pass 2 A1 on 9a98b537) the CIM query is dispatched only when what is LEFT of the budget (the budget less the time spent since the first statement) still holds its own
         # timeout: a budget under it (a grant read just before the bound, or time already spent in this call) starts no scan
         if ($BudgetMs -ne 0 -and -not $PSBoundParameters.ContainsKey('Processes') -and (($BudgetMs - (& $budgetElapsed)) -lt ($OperationTimeoutSec * 1000.0))) { return (& $unknown 'deadline-exceeded') }
@@ -5250,9 +5253,13 @@ function Wait-AttrCudaProcessTreeGone {
     $recorded = @{}
     $known = @{}
     $baseTable = @{}
-    $inBase = { param($BasePid, $BaseTicks, $BaseParent) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid][0] -eq [int64]$BaseTicks) -and (($baseTable[[int64]$BasePid].Count -lt 2) -or (($null -ne $BaseParent) -and ([int64]$baseTable[[int64]$BasePid][1] -eq [int64]$BaseParent))) }
+    # R3 (sol r9 B1 on d35aca43) ORDERING BELT, as in the snapshot: a baseline entry whose own stamp is at or after the root's ($rootStamp, the snapshot's rootCreationTicks) was not alive
+    # before the root, so it matches nothing and the row stays a survivor (an unconfirmed kill). It only removes outsiders; it never confirms one.
+    $rootStamp = $null
+    $inBase = { param($BasePid, $BaseTicks, $BaseParent) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and ($null -ne $rootStamp) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid][0] -eq [int64]$BaseTicks) -and ([int64]$BaseTicks -lt [int64]$rootStamp) -and (($baseTable[[int64]$BasePid].Count -lt 2) -or (($null -ne $BaseParent) -and ([int64]$baseTable[[int64]$BasePid][1] -eq [int64]$BaseParent))) }
     $skewTicks = 20000000L
     try {
+        $rootStamp = [int64]$Snapshot.rootCreationTicks
         $recorded[[int64]$Snapshot.rootProcessId] = [int64]$Snapshot.rootCreationTicks
         # r2b (sol r2 A6): a snapshot with no members field is an unknown tree, not an empty one
         # sol r2-b A7: a members field that is present but $null is as unknown as a missing one

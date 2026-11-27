@@ -5012,6 +5012,10 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         unproven = wait[wait.index("$unproven = @{}"):wait.index("$adopted.Add([int64]$q)")]
         self.assertNotRegex(unproven, r"-(lt|gt|le|ge)\b", "no ordering of two stamps decides ancestry in the wait")
         self.assertNotIn("$climb", cut + unproven, "no ParentProcessId climb through processes the listing does not hold")
+        # R3 (sol r9 B1): the ONE ordering left is the belt inside the baseline-identity test ($inBase, defined outside the two sections above): a baseline entry not strictly older than the root's own
+        # stamp matches nothing. It only removes outsiders (a kill can only become unconfirmed), so it does not reopen the stepped-back-clock hole this test pins shut.
+        self.assertIn("([int64]$BaseTicks -lt [int64]$rootTicks)", snap[:snap.index("$late = @{}")])
+        self.assertIn("([int64]$BaseTicks -lt [int64]$rootStamp)", wait[:wait.index("$unproven = @{}")])
 
     def test_a1_clock_free_a_recycled_pid_that_repeats_a_baseline_stamp_is_not_that_process_unless_its_parent_matches(self) -> None:
         """sol A1 on 91e548f8. The listing records pid, stamp AND parent pid. Baseline process 600 (stamp t-1h, parent 999) died; after a clock rollback a live DESCENDANT took
@@ -5035,6 +5039,89 @@ class ExportKillDescendantConfirmTests(unittest.TestCase):
         self.assertEqual(got["bMembers"], [201], f"control: the real baseline process is no member: {got}")
         self.assertIn(600, got["bOthers"], got)
         self.assertTrue(got["bWait"], got)
+
+    def test_r3_sol_r9_b2_a_scan_that_lands_past_the_bound_is_rejected_and_the_kill_is_the_next_act(self) -> None:
+        """R3 (sol r9 B2 on d35aca43). User-mode code cannot stop its own thread being suspended between the dispatch guard and the CIM call, so no guard order closes that window; the contract the
+        code CAN keep is pinned here by driving the clock past the bound INSIDE the query seam (the stub of Get-CimInstance is the scan that lands late). (1) The native OperationTimeoutSec handed to
+        the query never exceeds the whole seconds left at the guard (the guard read 1101 ms left: timeout 1). (2) The result that lands past the bound is rejected (the tree is unknown, the kill
+        unconfirmed). (3) NOTHING else waits between that result and the kill: the next event is the root's wait seam, which grants no wait on a spent allowance, and no confirmation scan, second
+        query or sleep runs. Two shapes: the early record (TimeoutSec >= 5, fake clock) and the cleanup record (TimeoutSec < 5, the real cleanup stopwatch, a 1.6 s scan against 1.5 s)."""
+        module = DV / "VenueChain.psm1"
+        stubs = (
+            "& $m { function script:New-VenueBoundedClock { $c = [pscustomobject]@{}; Add-Member -InputObject $c -MemberType ScriptProperty -Name Elapsed -Value { [pscustomobject]@{ TotalMilliseconds = [double]$global:fakeMs } }; $c }\n"
+            "  function script:Wait-VenueBoundedExit { param($Process, $Clock, [double]$BoundMs) $left = $BoundMs - [double](& $Clock); $global:ev.Add(('exit-wait left=' + [int][Math]::Round($left)))\n"
+            "    if ($global:waitJumps.Count -gt 0) { $global:fakeMs = [double]$global:waitJumps[0]; $global:waitJumps.RemoveAt(0) } elseif ($left -gt 0.0) { $global:fakeMs = [double]$global:fakeMs + $left }; $false }\n"
+            "  function script:Get-AttrCudaProcessTreeSnapshot { param($RootProcessId, $OperationTimeoutSec, $Baseline, [double]$BudgetMs, $Clock, [switch]$BaselineOnly)\n"
+            "    if ($BaselineOnly) { return @{ ([int64]4) = [int64[]]@(1) } }\n"
+            "    $global:ev.Add('snapshot'); & $script:realSnap @PSBoundParameters }\n"
+            "  function script:Get-CimInstance { [CmdletBinding()] param($ClassName, $Property, $OperationTimeoutSec) $global:ev.Add(('cim timeout=' + $OperationTimeoutSec)); if ($global:lateSleepMs -gt 0) { Start-Sleep -Milliseconds $global:lateSleepMs } else { $global:fakeMs = 5400.0 }; @() }\n"
+            "  function script:Wait-AttrCudaProcessTreeGone { param($Snapshot, $WaitMs, $Clock) $global:ev.Add('tree-wait'); [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } } }\n")
+        run = (
+            "$out = [ordered]@{}\n"
+            # name, TimeoutSec, CleanupWaitMs, wait jumps, late sleep (real ms; 0 = the fake clock jumps past the bound)
+            "foreach ($case in @(@('early', 5, 1500, @(3899.0), 0), @('cleanup', 2, 1500, @(2001.0), 1600))) {\n"
+            "  $global:ev = [System.Collections.Generic.List[string]]::new(); $global:fakeMs = 0.0; $global:lateSleepMs = [int]$case[4]\n"
+            "  $global:waitJumps = [System.Collections.Generic.List[double]]::new(); foreach ($j in $case[3]) { $global:waitJumps.Add([double]$j) }\n"
+            "  $r = Invoke-VenueBoundedProcess -FilePath $exe -ArgumentList @('-NoProfile', '-Command', 'Start-Sleep 60') -TimeoutSec ([int]$case[1]) -CleanupWaitMs ([int]$case[2])\n"
+            "  $out[$case[0]] = [ordered]@{ events = @($global:ev); timedOut = $r.timedOut; killConfirmed = $r.killConfirmed }\n"
+            "}\n"
+            "$out | ConvertTo-Json -Compress -Depth 5")
+        proc = run_pwsh(["-Command", self.ABSOLUTE_DEADLINE_PRELUDE.replace("{module}", str(module)) + stubs + run], timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        got = json.loads(proc.stdout.strip().splitlines()[-1])
+        early, cleanup = got["early"], got["cleanup"]
+        for name, c in (("early", early), ("cleanup", cleanup)):
+            self.assertTrue(c["timedOut"], f"{name}: {got}")
+            self.assertFalse(c["killConfirmed"], f"{name}: a result that landed past the bound is rejected: the tree is unknown, the kill unconfirmed: {got}")
+            self.assertNotIn("tree-wait", c["events"], f"{name}: no confirmation scan runs after a late result: {got}")
+            self.assertEqual(sum(1 for e in c["events"] if e.startswith("cim ")), 1, f"{name}: exactly the one late query, no second scan: {got}")
+        self.assertEqual(early["events"], ["exit-wait left=3000", "snapshot", "cim timeout=1", "exit-wait left=-400"],
+                         f"(1) the query is granted the whole seconds left at the guard (1101 ms: 1 s); (3) after the late result the next event is the spent root wait, which grants no wait: {early}")
+        self.assertEqual(cleanup["events"], ["exit-wait left=2000", "snapshot", "cim timeout=1"],
+                         f"cleanup record: the granted timeout fits the cleanup bound and the late result is followed by nothing but the kill: {cleanup}")
+
+    def test_r3_sol_r9_b1_a_baseline_match_at_or_after_the_roots_own_stamp_is_never_an_outsider(self) -> None:
+        """R3 (sol r9 B1 on d35aca43). Identity is (pid, creation stamp, parent pid); on Windows that triple names ONE process for the whole boot, and a process in the listing taken before
+        the root started was created BEFORE the root, so its stamp is strictly older than the root's. The code reads the stamp at full precision (([datetime]CreationDate).ToUniversalTime().Ticks
+        at every site), so a repeat can only come from a stamp that collides with the root's (a coarse or reformatted value) or from a stepped-back clock. A late row that repeats a baseline
+        tuple whose stamp is AT or AFTER the root's own stamp contradicts 'alive before the root' and is never classified an outsider (snapshot, wait, and the direct-parent path), so the
+        kill is UNCONFIRMED (fail closed). Controls: a baseline stamp strictly older than the root's stays an outsider, and the kill is confirmed."""
+        got = self.snapshot_and_wait(
+            "$sys0 = @((Row 0 0 $t.AddDays(-1)), (Row 4 0 $t.AddDays(-1)))\n"
+            "$tree = @((Row 100 4 $t), (Row 201 100 $t.AddSeconds(1)))\n"
+            "$o = [ordered]@{}\n"
+            # name, stamp of the repeated baseline process 600 (parent 999)
+            "foreach ($case in @(@('older', $t.AddSeconds(-30)), @('equal', $t), @('after', $t.AddSeconds(2)))) {\n"
+            "  $st = $case[1]\n"
+            "  $bl = @{ 0 = $t.AddDays(-1).Ticks; 4 = $t.AddDays(-1).Ticks; 600 = [int64[]]@($st.Ticks, 999) }\n"
+            "  $s = & $realSnapshot -RootProcessId 100 -Processes @($sys0 + $tree + @((Row 600 999 $st))) -Baseline $bl\n"
+            "  $w = Wait-AttrCudaProcessTreeGone -Snapshot $s -WaitMs 1200 -Scan { @($sys0 + @((Row 600 999 $st))) }\n"
+            # the wait on its own: a snapshot (hand-made, as an older one) whose baseline holds that tuple
+            "  $hand = [pscustomobject]@{ ok = $true; rootProcessId = 100; rootCreationTicks = $t.Ticks; members = @(); others = @{}; baseline = @{ 0 = [int64[]]@($t.AddDays(-1).Ticks); 4 = [int64[]]@($t.AddDays(-1).Ticks); 600 = [int64[]]@($st.Ticks, 999) } }\n"
+            "  $hw = Wait-AttrCudaProcessTreeGone -Snapshot $hand -WaitMs 1200 -Scan { @($sys0 + @((Row 600 999 $st))) }\n"
+            # the direct-parent path: a new child 700 of baseline process 500 (stamp as above)
+            "  $bl2 = @{ 0 = $t.AddDays(-1).Ticks; 4 = $t.AddDays(-1).Ticks; 500 = [int64[]]@($st.Ticks, 4) }\n"
+            "  $s2 = & $realSnapshot -RootProcessId 100 -Processes @($sys0 + $tree + @((Row 500 4 $st), (Row 700 500 $t.AddSeconds(5)))) -Baseline $bl2\n"
+            "  $w2 = Wait-AttrCudaProcessTreeGone -Snapshot $s2 -WaitMs 1200 -Scan { @($sys0 + @((Row 500 4 $st), (Row 700 500 $t.AddSeconds(5)))) }\n"
+            "  $o[$case[0]] = [ordered]@{ members = @($s.members | ForEach-Object { $_.processId } | Sort-Object); others = @($s.others.Keys | Sort-Object); confirmed = $w.confirmed; survivors = @($w.survivors);\n"
+            "                              handConfirmed = $hw.confirmed; handSurvivors = @($hw.survivors); parentOthers = @($s2.others.Keys | Sort-Object); parentConfirmed = $w2.confirmed }\n"
+            "}\n"
+            "$o | ConvertTo-Json -Compress -Depth 5")
+        older = got["older"]
+        self.assertIn(600, older["others"], f"control: a baseline process strictly older than the root is an outsider: {got}")
+        self.assertTrue(older["confirmed"], f"control: the kill is confirmed with that outsider alive: {got}")
+        self.assertTrue(older["handConfirmed"], got)
+        self.assertTrue(older["parentConfirmed"], f"control: a new child of a strictly older baseline process is an outsider: {got}")
+        for name in ("equal", "after"):
+            c = got[name]
+            self.assertNotIn(600, c["others"], f"{name}: a baseline match not older than the root is no outsider: {got}")
+            self.assertIn(600, c["members"], got)
+            self.assertFalse(c["confirmed"], f"{name}: a late row repeating that tuple must not confirm the kill: {got}")
+            self.assertEqual(c["survivors"], [600], got)
+            self.assertFalse(c["handConfirmed"], f"{name}: the wait applies the same ordering to the snapshot's own baseline: {got}")
+            self.assertEqual(c["handSurvivors"], [600], got)
+            self.assertNotIn(700, c["parentOthers"], got)
+            self.assertFalse(c["parentConfirmed"], f"{name}: a child of a baseline process not older than the root is unproven: {got}")
 
     def test_r2_sol_a1_a2_a9_a_baseline_look_alike_under_the_tree_is_a_member_an_outsider_keeps_its_parent_and_a_blind_row_confirms_nothing(self) -> None:
         """sol r2 on b428e461. A1: baseline process 600 (parent 100, stamp t-30s) died, the old 100 died, the root reuses 100 and its child reuses 600 and (after a rollback) the very
