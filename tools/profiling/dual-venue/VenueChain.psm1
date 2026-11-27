@@ -2034,7 +2034,9 @@ try { . ([scriptblock]::Create((Get-VenueProcessTreeHelperSource))); $script:Ven
 # R2-RESIDUE-2 r1 (test seams, module-private, never exported): the ONE clock of an Invoke-VenueBoundedProcess call and its timed wait for the root's exit. A test replaces either in the
 # module's own scope to place a clock read or an exit on either side of the bound without a real sleep; production behavior is the Stopwatch and Process.WaitForExit.
 function New-VenueBoundedClock { [Diagnostics.Stopwatch]::StartNew() }
-function Wait-VenueBoundedExit { param([Parameter(Mandatory)]$Process, [Parameter(Mandatory)][int]$Ms) [bool]$Process.WaitForExit($Ms) }
+# R2-RESIDUE-3 r2 (adversary A1 on 3853fb75): the wait takes the caller's clock and the ABSOLUTE bound on it, and reads the clock ONCE here, at the dispatch, so a caller suspended between its own
+# earlier read and this call hands the wait nothing stale: the grant is the whole milliseconds left NOW, rounded up (nothing left grants no wait).
+function Wait-VenueBoundedExit { param([Parameter(Mandatory)]$Process, [Parameter(Mandatory)][scriptblock]$Clock, [Parameter(Mandatory)][double]$BoundMs) $leftMs = $BoundMs - [double](& $Clock); if ($leftMs -le 0.0) { return $false }; [bool]$Process.WaitForExit([int][Math]::Ceiling($leftMs)) }
 
 function Invoke-VenueBoundedProcess {
     <#
@@ -2066,7 +2068,7 @@ function Invoke-VenueBoundedProcess {
     $callMs = { $censusClock.Elapsed.TotalMilliseconds }.GetNewClosure()
     if ($script:VenueProcessTreeHelpersLoaded -and $TimeoutSec -ge 5 -and ($null -eq $script:VenueBaselineClock -or $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30)) {
         $script:VenueBaseline = $null
-        try { $script:VenueBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 1 } catch { $script:VenueBaseline = $null }
+        try { $script:VenueBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 1 -BudgetMs ($TimeoutSec * 1000.0) -Clock $callMs } catch { $script:VenueBaseline = $null }
         $script:VenueBaselineClock = [Diagnostics.Stopwatch]::StartNew()
     } elseif ($TimeoutSec -lt 5 -and $null -ne $script:VenueBaselineClock -and $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30) {
         # sol r2-b A4 on ac0d5b6d: a short grant refreshes nothing, but it never reuses a listing older than 30 s either (none: an unknown tree on a timeout)
@@ -2086,7 +2088,7 @@ function Invoke-VenueBoundedProcess {
     $earlyRecord = $script:VenueProcessTreeHelpersLoaded -and $TimeoutSec -ge 5
     if ($earlyRecord) {
         $leadWaitMs = $TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds - 2000.0
-        if ($leadWaitMs -ge 1.0) { $exitedEarly = Wait-VenueBoundedExit -Process $p -Ms ([int][Math]::Floor($leadWaitMs)) }
+        if ($leadWaitMs -ge 1.0) { $exitedEarly = Wait-VenueBoundedExit -Process $p -Clock $callMs -BoundMs ($TimeoutSec * 1000.0 - 2000.0) }
         # R2-RESIDUE r1 (sol A3 on 96cbe079): the record is a scan like the others: it starts only when its 1 s CIM timeout (and 100 ms of slack) still fits what is left of the allowance, read at the
         # moment it is granted; a caller resumed at or past the bound launches no scan (the tree is then unknown, an unconfirmed kill, never a scan that delays the kill past the deadline).
         # R2-RESIDUE-2 r1 (sol B2): the snapshot decodes its rows under -BudgetMs (what is left of the allowance at the dispatch; past it the tree is unknown), and a snapshot that came back past the bound is
@@ -2097,8 +2099,8 @@ function Invoke-VenueBoundedProcess {
     # R2-RESIDUE-2 r1 (sol B1 = key3 B1, refiled A2): ONE clock read fixes the grant (the whole milliseconds left, rounded UP, so a child due inside the allowance is waited for: the old floor polled
     # for 0 ms with 0.65 ms left and rejected an exit 0.55 ms away; nothing left grants no wait), and the clock is read AGAIN when the wait returns: a root seen exiting past the bound (the wait's
     # timer-tick slack, or a poll between two reads that straddled it) is a timeout whatever the wait said. A root that exited during the lead wait above is judged by the same second read.
-    $leftMs = $TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds
-    $exited = $exitedEarly -or (($leftMs -gt 0.0) -and (Wait-VenueBoundedExit -Process $p -Ms ([int][Math]::Ceiling($leftMs))))
+    # R2-RESIDUE-3 r2 (adversary A1 on 3853fb75): that one read is now taken INSIDE the wait seam, at the dispatch, from the caller's clock and the absolute bound; no figure read here crosses the call.
+    $exited = $exitedEarly -or (Wait-VenueBoundedExit -Process $p -Clock $callMs -BoundMs ($TimeoutSec * 1000.0))
     $timedOut = (-not $exited) -or ($censusClock.Elapsed.TotalMilliseconds -gt $TimeoutSec * 1000.0)
     $killErrored = $false
     $treeGone = $true

@@ -5079,9 +5079,15 @@ function Get-AttrCudaProcessTreeSnapshot {
     # query has its own -OperationTimeoutSec; the rows it returns were then decoded with no deadline. Past the budget the answer is the typed unknown 'deadline-exceeded' (no caller may confirm
     # a tree from it). The check is inline (no helper) because VenueChain embeds this function alone, by name.
     $budgetClock = [Diagnostics.Stopwatch]::StartNew()
+    $budgetElapsed = { if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds } }
+    $overBudget = { [bool]($BudgetMs -gt 0 -and (& $budgetElapsed) -gt $BudgetMs) }
     if ($BaselineOnly) {
         try {
+            # R2-RESIDUE-3 r2 (adversary A2 on 3853fb75): the cold listing is a scan like the others. A caller that owns a bound passes it (-BudgetMs, -Clock) and the query is dispatched only while its own
+            # timeout still fits what is left of that bound at the dispatch; a listing that came back past the bound is no listing (the typed unknown: $null). No bound: as before.
+            if ($BudgetMs -ne 0 -and -not $PSBoundParameters.ContainsKey('Processes') -and (($BudgetMs - (& $budgetElapsed)) -lt ($OperationTimeoutSec * 1000.0))) { return $null }
             $baseRows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, CreationDate -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return $null }
             $baseTable = @{}
             # sol A1 on 91e548f8: the identity is the pid, the creation stamp AND the parent pid (immutable for a process's whole life): a replacement that reuses the number and, after a
             # rollback, even the stamp is another process unless it also names the same parent. A row with no readable parent is recorded by pid and stamp alone.
@@ -5096,8 +5102,6 @@ function Get-AttrCudaProcessTreeSnapshot {
         } catch { return $null }
     }
     $unknown = { param([string]$Why) [pscustomobject]@{ ok = $false; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $null; members = @(); error = $Why } }
-    $budgetElapsed = { if ($null -ne $Clock) { [double](& $Clock) } else { $budgetClock.Elapsed.TotalMilliseconds } }
-    $overBudget = { [bool]($BudgetMs -gt 0 -and (& $budgetElapsed) -gt $BudgetMs) }
     try {
         $baseTable = @{}
         if ($null -ne $Baseline) { foreach ($bk in @($Baseline.Keys)) { if ($null -ne $Baseline[$bk]) { $baseTable[[int64]$bk] = [int64[]]@($Baseline[$bk]) } } }
@@ -5226,7 +5230,8 @@ function Wait-AttrCudaProcessTreeGone {
     # between its read and this first statement) is never forgotten. Without -Clock, -WaitMs is relative to the stopwatch started here (the job's own 15 s wait, which has no outer bound).
     # (PowerShell names are case-insensitive: the stopwatch is $ownStopwatch because $clock would overwrite the -Clock parameter)
     $ownStopwatch = [Diagnostics.Stopwatch]::StartNew()
-    $elapsedMs = { if ($null -ne $Clock) { [double](& $Clock) } else { $ownStopwatch.Elapsed.TotalMilliseconds } }
+    # (adversary A6 on 3853fb75: the helper never throws, so a caller clock that throws reads as no time at all: the bound is spent and nothing is scanned)
+    $elapsedMs = { if ($null -ne $Clock) { try { [double](& $Clock) } catch { 1e15 } } else { $ownStopwatch.Elapsed.TotalMilliseconds } }
     # r3 fix 2 (adversary A2 advisory on 6b788356): every snapshot field is read through PSObject.Properties, so a snapshot missing one (under strict mode) is an
     # unknown tree, never a throw. r5b fix (adversary A4 on 2420b65f): a property getter that throws is read inside the same guard.
     $snapProps = $null

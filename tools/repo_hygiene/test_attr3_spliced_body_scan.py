@@ -358,7 +358,9 @@ _allow("Get-AttrCudaEligibilityVerdict", _LOCAL_BLOCK, ("R3", "& $read", 8))
 # R2-RESIDUE-2 r1 (sol B2): -BudgetMs bounds the decode. 16 $unknown calls = the 7 above + 9 'deadline-exceeded' returns (before the CIM dispatch, after its rows, in each of the row loops, and at the end).
 # $overBudget and $budgetElapsed are the body's own pure blocks (defined beside $unknown): $budgetElapsed reads one Stopwatch (or the -Clock test seam) and $overBudget is
 # `{ [bool]($BudgetMs -gt 0 -and (& $budgetElapsed) -gt $BudgetMs) }`; 8 $overBudget calls (one per row-loop / result check) and 2 $budgetElapsed calls (that block, and the pre-dispatch guard of the CIM query).
-_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 16), ("R3", "& $inBase", 2), ("R3", "& $overBudget", 8), ("R3", "& $budgetElapsed", 2))
+# R2-RESIDUE-3 r2 (adversary A2 on 3853fb75): the -BaselineOnly branch carries the bound too, so $budgetElapsed and $overBudget are defined BEFORE it (still pure blocks) and the branch reads them once
+# each: 3 $budgetElapsed calls (the $overBudget block, the baseline dispatch guard, the tree dispatch guard) and 9 $overBudget calls (the 8 above and the baseline's post-query check).
+_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 16), ("R3", "& $inBase", 2), ("R3", "& $overBudget", 9), ("R3", "& $budgetElapsed", 3))
 _allow("Get-AttrCudaProcessTreeSnapshot",
        "test-only seam: runs the caller's -Clock block (a stand-in for the elapsed-milliseconds read of the decode budget) only when a test passed one; production passes none and reads a Stopwatch",
        ("R3", "& $Clock", 1))
