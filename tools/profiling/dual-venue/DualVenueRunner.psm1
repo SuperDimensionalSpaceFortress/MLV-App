@@ -76,6 +76,24 @@ function ConvertTo-DvJsonString([string]$Value) {
     $sb.ToString()
 }
 
+function Get-DvDictionaryKeys {
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2 r2 (sol r1 B1): the keys of a dictionary read from RECEIPT / venue / probe data. PowerShell resolves
+    # `$dictionary.Keys` to the ENTRY named Keys when there is one (a Hashtable, an OrderedDictionary and ConvertFrom-Json -AsHashtable all do), so a
+    # receipt entry named Keys stood in for the key collection. This reads the IDictionary interface's own Keys property, which no entry can shadow.
+    param([System.Collections.IDictionary]$Dictionary)
+    [System.Collections.IDictionary].GetProperty('Keys').GetValue($Dictionary)
+}
+
+function ConvertTo-DvReceiptJson {
+    # r3 (adversary pass A3): ConvertTo-Json with every parameter the session's default-parameter table could set NAMED, so no session default can reach
+    # it. A default of `ConvertTo-Json:AsArray` wraps the root in a list and `ConvertTo-Json:EscapeHandling` = EscapeNonAscii writes a lone surrogate as an
+    # escape; the strict reader types either malformed. The receipt writer and the display-path writer's own check both serialize here, so the text they
+    # write and the text the writer proved readable are the same text in every session. (This file never names the session table itself: the spliced-body
+    # scan reads any file that does as one whose extractor bindings it cannot prove.)
+    param($Value, [int]$Depth = 12)
+    ConvertTo-Json -InputObject $Value -Depth $Depth -AsArray:$false -Compress:$false -EscapeHandling Default
+}
+
 function ConvertTo-DvCanonicalJson {
     <#
     .SYNOPSIS
@@ -89,7 +107,7 @@ function ConvertTo-DvCanonicalJson {
         return [string]::Format([Globalization.CultureInfo]::InvariantCulture, '{0}', $Value)
     }
     if ($Value -is [System.Collections.IDictionary]) {
-        $keys = @($Value.Keys | ForEach-Object { [string]$_ } | Sort-Object -Culture ([Globalization.CultureInfo]::InvariantCulture) -CaseSensitive)
+        $keys = @(Get-DvDictionaryKeys $Value | ForEach-Object { [string]$_ } | Sort-Object -Culture ([Globalization.CultureInfo]::InvariantCulture) -CaseSensitive)
         $parts = foreach ($k in $keys) { (ConvertTo-DvJsonString $k) + ':' + (ConvertTo-DvCanonicalJson $Value[$k]) }
         return '{' + ($parts -join ',') + '}'
     }
@@ -3302,7 +3320,7 @@ function Get-DvStoredPlaybackFieldProblems {
     #>
     param($Stored, $Derived)
     $problems = [System.Collections.Generic.List[string]]::new()
-    $storedNames = @($(if ($Stored -is [System.Collections.IDictionary]) { @($Stored.Keys) } else { @($Stored.PSObject.Properties.Name) }) | ForEach-Object { [string]$_ })
+    $storedNames = @($(if ($Stored -is [System.Collections.IDictionary]) { @(Get-DvDictionaryKeys $Stored) } else { @($Stored.PSObject.Properties.Name) }) | ForEach-Object { [string]$_ })
     foreach ($f in @($script:PlaybackComparedFields) + @($script:PlaybackComparedFieldsWhenStored)) {
         foreach ($n in $storedNames) {
             if ([string]::Equals($n, $f, [StringComparison]::OrdinalIgnoreCase) -and -not [string]::Equals($n, $f, [StringComparison]::Ordinal)) {
@@ -3327,7 +3345,7 @@ function Test-DvNumber($Value) {
 }
 
 function Get-DvKeys($Object) {
-    if ($Object -is [System.Collections.IDictionary]) { return @($Object.Keys | ForEach-Object { [string]$_ }) }
+    if ($Object -is [System.Collections.IDictionary]) { return @(Get-DvDictionaryKeys $Object | ForEach-Object { [string]$_ }) }
     @($Object.PSObject.Properties | ForEach-Object { $_.Name })
 }
 
@@ -6501,7 +6519,14 @@ function Test-DvReceiptValid {
     #>
     # -OfflineLegSpecBytes (r8): offline test mode only -- the leg spec bytes the runner ran, so a paired-seek block is checked against a spec contract there
     # too (bound to subject.legSpecSha256); production ignores it and reads the committed spec.
-    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null)
+    # -ReceiptText (R3-RESIDUE-1 A1): the TEXT the receipt object was parsed from. ConvertFrom-Json keeps only the last of two same-name members, so a duplicate
+    # `venue` / `venue.displayPath` member is visible only in the text: with it, a PASS/FAIL receipt that names either twice is INVALID (DISPLAY_PATH_DUPLICATE_MEMBER),
+    # and the DISPLAY_PATH_UNBOUND marker comes from one of two sources (Get-DvReceiptTextDisplayPathFacts). (a) The member scan completes (strict JSON, an object root, within
+    # depth 64; a lone surrogate does not stop it): the marker is owed when ANY venue occurrence in the text carries a displayPath member, and the scan keeps its marker and
+    # its duplicate finding even when the readability check then sets DISPLAY_PATH_TEXT_UNREADABLE. (b) The scan yields no facts (a comment, a trailing comma, depth past 64,
+    # a non-object root, a walk that threw): the marker follows the parsed object alone. In every unreadable case the receipt is INVALID with DISPLAY_PATH_TEXT_UNREADABLE. The file readers
+    # (Invoke-VenueBaseline, New-VenueSheetPair, New-VenueFlavorPair) and Write-DvReceipt pass it; a caller that omits it is judged on the parsed object, as before.
+    param([Parameter(Mandatory)]$Receipt, [string]$RepoRoot = '', [string]$EvidenceDir = '', [switch]$AllowOfflineTestMode, [byte[]]$OfflineLegSpecBytes = $null, [AllowNull()][AllowEmptyString()][string]$ReceiptText = '')
     $incomplete = [System.Collections.Generic.List[string]]::new()
     $invalid = [System.Collections.Generic.List[string]]::new()
     $outcome = [string](Get-DvProp $Receipt 'outcome')
@@ -6511,6 +6536,14 @@ function Test-DvReceiptValid {
     # Claims the receipt makes that NO hashed artifact carries (fable r1 B1 / sol r1 B3). They are recorded, typed, and never used as a verdict input.
     $unbound = @('CLIP_CONTENT_UNBOUND: subject.clipContentSha256 is computed by the local generator and written to no artifact the venue returns; it is recorded, never trusted',
                  'LEG_IDENTITY_UNBOUND: legId / legSpecSha256 name a committed spec, but no hashed artifact carries them; only the leg TYPE (summary.lookLeg), look flavor, backend, venue, clip and build are bound')
+    # VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2 (r1 adversary pass-3 A5): the display-path block copies the health probe's own report, which no hashed artifact carries
+    if (Test-DvReceiptCarriesDisplayPath $Receipt -ReceiptText $ReceiptText) { $unbound += 'DISPLAY_PATH_UNBOUND: venue.displayPath copies the health probe''s own report and is written to no hashed artifact; it is recorded, never a verdict input' }
+    # R3-RESIDUE-1 A1: a duplicate member only the text can show fails closed (the strict reader types such a receipt malformed; the parsed object kept one of them)
+    $textFacts = Get-DvReceiptTextDisplayPathFacts -ReceiptText $ReceiptText
+    if ($textFacts.duplicate) { $invalid.Add('DISPLAY_PATH_DUPLICATE_MEMBER: the receipt text names venue, or venue.displayPath, more than once; ConvertFrom-Json keeps only the last, so the receipt does not read the way the strict display-path reader reads it') }
+    # R3-R2-RESIDUE-1 A1: text that WAS supplied and the strict reader cannot inspect (deeper than its 64, a comment, a non-object root) cannot be ruled free of a duplicate
+    # member, so the receipt is INVALID: the parsed object's own status is never the answer for it (ConvertFrom-Json reads depth 1024 and accepts comments)
+    if ($textFacts.unreadable) { $invalid.Add('DISPLAY_PATH_TEXT_UNREADABLE: the receipt text is not strict JSON the display-path reader can inspect (System.Text.Json default options: depth 64, no comments, an object root), so a duplicate venue or venue.displayPath member cannot be ruled out') }
 
     $subject = Get-DvProp $Receipt 'subject'
     $clipId = [string](Get-DvProp $subject 'clipId')
@@ -7262,7 +7295,9 @@ try { Add-Type -AssemblyName System.Windows.Forms; `$probe.displayDevice = [stri
 
 function ConvertFrom-DvProbeStdout([string]$Stdout) {
     foreach ($line in ($Stdout -split "`r?`n")) {
-        if ($line.StartsWith('DVE_PROBE=')) {
+        # r3 (sol r2 DV-PROBE-LINE-ORDINAL-PICK-1): ORDINAL prefix test -- the culture-sensitive one ignores a soft hyphen or a NUL, so a line that only
+        # LOOKS like the probe line was picked and its Substring then cut the wrong characters. The display-path writer picks its line the same way.
+        if ($line.StartsWith('DVE_PROBE=', [System.StringComparison]::Ordinal)) {
             try { return ($line.Substring('DVE_PROBE='.Length) | ConvertFrom-Json) } catch { return $null }
         }
     }
@@ -7760,7 +7795,11 @@ function Write-DvReceipt {
         # after collection, one that vanished or turned unreadable) is an evidence-validation failure, never a receipt-destination write failure: it is
         # re-thrown tagged DVE_EVIDENCE_VALIDATION_IO|<path>|<reason> (the path the .NET message quotes), and the runner writes the leg as a typed UNRESOLVED.
         # (r8: -LegSpecBytes, the spec the runner ran, is the paired-still contract in offline test mode only; production reads the committed spec)
-        try { $validity = Test-DvReceiptValid -Receipt $Receipt -RepoRoot $RepoRoot -AllowOfflineTestMode:$OfflineTestMode -OfflineLegSpecBytes $(if ($OfflineTestMode) { $LegSpecBytes } else { $null }) }
+        # R3-RESIDUE-1 A1: the validator also reads the TEXT this receipt serializes to (a dictionary with `venue` in two letter cases writes two members). A
+        # serialization failure leaves the text empty (the validator then judges the object alone) and surfaces, as before, at the write below.
+        $receiptText = ''
+        try { $receiptText = [string](ConvertTo-DvReceiptJson $Receipt 12) } catch { $receiptText = '' }
+        try { $validity = Test-DvReceiptValid -Receipt $Receipt -RepoRoot $RepoRoot -AllowOfflineTestMode:$OfflineTestMode -OfflineLegSpecBytes $(if ($OfflineTestMode) { $LegSpecBytes } else { $null }) -ReceiptText $receiptText }
         catch {
             $reason = ([string]$_.Exception.Message) -replace '\s+', ' '
             $where = $(if ($reason -match "'((?:[A-Za-z]:\\|\\\\)[^']+)'") { $Matches[1] } else { '(validator)' })
@@ -7776,11 +7815,321 @@ function Write-DvReceipt {
     $dir = Join-Path (Join-Path (Join-Path $ReceiptRoot $Receipt['card']) $Receipt['legId']) $Receipt['venue']['name']
     New-Item -ItemType Directory -Force -Path $dir | Out-Null
     $path = Join-Path $dir ($Receipt['receiptId'] + '.json')
-    $json = ($Receipt | ConvertTo-Json -Depth 12)
+    $json = (ConvertTo-DvReceiptJson $Receipt 12)
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json + "`n")
     $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)   # CreateNew: never overwrite
     try { $stream.Write($bytes, 0, $bytes.Length) } finally { $stream.Dispose() }
     $path
+}
+
+# --- the display-path block (VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2) -----------------------------
+$script:DisplayPathSchema = 'mlv-app/venue-display-path/v2'
+$script:DisplayPathSource = 'health-probe'
+$script:DisplayPathFields = @('schema', 'source', 'adapters', 'firstAdapterDriverVersion', 'primaryDisplayDevice')
+$script:DisplayPathMaxAdapters = 64
+
+function Test-DvMemberNameIs {
+    # r3 (sol r2 B1): THE case rule for finding a receipt member by name -- ordinal, ANY letter case (PowerShell reads member names case-insensitively, so a
+    # case variant must never hide). The strict reader (Get-DvJsonMembersNamed, over a System.Text.Json element) and the validator's marker lookup
+    # (Get-DvObjectMembersNamed, over a parsed PSCustomObject / Hashtable / OrderedDictionary / ConvertFrom-Json -AsHashtable result) decide a match here
+    # and nowhere else, so "the block is present" and "the marker is owed" cannot disagree about which member is `venue`.
+    param([AllowNull()][string]$Name, [string]$Wanted)
+    [string]::Equals($Name, $Wanted, [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-DvJsonMembersNamed {
+    # The members of a System.Text.Json object element whose name matches -Name (Test-DvMemberNameIs). A name that cannot be read back (an escaped lone
+    # surrogate) throws: the caller's catch types the block malformed. -SkipUnreadable (R3-RESIDUE-1 A1, Get-DvReceiptTextDisplayPathFacts) skips such a
+    # member instead: a name that cannot be read back is not `venue` or `displayPath`, so it neither matches nor hides a member that does.
+    param([System.Text.Json.JsonElement]$Element, [string]$Name, [switch]$SkipUnreadable)
+    $hits = [System.Collections.Generic.List[object]]::new()
+    foreach ($p in $Element.EnumerateObject()) {
+        $n = $null
+        try { $n = $p.Name } catch { $n = $null }
+        if ($null -eq $n) { if ($SkipUnreadable) { continue }; throw 'a member name cannot be read back' }
+        if (Test-DvMemberNameIs ([string]$n) $Name) { $hits.Add($p) }
+    }
+    $hits.ToArray()   # unrolled to the caller, which collects it with @(): zero, one or more JsonProperty values
+}
+
+function Get-DvObjectMembersNamed {
+    # r3 (sol r2 B1): the VALUES of every member of a parsed receipt object whose name matches -Name (Test-DvMemberNameIs), whatever the representation: an
+    # IDictionary (Hashtable, OrderedDictionary, ConvertFrom-Json -AsHashtable, whose keys are case-SENSITIVE) is walked by its real keys (Get-DvDictionaryKeys),
+    # any other object by its properties. Unlike Get-DvProp it never misses `Venue` beside `venue`, and every case variant is returned. Returns one
+    # [pscustomobject]@{ Name; Value } per member (a $null member value stays a member), unrolled to the caller, which collects it with @().
+    param($Object, [string]$Name)
+    $hits = [System.Collections.Generic.List[object]]::new()
+    if ($null -ne $Object) {
+        if ($Object -is [System.Collections.IDictionary]) {
+            foreach ($k in @(Get-DvDictionaryKeys $Object)) {
+                if (Test-DvMemberNameIs ([string]$k) $Name) { $hits.Add([pscustomobject]@{ Name = [string]$k; Value = $Object[$k] }) }
+            }
+        } else {
+            foreach ($p in $Object.PSObject.Properties) {
+                if (Test-DvMemberNameIs ([string]$p.Name) $Name) { $hits.Add([pscustomobject]@{ Name = [string]$p.Name; Value = $p.Value }) }
+            }
+        }
+    }
+    $hits.ToArray()
+}
+
+function Test-DvJsonTextReadable {
+    # r1 adversary pass-3 A4: every member name and string value under a System.Text.Json element can be read back (an escaped lone surrogate cannot).
+    # Iterative (a work stack), so the document's own depth bound is the only bound.
+    param([System.Text.Json.JsonElement]$Element)
+    $stack = [System.Collections.Generic.Stack[System.Text.Json.JsonElement]]::new()
+    $stack.Push($Element)
+    try {
+        while ($stack.Count -gt 0) {
+            $e = $stack.Pop()
+            if ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Object) {
+                foreach ($p in $e.EnumerateObject()) {
+                    if ($null -eq $p.Name) { return $false }
+                    $stack.Push($p.Value)
+                }
+            } elseif ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::Array) {
+                foreach ($x in $e.EnumerateArray()) { $stack.Push($x) }
+            } elseif ($e.ValueKind -eq [System.Text.Json.JsonValueKind]::String) {
+                if ($null -eq $e.GetString()) { return $false }
+            }
+        }
+    } catch { return $false }
+    $true
+}
+
+function Get-DvReceiptTextDisplayPathFacts {
+    <#
+    .SYNOPSIS
+    R3-RESIDUE-1 A1: what the receipt TEXT says about `venue` and `venue.displayPath`, read with System.Text.Json (the reader's own grammar). ConvertFrom-Json
+    (object and -AsHashtable) keeps only the LAST of two same-name members, so a parsed receipt cannot show a first `venue` block; the text can.
+    Returns [pscustomobject]@{ parsed; unreadable; venueCount; carries; duplicate }:
+      parsed    -- the text is strict JSON with an object root. Not parsed (empty, not strict JSON, an array root): carries and duplicate stay $false, and the
+                   caller keeps what the parsed receipt object says (the text cannot say where a member sits) -- EXCEPT that text which was supplied
+                   (non-empty) and could not be inspected is `unreadable`.
+      unreadable-- R3-R2-RESIDUE-1 A1: non-empty text the strict System.Text.Json reader cannot inspect: not strict JSON (a comment, a trailing comma, more
+                   than its default depth of 64 -- ConvertFrom-Json reads 1024), a root that is not an object, a walk that threw, or a name or string that
+                   cannot be read back (an escaped lone surrogate: Test-DvJsonTextReadable, the check Read-DvReceiptDisplayPath makes). Duplicate members cannot be
+                   ruled out in such a text, so the validator types a PASS/FAIL receipt carrying it INVALID (DISPLAY_PATH_TEXT_UNREADABLE) and never takes the
+                   parsed object's answer. Empty text is not unreadable: it is a caller that did not supply the text, and keeps today's reading.
+      venueCount-- the `venue` members at the root, in any letter case (Test-DvMemberNameIs), a name written with a JSON \u escape for one of its letters included (the parser decodes it).
+      carries   -- ANY venue occurrence that is an object holds a `displayPath` member (any letter case). Two cases. (a) The membership scan completes (strict JSON,
+                   an object root, within depth 64): `carries` and `duplicate` come from the scan, and they are KEPT when the readability check then sets `unreadable`
+                   for a lone surrogate (an unreadable name is skipped by the scan, it is neither `venue` nor `displayPath`). The scan never looks at what the block holds.
+                   (b) The scan yields no facts (a comment, a trailing comma, depth past 64, a non-object root, a walk that threw): `carries` stays $false and the marker
+                   follows the parsed object alone (Test-DvReceiptCarriesDisplayPath). In every unreadable case the receipt is INVALID (DISPLAY_PATH_TEXT_UNREADABLE).
+      duplicate -- `venue` appears more than once, or one venue holds `displayPath` more than once.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$ReceiptText)
+    $facts = [pscustomobject]@{ parsed = $false; unreadable = $false; venueCount = 0; carries = $false; duplicate = $false }
+    if ([string]::IsNullOrEmpty($ReceiptText)) { return $facts }
+    $unreadableFacts = [pscustomobject]@{ parsed = $false; unreadable = $true; venueCount = 0; carries = $false; duplicate = $false }
+    $doc = $null
+    # The reader's own options, on purpose (default depth 64): raising the limit here would make this reader read what Read-DvReceiptDisplayPath refuses.
+    try { $doc = [System.Text.Json.JsonDocument]::Parse($ReceiptText, [System.Text.Json.JsonDocumentOptions]::new()) } catch { return $unreadableFacts }
+    try {
+        $root = $doc.RootElement
+        if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $unreadableFacts }
+        $venues = @(Get-DvJsonMembersNamed -Element $root -Name 'venue' -SkipUnreadable)
+        $carries = $false; $duplicate = ($venues.Count -gt 1)
+        foreach ($v in $venues) {
+            if ($v.Value.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { continue }
+            $blocks = @(Get-DvJsonMembersNamed -Element $v.Value -Name 'displayPath' -SkipUnreadable).Count
+            if ($blocks -gt 0) { $carries = $true }
+            if ($blocks -gt 1) { $duplicate = $true }
+        }
+        $facts.parsed = $true; $facts.venueCount = $venues.Count; $facts.carries = $carries; $facts.duplicate = $duplicate
+        # luna r1l A1: the reader (Read-DvReceiptDisplayPath) also refuses a text holding any name or string that cannot be read back (an escaped lone surrogate), so the
+        # SAME check decides `unreadable` here. The member walk above skips such a name (it is neither `venue` nor `displayPath`), so carries / duplicate stay as they were.
+        $facts.unreadable = -not (Test-DvJsonTextReadable -Element $root)
+    } catch { $facts = $unreadableFacts }
+    finally { $doc.Dispose() }
+    $facts
+}
+
+function Test-DvReceiptCarriesDisplayPath {
+    # r1 adversary pass-3 A5: does the receipt's venue carry a displayPath member (any letter case)? Presence only, for the validator's UNBOUND list;
+    # the block's content is read by Read-DvReceiptDisplayPath alone. r3 (sol r2 B1): `venue` is found by the reader's own name rule
+    # (Test-DvMemberNameIs, via Get-DvObjectMembersNamed), so `Venue` in a case-sensitive dictionary owes the marker exactly as the reader's `present` says;
+    # when a receipt names venue in two letter cases the reader types it malformed, and the marker is owed if ANY of them carries a displayPath member.
+    # R3-RESIDUE-1 A1: -ReceiptText is the text the receipt was parsed from. The parsed object keeps only the LAST of two same-name members, so the text is
+    # asked too (Get-DvReceiptTextDisplayPathFacts: ANY venue occurrence in a text the strict reader can inspect carrying a displayPath member owes the marker).
+    # Two cases: (a) the membership scan completes (a lone surrogate does not stop it): the marker comes from the scan and is kept even though the receipt is then INVALID
+    # (DISPLAY_PATH_TEXT_UNREADABLE); (b) the scan yields no facts (a comment, a trailing comma, depth past 64, a non-object root, a walk that threw): the marker follows the
+    # parsed object alone. A caller that omits it gets the object's answer alone, as before.
+    param($Receipt, [AllowNull()][AllowEmptyString()][string]$ReceiptText = '')
+    foreach ($venue in @(Get-DvObjectMembersNamed $Receipt 'venue')) {
+        if (@(Get-DvObjectMembersNamed $venue.Value 'displayPath').Count -gt 0) { return $true }
+    }
+    if (-not [string]::IsNullOrEmpty($ReceiptText)) { if ((Get-DvReceiptTextDisplayPathFacts -ReceiptText $ReceiptText).carries) { return $true } }
+    $false
+}
+
+function Read-DvReceiptDisplayPath {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2: the ONE reader of a leg receipt's `venue.displayPath` block. It reads the receipt TEXT with System.Text.Json
+    and its default, strict options (no comments, no trailing commas, double-quoted names and strings only, depth 64); every string is the text as
+    written. There is no second reader, no fallback to the PowerShell JSON cmdlet and no recovery rewrite. Returns [pscustomobject]@{ state; block; reason }:
+      present   -- block is the typed block: [ordered]@{ schema; source; adapters ([string[]]); firstAdapterDriverVersion; primaryDisplayDevice }
+      malformed -- block $null, reason names why: the text is empty or not strict JSON, the root is not an object, a `venue` or `displayPath` member
+                   appears twice in any letter case, venue is not an object, the block member is not spelled `displayPath`, the block is not an
+                   object, a field is missing, unknown, doubled (any letter case) or of the wrong type, schema/source is not the exact string, the
+                   adapter list is empty or holds more than 64, an adapter name, driver version or display device carries U+FFFD or `?` (the marks of a
+                   text that was not carried as reported), or any name or string cannot be read back. Every exception inside the reader is this state.
+                   The `venue` and `displayPath` members are found in ANY letter case by one rule (Test-DvMemberNameIs), the rule the validator's
+                   DISPLAY_PATH_UNBOUND marker lookup uses too.
+      NO_SIGNAL -- block and reason $null: no `venue` member, or a venue object with no `displayPath` member (every receipt fork/master writes).
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$ReceiptText)
+    if ([string]::IsNullOrEmpty($ReceiptText)) { return [pscustomobject]@{ state = 'malformed'; block = $null; reason = 'the receipt text is empty' } }
+    $doc = $null
+    try { $doc = [System.Text.Json.JsonDocument]::Parse($ReceiptText, [System.Text.Json.JsonDocumentOptions]::new()) }
+    catch { return [pscustomobject]@{ state = 'malformed'; block = $null; reason = 'the receipt text is not strict JSON' } }
+    $why = $null
+    try {
+        $object = [System.Text.Json.JsonValueKind]::Object
+        $root = $doc.RootElement
+        if ($root.ValueKind -ne $object) { $why = 'the receipt root is not an object' }
+        elseif (-not (Test-DvJsonTextReadable -Element $root)) { $why = 'the receipt text holds a name or string that cannot be read back' }
+        else {
+            $venues = @(Get-DvJsonMembersNamed -Element $root -Name 'venue')
+            if ($venues.Count -eq 0) { return [pscustomobject]@{ state = 'NO_SIGNAL'; block = $null; reason = $null } }
+            if ($venues.Count -gt 1) { $why = 'the receipt names venue more than once' }
+            elseif ($venues[0].Value.ValueKind -ne $object) { $why = 'venue is not an object' }
+            else {
+                $members = @(Get-DvJsonMembersNamed -Element $venues[0].Value -Name 'displayPath')
+                if ($members.Count -eq 0) { return [pscustomobject]@{ state = 'NO_SIGNAL'; block = $null; reason = $null } }
+                if ($members.Count -gt 1) { $why = 'venue names displayPath more than once' }
+                # r1 adversary pass-1 A1/A2: every name and string comparison below is ORDINAL (Test-DvOrdinalEqual, an OrdinalIgnoreCase dictionary):
+                # PowerShell's -ceq / -cne / -cnotcontains compare by culture and ignore a NUL, a soft hyphen or a U+034F inside a text.
+                elseif (-not (Test-DvOrdinalEqual $members[0].Name 'displayPath')) { $why = 'the block member is not spelled displayPath' }
+                elseif ($members[0].Value.ValueKind -ne $object) { $why = 'the block is not an object' }
+                else {
+                    $fields = [System.Collections.Generic.Dictionary[string, System.Text.Json.JsonElement]]::new([System.StringComparer]::OrdinalIgnoreCase)
+                    foreach ($p in $members[0].Value.EnumerateObject()) {
+                        $n = $p.Name
+                        if ($null -eq $n) { throw 'a block member name cannot be read back' }
+                        if ($fields.ContainsKey([string]$n)) { $why = 'the block names a field more than once'; break }
+                        if (@($script:DisplayPathFields | Where-Object { Test-DvOrdinalEqual $_ $n }).Count -ne 1) { $why = 'the block carries an unknown field'; break }
+                        $fields[[string]$n] = $p.Value
+                    }
+                    if ($null -eq $why) {
+                        foreach ($f in $script:DisplayPathFields) { if (-not $fields.ContainsKey($f)) { $why = "the block has no $f"; break } }
+                    }
+                    if ($null -eq $why) {
+                        $string = [System.Text.Json.JsonValueKind]::String
+                        $null_ = [System.Text.Json.JsonValueKind]::Null
+                        $adapters = $fields['adapters']
+                        # r1 adversary pass-1 A3 / pass-3 A1: U+FFFD and '?' are the marks of a text that was not carried as it was reported (a decoder
+                        # turns an escaped lone surrogate into U+FFFD; a venue agent that writes its result as ASCII turns a non-ASCII letter into '?'). No
+                        # adapter name, driver version or display device name holds either, so a block string carrying one is malformed, never present evidence.
+                        $lossy = [char[]]@([char]0xFFFD, [char]0x3F)
+                        $nullable = @{}
+                        foreach ($f in @('firstAdapterDriverVersion', 'primaryDisplayDevice')) {
+                            $v = $fields[$f]
+                            if ($v.ValueKind -eq $null_) { $nullable[$f] = $null }
+                            elseif ($v.ValueKind -eq $string) {
+                                $s = [string]$v.GetString()
+                                if ($s.IndexOfAny($lossy) -ge 0) { $why = "$f carries U+FFFD or '?'"; break }
+                                $nullable[$f] = $s
+                            }
+                            else { $why = "$f is neither a string nor null"; break }
+                        }
+                        if ($null -ne $why) { }
+                        elseif ($fields['schema'].ValueKind -ne $string -or -not (Test-DvOrdinalEqual $fields['schema'].GetString() $script:DisplayPathSchema)) { $why = "schema is not $($script:DisplayPathSchema)" }
+                        elseif ($fields['source'].ValueKind -ne $string -or -not (Test-DvOrdinalEqual $fields['source'].GetString() $script:DisplayPathSource)) { $why = "source is not $($script:DisplayPathSource)" }
+                        elseif ($adapters.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { $why = 'adapters is not a list' }
+                        elseif ($adapters.GetArrayLength() -gt $script:DisplayPathMaxAdapters) { $why = "adapters lists more than $($script:DisplayPathMaxAdapters)" }
+                        # r1 adversary pass-3 A3: every Windows host has a video controller (Microsoft Basic Display Adapter at least), so a sample with none is a
+                        # failed controller read, never a venue state: an empty list is malformed.
+                        elseif ($adapters.GetArrayLength() -lt 1) { $why = 'adapters is empty (a sample with no video controller is a failed read)' }
+                        else {
+                            $names = [System.Collections.Generic.List[string]]::new()
+                            foreach ($e in $adapters.EnumerateArray()) {
+                                if ($e.ValueKind -ne $string) { $why = 'an adapter is not a string'; break }
+                                $s = [string]$e.GetString()
+                                if ($s.IndexOfAny($lossy) -ge 0) { $why = "an adapter carries U+FFFD or '?'"; break }
+                                $names.Add($s)
+                            }
+                            if ($null -eq $why) {
+                                return [pscustomobject]@{ state = 'present'; reason = $null; block = [ordered]@{
+                                    schema = $script:DisplayPathSchema
+                                    source = $script:DisplayPathSource
+                                    adapters = [string[]]$names.ToArray()
+                                    firstAdapterDriverVersion = $nullable['firstAdapterDriverVersion']
+                                    primaryDisplayDevice = $nullable['primaryDisplayDevice']
+                                } }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } catch {
+        $why = 'the block cannot be read back as written'
+    } finally { $doc.Dispose() }
+    [pscustomobject]@{ state = 'malformed'; block = $null; reason = [string]$why }
+}
+
+function New-DvDisplayPathBlock {
+    <#
+    .SYNOPSIS
+    VENUE-LEG-DISPLAY-PATH-RECEIPT-NARROW-2: the ONE writer of a leg receipt's `venue.displayPath` block. It copies three fields the health probe ALREADY
+    reported (gpuNames from its Win32_VideoController read, driverVersion, displayDevice = Screen.PrimaryScreen.DeviceName) into the block; it reads nothing
+    on the venue, waits on nothing and reads no clock. r1 adversary pass-3 A2: it takes the probe job's stdout TEXT and reads the same `DVE_PROBE=` line
+    ConvertFrom-DvProbeStdout reads (the first one) with System.Text.Json, strict default options, so a key that appears twice or in another letter case,
+    an array root, a comment or a time-looking text is never read the way ConvertFrom-Json reads it. Returns the block the ONE reader
+    (Read-DvReceiptDisplayPath) gives back for it, or $null -- the caller then writes no block and the receipt reads NO_SIGNAL -- when there is no such line,
+    it is not a strict JSON object, gpuNames / driverVersion / displayDevice is missing, doubled or misspelled in case, gpuNames is not a list of strings,
+    a driver or device is neither a string nor null, a string cannot be read back, or the reader does not type the block present. Never throws.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$ProbeStdout)
+    try {
+        $json = $null
+        foreach ($line in ($ProbeStdout -split "`r?`n")) {
+            if ($line.StartsWith('DVE_PROBE=', [System.StringComparison]::Ordinal)) { $json = $line.Substring('DVE_PROBE='.Length); break }   # the line ConvertFrom-DvProbeStdout reads (same ordinal test)
+        }
+        if ($null -eq $json) { return $null }
+        $doc = [System.Text.Json.JsonDocument]::Parse($json, [System.Text.Json.JsonDocumentOptions]::new())
+        try {
+            $root = $doc.RootElement
+            if ($root.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) { return $null }
+            $got = @{}
+            foreach ($name in @('gpuNames', 'driverVersion', 'displayDevice')) {
+                $hits = @(Get-DvJsonMembersNamed -Element $root -Name $name)
+                if ($hits.Count -ne 1 -or -not (Test-DvOrdinalEqual $hits[0].Name $name)) { return $null }
+                $got[$name] = $hits[0].Value
+            }
+            if ($got['gpuNames'].ValueKind -ne [System.Text.Json.JsonValueKind]::Array) { return $null }
+            $list = [System.Collections.Generic.List[string]]::new()
+            foreach ($e in $got['gpuNames'].EnumerateArray()) {
+                if ($e.ValueKind -ne [System.Text.Json.JsonValueKind]::String) { return $null }
+                $list.Add([string]$e.GetString())
+            }
+            $names = $list.ToArray()
+            $text = @{}
+            foreach ($name in @('driverVersion', 'displayDevice')) {
+                $v = $got[$name]
+                if ($v.ValueKind -eq [System.Text.Json.JsonValueKind]::Null) { $text[$name] = $null }
+                elseif ($v.ValueKind -eq [System.Text.Json.JsonValueKind]::String) { $text[$name] = [string]$v.GetString() }
+                else { return $null }
+            }
+            $driver = $text['driverVersion']
+            $device = $text['displayDevice']
+        } finally { $doc.Dispose() }
+        $block = [ordered]@{
+            schema = $script:DisplayPathSchema
+            source = $script:DisplayPathSource
+            adapters = [string[]]$names
+            firstAdapterDriverVersion = $driver
+            primaryDisplayDevice = $device
+        }
+        # The writer never writes a block its reader does not type `present`: it hands back the reader's own typed block.
+        $read = Read-DvReceiptDisplayPath -ReceiptText (ConvertTo-DvReceiptJson ([ordered]@{ venue = [ordered]@{ displayPath = $block } }) 6)
+        if (-not (Test-DvOrdinalEqual $read.state 'present')) { return $null }
+        return $read.block
+    } catch { return $null }
 }
 
 function Get-DvAcceptanceVerdict {
@@ -7824,4 +8173,5 @@ Export-ModuleMember -Function Get-DvOutcomeEnum, ConvertTo-DvCanonicalJson, Get-
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
     Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
-    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict, Get-DvStoredPlaybackFieldProblems
+    Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict, Get-DvStoredPlaybackFieldProblems,
+    Read-DvReceiptDisplayPath, New-DvDisplayPathBlock
