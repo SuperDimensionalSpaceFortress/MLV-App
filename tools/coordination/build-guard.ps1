@@ -1077,6 +1077,60 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} HeavySlotClass={3} ({4}) utc={5}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($classRaw -replace '\s+', ' '), ($classWhy -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
         exit 2
     }
+    # The durations are judged here too, BEFORE the shim is looked for (adversary db7a9734-A1/A2): every fail-open return below builds
+    # WITHOUT the slot, so a wait or eta that was judged after them (NaN, 1e100, an exclusive-short eta that formats as 0) was never refused
+    # on a host without heavy-slot. Nothing below this block is needed to judge them.
+    # heavy-slot ends its own wait (a marked 75) and its admit cap; this bound only catches a hung tool. It is numeric even
+    # when a Library caller passes the minutes as a string, and monotonic, so a wall-clock step cannot move it. It is
+    # computed BEFORE heavy-slot starts: a value it cannot hold (an overflow, NaN, text) is a typed refusal with nothing
+    # launched, never a throw after the launch that skips the stop file (r2 adversary A3).
+    # --wait and --eta are written in the invariant culture: heavy-slot reads only plain decimals ('0.5m'), never the
+    # '0,5m' a de-DE culture writes. An eta that is not a finite number >= 0 is refused here too (r4 adversary A1).
+    # heavy-slot reads both with ^\d+(\.\d+)?m$ into TimeSpan.FromMinutes, so a negative wait, or either one past
+    # TimeSpan's range, fails its parser after the launch; both must be 0..$maxMin (r5b adversary A2).
+    $giveUp = $null
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    $boundNote = ''
+    try {
+        $waitMin = [double]$Options.HeavySlotWaitMinutes
+        $etaMin = [double]$Options.HeavySlotEtaMinutes
+        # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: a staging driver that has its own deadline passes it here, and the wait is what
+        # is left of it (0 once it has passed; one week at most), not the 60 min default. A refusal at 60 min threw the ticket's age
+        # away: the driver re-queued as the youngest ticket, behind newer work, for as long as the queue stayed deeper than 60 min.
+        # The deadline was read and refused at the top of this function; here it only sets the first wait, which
+        # is checked like any other. The wait actually launched is computed again right before the launch (adversary cd45eeb5-A3).
+        if ($deadline.At) {
+            $waitMin = [Math]::Min([Math]::Max(($deadline.At - [DateTime]::UtcNow).TotalMinutes, 0.0), $maxMin)
+            $boundNote = [string]::Concat('deadline=', [string]::Format($inv, '{0:o}', $deadline.At))
+        }
+        foreach ($d in @(@('HeavySlotWaitMinutes', $waitMin), @('HeavySlotEtaMinutes', $etaMin))) {
+            if (-not ($d[1] -ge 0 -and $d[1] -le $maxMin)) { throw ('{0} is not a number from 0 to {1}' -f $d[0], $maxMin) }
+        }
+        # -0.0 is in range but formats as '-0' (r5b pass 2 A1); Abs makes it 0. Each value then goes out only in the form
+        # heavy-slot's parser reads.
+        # Written with the static [string]::Format, never $x.ToString(): a Library caller's Update-TypeData can replace a method PowerShell
+        # calls on a value, so the text was '20000' for a 240 min wait (adversary 84f4e8af-A2). Each text is then read back with the static
+        # [double]::TryParse and must be the minutes computed (within 0.01) and within the cap; anything else is a refusal.
+        $waitMin = [Math]::Abs($waitMin); $etaMin = [Math]::Abs($etaMin)
+        $num = [string]::Format($inv, '{0:0.##########}', $waitMin)
+        $back = 0.0
+        if (-not ($num -cmatch '^\d+(\.\d+)?$' -and [double]::TryParse($num, [Globalization.NumberStyles]::AllowDecimalPoint, $inv, [ref]$back) -and
+                [Math]::Abs($back - $waitMin) -le 0.01 -and $back -le $maxMin)) { throw "'$num' is not the wait of $waitMin min in a form heavy-slot reads" }
+        $waitArg = [string]::Concat($num, 'm')
+        $num = [string]::Format($inv, '{0:0.##########}', $etaMin)
+        $back = 0.0
+        if (-not ($num -cmatch '^\d+(\.\d+)?$' -and [double]::TryParse($num, [Globalization.NumberStyles]::AllowDecimalPoint, $inv, [ref]$back) -and
+                [Math]::Abs($back - $etaMin) -le 0.01 -and $back -le $maxMin)) { throw "'$num' is not the eta of $etaMin min in a form heavy-slot reads" }
+        $etaArg = [string]::Concat($num, 'm')
+        # The class was judged on the raw eta before the shim was looked for; the text heavy-slot is given must hold it too: a tiny
+        # positive eta formats as '0' (exclusive-short needs 0 < eta <= 15 as sent), never promoted on a figure it was not given.
+        if ($classArg -ceq 'exclusive-short' -and -not ($back -gt 0 -and $back -le 15)) { throw "exclusive-short eta '$num' is not above 0 and at most 15 min as sent to heavy-slot" }
+        $giveUp = [TimeSpan]::FromMinutes($waitMin + $slackMin)
+    } catch { $why = $_.Exception.Message }
+    if ($null -eq $giveUp) {
+        Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} HeavySlotClass={3} ({4}) utc={5}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($classRaw -replace '\s+', ' '), ($why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
+        exit 2
+    }
     $cmd = Resolve-HeavySlotCmd $Options
     if (-not $cmd) {
         Write-BuildGuardLog "HEAVY_SLOT_WARN label=$Label shim=missing: heavy-slot.cmd not found; building WITHOUT the machine heavy slot (fail open)"
@@ -1131,57 +1185,6 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         Ready = [IO.Path]::Combine($dir, "$id.ready"); Stop = [IO.Path]::Combine($dir, "$id.stop"); ExitFile = [IO.Path]::Combine($dir, "$id.exit.json")
         Log = [IO.Path]::Combine($dir, "$id.log"); Lines = [System.Collections.Generic.List[string]]::new(); Process = $null; Ticket = ''; Reason = ''; LogUnread = $false; Holder = $null
         Owner = $null; Gone = ''; Tail = ''; StopHolder = $null; StopSent = $false
-    }
-    # heavy-slot ends its own wait (a marked 75) and its admit cap; this bound only catches a hung tool. It is numeric even
-    # when a Library caller passes the minutes as a string, and monotonic, so a wall-clock step cannot move it. It is
-    # computed BEFORE heavy-slot starts: a value it cannot hold (an overflow, NaN, text) is a typed refusal with nothing
-    # launched, never a throw after the launch that skips the stop file (r2 adversary A3).
-    # --wait and --eta are written in the invariant culture: heavy-slot reads only plain decimals ('0.5m'), never the
-    # '0,5m' a de-DE culture writes. An eta that is not a finite number >= 0 is refused here too (r4 adversary A1).
-    # heavy-slot reads both with ^\d+(\.\d+)?m$ into TimeSpan.FromMinutes, so a negative wait, or either one past
-    # TimeSpan's range, fails its parser after the launch; both must be 0..$maxMin (r5b adversary A2).
-    $giveUp = $null
-    $inv = [Globalization.CultureInfo]::InvariantCulture
-    $boundNote = ''
-    try {
-        $waitMin = [double]$Options.HeavySlotWaitMinutes
-        $etaMin = [double]$Options.HeavySlotEtaMinutes
-        # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: a staging driver that has its own deadline passes it here, and the wait is what
-        # is left of it (0 once it has passed; one week at most), not the 60 min default. A refusal at 60 min threw the ticket's age
-        # away: the driver re-queued as the youngest ticket, behind newer work, for as long as the queue stayed deeper than 60 min.
-        # The deadline was read and refused at the top of this function; here it only sets the first wait, which
-        # is checked like any other. The wait actually launched is computed again right before the launch (adversary cd45eeb5-A3).
-        if ($deadline.At) {
-            $waitMin = [Math]::Min([Math]::Max(($deadline.At - [DateTime]::UtcNow).TotalMinutes, 0.0), $maxMin)
-            $boundNote = [string]::Concat('deadline=', [string]::Format($inv, '{0:o}', $deadline.At))
-        }
-        foreach ($d in @(@('HeavySlotWaitMinutes', $waitMin), @('HeavySlotEtaMinutes', $etaMin))) {
-            if (-not ($d[1] -ge 0 -and $d[1] -le $maxMin)) { throw ('{0} is not a number from 0 to {1}' -f $d[0], $maxMin) }
-        }
-        # -0.0 is in range but formats as '-0' (r5b pass 2 A1); Abs makes it 0. Each value then goes out only in the form
-        # heavy-slot's parser reads.
-        # Written with the static [string]::Format, never $x.ToString(): a Library caller's Update-TypeData can replace a method PowerShell
-        # calls on a value, so the text was '20000' for a 240 min wait (adversary 84f4e8af-A2). Each text is then read back with the static
-        # [double]::TryParse and must be the minutes computed (within 0.01) and within the cap; anything else is a refusal.
-        $waitMin = [Math]::Abs($waitMin); $etaMin = [Math]::Abs($etaMin)
-        $num = [string]::Format($inv, '{0:0.##########}', $waitMin)
-        $back = 0.0
-        if (-not ($num -cmatch '^\d+(\.\d+)?$' -and [double]::TryParse($num, [Globalization.NumberStyles]::AllowDecimalPoint, $inv, [ref]$back) -and
-                [Math]::Abs($back - $waitMin) -le 0.01 -and $back -le $maxMin)) { throw "'$num' is not the wait of $waitMin min in a form heavy-slot reads" }
-        $waitArg = [string]::Concat($num, 'm')
-        $num = [string]::Format($inv, '{0:0.##########}', $etaMin)
-        $back = 0.0
-        if (-not ($num -cmatch '^\d+(\.\d+)?$' -and [double]::TryParse($num, [Globalization.NumberStyles]::AllowDecimalPoint, $inv, [ref]$back) -and
-                [Math]::Abs($back - $etaMin) -le 0.01 -and $back -le $maxMin)) { throw "'$num' is not the eta of $etaMin min in a form heavy-slot reads" }
-        $etaArg = [string]::Concat($num, 'm')
-        # The class was judged on the raw eta before the shim was looked for; the text heavy-slot is given must hold it too: a tiny
-        # positive eta formats as '0' (exclusive-short needs 0 < eta <= 15 as sent), never promoted on a figure it was not given.
-        if ($classArg -ceq 'exclusive-short' -and -not ($back -gt 0 -and $back -le 15)) { throw "exclusive-short eta '$num' is not above 0 and at most 15 min as sent to heavy-slot" }
-        $giveUp = [TimeSpan]::FromMinutes($waitMin + $slackMin)
-    } catch { $why = $_.Exception.Message }
-    if ($null -eq $giveUp) {
-        Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} HeavySlotClass={3} ({4}) utc={5}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($classRaw -replace '\s+', ' '), ($why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
-        exit 2
     }
     # cmd opens the log for its own redirect and, when it cannot, writes that diagnostic to the stderr it inherited, past the
     # bounded writer (r9 adversary 353c9a42-A2: a lease directory that denies creating files). The guard makes the log first,

@@ -4687,3 +4687,32 @@ def test_an_exclusive_short_eta_that_formats_as_zero_is_refused(box) -> None:
     assert done.returncode == 2, done.stdout + done.stderr
     assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option" in done.stdout, done.stdout
     assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+# Adversary db7a9734, A1/A2: the durations were judged after the fail-open returns too, and a [double] parameter lets NaN and 1e100 reach them.
+
+
+@pytest.mark.parametrize("args", [
+    ["-HeavySlotEtaMinutes", "NaN"], ["-HeavySlotWaitMinutes", "NaN"],
+    ["-HeavySlotEtaMinutes", "1e100"], ["-HeavySlotWaitMinutes", "1e100"],
+    ["-HeavySlotEtaMinutes", "-1"], ["-HeavySlotWaitMinutes", "10081"],
+    ["-HeavySlotClass", "exclusive-short", "-HeavySlotEtaMinutes", "NaN"],
+    ["-HeavySlotClass", "exclusive-short", "-HeavySlotEtaMinutes", "1e-12"],
+], ids=lambda a: " ".join(a))
+def test_a_duration_heavy_slot_cannot_hold_is_refused_on_a_host_without_heavy_slot_too(box, args) -> None:
+    # The shim is absent, so every fail-open return of Enter-HeavySlot is reachable: the build would run WITHOUT the slot on a figure heavy-slot
+    # (or the guard's own range) would have refused. The durations are judged before the shim is looked for, like the deadline and the class.
+    done = _heavy(box, "run", [*args, "-Command", _marker_command(box)], shim=NO_HEAVY_SLOT)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option" in done.stdout, done.stdout
+    assert not box["marker"].exists(), "the build action never ran"
+    assert _stub_calls(box) == []
+
+
+def test_a_valid_exclusive_short_request_on_a_host_without_heavy_slot_still_fails_open(box) -> None:
+    # The refusal is for what is WRONG with the request; a good one on a host without heavy-slot keeps today's fail-open (one WARN, builds).
+    done = _heavy(box, "run", ["-HeavySlotClass", "exclusive-short", "-HeavySlotEtaMinutes", "12", "-Command", _marker_command(box)], shim=NO_HEAVY_SLOT)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "HEAVY_SLOT_WARN" in done.stderr and "fail open" in done.stderr, done.stderr
+    assert box["marker"].exists()
+    assert "BUILD_HEAVY_SLOT_CLASS" not in done.stdout, "no heavy-slot was started, so there is no class to name"
