@@ -364,7 +364,8 @@ function Get-OfflineSeamLocationRefusal {
     [Environment]::SetEnvironmentVariable('GIT_DISCOVERY_ACROSS_FILESYSTEM', '1')
     [Environment]::SetEnvironmentVariable('LC_ALL', 'C')
     try {
-        foreach ($dir in ($dirs | Sort-Object -Unique -CaseSensitive)) {
+        # (r4 fix 2, adversary r4 pass 11 A2: an ORDINAL set. The pipeline sort's -Unique compares by CULTURE even with -CaseSensitive, which ignores a zero-width character: two directories one U+200B apart were one)
+        foreach ($dir in [Collections.Generic.SortedSet[string]]::new($dirs, [StringComparer]::Ordinal)) {
             # a git that does not start or return is exit -1 with a typed stderr
             $g = & $module { param($d) Invoke-DvGit -RepoRoot $d -GitArgs @('rev-parse', '--is-inside-work-tree') } $dir
             $said = [Text.Encoding]::UTF8.GetString([byte[]]$g.bytes).Trim()
@@ -383,19 +384,24 @@ if (-not $umRunIsReal) {
     # r4 fix (adversary r4 pass 10 A2): the location walk is file-system work and runs BEFORE -DeadlineUtc is read below, where nothing else holds it, so it runs on a bounded worker (the module's
     # Invoke-VenueBoundedRead, as every claim-folder read does): at most 30 s and at most the room left before -DeadlineUtc less 2 s (at least 1 s). A probe that does not answer, or does not answer once, is
     # "not shown to be outside" -- the same fail-closed answer as a git that cannot say. An abandoned worker is counted, and Complete-VenueProcess in Stop-Usage ends the process at once.
+    # r4 fix 2 (adversary r4 pass 11 A1): the room is sampled ONCE, on a stopwatch started just before the sample, and the bounded read is handed that stopwatch and its end (-Clock / -EndSec), so a caller
+    # descheduled between the sample and the start gets no fresh wait. With less than 1 s of room (less than 3 s before -DeadlineUtc, or a deadline already past) the probe is NOT started: nothing can start
+    # in such a run -- every later gate refuses on the deadline, before any claim or lease -- so there is no location left to decide.
+    $locationClock = [Diagnostics.Stopwatch]::StartNew()
     $locationCapSec = 30.0
     $locationDeadline = [DateTimeOffset]::MinValue
     if ($DeadlineUtc -and [DateTimeOffset]::TryParse($DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$locationDeadline)) {
         $locationCapSec = [Math]::Min($locationCapSec, ($locationDeadline.UtcDateTime - [DateTime]::UtcNow).TotalSeconds - 2.0)
     }
-    $locationCapSec = [Math]::Max(1.0, $locationCapSec)
-    $locationProbeText = 'param($a) $ErrorActionPreference = ''Stop''; Import-Module $a.module -Force -DisableNameChecking; if ($a.delaySec -gt 0) { [Threading.Thread]::Sleep([int]($a.delaySec * 1000)) }' + "`n" +
+    if ($locationCapSec -ge 1.0) {
+    $locationProbeText ='param($a) $ErrorActionPreference = ''Stop''; Import-Module $a.module -Force -DisableNameChecking; if ($a.delaySec -gt 0) { [Threading.Thread]::Sleep([int]($a.delaySec * 1000)) }' + "`n" +
         'function Get-OfflineSeamLocationRefusal {' + "`n" + (Get-Item -LiteralPath Function:Get-OfflineSeamLocationRefusal).ScriptBlock.ToString() + "`n}`n" + '[string](Get-OfflineSeamLocationRefusal -Files $a.files)'
-    $probe = & (Get-Module VenueChain) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } $locationProbeText @{ module = (Join-Path $here 'DualVenueRunner.psm1'); files = @($umRunFull, $LegScript); delaySec = $LocationProbeDelaySec } $locationCapSec
+    $probe = & (Get-Module VenueChain) { param($t, $a, $s, $c) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s -Clock $c -EndSec $s -EndIsBoundEnd } $locationProbeText @{ module = (Join-Path $here 'DualVenueRunner.psm1'); files = @($umRunFull, $LegScript); delaySec = $LocationProbeDelaySec } $locationCapSec $locationClock
     $locationRefusal = $(if (-not $probe.answered) { "its location could not be established within $([Math]::Round($locationCapSec, 1)) s ($($probe.error))" }
                          elseif (@($probe.value).Count -ne 1) { 'its location could not be established (the probe gave no single answer)' }
                          else { [string]@($probe.value)[0] })
     if ($locationRefusal) { $umRunIsReal = $true }   # not shown to be a stand-in by location: production-shaped, whatever its bytes are (every seam below, the skip switch among them, is refused)
+    }
 }
 if ($umRunIsReal -and $LeaseBudgetWindowSec -lt 10800) {
     Stop-Usage "LEASE_CAP_RELAXED -LeaseBudgetWindowSec $LeaseBudgetWindowSec is looser than Bachelor's 10800 s window"
@@ -418,7 +424,12 @@ function Get-SeamPathSpellingRefusal([string]$Path) {
     $rest = $Path
     if ($Path -match '^(?:[\\/]{2}\?[\\/])?([A-Za-z]):[\\/]') { $letter = $Matches[1]; $rest = $Path.Substring($Matches[0].Length) }   # (the drive's own colon, plain or in the \\?\C:\ form, is not a provider's)
     if ($rest.Contains(':')) { return 'SEAM_PATH_PSDRIVE' }
-    if ($letter -and (Get-PSDrive -Name $letter -ErrorAction SilentlyContinue) -and -not ([IO.DriveInfo]::GetDrives() | Where-Object { $_.Name -ieq "${letter}:\" })) { return 'SEAM_PATH_PSDRIVE' }
+    # (r4 fix 2, adversary r4 pass 11 A3: a PSDrive of that letter is acceptable only when it IS the host's drive -- listed by .NET, and rooted at "X:\" -- not a session drive that shadows or mimics it)
+    if ($letter) {
+        $psDrive = Get-PSDrive -Name $letter -ErrorAction SilentlyContinue
+        $listed = @([IO.DriveInfo]::GetDrives() | Where-Object { $_.Name -ieq "${letter}:\" }).Count -gt 0
+        if ($psDrive -and (-not $listed -or $psDrive.Root -ine "${letter}:\")) { return 'SEAM_PATH_PSDRIVE' }
+    }
     ''
 }
 foreach ($seam in @(@('-CommittedSpecRepoRoot', $CommittedSpecRepoRoot), @('-CommittedSpecScript', $CommittedSpecScript))) {

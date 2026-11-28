@@ -6435,8 +6435,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         walk = text[start:text.index("$umRunIsReal = ($umRunFull", start)]
         self.assertRegex(walk, r"HashSet\[string\]\]::new\(\[StringComparer\]::Ordinal\)")
         self.assertNotRegex(walk, r"OrdinalIgnoreCase")
-        self.assertRegex(walk, r"Sort-Object\s+-Unique\s+-CaseSensitive")
-        self.assertNotRegex(walk, r"Sort-Object\s+-Unique(?!\s+-CaseSensitive)")
+        # (r4 fix 2: Sort-Object -Unique, with or without -CaseSensitive, compares by CULTURE and ignores a zero-width character: the directories are de-duplicated by an ORDINAL set)
+        self.assertNotRegex(walk, r"Sort-Object")
+        self.assertRegex(walk, r"SortedSet\[string\]\]::new\(\$dirs, \[StringComparer\]::Ordinal\)")
 
     # A2: the walk is file-system work (a .git probe on every ancestor, a link target) that runs BEFORE -DeadlineUtc is read, so a stalled share held the batch. It runs on a bounded worker, capped at 30 s and at
     # the room left before -DeadlineUtc; a probe that does not answer is "not shown to be outside" (fail closed), as a git that does not answer is. -LocationProbeDelaySec stalls the worker for the test.
@@ -6477,6 +6478,67 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 got = log.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1]
                 self.assertRegex(got, r"^[A-Za-z]:\\", f"the child was handed {got!r}, which is resolved on the process directory's drive")
                 self.assertEqual(got.lower(), (Path(str(self.tmp)).drive + "\\repo").lower())
+
+    # ---- r4 fix 2 (adversary r4 pass 11: A1, A2, advisory A3) ----
+    # A2: Sort-Object -Unique -CaseSensitive still compares by CULTURE, which ignores a zero-width character, so C:\offline\A and C:\offline\A<U+200B> (two directories) collapsed to one and git was never asked about the second.
+    def test_legspec_committed_r4c_a2_two_directories_that_differ_by_a_zero_width_character_are_both_asked_of_git(self) -> None:
+        plain = self.case / "ZWA"
+        odd = self.case / "ZWA\u200b"
+        plain.mkdir()
+        odd.mkdir()
+        (plain / "fake-umrun.ps1").write_bytes((self.tmp / "fake-umrun.ps1").read_bytes())
+        (odd / "fake-leg.ps1").write_bytes((self.tmp / "fake-leg.ps1").read_bytes())
+        # a directory that looks like a bare repository whose config git cannot read: git answers with a failure that is NOT "not a git repository"
+        (odd / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (odd / "objects").mkdir()
+        (odd / "refs").mkdir()
+        (odd / "config").write_text("[unterminated\n", encoding="utf-8")
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+        args[args.index("-UmRunScript") + 1] = str(plain / "fake-umrun.ps1")
+        args[args.index("-LegScript") + 1] = str(odd / "fake-leg.ps1")
+        self._assert_switch_refused_by_location("two directories one zero-width character apart", args, e, needle="git could not show that")
+
+    # A1: with no room before -DeadlineUtc nothing can start (every later gate refuses on the deadline), so the probe is not started either -- it used to be started with a one-second floor, after the deadline
+    def test_legspec_committed_r4c_a1_a_probe_is_not_started_when_no_room_is_left_before_the_deadline(self) -> None:
+        for label, deadline in (("a second ago", utc_iso(datetime.now(timezone.utc) - timedelta(seconds=1))), ("year 1", "0001-01-01T00:00:00Z")):
+            with self.subTest(deadline=label):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], "-LocationProbeDelaySec", "600", "-DeadlineUtc", deadline, *self._hermetic_receipt_root())
+                t0 = time.monotonic()
+                r = subprocess.run(args, capture_output=True, text=True, timeout=150, env=e)
+                self.assertLess(time.monotonic() - t0, 60, r.stderr[-800:])
+                self.assertNotIn("could not be established", r.stderr, "a probe was started (and given up on) with no room left")
+                self.assertEqual(self.kinds(), [], "nothing claimed, leased, opened or run")
+                self.assertNotEqual(r.returncode, 0, r.stdout[-800:] + r.stderr[-800:])
+
+    def test_legspec_committed_r4c_a1_the_probe_wait_ends_at_the_sampled_end_of_the_room(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        probe = text[text.index("$locationCapSec = "):text.index("$locationRefusal = $(if")]
+        for needle in ("-Clock", "-EndSec", "-EndIsBoundEnd"):
+            self.assertIn(needle, probe, f"the bounded read is not handed the caller's clock and end ({needle})")
+
+    # A3 (advisory): a PSDrive that shadows a real drive's letter (D: mapped to another directory) passed the "is this a drive of the host" test; the child would read the physical D:
+    def test_legspec_committed_r4c_a3_a_psdrive_shadowing_a_real_drive_letter_is_refused(self) -> None:
+        letter = next((c for c in "QPXYWVU" if not Path(f"{c}:\\").exists()), None)
+        if letter is None:
+            self.skipTest("no free drive letter for subst")
+        made = subprocess.run(["subst", f"{letter}:", str(self.tmp)], capture_output=True, text=True, timeout=60)
+        if made.returncode != 0:
+            self.skipTest("cannot create a substituted drive here: " + made.stdout + made.stderr)
+        try:
+            for flag in ("-CommittedSpecRepoRoot", "-CommittedSpecScript"):
+                with self.subTest(seam=flag):
+                    self._reset_committed_case()
+                    args, e = self.batch_cmd([self._COMMITTED_SPEC], flag, f"{letter}:\\x", *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+                    runner_at = args.index("-File") + 1
+                    command = (f"& {{ New-PSDrive -Name {letter} -PSProvider FileSystem -Root '{psq(self.case)}' -Scope Local | Out-Null; & '{psq(args[runner_at])}' "
+                               + " ".join(a if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", a) else f"'{psq(a)}'" for a in args[runner_at + 1:]) + " }; exit $LASTEXITCODE")
+                    r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=300, env=e, cwd=str(ROOT))
+                    self._assert_nothing_claimed_or_leased(f"{flag} {letter}:\\x", r)
+                    self.assertIn("BATCH_USAGE SEAM_PATH_PSDRIVE", r.stderr)
+        finally:
+            subprocess.run(["subst", f"{letter}:", "/d"], capture_output=True, text=True, timeout=60)
 
     # adversary r2 pass 4 A2: the canonical-receipt teardown check counts only what this harness wrote, so another process's receipt in the same directory is not a false failure
     def test_legspec_committed_r2_the_receipt_state_check_ignores_files_another_process_wrote(self) -> None:
