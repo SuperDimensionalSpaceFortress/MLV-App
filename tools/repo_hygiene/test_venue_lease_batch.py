@@ -743,7 +743,8 @@ def _g11_pairs(runner_text: str) -> tuple[set, set, list]:
         if not re.match(stop_re, call, flags=re.IGNORECASE):
             odd.append(re.split(r";|\s\}", call)[0].strip())
     # (r8, adversary r8 pass 18 A4: also a scoped variable ($script:b.endReason) and an indexed one ($b['endReason'] =): every spelling of the assignment is either read or reported)
-    for assign in re.findall(r"""\$[\w:]+(?:\.endReason|\[\s*['"]endReason['"]\s*\])\s*=(?!=)[^\n]*""", code, flags=re.IGNORECASE):
+    # (r9, adversary r9 pass 19 A3: and the quoted member names PowerShell takes the same way, $b."endReason" / $b.'endReason' / $b.('endReason'), and any computed member name on the batch variable, $b.("end" + "Reason"))
+    for assign in re.findall(r"""\$[\w:]+(?:\.endReason|\.\s*['"]endReason['"]|\.\(\s*['"]endReason['"]\s*\)|\[\s*['"]endReason['"]\s*\])\s*=(?!=)[^\n]*|\$(?:\w+:)?b\.\([^\n]*?\)\s*=(?!=)[^\n]*""", code, flags=re.IGNORECASE):
         if not re.match(end_re, assign, flags=re.IGNORECASE):
             odd.append(re.split(r";|\s\}", assign)[0].strip())
     return stops, ends, sorted(set(odd))
@@ -6683,6 +6684,64 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("did not answer", r.stderr)
         self.assertNotIn("after -DeadlineUtc", r.stderr)
 
+    # r9 (Grok G13 = adversary r9 pass 19 A2): the helper turned an answer seen after the sampled end into a timeout and killed nothing, passing the module's killConfirmed=$true through, so a descendant of the answered
+    # root outlived a timeout reported as a confirmed kill. The child here starts a hidden descendant (through ShellExecute, so it inherits no handle and holds none of the test's pipes) and then answers FOUND.
+    def _g13_child_with_descendant(self, name: str) -> tuple[Path, Path]:
+        child = self.case / name
+        desc = self.case / (name + ".desc.pid")
+        desc.unlink(missing_ok=True)
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         "$d = Join-Path $env:FAKE_LEG_ROOT 'DESCPID'\n"
+                         "Remove-Item -LiteralPath $d -ErrorAction SilentlyContinue\n"
+                         "$psi = [Diagnostics.ProcessStartInfo]::new('pwsh'); $psi.UseShellExecute = $true; $psi.WindowStyle = 'Hidden'\n"
+                         "$psi.Arguments = '-NoProfile -Command \"Set-Content -LiteralPath ''' + $d + ''' -Value $PID; Start-Sleep 600\"'\n"
+                         "[void][Diagnostics.Process]::Start($psi)\n"
+                         "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                         "while (-not (Test-Path -LiteralPath $d) -and $sw.Elapsed.TotalSeconds -lt 30) { Start-Sleep -Milliseconds 100 }\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n".replace("DESCPID", desc.name), encoding="utf-8")
+        return child, desc
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True).stdout
+        return f'"{pid}"' in out
+
+    def _descendant_pid(self, desc: Path) -> int:
+        self.assertTrue(desc.exists(), "the descendant never started: the test proves nothing")
+        pid = int(desc.read_text(encoding="utf-8-sig").strip())
+        self.addCleanup(lambda: subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True))
+        return pid
+
+    def test_legspec_committed_r9_a2_g13_an_answer_seen_after_the_sampled_end_kills_the_tree_of_the_answered_root(self) -> None:
+        child, desc = self._g13_child_with_descendant("r9-g13-kill.ps1")
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=10))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildReturnDelaySec", "122", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("FOUND after the sampled end, descendant alive", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        pid = self._descendant_pid(desc)
+        self.assertIn("kill confirmed", r.stderr)
+        self.assertNotIn("UNCONFIRMED", r.stderr)
+        for _ in range(50):
+            if not self._pid_is_alive(pid):
+                break
+            time.sleep(0.2)
+        self.assertFalse(self._pid_is_alive(pid), "a timeout reported as a confirmed kill left a descendant of the answered root running (pid %d)" % pid)
+        text = RUNNER.read_text(encoding="utf-8")
+        helper = text[text.index("function Invoke-BatchBoundedChild"):text.index("function Get-UnconfirmedKillText")]
+        self.assertNotIn("killConfirmed = $r.killConfirmed;", helper, "the helper copies the module's confirmation into a timeout it made itself")
+        self.assertIn(".Kill($true)", helper, "the branch that turns an answer into a timeout kills the tree itself")
+
+    def test_legspec_committed_r9_a2_g13_an_answer_after_the_sampled_end_whose_kill_cannot_be_made_is_reported_unconfirmed(self) -> None:
+        child, desc = self._g13_child_with_descendant("r9-g13-unconfirmed.ps1")
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=26))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildReturnDelaySec", "30", "-BoundedChildKillFails", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("FOUND after the sampled end, the kill fails", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        pid = self._descendant_pid(desc)
+        self.assertIn("kill UNCONFIRMED", r.stderr)
+        self.assertNotIn("kill confirmed", r.stderr)
+        self.assertTrue(self._pid_is_alive(pid), "the seam made the kill fail, so the descendant must still be there (the test proves the report, not a kill)")
+
     def test_legspec_committed_r5_g5_the_export_budget_siblings_are_bounded_by_the_same_sampled_end(self) -> None:
         pid = self.case / "g5-budget.pid"
         pid.unlink(missing_ok=True)
@@ -6871,6 +6930,16 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         named_stops, named_ends = _g11_named_pairs(tests, stops, ends)
         self.assertEqual(named_stops, {("SIBLING_STOP", 3), ("DYNAMIC_STOP", 7)}, "the (SIBLING_STOP, 9) branch and the (DYNAMIC_STOP, 3) branch are named by no test")
         self.assertEqual(named_ends, {"SIBLING_END"}, "a negative assertion, or a method that reads no end, does not name a branch")
+
+    def test_legspec_committed_r9_a3_a_quoted_or_parenthesised_member_name_of_the_end_is_read_or_reported(self) -> None:
+        """r9 (adversary r9 pass 19 A3): PowerShell takes `$b."endReason" = ...`, `$b.'endReason' = ...` and `$b.('endReason') = ...` as the same assignment as `$b.endReason = ...`; the end recogniser read only the plain
+        spelling and the odd-form recogniser only `.endReason` and `['endReason']`, so the three above were in neither list and a typed end written that way was silently skipped by the coverage gate."""
+        script = ("$b.endReason = 'PLAIN_END'\n$b.\"endReason\" = 'QUOTED_END'\n$b.'endReason' = 'SINGLE_END'\n$b.('endReason') = 'PAREN_END'\n$b.(\"end\" + \"Reason\") = 'BUILT_END'\n$script:b.(\"endReason\") = 'SCOPED_END'\n"
+                  "if ($b.endReason -eq 'X') { }\n$other.('endReason') = 'NOT_THE_BATCH'\n")
+        _stops, ends, odd = _g11_pairs(script)
+        self.assertEqual(ends, {"PLAIN_END"})
+        self.assertEqual(odd, sorted(["$b.\"endReason\" = 'QUOTED_END'", "$b.'endReason' = 'SINGLE_END'", "$b.('endReason') = 'PAREN_END'", "$b.(\"end\" + \"Reason\") = 'BUILT_END'",
+                                      "$script:b.(\"endReason\") = 'SCOPED_END'", "$other.('endReason') = 'NOT_THE_BATCH'"]), "every spelling of the assignment is read or reported: " + repr(odd))
 
     def test_legspec_committed_r6_g10_a_preflight_child_killed_at_start_is_a_started_and_killed_refusal_never_a_not_started_one(self) -> None:
         child, _pid = self._g5_found_child("g10-committed.ps1")

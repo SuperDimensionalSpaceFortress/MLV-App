@@ -490,9 +490,19 @@ function Invoke-BatchBoundedChild {
     if ($r.notStarted) { return [pscustomobject]@{ started = $false; reason = [string]$r.reason; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = [bool]$r.killConfirmed; stdout = ''; stderr = ''; lateKind = [string]$r.lateKind; childPid = $r.childPid } }
     if ($BoundedChildReturnDelaySec -gt 0) { [Threading.Thread]::Sleep($BoundedChildReturnDelaySec * 1000) }
     # r8 (adversary r8 pass 18 A2): an answer in hand only after the SAMPLED END is a timeout, whatever -NotAfterUtc says (the run deadline can be minutes beyond a 120 s capped end): the module judges it up to its own return,
-    # and the return path above (a parent descheduled after it) is judged here, from the same stopwatch. The child needs no kill (it answered); killConfirmed stays what the module read.
+    # and the return path above (a parent descheduled after it) is judged here, from the same stopwatch.
     $answered = ((-not $r.timedOut) -and ((($EndSec - $Clock.Elapsed.TotalSeconds) -gt 0)))   # (written as "greater", so a NaN end is no room)
-    [pscustomobject]@{ started = $true; reason = ''; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $(if ($answered) { $r.exit } else { $null }); timedOut = (-not $answered); killConfirmed = $r.killConfirmed; stdout = $r.stdout; stderr = $r.stderr; lateKind = ''; childPid = $r.childPid }
+    # r9 (Grok G13, adversary r9 pass 19 A2): a timeout made HERE is not one the module killed: the module read the answer in time (killConfirmed $true, nothing killed), so a descendant of the root that answered can still be
+    # running. The tree is killed from the module's Process (Kill($true) of an exited root takes its surviving descendants, measured in r8), and killConfirmed is read from THAT kill: no kill error and the root gone; a kill
+    # that cannot be made (no Process, a throw, -BoundedChildKillFails) is not confirmed, so Get-UnconfirmedKillText and LEG_KILL_UNCONFIRMED see it. A timeout the module made keeps the module's own kill and confirmation.
+    $killConfirmed = $r.killConfirmed
+    if (-not $answered -and -not $r.timedOut) {
+        $killErrored = $false
+        if (-not $r.process) { $killErrored = $true } elseif ($BoundedChildKillFails) { $killErrored = $true } else { try { $r.process.Kill($true) } catch { $killErrored = $true } }
+        $killConfirmed = $false
+        if (-not $killErrored) { [void]$r.process.WaitForExit([Math]::Max(500, [Math]::Min($CleanupWaitMs, 5000))); $killConfirmed = [bool]$r.process.HasExited }
+    }
+    [pscustomobject]@{ started = $true; reason = ''; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $(if ($answered) { $r.exit } else { $null }); timedOut = (-not $answered); killConfirmed = $killConfirmed; stdout = $r.stdout; stderr = $r.stderr; lateKind = ''; childPid = $r.childPid }
 }
 # r6 fix (adversary r6 pass 15 A5): a late answer that was also a timeout whose kill is unconfirmed says so (the late branch returns before the timeout branch's own wording)
 function Get-UnconfirmedKillText($Child) { if ($Child.timedOut -and -not $Child.killConfirmed) { ' (the child was also killed at its bound with the kill UNCONFIRMED: it may still be running)' } else { '' } }

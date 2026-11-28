@@ -2517,11 +2517,11 @@ function Invoke-VenueBoundedProcess {
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
           [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000,
           [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [Nullable[DateTime]]$StartBeforeUtc = $null,
-          [ValidateRange(0, 600000)][int]$TestStartDelayMs = 0, [switch]$TestKillThrows, [ValidateRange(0, 600000)][int]$TestAfterStartDelayMs = 0, [ValidateRange(0, 600000)][int]$TestBeforeWaitDelayMs = 0)
+          [ValidateRange(0, 600000)][int]$TestStartDelayMs = 0, [switch]$TestKillThrows, [ValidateRange(0, 600000)][int]$TestAfterStartDelayMs = 0, [ValidateRange(0, 600000)][int]$TestBeforeWaitDelayMs = 0, [ValidateRange(0, 600000)][int]$TestBeforeDrainDelayMs = 0)
     # r7 (adversary r7 pass 17 A1): the four offline seams above are inert unless the process says it is an offline test (MLV_VENUE_BOUNDED_TEST_SEAMS=1, set by the batch script only when one of its own seam switches is
     # asked for, and by the module tests). A value a caller never typed, one that $PSDefaultParameterValues (a profile, a wrapper) binds to the parameter, is indistinguishable from one it typed (both read as bound), so the
     # production guard cannot sit on the parameter: no caller of this function, in this repo or outside it, can inherit a delay or a failing kill into a production child.
-    if ($env:MLV_VENUE_BOUNDED_TEST_SEAMS -cne '1') { $TestStartDelayMs = 0; $TestKillThrows = [switch]::new($false); $TestAfterStartDelayMs = 0; $TestBeforeWaitDelayMs = 0 }
+    if ($env:MLV_VENUE_BOUNDED_TEST_SEAMS -cne '1') { $TestStartDelayMs = 0; $TestKillThrows = [switch]::new($false); $TestAfterStartDelayMs = 0; $TestBeforeWaitDelayMs = 0; $TestBeforeDrainDelayMs = 0 }
     # r6 fix (adversary r6 pass 15 A1, A2): right after Process.Start the child is also late when the caller's SAMPLED END is already used up (lateKind ROOM, as a passed -StartBeforeUtc is lateKind DEADLINE): it is killed at
     # once and reported KILLED_AT_START, so nothing runs on with no room. And a child that exited on its own is no answer when the wait began with no room left (WaitForExit(0) is true for an exited child): it is timedOut,
     # exit $null, never accepted. -TestAfterStartDelayMs (held right after Process.Start's late check) stands in for a parent descheduled between the launch and the wait.
@@ -2568,8 +2568,18 @@ function Invoke-VenueBoundedProcess {
     # r8 (adversary r8 pass 18 A2, module sibling): the streams of a child that answered inside its end are still drained for up to -CleanupWaitMs (a descendant that holds the stdout keeps them open), which can run past the end:
     # the drain is bounded by the end too, and an answer that is only in hand after the end is a timeout (its tree is killed below).
     if (-not $timedOut) {
-        $drainMs = { $m = [double]($CleanupWaitMs - $cleanup.ElapsedMilliseconds); if ($null -ne $Clock) { $m = [Math]::Min($m, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }; if ($m -gt 0) { [int][Math]::Min($m, 2147483647.0) } else { 0 } }
-        [void]$outTask.Wait((& $drainMs)); [void]$errTask.Wait((& $drainMs))
+        # r9 (adversary r9 pass 19 A1): a drain sized once and begun later is as stale as the wait was: a parent descheduled between the sample and Task.Wait got the whole stale size past the end. Each stream is drained in slices of at most
+        # 250 ms, each sized from what is left of the end and of the cleanup budget AT THAT MOMENT (a NaN is no room). -TestBeforeDrainDelayMs (once, after a slice is sized and before it waits) stands in for that parent.
+        $drainPaused = $false
+        foreach ($stream in @($outTask, $errTask)) {
+            while (-not $stream.IsCompleted) {
+                $m = [double]($CleanupWaitMs - $cleanup.ElapsedMilliseconds)
+                if ($null -ne $Clock) { $m = [Math]::Min($m, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
+                if (-not ($m -gt 0)) { break }
+                if ($TestBeforeDrainDelayMs -gt 0 -and -not $drainPaused) { $drainPaused = $true; [Threading.Thread]::Sleep($TestBeforeDrainDelayMs) }
+                [void]$stream.Wait([int][Math]::Ceiling([Math]::Min(250.0, $m)))
+            }
+        }
         if ($null -ne $Clock -and -not (($EndSec - $Clock.Elapsed.TotalSeconds) -gt 0)) { $timedOut = $true }
     }
     # r8 (adversary r8 pass 18 A3): the tree is killed on EVERY timeout, also when the root had already exited (a descendant that outlived it keeps running: Kill($true) of an exited root takes its surviving descendants and does not
@@ -2577,7 +2587,7 @@ function Invoke-VenueBoundedProcess {
     if ($timedOut) { if ($TestKillThrows) { $killErrored = $true } else { try { $p.Kill($true) } catch { $killErrored = $true } }; [void]$p.WaitForExit([int][Math]::Max([Math]::Min($CleanupWaitMs, 500), $CleanupWaitMs - $cleanup.ElapsedMilliseconds)) }   # (a floor of 500 ms: a drain that used the whole budget must still leave the kill time to land)
     [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
     [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
-        stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }); notStarted = $lateStart; reason = $(if ($lateStart) { 'KILLED_AT_START' } else { '' }); lateKind = $lateKind; childPid = $p.Id }
+        stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }); notStarted = $lateStart; reason = $(if ($lateStart) { 'KILLED_AT_START' } else { '' }); lateKind = $lateKind; childPid = $p.Id; process = $p }   # (r9 G13: the Process, so a caller that judges the answer late AFTER this return can kill the tree of a root that answered)
 }
 
 function Get-VenueDriverScriptMissing {
