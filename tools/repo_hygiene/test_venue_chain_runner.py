@@ -1595,6 +1595,28 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         ok = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output hi; exit 3') -TimeoutSec 60; \"$($r.timedOut) $($r.exit) $($r.stdout.Trim())\"")
         self.assertEqual(ok, "False 3 hi")
 
+    def test_r5_bounded_process_wait_is_what_is_left_of_the_callers_sampled_end_and_nothing_starts_past_it(self) -> None:
+        """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r5 (adversary r5 pass 14 A2): the wait after Process.Start was a fresh relative -TimeoutSec, so a caller descheduled around the launch got a whole new wait
+        past the end it had sampled. -Clock/-EndSec make the wait what is left of that end; -StartBeforeUtc and an end with under 1 s left start nothing. A caller that passes none is unchanged (the tests around this one)."""
+        marker = Path(tempfile.mkdtemp(prefix="bounded-r5-")) / "started.txt"
+        lead = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        waited = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 60 -Clock $c -EndSec 4 -CleanupWaitMs 1000; "
+                           "\"$($r.timedOut) $($r.notStarted) $([int]$c.Elapsed.TotalSeconds)\"").split()
+        self.assertEqual(waited[:2], ["True", "False"], waited)
+        self.assertLessEqual(int(waited[2]), 15, f"the wait outlived the sampled end by far (a fresh 60 s bound): {waited}")
+        past = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command',\"Set-Content -LiteralPath '{marker}' -Value 1\") -TimeoutSec 60 -StartBeforeUtc ([DateTime]::UtcNow.AddSeconds(-1)); "
+                         "\"$($r.notStarted) $($r.reason) $($r.timedOut)\"")
+        self.assertEqual(past, "True DEADLINE False")
+        spent = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command',\"Set-Content -LiteralPath '{marker}' -Value 1\") -TimeoutSec 60 -Clock $c -EndSec 0.5; "
+                          "\"$($r.notStarted) $($r.reason) $($r.timedOut)\"")
+        self.assertEqual(spent, "True ROOM False")
+        self.assertFalse(marker.exists(), "a child was started although the deadline or the sampled end had passed")
+        shutil.rmtree(marker.parent, ignore_errors=True)
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        self.assertIn("($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0", body, "the wait is derived from the caller's clock AFTER the launch")
+        self.assertIn("$lateStart", body, "a child that came to life after the deadline is killed and reported notStarted")
+
     def test_r11_bounded_process_cleanup_waits_share_one_budget_and_a_failed_tree_kill_is_never_confirmed(self) -> None:
         """EXPORT-VENUE-LEG-1 r11 (adversary r11 A5, A6). A6: after the bound, the kill wait and both stream waits shared 3 x 15 s past a caller's deadline; a grandchild that outlives its parent
         and holds the inherited stdout (Start-Process -NoNewWindow, 40 s) now costs the ONE -CleanupWaitMs budget, not 15 s per wait. A5: a tree kill that threw is never `killConfirmed`

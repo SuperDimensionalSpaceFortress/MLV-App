@@ -2515,22 +2515,31 @@ function Invoke-VenueBoundedProcess {
     must not leave a child behind reads it.
     #>
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
-          [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000)
+          [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000,
+          [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [Nullable[DateTime]]$StartBeforeUtc = $null)
+    # r5 (adversary r5 pass 14 A2): -Clock / -EndSec / -StartBeforeUtc are optional (a caller that passes none is unchanged). With them, the wait is NOT a fresh relative -TimeoutSec: it is what is left of the caller's
+    # sampled end on its stopwatch AT the wait, so a caller descheduled between the launch and the wait gets no extra time; nothing is started with under 1 s left of that end or at or after -StartBeforeUtc (notStarted, with
+    # the reason); and a child that came to life only after -StartBeforeUtc (a caller descheduled in the gap just before Process.Start) is killed at once and reported notStarted.
     # r11 (adversary r11 A5, A6): after the bound, the kill wait and both stream waits share ONE budget ($CleanupWaitMs: they used to add up to 3 x 15 s past a caller's deadline), and a tree kill
     # that threw is never "confirmed" because the root happened to exit: killConfirmed needs no kill error AND the root gone.
     $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
     foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    if ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'DEADLINE' } }
+    if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -lt 1) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'ROOM' } }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
-    $timedOut = -not $p.WaitForExit($TimeoutSec * 1000)
+    $lateStart = ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc)
+    $waitMs = [double]$TimeoutSec * 1000.0
+    if ($null -ne $Clock) { $waitMs = [Math]::Min($waitMs, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
+    $timedOut = $(if ($lateStart) { $true } else { -not $p.WaitForExit([int][Math]::Max(0.0, [Math]::Min([double][int]::MaxValue, $waitMs))) })
     $killErrored = $false
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
     if ($timedOut) { try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit($CleanupWaitMs) }
     [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
     [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
-        stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
+        stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }); notStarted = $lateStart; reason = $(if ($lateStart) { 'DEADLINE' } else { '' }) }
 }
 
 function Get-VenueDriverScriptMissing {

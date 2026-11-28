@@ -5223,7 +5223,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     _R7_WRITERS = {
         "batch.log (L)": ('                L "LEG $($leg.name) RUN batch=',
                           "[IO.File]::Delete((Join-Path $RunDir 'batch.log')); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch.log') -Value '{b}' | Out-Null"),
-        "leg output": ("                try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {\n",
+        "leg output": ("                try { $lp = Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList $lArgs -Clock $legClock -EndSec $legBoundSec -StartBeforeUtc $deadline } catch {\n",
                        "New-Item -ItemType HardLink -Path $out -Value '{b}' | Out-Null"),
         "probe output": ("    $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript,", "New-Item -ItemType HardLink -Path $out -Value '{b}' | Out-Null"),
         "leg-plan.json": ('        L "CLAIM_TAKEN batch=$batchNo',
@@ -5728,8 +5728,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # process creation and the leg that never started was recorded LEG_FAILED. A launch that throws a Win32Exception started nothing: the leg stays NOT_RUN.
         # The 40000-character -SheetCopyDir cannot be fed to the runner itself (its own command line is past the limit), so the launch is made to fail the same way:
         # Process.Start on a file that does not exist throws the same Win32Exception, before any child exists.
-        anchor = "Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs"
-        runner = self._patched_runner(anchor, "Invoke-VenueBoundedProcess -FilePath (Join-Path $RunDir 'no-such-pwsh.exe') -ArgumentList $lArgs")
+        anchor = "Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList $lArgs"
+        runner = self._patched_runner(anchor, "Invoke-BatchBoundedChild -FilePath (Join-Path $RunDir 'no-such-pwsh.exe') -ArgumentList $lArgs")
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
         args[args.index("-File") + 1] = str(runner)
         r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
@@ -10518,7 +10518,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # adversary r5 pass 2 A2: the marker was set before the "LEG .. RUN" log line, so a throw while that line was appended recorded a leg whose child never started as
         # LEG_FAILED. It is set on the line before the child is launched, after everything that can throw without having started it.
         text = RUNNER.read_text(encoding="utf-8")
-        run_line, launch = text.index('L "LEG $($leg.name) RUN batch='), text.index("$lp = Invoke-VenueBoundedProcess -FilePath $pwshExe")
+        run_line, launch = text.index('L "LEG $($leg.name) RUN batch='), text.index("$lp = Invoke-BatchBoundedChild -FilePath $pwshExe")
         marks = [i for i in range(len(text)) if text.startswith("$inFlightLeg = $leg", i)]
         self.assertEqual(len(marks), 1, marks)
         self.assertTrue(run_line < marks[0] < launch, (run_line, marks, launch))

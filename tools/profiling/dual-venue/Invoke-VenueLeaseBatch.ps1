@@ -475,7 +475,10 @@ function Invoke-BatchBoundedChild {
     $boundSec = $(if ([double]::IsNaN($leftSec)) { 0 } else { [int][Math]::Min($CapSec, [Math]::Floor([Math]::Max(0.0, $leftSec))) })
     $notStarted = $(if ([DateTime]::UtcNow -ge $StartBeforeUtc) { 'DEADLINE' } elseif ($boundSec -lt 1) { 'ROOM' } else { '' })
     if ($notStarted) { return [pscustomobject]@{ started = $false; reason = $notStarted; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = '' } }
-    $r = Invoke-VenueBoundedProcess -FilePath $FilePath -ArgumentList $ArgumentList -TimeoutSec $boundSec -CleanupWaitMs $CleanupWaitMs
+    # (r5 pass 14 A2: the module is handed the stopwatch, the end and the deadline too, so the wait it makes AFTER Process.Start is what is left of the sampled end, not a fresh relative bound, and a child that came to
+    # life only after the deadline is killed at once and comes back notStarted)
+    $r = Invoke-VenueBoundedProcess -FilePath $FilePath -ArgumentList $ArgumentList -TimeoutSec $boundSec -CleanupWaitMs $CleanupWaitMs -Clock $Clock -EndSec $EndSec -StartBeforeUtc $StartBeforeUtc
+    if ($r.notStarted) { return [pscustomobject]@{ started = $false; reason = [string]$r.reason; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = [bool]$r.killConfirmed; stdout = ''; stderr = '' } }
     if ($BoundedChildReturnDelaySec -gt 0) { [Threading.Thread]::Sleep($BoundedChildReturnDelaySec * 1000) }
     [pscustomobject]@{ started = $true; reason = ''; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $r.exit; timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; stdout = $r.stdout; stderr = $r.stderr }
 }
