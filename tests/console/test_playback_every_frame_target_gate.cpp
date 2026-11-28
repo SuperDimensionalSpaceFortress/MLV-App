@@ -292,14 +292,22 @@ QString playbackHandlingBody( const QString & source )
 //     pp-number 1 and the char literal '/'.
 // Splices in code outside comments are copied unchanged, so the code text the exact pins compare is the source text.
 // Not handled: header-names (`#include <a//b.h>`), trigraphs (removed in C++17), a universal-character-name (`é`) inside an
-// identifier or pp-number in front of a quote (the token stops at its backslash), and a macro that expands to a comment or to
-// code (the stripper does not preprocess). No pin depends on these: MainWindow.cpp has no splice, raw string, digit separator,
-// universal-character-name or header-name with `//` or `/*` (the EveryFrameTargetGate.StripComments* tests below prove each
-// handled case on fixtures). r8 re-check against the adversary advisories still OPEN on this card: none is in these helpers
-// (pass 8 A1 is fixed here, and so are pass 9 A1, a char literal with a user-defined-literal suffix in front of a quote, and pass 9
-// A2, the `<%` / `%>` digraph braces in enclosingBlockHeaders, and pass 10 A1, a raw-string prefix after a char literal (the floor),
-// and pass 10 A2, a next signature inside a comment or literal in functionBody; pass 8 A2 / pass 9 A3 / pass 10 A3, pass 6 A3 and
-// pass 7 A5 / pass 9 A4 / pass 10 A4 are product-path gaps in MainWindow.cpp / GpuDisplayWindow.cpp, outside these helpers).
+// identifier or pp-number in front of a quote (the token stops at its backslash), a bare CR (a CR not followed by LF) as a line
+// end (stripComments' `//` scan ends only at `\n`, so `// note` + bare CR + `use( x );` + LF reads the use as comment; the
+// splice helpers and literalEnd also see only LF and CR LF; adversary pass 11 A1), and a macro that expands to a comment or to
+// code (the stripper does not preprocess). No pin depends on these: MainWindow.cpp has no bare CR, and no splice, raw string,
+// digit separator, universal-character-name or header-name with `//` or `/*` (the EveryFrameTargetGate.StripComments* tests below
+// prove each handled case on fixtures). Also not handled, in the model above: frame numbers near the top of the int range
+// (EveryFrameModel's `target + 1` lookahead request and the `last - first + 1` frame count in
+// assertEveryFramePresentedOnceInOrder overflow signed int when `last` is INT_MAX; adversary pass 11 A5). No test reaches it: every
+// model range here is small and fixed.
+// r9 re-check (Grok CoS G12) against the adversary advisories still OPEN on this card: two are in these test helpers, both minor and
+// introduced, both listed above as not handled and owned by EVERY-FRAME-TARGET-GATE-WIRING-SPLICE-HARDEN-1: pass 11 A1 (the bare
+// CR, stripComments) and pass 11 A5 (the int range, EveryFrameModel). Fixed here earlier: pass 8 A1, pass 9 A1 (a char literal
+// with a user-defined-literal suffix in front of a quote), pass 9 A2 (the `<%` / `%>` digraph braces in enclosingBlockHeaders),
+// pass 10 A1 (a raw-string prefix after a char literal: the floor) and pass 10 A2 (a next signature inside a comment or literal in
+// functionBody). The rest are product-path gaps in MainWindow.cpp / GpuDisplayWindow.cpp / RenderFrameThread.cpp, outside these
+// helpers: pass 8 A2 / pass 9 A3 / pass 10 A3, pass 6 A3, pass 7 A5 / pass 9 A4 / pass 10 A4, and pass 11 A2 / A3 / A4.
 int skipLineSplices( const QString & s, int i )
 {
     const int n = s.size();
