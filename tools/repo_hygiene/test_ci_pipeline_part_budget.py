@@ -12,6 +12,7 @@ LookAssist fixture renders take 60-90 s each. The assignment now uses measured w
 from __future__ import annotations
 
 import re
+import unicodedata
 import unittest
 
 from tools.repo_hygiene import ci_pipeline_part_plan as plan
@@ -305,6 +306,31 @@ _TESTS_PER_SHARD_SHAPE = re.compile(r"\$testsPerShard = [0-9]+")
 _GOLDEN_ENTRY_SHAPE = re.compile(r"'[a-z0-9_.]+' = '[A-Za-z0-9_.]+'")
 
 
+def _ps_lines(text: str) -> list[str]:
+    """Split the way PowerShell does: on LF only, one trailing CR dropped per line (adversary r2 pass 6 A1).
+
+    `str.splitlines()` also breaks on U+2028, U+2029, U+0085, \\v, \\f and \\x1c-\\x1e, which
+    PowerShell reads as ordinary characters: `# comment<U+2028>$myShards = ...` is one comment line
+    there and two lines here, so the guard saw an assignment that never runs.
+    """
+    return [line[:-1] if line.endswith("\r") else line for line in text.split("\n")]
+
+
+def _unsafe_char(char: str) -> bool:
+    """A character the step may not hold: any control (Cc) or line/paragraph separator (Zl, Zp) but a tab."""
+    return char != "\t" and unicodedata.category(char) in ("Cc", "Zl", "Zp")
+
+
+def _is_dropped(text: str) -> bool:
+    """A blank line, or a line comment: `#` alone, or `#` and a space. Nothing else is skipped.
+
+    `#requires -PSEdition Desktop` starts with `#` but is a directive that stops the script under
+    pwsh Core (adversary r2 pass 6 A2), and `<#` opens a block comment that can hide whole lines; both
+    stay in the body, where they differ from the pinned text.
+    """
+    return not text or text == "#" or text.startswith("# ")
+
+
 def _step_span(lines: list[str]) -> tuple[int, int, int]:
     """Index of the step's `- name:` line, of its `run: |` line and of its last line (ValueError if it moved).
 
@@ -324,15 +350,18 @@ def _step_span(lines: list[str]) -> tuple[int, int, int]:
 
 
 def _step_body(part_job: str) -> tuple[str, ...]:
-    lines = part_job.splitlines()
+    lines = _ps_lines(part_job)
     try:
         first, _run, last = _step_span(lines)
     except ValueError as error:
         return (f"MISSING: {error}",)
     body: list[str] = []
     for line in lines[first : last + 1]:
-        text = line.strip()
-        if not text or text.startswith("#"):
+        unsafe = sorted({f"U+{ord(char):04X}" for char in line if _unsafe_char(char)})
+        if unsafe:
+            return (f"REFUSED: control or line-separator character {unsafe} in the step",)
+        text = line.strip(" \t")  # str.strip() would also eat U+0085, U+2028 and the other Unicode spaces
+        if _is_dropped(text):
             continue
         if _SOLO_SHAPE.fullmatch(text):
             text = SOLO_PLACEHOLDER
@@ -352,9 +381,9 @@ def _guard_flags(part_job: str) -> bool:
 
 
 def _step_code_lines(part_job: str) -> list[str]:
-    lines = part_job.splitlines()
+    lines = _ps_lines(part_job)
     first, _run, last = _step_span(lines)
-    return [line.strip() for line in lines[first : last + 1]]
+    return [line.strip(" \t") for line in lines[first : last + 1]]
 
 
 def _solo_pattern(part_job: str) -> str:
@@ -556,11 +585,9 @@ class PipelineStepBodyPinTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.part_job = _workflow_job(_read_workflow(), "windows-product-oracles-part")
-        cls.lines = cls.part_job.splitlines()
+        cls.lines = _ps_lines(cls.part_job)
         cls.first, _run, cls.last = _step_span(cls.lines)
-        cls.code = [
-            i for i in range(cls.first, cls.last + 1) if cls.lines[i].strip() and not cls.lines[i].strip().startswith("#")
-        ]
+        cls.code = [i for i in range(cls.first, cls.last + 1) if not _is_dropped(cls.lines[i].strip(" \t"))]
 
     def _flags(self, lines: list[str]) -> bool:
         return _guard_flags("\n".join(lines))
@@ -614,7 +641,7 @@ class PipelineStepBodyPinTests(unittest.TestCase):
         self.assertNotEqual(grown, self.part_job)
         self.assertFalse(_guard_flags(grown))
         shrunk = "\n".join(
-            line for line in self.part_job.splitlines() if not line.strip().startswith("'tiny_dual_iso.gpu_preview_subset.signature.frame1'")
+            line for line in _ps_lines(self.part_job) if not line.strip().startswith("'tiny_dual_iso.gpu_preview_subset.signature.frame1'")
         )
         self.assertNotEqual(shrunk, self.part_job)
         self.assertFalse(_guard_flags(shrunk))
@@ -684,6 +711,71 @@ class PipelineStepBodyPinTests(unittest.TestCase):
         ):
             with self.subTest(original=original):
                 self.assertTrue(_guard_flags(self.part_job.replace(original, mutated, 1)))
+
+    # adversary r2 pass 6 -----------------------------------------------------------------------
+
+    # Every character str.splitlines() breaks a line on besides LF/CR-LF, and a lone CR and a NUL.
+    BREAK_CHARS = (" ", " ", "\x85", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\r", "\x00")
+    ASSIGNMENT = "$myShards = @($shards | Where-Object { $partOf[$_.Name] -eq $part })"
+
+    def test_a_line_break_powershell_does_not_read_cannot_hide_code_in_a_comment(self) -> None:
+        # A1, the verdict's literal input: `# accepted comment<U+2028>$myShards = ...`. PowerShell reads
+        # all of it as ONE comment, so the assignment never runs (zero shards); splitlines() saw two lines.
+        line = "          " + self.ASSIGNMENT
+        self.assertIn(line + "\n", self.part_job)
+        for char in self.BREAK_CHARS:
+            with self.subTest(char=f"U+{ord(char):04X}"):
+                mutated = self.part_job.replace(line, "          # accepted comment" + char + line, 1)
+                self.assertNotEqual(mutated, self.part_job)
+                self.assertTrue(_guard_flags(mutated))
+
+    def test_a_break_or_control_character_is_refused_on_every_code_line_and_at_its_end(self) -> None:
+        self.assertFalse(_guard_flags(self.part_job))
+        for index in self.code:
+            line = self.lines[index]
+            for char in (" ", " ", "\x85"):
+                with self.subTest(line=line.strip()[:50], char=f"U+{ord(char):04X}"):
+                    hidden = self.lines[:index] + ["          # accepted" + char + line] + self.lines[index + 1 :]
+                    self.assertTrue(self._flags(hidden), "comment + separator + the line")
+                    self.assertTrue(self._flags(self.lines[:index] + [line + char] + self.lines[index + 1 :]), "separator at the end")
+
+    def test_every_character_splitlines_breaks_on_is_refused_and_does_not_split_here(self) -> None:
+        # Differential, exact oracle: Python's own str.splitlines() over every code point.
+        for code in range(0x110000):
+            char = chr(code)
+            if char in "\n\t":
+                continue
+            if len(("a" + char + "b").splitlines()) != 1:
+                self.assertTrue(_unsafe_char(char), f"U+{code:04X} splits a line in Python and is not refused")
+            if char != "\r":
+                self.assertEqual(_ps_lines("a" + char + "b"), ["a" + char + "b"], f"U+{code:04X} split a line")
+        self.assertEqual(_ps_lines("a\r\nb\nc\r"), ["a", "b", "c"])
+        self.assertEqual(_ps_lines("a\rb"), ["a\rb"])
+
+    def test_a_requires_directive_or_a_block_comment_is_not_a_comment(self) -> None:
+        # A2: `#requires -PSEdition Desktop` stops the script under pwsh Core; `<#` hides whole lines.
+        for label, new_line in (
+            ("A2 the verdict's literal", "#requires -PSEdition Desktop"),
+            ("upper case", "#REQUIRES -Version 99"),
+            ("mixed case", "#Requires -Modules NoSuchModule"),
+            ("a space after the hash is not a directive but a comment", None),
+            ("no space after the hash", "#not-a-pinned-comment"),
+            ("hash then tab", "#\trequires -PSEdition Desktop"),
+            ("block comment opened", "<#"),
+            ("block comment on one line", "<# hidden #>"),
+            ("block comment after code", "$shards = @() <# hidden #>"),
+        ):
+            with self.subTest(label):
+                if new_line is None:
+                    self.assertFalse(_guard_flags(_insert_before(self.part_job, "$shards = @()", "# requires is only a word here")))
+                    continue
+                self.assertTrue(_guard_flags(_insert_before(self.part_job, "$shards = @()", new_line)))
+        block = _insert_before(self.part_job, "$shards = @()", "<#")
+        block = _insert_before(block, "& tools\\testing\\check-expected-failures.ps1", "#>")
+        self.assertTrue(_guard_flags(block), "a block comment spanning the shard loop")
+
+    def test_a_lone_hash_line_stays_a_comment(self) -> None:
+        self.assertFalse(_guard_flags(_insert_before(self.part_job, "$shards = @()", "#")))
 
 
 if __name__ == "__main__":
