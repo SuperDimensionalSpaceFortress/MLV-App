@@ -350,6 +350,9 @@ static bool buildGpuPlaybackReconStateForTexturePresent(
         source.applyDither ? source.luts->randn05.data() : nullptr;
     destination->apply_dither = source.applyDither ? 1 : 0;
     destination->frame_id = source.frameId;
+    /* adversary r7 A1: the stamp of the source tables travels with the snapshot, so a fresh snapshot that lands at a
+     * freed one's address (or a rewrite of the source tables) is not mistaken for no change by the backend's LUT key. */
+    destination->lut_generation = source.lutGeneration;
     return true;
 }
 
@@ -31696,8 +31699,8 @@ void MainWindow::onPlaybackReconWarmDone( const RenderFrameThread::PlaybackRecon
         line.amazeOk = GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(
             outcome.retained.device_bayer16, outcome.width, outcome.height, done.blackLevel, wb,
             playbackReducedHnyquistWanted( outcome.scale > 1 ), &line.amazeKernelMs, &amazeReason, &amazeTiming,
-            static_cast<uint64_t>( done.frameNumber ), outcome.setClipCountAfter, outcome.setLutsCountAfter,
-            &reuseCapture, &warmState );
+            static_cast<uint64_t>( done.frameNumber ), outcome.keySetClipCount, outcome.keySetLutsCount,
+            outcome.keySetPatternCount, outcome.keyConfigureGeneration, &reuseCapture, &warmState );   // r22: taken under the backend lock
     }
     else if( hasOutput )
     {

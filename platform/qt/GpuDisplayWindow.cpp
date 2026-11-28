@@ -646,6 +646,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16
                                                                     uint64_t frame,
                                                                     uint64_t setClipCountAfter,
                                                                     uint64_t setLutsCountAfter,
+                                                                    uint64_t setPatternCountAfter,
+                                                                    uint64_t configureGenerationAfter,
                                                                     QString *reuseCapture,
                                                                     const playback_warm_output_reuse::PreparedState *warmState)
 {
@@ -670,8 +672,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16IfActive(const uint16
     // like the prewarm: GUI thread, no g_activeMutex (the window is only destroyed on this thread)
     return win->warmStagedReconSlotFromDeviceBayer16(deviceBayer16, width, height, blackLevel, wbMultipliers,
                                                      reducedHnyquist, kernelMs, reason, amazeTiming,
-                                                     frame, setClipCountAfter, setLutsCountAfter, reuseCapture,
-                                                     warmState);
+                                                     frame, setClipCountAfter, setLutsCountAfter, setPatternCountAfter,
+                                                     configureGenerationAfter, reuseCapture, warmState);
 }
 
 /* PLAYBACK-STARTUP-WAIT-S1-RECON-WARM-RUN-1 Row W: the first recon present's AMaZE call (device Bayer16 -> RGBA16, the
@@ -690,6 +692,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
                                                             uint64_t frame,
                                                             uint64_t setClipCountAfter,
                                                             uint64_t setLutsCountAfter,
+                                                            uint64_t setPatternCountAfter,
+                                                            uint64_t configureGenerationAfter,
                                                             QString *reuseCapture,
                                                             const playback_warm_output_reuse::PreparedState *warmState)
 {
@@ -765,6 +769,8 @@ bool GpuDisplayWindow::warmStagedReconSlotFromDeviceBayer16(const uint16_t *devi
             key.reducedHnyquist = reducedHnyquist;
             key.setClipCountAfterWarm = setClipCountAfter;
             key.setLutsCountAfterWarm = setLutsCountAfter;
+            key.setPatternCountAfterWarm = setPatternCountAfter;
+            key.configureGenerationAfterWarm = configureGenerationAfter;
             key.captureId = captureId;
             // WARM-RECON-DETERMINISM-1 F-key: the recon constants of this input (unknown without them: never reused)
             if ( warmState ) key.state = *warmState;
@@ -1445,27 +1451,36 @@ bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture(
             presentKey.reducedHnyquist = reducedHnyquist;
             // WARM-RECON-DETERMINISM-1 F-key: this present's recon constants (the state its recon ran with)
             presentKey.state = playback_warm_output_reuse::preparedStateFrom( *state );
-            playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::preGate(
+            // sol r17 #2: the recon worker configures (a lookahead frame's set_iso_pattern) while this GUI thread
+            // presents, so decide() reads the live counts for the gate AND twice after the compare (adversary r18 A1)
+            const auto readLiveConfigureCounts = []()
+            {
+                playback_warm_output_reuse::LiveCounts now;
+                now.setClip = llrpGpuPlaybackReconSetClipCount();
+                now.setLuts = llrpGpuPlaybackReconSetLutsCount();
+                now.setPattern = llrpGpuPlaybackReconSetIsoPatternCount();
+                // r22 adversary A1: LAST, so that no configure can store between the final load and the decision
+                now.generation = llrpGpuPlaybackReconConfigureGeneration();
+                return now;
+            };
+            bool reuseCompareAttempted = false;
+            playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::decide(
                 playbackWarmOutputReuseEnabled(),
                 stagedAdopted,
                 warmKey,
                 presentKey,
                 llrpGpuCudaSuppressed() != 0,
                 validationProbeTexture,
-                llrpGpuPlaybackReconSetClipCount(),
-                llrpGpuPlaybackReconSetLutsCount());
-            bool reuseCompareAttempted = false;
-            if ( reuseReason == playback_warm_output_reuse::Reason::None )
-            {
-                reuseCompareAttempted = true;
-                const double compareStartMs = elapsedMs();
-                bool sameInput = false;
-                QString compareWhy;
-                const bool compared = gpuAmazeDebayerInputBayer16MatchesCapture(
-                    deviceBayer16, texWidth, texHeight, warmKey.captureId, &sameInput, &compareWhy);
-                setupTiming.reuse_compare_ms = elapsedMs() - compareStartMs;
-                reuseReason = playback_warm_output_reuse::afterCompare(compared, sameInput, compareWhy);
-            }
+                readLiveConfigureCounts,
+                [&](bool *sameInput, QString *compareWhy)
+                {
+                    const double compareStartMs = elapsedMs();
+                    const bool compared = gpuAmazeDebayerInputBayer16MatchesCapture(
+                        deviceBayer16, texWidth, texHeight, warmKey.captureId, sameInput, compareWhy);
+                    setupTiming.reuse_compare_ms = elapsedMs() - compareStartMs;
+                    return compared;
+                },
+                &reuseCompareAttempted);
             // WARM-RECON-DETERMINISM-1: both states on a state or content miss; the opt-in dump reads the capture, so
             // before its release
             setupTiming.reuse_states = playback_warm_output_reuse::stateFields( reuseReason, warmKey, presentKey );

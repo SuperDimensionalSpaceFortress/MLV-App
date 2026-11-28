@@ -444,6 +444,8 @@ const QStringList & nonEmittingUnlockBodies()
         QStringLiteral("llrpFakeGpuBackendFailCreateForTesting"),
         QStringLiteral("llrpHoldGpuReconBackendMutexForTesting"),
         QStringLiteral("llrpSetFakeGpuBackendReducedIsoNotchSymbolForTesting"),
+        // DUALISO-CONFIGURE-CACHE-1: same shape as the notch-symbol body above: swaps one fake-backend function pointer under the lock, runs no backend call, captures no device loss, emits nothing.
+        QStringLiteral("llrpSetFakeGpuBackendIsoPatternSymbolForTesting"),
         QStringLiteral("llrawproc_gpu_recon_backend_available_guarded"),
         QStringLiteral("llrpGpuPlaybackReconCopyLastDeviceBayer16ToGlTexture"),
         QStringLiteral("llrpGpuPlaybackReconReleaseRetainedDeviceBayer16"),
