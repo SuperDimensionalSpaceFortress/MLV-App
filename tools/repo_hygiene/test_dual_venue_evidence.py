@@ -23289,7 +23289,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         "gui_smoke.visual_capture": {"measured_session": "3", "requested": "5", "written": "5", "stop_frame": "480", "paused_settled": "1",
                                      "tail_begin_utc": BEGIN_UTC, "tail_end_utc": "2026-11-25T18:00:03.100Z", "error": "", "source_difference": "omitted"},
     }
-    TAIL_CATCH_ALL = (r"""[regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace\s*["'']?\s*event["'']?\s*[=\x1A]\s*["'']?\s*"""
+    TAIL_CATCH_ALL = (r"""[regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace\W*event\W*"""
                       r"""(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)'), $script:DvCi)""")
     R11_CATCH_ALL = r"[string]$line -match '(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation'"
     R12_CATCH_ALL = (r"""[string]$line -match '(?i)interaction_trace\b.*\bevent["'']?\s*[=\x1A]\s*["'']?\s*"""
@@ -23575,11 +23575,29 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
                 self.assertEqual((derived["visualCaptureBeginSession"], derived["visualTailPrepDrops"], derived["visualBurstCaptures"]), ("3", 0, 2), derived)
                 self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
 
+    def test_r13_adv_a2_an_event_slot_with_no_or_another_separator_still_voids_the_binding(self) -> None:
+        """r13 adversary A2 (sol pass 17 on 48616ea5), its input: between a valid begin and a valid burst_end, `interaction_trace event
+        playback_prep.invalidate_generation reason=resize` (no `=`). The anchored catch-all required exactly one `=` (or its mask) after `event`, so the record
+        was skipped and the binding survived with tailPrepDrops=0. Siblings: `event:<name>` and `event==<name>`, for begin, burst_end, clip_changed and
+        invalidate_generation. The event slot now takes any run of non-word characters between `event` and the name."""
+        base = self.every_emitter_log(error="")
+        at = next(i for i, line in enumerate(base) if "event=gui_smoke.visual_capture.burst_end" in line)
+        pre = self.TAIL_PRE + "interaction_trace "
+        rows = [("its input verbatim", "event playback_prep.invalidate_generation reason=resize")]
+        for name in ("gui_smoke.visual_capture.begin", "gui_smoke.visual_capture.burst_end", "gui_smoke.visual_capture.clip_changed", "playback_prep.invalidate_generation"):
+            for sep in (" ", ":", "=="):
+                rows.append((f"event{sep!r}{name}", f"event{sep}{name} k=1"))
+        for name, body in rows:
+            with self.subTest(case=name):
+                derived = self.derive_tail_binding(base[:at] + [pre + body + self.TAIL_LOC] + base[at:])
+                self.assertEqual({k: derived[k] for k in ("visualCaptureBeginSession", "visualCaptureBeginUtc", "visualTailPrepDrops")},
+                                 {"visualCaptureBeginSession": None, "visualCaptureBeginUtc": None, "visualTailPrepDrops": None}, derived)
+
     def test_r13_b1_differential_only_the_event_slot_of_an_interaction_record_voids_the_binding(self) -> None:
         """r13 (FIX-ROUND-CLASS-SWEEP-1 item 4: a parser defect gets a generated-input check against an exact oracle). Records generated from a fixed seed,
         each inserted after the begin record of the G4 control log. The oracle is the generator's own label, never the reader's regex: a watched name the
         generator put in the EVENT SLOT of an interaction_trace record (two spaces, a tab, a quoted token, a quoted name, a space round `=`, an unknown
-        suffix) means `voided` (session null); a watched name it put anywhere else (a double- or single-quoted note, a quoted dir, an unquoted path value of
+        suffix, a space, `:` or `==` in place of `=`) means `voided` (session null); a watched name it put anywhere else (a double- or single-quoted note, a quoted dir, an unquoted path value of
         an unwatched event, a run_metadata path, a non-interaction record's quoted text) means `kept` (session 3, burst 2). One pwsh reads every log."""
         import random
         rng = random.Random(20261128)
@@ -23590,7 +23608,8 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         unwatched = ("gui_smoke.window_screenshot", "gui_smoke.contact_sheet", "look_assist.daylight_refine", "gui_smoke.visual_capture")
         slots = ("interaction_trace  event={n} k=1", "interaction_trace\tevent={n} k=1", 'interaction_trace "event={n}" k=1', "interaction_trace 'event={n}' k=1",
                  'interaction_trace event="{n}" k=1', "interaction_trace event='{n}' k=1", "interaction_trace event = {n} k=1", "interaction_trace event ={n} k=1",
-                 'interaction_trace "event"={n} k=1', "interaction_trace event={n}x k=1")
+                 'interaction_trace "event"={n} k=1', "interaction_trace event={n}x k=1",
+                 "interaction_trace event {n} k=1", "interaction_trace event:{n} k=1", "interaction_trace event=={n} k=1")   # (the last three: r13 adversary A2)
         texts = ("event={n}", "interaction_trace event={n}", "event = {n}", "C:/runs/event={n}/run1", "interaction_trace  event={n} done")
         places = ('interaction_trace event={u} note="{t}" w=1', "interaction_trace event={u} note='{t}' w=1", 'interaction_trace event={u} dir="{t}" w=1',
                   'run_metadata={{"command_line":["MLVApp.exe","--visual-capture-dir","C:/Temp/{t}"]}}', 'playback_smoke.note session=3 text="{t}"')
