@@ -35,7 +35,8 @@
     "CUDA-HEADROOM-UTIL-SAMPLER-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
     "M16-1457-VENUE-BASELINE-DRIFT-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
     "EVERY-FRAME-PLAY-OLDEST-FIRST-UNPINNED-VENUE-LEG-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
-    "PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" }
+    "PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" },
+    "BACHELOR-1457-CPU-HEADROOM-UTIL-SPECS-1": { "bachelor": "acceptance", "ultra-magnus": "supplementary" }
   },
   "defaultRole": "supplementary",
   "ownerFootage": {
