@@ -63,6 +63,15 @@ struct EveryFrameModel
     bool notifyModel = false;
     bool kickOnHold = true;
     int notifications = 0;
+    // r8 (Grok CoS G9): the "one per publish" claim is asserted inside the model. Every publish goes through publish(), which posts
+    // one notification when notifyModel is set; the held tick's kick posts its own; and checkNotificationLedger() runs after every
+    // step, so a publish that posts none (or two), a kick that is not counted, or a callback that is lost fails at the step itself.
+    int publishes = 0;
+    int publishNotifications = 0;
+    int kickNotifications = 0;
+    int consumedNotifications = 0;
+    int acceptsOnNotification = 0;   // a consumed notification that accepted the target's slot
+    int emptyCallbacks = 0;          // a consumed notification whose target had no Ready slot: it takes nothing, never another frame
 
     EveryFrameModel( int firstFrame, int lastFrame ) : first( firstFrame ), last( lastFrame ), target( firstFrame )
     {
@@ -87,7 +96,12 @@ struct EveryFrameModel
         if( !playbackEveryFrameTickMayAdvance( true, false, accepted, target, outstanding ) )
         {
             ++heldTicks;
-            if( kickOnHold && ready.count( target ) ) ++notifications;
+            if( kickOnHold && ready.count( target ) )
+            {
+                ++notifications;
+                ++kickNotifications;
+            }
+            checkNotificationLedger();
             return;
         }
         ++target;
@@ -104,10 +118,36 @@ struct EveryFrameModel
         tick();
     }
 
+    // the notification ledger (r8, Grok CoS G9): with notifyModel, every publish posted exactly one notification, every pending
+    // notification came from a publish or a kick and was not yet consumed, and every consumed one either accepted the target's slot
+    // or took nothing
+    void checkNotificationLedger() const
+    {
+        if( !notifyModel ) return;
+        ASSERT_EQ( publishes, publishNotifications );
+        ASSERT_EQ( publishNotifications + kickNotifications - consumedNotifications, notifications );
+        ASSERT_EQ( consumedNotifications, acceptsOnNotification + emptyCallbacks );
+        ASSERT_TRUE( notifications >= 0 );
+    }
+
+    // a render completes and publishes its slot Ready; the frameReady signal fires once for it
+    void publish( int frame )
+    {
+        ready.insert( frame );
+        ++publishes;
+        if( notifyModel )
+        {
+            ++notifications;
+            ++publishNotifications;
+        }
+        checkNotificationLedger();
+    }
+
     void renderCompleteAll()
     {
-        for( int frame : requested ) ready.insert( frame );
+        const std::set<int> completed = requested;
         requested.clear();
+        for( int frame : completed ) publish( frame );
     }
 
     void renderCompleteOne()
@@ -115,7 +155,7 @@ struct EveryFrameModel
         if( requested.empty() ) return;
         const int frame = *requested.begin();
         requested.erase( requested.begin() );
-        ready.insert( frame );
+        publish( frame );
     }
 
     bool frameReady()
@@ -124,15 +164,29 @@ struct EveryFrameModel
         {
             if( notifications == 0 ) return false;
             --notifications;
+            ++consumedNotifications;
         }
         // prune: a slot below the target is released unpainted
         while( !ready.empty() && *ready.begin() < target ) ready.erase( ready.begin() );
-        if( !ready.count( target ) ) return false;
+        if( !ready.count( target ) )
+        {
+            if( notifyModel ) ++emptyCallbacks;
+            checkNotificationLedger();
+            return false;
+        }
         ready.erase( target );
         presented.push_back( target );
         accepted = target;
+        if( notifyModel ) ++acceptsOnNotification;
         tick();   // drawFrameReady's early advance runs right after the accept
+        checkNotificationLedger();
         return true;
+    }
+
+    // the event loop drains every queued frameReady notification (the publish callbacks and the held tick's kick)
+    void drainNotifications()
+    {
+        while( notifyModel && notifications > 0 ) frameReady();
     }
 
     bool finished() const { return !presented.empty() && presented.back() == last; }
@@ -219,11 +273,16 @@ QString playbackHandlingBody( const QString & source )
 //     is literal text and the code after the literal on the same line survives;
 //   - raw string literals `R"delim(...)delim"` (prefixes R, LR, uR, UR, u8R): their body is copied verbatim and, as the standard
 //     says, splicing is undone inside them;
-//   - digit separators (`1'000'000`), which are not char literals.
+//   - digit separators, which are not char literals: a `'` inside a pp-number followed by a digit or nondigit, however many the
+//     number has (`1'000'000`, `0xA'B'C`, `0b1'0`, `1e+1'0`; r8, Grok CoS G11 / adversary pass 8 A1), while `1'/'` is the
+//     pp-number 1 and the char literal '/'.
 // Splices in code outside comments are copied unchanged, so the code text the exact pins compare is the source text.
-// Not handled: header-names (`#include <a//b.h>`), trigraphs (removed in C++17), and a macro that expands to a comment or to code
-// (the stripper does not preprocess). No pin depends on these: MainWindow.cpp has no splice, raw string, digit separator or
-// header-name with `//` or `/*` (the EveryFrameTargetGate.StripComments* tests below prove each handled case on fixtures).
+// Not handled: header-names (`#include <a//b.h>`), trigraphs (removed in C++17), a universal-character-name (`é`) inside an
+// identifier or pp-number in front of a quote (the token stops at its backslash), and a macro that expands to a comment or to
+// code (the stripper does not preprocess). No pin depends on these: MainWindow.cpp has no splice, raw string, digit separator,
+// universal-character-name or header-name with `//` or `/*` (the EveryFrameTargetGate.StripComments* tests below prove each
+// handled case on fixtures). r8 re-check against the adversary advisories still OPEN on this card: none is in these helpers
+// (pass 8 A1 is fixed here; pass 8 A2, pass 6 A3 and pass 7 A5 are product-path gaps in MainWindow.cpp / GpuDisplayWindow.cpp).
 int skipLineSplices( const QString & s, int i )
 {
     const int n = s.size();
@@ -260,16 +319,51 @@ int skipLineSplicesBackward( const QString & s, int i )
 // The identifier or pp-number that ends right before \a i (empty when \a i follows punctuation or whitespace), read after
 // splicing (r7, adversary A1 on db994303): `R\` + newline + `"x(` is the raw-string prefix R, and `1\` + newline + `'000` is a
 // digit separator, exactly as the compiler reads them.
+// r8 (Grok CoS G11, adversary pass 8 A1 on 257ad2a9): the token is found by lexing FORWARD over the longest run of characters that
+// can belong to a pp-number ([lex.ppnumber]: identifier characters, '.', `'` followed by a digit or nondigit, and a sign after
+// e/E/p/P) ending at \a i, read after splicing. A pp-number with several separators (`0xA'B'C`, `1'000'000`, `0b1'0`) or a
+// signed exponent (`1e+1'0`) is therefore one token. The old backward walk stopped at the earlier separator and returned `B`, so
+// the second `'` of `0xA'B'C` opened a char literal that ran to the newline and kept a // comment as code.
 QString tokenBefore( const QString & s, int i )
 {
-    QString token;
+    QString run;
     int k = skipLineSplicesBackward( s, i );
-    while( k > 0 && ( isIdentifierChar( s.at( k - 1 ) ) || s.at( k - 1 ) == QLatin1Char( '.' ) ) )
+    while( k > 0 )
     {
-        token.prepend( s.at( k - 1 ) );
+        const QChar c = s.at( k - 1 );
+        if( !isIdentifierChar( c ) && c != QLatin1Char( '.' ) && c != QLatin1Char( '\'' ) && c != QLatin1Char( '+' )
+            && c != QLatin1Char( '-' ) )
+            break;
+        run.prepend( c );
         k = skipLineSplicesBackward( s, k - 1 );
     }
-    return token;
+    // the run starts after a character no token here can contain, so a token starts there; lex it forward to its last token
+    enum class Kind
+    {
+        Other,
+        Identifier,
+        PpNumber
+    };
+    Kind kind = Kind::Other;
+    int start = 0;
+    for( int j = 0; j < run.size(); ++j )
+    {
+        const QChar c = run.at( j );
+        if( kind == Kind::PpNumber )
+        {
+            if( isIdentifierChar( c ) || c == QLatin1Char( '.' ) ) continue;
+            if( c == QLatin1Char( '\'' ) && j + 1 < run.size() && isIdentifierChar( run.at( j + 1 ) ) ) continue;
+            if( ( c == QLatin1Char( '+' ) || c == QLatin1Char( '-' ) ) && QStringLiteral( "eEpP" ).contains( run.at( j - 1 ) ) )
+                continue;
+        }
+        else if( kind == Kind::Identifier && isIdentifierChar( c ) )
+            continue;
+        start = j;
+        if( c.isDigit() || ( c == QLatin1Char( '.' ) && j + 1 < run.size() && run.at( j + 1 ).isDigit() ) ) kind = Kind::PpNumber;
+        else if( isIdentifierChar( c ) ) kind = Kind::Identifier;
+        else kind = Kind::Other;   // '.', `'`, '+' or '-' as punctuation (a `'` here opened a literal: what follows is not a prefix)
+    }
+    return kind == Kind::Other ? QString() : run.mid( start );
 }
 
 // When a string or char literal (any prefix) or a raw string literal opens at \a i (a '"' or '\'' in code), the index just past
@@ -285,10 +379,13 @@ int literalEnd( const QString & s, int i )
     const QChar quote = s.at( i );
     if( quote == QLatin1Char( '\'' ) )
     {
+        // a separator continues a pp-number only as `' digit` or `' nondigit` (r8): `1'/'` is the pp-number 1 and the literal '/'
         const QString token = tokenBefore( s, i );
+        const int after = skipLineSplices( s, i + 1 );
         const bool digitSeparator = !token.isEmpty()
                                     && ( token.at( 0 ).isDigit()
-                                         || ( token.at( 0 ) == QLatin1Char( '.' ) && token.size() > 1 && token.at( 1 ).isDigit() ) );
+                                         || ( token.at( 0 ) == QLatin1Char( '.' ) && token.size() > 1 && token.at( 1 ).isDigit() ) )
+                                    && after < n && isIdentifierChar( s.at( after ) );
         if( digitSeparator ) return -1;
     }
     else
@@ -610,6 +707,74 @@ TEST( EveryFrameTargetGate, AHeldTargetWhoseCallbackWasAlreadyHandledIsStillTake
             ASSERT_TRUE( ( model.presented == std::vector<int>{ 1, 2, 3, 4, 5, 6, 7 } ) );
             ASSERT_TRUE( model.maxLeadPastAccepted <= 1 );
         }
+    }
+}
+
+// r8 (Grok CoS G9): the notify model through NORMAL publishes, each posting its own frameReady notification, with the poll tick's
+// hold in between. The lookahead slot N+1 is published (one notification) while the slider is on N; the held tick then kicks for a
+// target that is already Ready, so two notifications are pending for one target. The first takes the target; the surplus one finds
+// the next target not yet Ready and takes nothing. Every frame is presented exactly once, in order, each accept consumed exactly
+// one notification, and the model's ledger (one notification per publish) holds after every step.
+TEST( EveryFrameTargetGate, NotifyModelPublishCallbacksAndTheHeldKickTakeEveryFrameOnceInOrder )
+{
+    EveryFrameModel model( 1, 480 );
+    model.notifyModel = true;
+    model.kickOnHold = true;
+    int doubleNotifiedHolds = 0;   // a hold whose kick joined a publish notification still pending for the same Ready target
+    for( int step = 0; step < 480 * 10 && !model.finished(); ++step )
+    {
+        model.renderCompleteAll();   // publishes the target (or the lookahead slot N+1): one notification each
+        if( model.accepted >= 0 )    // before this Play's first accept the predicate is open by design (startup unchanged)
+        {
+            const int pendingBefore = model.notifications;
+            const int kicksBefore = model.kickNotifications;
+            model.pollTick();
+            if( model.kickNotifications > kicksBefore && pendingBefore > 0 ) ++doubleNotifiedHolds;
+        }
+        model.drainNotifications();
+    }
+    ASSERT_TRUE( model.finished() );
+    assertEveryFramePresentedOnceInOrder( model );
+    model.checkNotificationLedger();
+    ASSERT_EQ( static_cast<int>( model.presented.size() ), model.acceptsOnNotification );   // no double take, no take without one
+    ASSERT_EQ( model.publishes, model.publishNotifications );
+    ASSERT_TRUE( model.publishes >= static_cast<int>( model.presented.size() ) );
+    ASSERT_TRUE( model.heldTicks > 0 );            // the hold was exercised
+    ASSERT_TRUE( model.kickNotifications > 0 );    // and so was its kick
+    ASSERT_TRUE( doubleNotifiedHolds > 0 );        // a publish callback and the kick were pending for the same target
+    ASSERT_TRUE( model.emptyCallbacks > 0 );       // the surplus callback took nothing (not the next frame, not a second copy)
+    ASSERT_EQ( 0, model.notifications );
+}
+
+// r8 (Grok CoS G9): the same notify model under a seeded random mix of publishes (one or all), single frameReady callbacks and poll
+// ticks; the ledger is checked inside the model at every step.
+TEST( EveryFrameTargetGate, NotifyModelSeededRandomEventMixTakesEveryFrameOnceInOrder )
+{
+    for( uint32_t seed = 1; seed <= 32; ++seed )
+    {
+        std::mt19937 rng( seed );
+        EveryFrameModel model( 1, 480 );
+        model.notifyModel = true;
+        model.kickOnHold = true;
+        int steps = 0;
+        while( !model.finished() && steps < 200000 )
+        {
+            ++steps;
+            switch( rng() % 4u )
+            {
+            case 0: model.renderCompleteOne(); break;
+            case 1: model.renderCompleteAll(); break;
+            case 2: model.frameReady(); break;
+            default:
+                if( model.accepted >= 0 ) model.pollTick();
+                break;
+            }
+        }
+        ASSERT_TRUE( model.finished() );
+        assertEveryFramePresentedOnceInOrder( model );
+        model.checkNotificationLedger();
+        ASSERT_EQ( static_cast<int>( model.presented.size() ), model.acceptsOnNotification );
+        ASSERT_EQ( model.publishes, model.publishNotifications );
     }
 }
 
@@ -970,6 +1135,18 @@ TEST( EveryFrameTargetGate, StripCommentsKeepsCodeAfterALiteralThatHoldsAComment
           QStringLiteral( "c = '\\\\\n''; forbidden_code(); \n" ) },
         { QStringLiteral( "log(\"a \\\n// still the string\"); forbidden_code(); // gone\n" ),
           QStringLiteral( "log(\"a \\\n// still the string\"); forbidden_code(); \n" ) },
+        // r8 (Grok CoS G11, adversary pass 8 A1 on 257ad2a9): a pp-number with several separators is one token, so its second `'` is
+        // not a char opener and the comment after it is still removed
+        { QStringLiteral( "n = 0xA'B'C; forbidden_code(); // gone m_newPosDropMode\n" ),
+          QStringLiteral( "n = 0xA'B'C; forbidden_code(); \n" ) },
+        { QStringLiteral( "n = 0b1'0'1; forbidden_code(); // gone '\n" ), QStringLiteral( "n = 0b1'0'1; forbidden_code(); \n" ) },
+        { QStringLiteral( "d = 1e+1'0; e = .5'0; forbidden_code(); // gone\n" ),
+          QStringLiteral( "d = 1e+1'0; e = .5'0; forbidden_code(); \n" ) },
+        { QStringLiteral( "n = 0xA'\\\nB'C; forbidden_code(); // gone\n" ), QStringLiteral( "n = 0xA'\\\nB'C; forbidden_code(); \n" ) },
+        // `' digit` / `' nondigit` only: `1'/'` is the pp-number 1 and the char literal '/', whose `/` opens no comment
+        { QStringLiteral( "t = 1'/'; forbidden_code(); // gone\n" ), QStringLiteral( "t = 1'/'; forbidden_code(); \n" ) },
+        // a sign joins a pp-number only after its e/E/p/P: `e-'0'` is the identifier e, '-', and the literal '0'
+        { QStringLiteral( "v = e-'/'; forbidden_code(); // gone\n" ), QStringLiteral( "v = e-'/'; forbidden_code(); \n" ) },
     };
     for( const Case & item : cases )
     {
@@ -1000,6 +1177,9 @@ TEST( EveryFrameTargetGate, StripCommentsSiblingHelpersLexLiteralsLikeTheCompile
         { QStringLiteral( "void f() { log( \"a\\\\\n}\" ); if( a ) { target(); } }" ), "void f() | if( a )" },
         { QStringLiteral( "void f() { const char c = '{'; if( a ) { target(); } }" ), "void f() | if( a )" },
         { QStringLiteral( "void f() { log( \"q\\\"}\" ); if( a ) { target(); } }" ), "void f() | if( a )" },
+        // r8 sibling of G11 (adversary pass 8 A1 sibling :435): enclosingBlockHeaders reads `0xA'B'C` as one pp-number too
+        { QStringLiteral( "void f() { const int n = 0xA'B'C; if( a ) { target(); } }\n" ), "void f() | if( a )" },
+        { QStringLiteral( "void f() { const char c = 1'{'; if( a ) { target(); } }" ), "void f() | if( a )" },
     };
     for( const Case & item : cases )
     {
@@ -1009,4 +1189,68 @@ TEST( EveryFrameTargetGate, StripCommentsSiblingHelpersLexLiteralsLikeTheCompile
     }
     ASSERT_EQ( 0, countOccurrences( QStringLiteral( "x" ), QString() ) );
     ASSERT_EQ( 2, countOccurrences( QStringLiteral( "a1'0a" ), QStringLiteral( "a" ) ) );
+}
+
+// r8 (Grok CoS G11; FIX-ROUND-CLASS-SWEEP-1 item 4, a lexer defect gets a generated-input test against an exact oracle): seeded
+// random pp-numbers with any number of digit separators (decimal, hex, binary, octal, a leading '.', signed exponents, suffixes,
+// optional line splices between their characters), and seeded char literals after an identifier or encoding prefix. The oracle is
+// the construction itself: the code before the comment is known exactly, so stripComments must return it unchanged with the
+// comment removed, and enclosingBlockHeaders must see exactly the two blocks the fixture opens.
+TEST( EveryFrameTargetGate, StripCommentsGeneratedPpNumbersAndCharLiteralsMatchTheConstruction )
+{
+    const QString decimalDigits = QStringLiteral( "0123456789" );
+    const QString hexDigits = QStringLiteral( "0123456789abcdefABCDEF" );
+    const QString splice = QStringLiteral( "\\\n" );
+    for( uint32_t seed = 1; seed <= 400; ++seed )
+    {
+        std::mt19937 rng( seed );
+        const auto pick = [&rng]( const QString & from ) { return from.at( static_cast<int>( rng() % static_cast<uint32_t>( from.size() ) ) ); };
+        // a digit sequence of 1..4 groups joined by separators
+        const auto groups = [&]( const QString & digits ) {
+            QString text;
+            const int count = 1 + static_cast<int>( rng() % 4u );
+            for( int g = 0; g < count; ++g )
+            {
+                if( g > 0 ) text += QLatin1Char( '\'' );
+                const int width = 1 + static_cast<int>( rng() % 3u );
+                for( int w = 0; w < width; ++w ) text += pick( digits );
+            }
+            return text;
+        };
+        QString number;
+        switch( rng() % 5u )
+        {
+        case 0: number = QStringLiteral( "0x" ) + groups( hexDigits ); break;
+        case 1: number = QStringLiteral( "0b" ) + groups( QStringLiteral( "01" ) ); break;
+        case 2: number = QStringLiteral( "0" ) + groups( QStringLiteral( "01234567" ) ); break;
+        case 3:
+            number = groups( decimalDigits ) + QLatin1Char( '.' ) + groups( decimalDigits ) + pick( QStringLiteral( "eE" ) )
+                     + pick( QStringLiteral( "+-" ) ) + groups( decimalDigits );
+            break;
+        default: number = QLatin1Char( '.' ) + pick( decimalDigits ) + groups( decimalDigits ); break;
+        }
+        if( rng() % 2u ) number += pick( QStringLiteral( "uUlLfF" ) );
+        // optional splices between characters of the number (never before its first character)
+        QString spliced;
+        for( int c = 0; c < number.size(); ++c )
+        {
+            if( c > 0 && rng() % 6u == 0 ) spliced += splice;
+            spliced += number.at( c );
+        }
+        const QString prefix = QStringList{ QString(), QStringLiteral( "L" ), QStringLiteral( "u" ), QStringLiteral( "U" ),
+                                            QStringLiteral( "u8" ) }.at( static_cast<int>( rng() % 5u ) );
+        const QString literal = prefix + QLatin1Char( '\'' ) + pick( QStringLiteral( "/{}*'" ) ) + QLatin1Char( '\'' );
+        const QString fixedLiteral = literal.endsWith( QStringLiteral( "'''" ) ) ? prefix + QStringLiteral( "'\\''" ) : literal;
+        const QString code = QStringLiteral( "n = " ) + spliced + QStringLiteral( "; c = " ) + fixedLiteral
+                             + QStringLiteral( "; forbidden_code(); " );
+        const QString input = code + QStringLiteral( "// gone ' \" /*\n" );
+        ASSERT_EQ( ( code + QStringLiteral( "\n" ) ).toStdString(), stripComments( input ).toStdString() );
+
+        const QString blocks = QStringLiteral( "void f() { const auto n = " ) + spliced + QStringLiteral( "; const auto c = " )
+                               + fixedLiteral + QStringLiteral( "; if( a ) { target(); } }\n" );
+        const int at = blocks.indexOf( QStringLiteral( "target();" ) );
+        ASSERT_TRUE( at > 0 );
+        ASSERT_EQ( std::string( "void f() | if( a )" ),
+                   enclosingBlockHeaders( blocks, at ).join( QStringLiteral( " | " ) ).toStdString() );
+    }
 }
