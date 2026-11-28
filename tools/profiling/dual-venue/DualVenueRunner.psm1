@@ -8009,6 +8009,43 @@ function ConvertFrom-DvStrictJsonBytes {
     catch { return $null }
 }
 
+# EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1 (Grok CoS #913 G7): every per-row field Get-DvTailVisualEvidence reads from a play capture row, and the JSON type the
+# app writes it as (MainWindow.cpp frameJson.insert: bool, integer, number or string). `source_id` is the only one the app may omit (once the open clip changed).
+$script:TailRowFieldTypes = [ordered]@{
+    saved = 'bool'; play_active = 'bool'; label_bound = 'bool'; painted_serial_valid = 'bool'
+    display_frame = 'integer'; forced_paints_before = 'integer'; serial = 'integer'; painted_serial = 'integer'
+    tail_elapsed_ms = 'number'; label_bound_basis = 'string'; source_id = 'string'
+}
+
+function Get-DvTailRowTypeProblem {
+    <#
+    .SYNOPSIS
+    EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1 (Grok CoS #913 G7). A play capture row's ordering or binding field that is PRESENT but of the WRONG JSON type (a
+    string "true" for play_active, "0" for forced_paints_before, a number for label_bound_basis, ...; a JSON null is present and of no type) is read by
+    Get-DvTailVisualEvidence as false or $null, so the row either leaves the credit's order and repeat checks (a hidden paint) or stays counted beside rows the credit
+    credits. Returns the text naming the first such field (and the type found), or $null when every present field has its type. An ABSENT field is no problem here
+    (the credit refuses a row it needs a field of). Pure; never throws.
+    #>
+    param($Row)
+    foreach ($name in $script:TailRowFieldTypes.Keys) {
+        $property = $Row.PSObject.Properties[$name]
+        if ($null -eq $property) { continue }
+        $value = $property.Value
+        $wanted = [string]$script:TailRowFieldTypes[$name]
+        $ok = switch ($wanted) {
+            'bool' { $value -is [bool] }
+            'integer' { ($value -is [int]) -or ($value -is [long]) }
+            'number' { ($value -is [int]) -or ($value -is [long]) -or ($value -is [double]) }
+            'string' { $value -is [string] }
+        }
+        if (-not $ok) {
+            $found = $(if ($null -eq $value) { 'null' } else { $value.GetType().Name })
+            return "$name=$(if ($null -eq $value) { 'null' } elseif ($value -is [string] -and $value.Length -gt 40) { $value.Substring(0, 40) } else { [string]$value }) (a JSON $found), not a JSON $wanted"
+        }
+    }
+    return $null
+}
+
 function Get-DvTailVisualEvidence {
     <#
     .SYNOPSIS
@@ -8102,6 +8139,15 @@ function Get-DvTailVisualEvidence {
                  [string]::Equals($kind, 'play_first_unbound', [StringComparison]::Ordinal)) -and
                 (-not (($index -is [int]) -or ($index -is [long])) -or [int64]$index -lt 0)) {
                 return (& $refuse "TAIL_VISUAL_ROW_UNREADABLE: a $kind capture carries index=$([string]$index), not a non-negative JSON integer, so a paint it records cannot be ordered and the post-close tail is not credited")
+            }
+            # EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1 (Grok CoS #913 G7): a play row whose ordering or binding field is PRESENT with the wrong JSON type is
+            # read below as false or $null, so it would leave the credit's order and repeat checks (or be counted beside the rows that credit): it refuses the whole
+            # tail, typed, naming the field, exactly as an unreadable index does above
+            if ($kind -ceq 'play' -or $kind -ceq 'play_unbound' -or $kind -ceq 'play_first_unbound') {
+                $typeProblem = Get-DvTailRowTypeProblem -Row $row
+                if ($null -ne $typeProblem) {
+                    return (& $refuse "TAIL_VISUAL_ROW_UNREADABLE: the $kind capture $index carries $typeProblem, so a paint it records cannot be ordered or bound and the post-close tail is not credited")
+                }
             }
             if (-not (($index -is [int]) -or ($index -is [long]))) { continue }
             if ([int64]$index -lt 0) { continue }
