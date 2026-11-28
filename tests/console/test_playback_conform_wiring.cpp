@@ -291,11 +291,17 @@ TEST(PlaybackConformWiring, DropFrameTickQuantisesTheConformedCatchupToWholeFram
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("const int target = static_cast<int>( position );")));
     ASSERT_FALSE(outstandingBody.contains(QStringLiteral("m_newPosDropMode")));
     ASSERT_TRUE(outstandingBody.contains(QStringLiteral("if( !m_pRenderThread || !playbackConformActive() ) return false;")));
-    ASSERT_TRUE(outstandingBody.contains(QStringLiteral("if( renderThreadBusyForPlaybackAdvance( target ) ) return true;")));
-    ASSERT_TRUE(outstandingBody.contains(QStringLiteral("m_pRenderThread->hasPlaybackLookaheadRequest(")));
+    // PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1: the checks below moved, unchanged, into the mode-neutral
+    // playbackTargetPresentOutstanding( target ), which conform delegates to after its own gate and early-out
+    ASSERT_TRUE(outstandingBody.contains(QStringLiteral("return playbackTargetPresentOutstanding( target );")));
+    const int neutral = drawReady.indexOf(QStringLiteral("bool MainWindow::playbackTargetPresentOutstanding( int target )"));
+    ASSERT_TRUE(neutral > 0);
+    const QString neutralBody = drawReady.mid(neutral, drawReady.indexOf(QStringLiteral("\n}\n"), neutral) - neutral);
+    ASSERT_TRUE(neutralBody.contains(QStringLiteral("if( renderThreadBusyForPlaybackAdvance( target ) ) return true;")));
+    ASSERT_TRUE(neutralBody.contains(QStringLiteral("m_pRenderThread->hasPlaybackLookaheadRequest(")));
     // fix iteration 2 (adversary A1 on 9e88a583): a published Ready frame for the target, lookahead or not (the CPU path with
     // lookahead 0 is non-lookahead), is a present still coming -- isIdleExceptPlaybackLookahead and isIdle omit Ready slots
-    ASSERT_TRUE(outstandingBody.contains(QStringLiteral("m_pRenderThread->hasReadyFrameForPlaybackTarget(")));
+    ASSERT_TRUE(neutralBody.contains(QStringLiteral("m_pRenderThread->hasReadyFrameForPlaybackTarget(")));
     const QString renderThread = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
     const int ready = renderThread.indexOf(QStringLiteral("bool RenderFrameThread::hasReadyFrameForPlaybackTarget("));
     ASSERT_TRUE(ready > 0);

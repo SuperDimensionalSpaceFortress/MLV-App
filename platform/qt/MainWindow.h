@@ -1175,6 +1175,9 @@ private:
     // Last playback frame number accepted for presentation; drives the forward-only
     // present guard in drawFrameReady() that drops stale backward-jumping renders.
     long long m_lastPresentedPlaybackFrame = -1;
+    // PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1: the frame drawFrameReady last accepted in THIS Play (-1 until the first
+    // accept; reset at Play start). The unpaced every-frame poll tick holds past an unaccepted target (playbackEveryFrameTickMayAdvance).
+    long long m_playbackEveryFrameAcceptedFrame = -1;
     // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): the playback frame last put on screen (finishPresentedFrame). An
     // accepted frame is not displayed yet: the non-inline prep may still hold it, and a newer enqueue can replace it.
     long long m_lastDisplayedPlaybackFrame = -1;
@@ -1426,6 +1429,7 @@ private:
     int playbackRenderLookaheadFrames() const;
     int currentPlaybackAdvanceTarget();
     bool renderThreadBusyForPlaybackAdvance( int activePlaybackTarget );
+    bool playbackTargetPresentOutstanding( int target );
     bool conformTargetPresentOutstanding( double position );       // r2: the tick's corrected start
     bool conformAcceptedTargetPresentPending( double position );   // r2: the tick's corrected start
     bool conformDisplayedFramePaintPending();

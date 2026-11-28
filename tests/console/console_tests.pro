@@ -100,6 +100,7 @@ SOURCES += \
     $$REPO_ROOT/tests/console/test_playback_fps_meter_wiring.cpp \
     $$REPO_ROOT/tests/console/test_playback_native_pace_guard.cpp \
     $$REPO_ROOT/tests/console/test_playback_due_wake_native.cpp \
+    $$REPO_ROOT/tests/console/test_playback_every_frame_target_gate.cpp \
     $$REPO_ROOT/platform/qt/PlaybackDueWake.cpp \
     $$REPO_ROOT/tests/console/test_playback_slip_histogram.cpp \
     $$REPO_ROOT/tests/console/test_playback_texture_present_split.cpp \

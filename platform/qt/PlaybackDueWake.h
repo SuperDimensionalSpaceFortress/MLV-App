@@ -234,6 +234,26 @@ inline bool playbackDueWakeMayAdvance( bool frameStillDrawing, bool dropFrameMod
     return lastPresentedFrame < 0 || lastPresentedFrame == static_cast<long long>( position );
 }
 
+// PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1 fix 1 (adversary A1 on 5370a8e6): does the tick's verdict depend on whether a present
+// of the target is still coming? Only then may the caller ask the render thread (its mutex): paced, drop-frame, a Play that has
+// accepted nothing, and an accepted target never consult it, so the paced tick never waits on the render thread.
+inline bool playbackEveryFrameTickConsultsOutstanding( bool unpaced, bool dropFrameMode, long long acceptedFrameThisPlay, int target )
+{
+    if( dropFrameMode || !unpaced ) return false;
+    if( acceptedFrameThisPlay < 0 ) return false;
+    return acceptedFrameThisPlay != static_cast<long long>( target );
+}
+
+// PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1: may an unpaced every-frame (drop-frame off) tick advance past the engine target?
+// Only once drawFrameReady has accepted the target in this Play, or when no present of the target is coming (it never holds then).
+// Paced or drop-frame Play is unchanged (true), and so is a Play that has accepted nothing yet (startup unchanged).
+inline bool playbackEveryFrameTickMayAdvance( bool unpaced, bool dropFrameMode, long long acceptedFrameThisPlay,
+                                              int target, bool targetPresentOutstanding )
+{
+    if( !playbackEveryFrameTickConsultsOutstanding( unpaced, dropFrameMode, acceptedFrameThisPlay, target ) ) return true;
+    return !targetPresentOutstanding;
+}
+
 /*! r3 (adversary pass 6 A1): what a due wake does. A busy renderer defers the advance to the frameReady / drawFrameReady
  *  paths (the pending advance). An every-frame wake held because the slider's frame has not presented yet does NOT leave
  *  a pending advance: the empty-frameReady and lookahead-drop paths would consume it while that frame's preparation is

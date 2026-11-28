@@ -2868,10 +2868,23 @@ bool MainWindow::renderThreadBusyForPlaybackAdvance( int activePlaybackTarget )
     return !m_pRenderThread->isIdle();
 }
 
+// PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1: the mode-neutral body of conformTargetPresentOutstanding -- whether a present of
+// \a target is still coming (a render in flight for it, non-speculative work, a published Ready frame for it, or a lookahead
+// request or slot for it in the active generation). The unpaced every-frame poll tick holds on it too.
+bool MainWindow::playbackTargetPresentOutstanding( int target )
+{
+    if( !m_pRenderThread || target < 0 ) return false;
+    if( renderThreadBusyForPlaybackAdvance( target ) ) return true;
+    const uint64_t generation = m_playbackPresentationGeneration.load( std::memory_order_acquire );
+    // fix iteration 2 (adversary A1 on 9e88a583): a published Ready frame for the target, lookahead or not, is still coming
+    if( m_pRenderThread->hasReadyFrameForPlaybackTarget( static_cast<uint32_t>( target ), generation ) ) return true;
+    return m_pRenderThread->hasPlaybackLookaheadRequest( static_cast<uint32_t>( target ), generation );
+}
+
 // HFR-NATIVE-60FPS-FULLRES-1 r27 fix iteration 1 (adversary A1 on d98be193): whether a present of the drop-frame engine's
-// current target is still coming -- a render in flight for it (or non-speculative work) or a lookahead request or slot for it
-// in the active generation. The conformed tick holds only then (playback_frame_range::conformTargetPresented). The render
-// thread is asked only under conform and only while the target is not the frame drawFrameReady last accepted.
+// current target is still coming (playbackTargetPresentOutstanding). The conformed tick holds only then
+// (playback_frame_range::conformTargetPresented). The render thread is asked only under conform and only while the target is
+// not the frame drawFrameReady last accepted.
 // PLAYBACK-STALE-POSITION-FOLD-CONTRACT-1 r2 (adversary pass 3 A2 on c4fa34c3): \a position is the tick's CORRECTED start (the
 // gate's own position), never the stale m_newPosDropMode a fold or clamp is about to move off.
 bool MainWindow::conformTargetPresentOutstanding( double position )
@@ -2879,11 +2892,7 @@ bool MainWindow::conformTargetPresentOutstanding( double position )
     if( !m_pRenderThread || !playbackConformActive() ) return false;
     const int target = static_cast<int>( position );
     if( target < 0 || m_lastPresentedPlaybackFrame == static_cast<long long>( target ) ) return false;
-    if( renderThreadBusyForPlaybackAdvance( target ) ) return true;
-    const uint64_t generation = m_playbackPresentationGeneration.load( std::memory_order_acquire );
-    // fix iteration 2 (adversary A1 on 9e88a583): a published Ready frame for the target, lookahead or not, is still coming
-    if( m_pRenderThread->hasReadyFrameForPlaybackTarget( static_cast<uint32_t>( target ), generation ) ) return true;
-    return m_pRenderThread->hasPlaybackLookaheadRequest( static_cast<uint32_t>( target ), generation );
+    return playbackTargetPresentOutstanding( target );
 }
 
 // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 6714996522 on c4efe7e3): whether the present of the target drawFrameReady accepted is
@@ -13522,6 +13531,28 @@ void MainWindow::playbackHandling(int timeDiff)
                 //Normal mode: next frame (held while the wall clock owes no whole frame)
                 if( !ui->actionDropFrameMode->isChecked() )
                 {
+                    // PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1: unpaced, grantWholeFrame always grants, so the 8 ms poll tick
+                    // moved past a target whose lookahead slot was Ready but not yet accepted (receipt a877bb17: 6 and 57 never
+                    // painted). Hold until drawFrameReady accepts the target, unless no present of it is coming. Paced, drop-frame
+                    // and a Play that has accepted nothing yet are unchanged; the pace credit is not spent while holding.
+                    // fix 1 (adversary A1 on 5370a8e6): the render thread (its mutex) is asked only when the verdict depends on it,
+                    // through the && short-circuit, so a paced tick never waits on it.
+                    const int everyFrameTarget = ui->horizontalSliderPosition->value();
+                    const bool everyFrameUnpaced = !( playbackPaceGuardFps() > 0.0 );
+                    if( !playbackEveryFrameTickMayAdvance( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget,
+                                                           playbackEveryFrameTickConsultsOutstanding( everyFrameUnpaced, false, m_playbackEveryFrameAcceptedFrame, everyFrameTarget )
+                                                               && playbackTargetPresentOutstanding( everyFrameTarget ) ) )
+                    {
+                        // fix 2 (adversary A1 on 06031667): a target already published Ready whose frameReady was handled while the
+                        // slider was still on the frame before gets no further callback, so the hold would wait forever. Ask
+                        // drawFrameReady to take it (queued; at most one per held tick); with nothing to take it is the empty path.
+                        if( m_pRenderThread
+                         && m_pRenderThread->hasReadyFrameForPlaybackTarget(
+                                static_cast<uint32_t>( everyFrameTarget ),
+                                m_playbackPresentationGeneration.load( std::memory_order_acquire ) ) )
+                            QMetaObject::invokeMethod( this, "drawFrameReady", Qt::QueuedConnection );
+                        return;
+                    }
                     if( !m_playbackPaceGuard.grantWholeFrame( paceNowMs, playbackPaceGuardFps() ) ) return;
                     // PLAYBACK-CLIP-LENGTH-ENFORCE-3: every source frame the engine advances is counted (the
                     // slider value AFTER setValue, so a clamp at the slider maximum is not counted as footage).
@@ -21956,6 +21987,7 @@ void MainWindow::resetPlaybackDueWakeCounters( void )
     m_playbackDueWakePostFailedBase = m_playbackDueWake ? m_playbackDueWake->postFailures() : 0;
     m_playbackDueWakePostRescuedBase = m_playbackDueWake ? m_playbackDueWake->postRescued() : 0;
     m_playbackDueWakePresentedFrame = -1;   // nothing presented in this Play yet
+    m_playbackEveryFrameAcceptedFrame = -1;   // PLAYBACK-UNPACED-EVERY-TARGET-PAINTED-CUDA-1: nothing accepted in this Play yet
     m_playbackDueWakeHiRes = false;
     m_playbackDueWakeDelivery = QStringLiteral( "none" );
     m_playbackDueWakeMechanismSeen = false;
@@ -36806,6 +36838,7 @@ void MainWindow::drawFrameReady()
         return;
     }
     m_lastPresentedPlaybackFrame = static_cast<long long>( display_frame );
+    if( ui->actionPlay->isChecked() ) m_playbackEveryFrameAcceptedFrame = static_cast<long long>( display_frame );
     // HFR-NATIVE-60FPS-FULLRES-1 r28 (CoS B1 on c4efe7e3): accepted is not displayed. Until this call returns (the early advance
     // below, then the inline present or the enqueue to the prep queue) the frame's present is still to come.
     PlaybackPresentDispatchWindow presentDispatchWindow( m_playbackPresentDispatchFrame, static_cast<long long>( display_frame ) );
