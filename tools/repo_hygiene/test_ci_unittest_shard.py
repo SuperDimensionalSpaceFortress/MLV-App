@@ -71,7 +71,7 @@ class AssignTests(unittest.TestCase):
     def test_no_shard_is_far_above_the_mean_load(self) -> None:
         # The point of weighting: the longest shard stays near the mean, so wall time is
         # the mean plus setup rather than the unlucky bucket.
-        for profile, shards in (("windows", 7), ("ubuntu", 3)):
+        for profile, shards in (("windows", 7), ("ubuntu", UBUNTU_LIGHT_SHARDS)):
             weights = shard.load_weights(profile)
             buckets = shard.assign(_COUNTS, shards, weights)
             loads = [
@@ -122,7 +122,7 @@ class AssignTests(unittest.TestCase):
 class CoverageTests(unittest.TestCase):
     def test_shards_are_an_exact_cover_of_discover(self) -> None:
         expected = sorted(test.id() for test in _TESTS)
-        for profile, shards in (("windows", 7), ("ubuntu", 3)):
+        for profile, shards in (("windows", 7), ("ubuntu", UBUNTU_LIGHT_SHARDS)):
             with self.subTest(profile=profile):
                 buckets = shard.assign(_COUNTS, shards, shard.load_weights(profile))
                 covered = sorted(
@@ -150,7 +150,7 @@ class CoverageTests(unittest.TestCase):
         # parts; together they must hold every discovered id exactly once. Ubuntu has no heavy
         # set, so its 3-way partition alone must still cover everything.
         expected = sorted(test.id() for test in _TESTS)
-        for profile, shards in (("windows", 7), ("ubuntu", 3)):
+        for profile, shards in (("windows", 7), ("ubuntu", UBUNTU_LIGHT_SHARDS)):
             with self.subTest(profile=profile):
                 partition, heavy = shard.plan_buckets(_COUNTS, profile, shards)
                 self.assertEqual(len(partition), shards)
@@ -203,6 +203,32 @@ MAX_CAP_SHARE_USED = 0.85
 # the workflow and the heavy set.
 WINDOWS_LIGHT_SHARDS = 7
 WINDOWS_HEAVY_PARTS = 14
+# CI-UBUNTU-UNITTEST-SHARD-HEADROOM-1: the ubuntu analogue. Three light shards held 1274 s of weight each
+# (hosted jobs measured 14.5-30.3 min, median 18 / 20.6 / 22.1 min for shards 1-3, 20 runs), so shard 3/4
+# hit its 30 min cap on #928 71ef6f07 (job 140856692786). The ubuntu suite weighs 3822 s, so six light
+# shards (637 s each) are what keeps every shard at half its cap or less. The workflow's matrix is the
+# six light shards plus one more shard for the tail steps (a job of its own, as before). A change of
+# the count has to change this constant in the same commit as the workflow.
+UBUNTU_LIGHT_SHARDS = 6
+# Seconds an ubuntu shard job spends outside its tests (checkout with fetch-depth 0, setup-python, the pip
+# installs, --verify-partition): 31-47 s measured over 12 jobs in four hosted runs; 60 s leaves margin.
+UBUNTU_SETUP_SECONDS = 60
+# The tail steps (release evidence, output budget, golden provenance, vendored payloads, verify-policy,
+# pinned tokens, k9 witness): 9-12 s measured over four hosted runs, the whole of the tail shard's work.
+UBUNTU_TAIL_SECONDS = 15
+# The ubuntu budget: a shard is expected at no more than half its job's timeout-minutes (900 s of 30 min),
+# so a runner twice as slow as the table still finishes inside the cap. The measured spread between hosted
+# runs of one shard was up to 1.4x, which is why the headroom row below also applies MAX_CAP_SHARE_USED.
+UBUNTU_CAP_SHARE = 0.5
+UBUNTU_TAIL_COMMANDS = (
+    "python -m unittest tools.release.test_release_evidence -v",
+    "python -m unittest tools.gates.test_output_budget -v",
+    "python -m tools.repo_hygiene.pipeline_golden_provenance --repo-root .",
+    "python -m tools.repo_hygiene.vendored_native_payloads --repo-root .",
+    "python tools/repo-hygiene/hygiene.py --repo-root . verify-policy",
+    "python tools/docs/check_pinned_tokens.py",
+    "python -m tools.repo_hygiene.k9_witness tree HEAD",
+)
 
 
 def _workflow_job(job_name: str) -> str:
@@ -453,6 +479,120 @@ class EveryClassHasWeightRowTests(unittest.TestCase):
                 self.assertTrue(reason.strip(), "an exemption names its reason")
                 for profile in shard.PROFILES:
                     self.assertNotIn(key, shard.load_weights(profile), f"{profile} now weights it: drop the exemption")
+
+
+_UBUNTU_TOOL = "python -m tools.repo_hygiene.ci_unittest_shard --profile ubuntu"
+_UBUNTU_RUN_VERIFY = f"        run: {_UBUNTU_TOOL} --of {UBUNTU_LIGHT_SHARDS} --verify-partition"
+_UBUNTU_RUN_SHARD = f"        run: {_UBUNTU_TOOL} --of {UBUNTU_LIGHT_SHARDS} --shard ${{{{ matrix.shard }}}}"
+
+
+def _ubuntu_run_step_of(job: str) -> int:
+    """The ``--of`` of the ubuntu job's shard run step, read from its exact line."""
+    found = re.search(
+        r"(?m)^        run: python -m tools\.repo_hygiene\.ci_unittest_shard --profile ubuntu "
+        r"--of (\d+) --shard \$\{\{ matrix\.shard \}\}$",
+        job,
+    )
+    assert found is not None, "the ubuntu shard run step is not the pinned line"
+    return int(found.group(1))
+
+
+def _ubuntu_tail_shard(job: str) -> int:
+    """The matrix shard that runs the tail steps, read from the tail step's exact ``if`` line."""
+    found = re.search(r"(?m)^      - name: Run repo hygiene tail steps\n        if: matrix\.shard == (\d+)$", job)
+    assert found is not None, "the ubuntu tail step is not the pinned step"
+    return int(found.group(1))
+
+
+def _ubuntu_expected_seconds(job: str) -> list[float]:
+    """The predicted job seconds of every ubuntu shard: setup plus the bucket's weights for each light
+    shard, then setup plus the tail steps for the tail shard."""
+    of = _ubuntu_run_step_of(job)
+    weights = shard.load_weights("ubuntu")
+    buckets, _heavy = shard.plan_buckets(_COUNTS, "ubuntu", of)
+    light = [
+        UBUNTU_SETUP_SECONDS + sum(shard.unit_weight(key, _COUNTS[key], weights) for key in bucket)
+        for bucket in buckets
+    ]
+    return [*light, UBUNTU_SETUP_SECONDS + UBUNTU_TAIL_SECONDS]
+
+
+class UbuntuShardBudgetTests(unittest.TestCase):
+    """CI-UBUNTU-UNITTEST-SHARD-HEADROOM-1: every ubuntu shard job is expected at half its cap or less."""
+
+    def test_every_ubuntu_shard_is_expected_within_half_the_cap(self) -> None:
+        job = _workflow_job(UBUNTU_SHARD_JOB)
+        cap = re.search(r"(?m)^    timeout-minutes: (\d+)$", job)
+        self.assertIsNotNone(cap)
+        budget = int(cap.group(1)) * 60 * UBUNTU_CAP_SHARE
+        expected = _ubuntu_expected_seconds(job)
+        self.assertEqual(len(expected), _ubuntu_run_step_of(job) + 1)
+        for index, seconds in enumerate(expected, start=1):
+            self.assertLessEqual(
+                seconds,
+                budget,
+                f"ubuntu shard {index}/{len(expected)} is expected at {seconds:.0f} s, over "
+                f"{UBUNTU_CAP_SHARE:.0%} of its {cap.group(1)} min cap ({budget:.0f} s); "
+                "re-derive ci_unittest_shard_weights.json from fresh hosted logs or add shards",
+            )
+
+    def test_every_ubuntu_shard_keeps_headroom_under_the_cap_share(self) -> None:
+        job = _workflow_job(UBUNTU_SHARD_JOB)
+        cap = re.search(r"(?m)^    timeout-minutes: (\d+)$", job)
+        self.assertIsNotNone(cap)
+        budget = int(cap.group(1)) * 60 * UBUNTU_CAP_SHARE
+        limit = budget * MAX_CAP_SHARE_USED
+        for index, seconds in enumerate(_ubuntu_expected_seconds(job), start=1):
+            self.assertLessEqual(
+                seconds,
+                limit,
+                f"ubuntu shard {index} is expected at {seconds:.1f} s, {seconds / budget:.1%} of its cap share "
+                f"({budget:.0f} s); the limit is {MAX_CAP_SHARE_USED:.0%} ({limit:.0f} s) so new tests have "
+                "headroom; add an ubuntu shard or re-derive the weights from hosted logs",
+            )
+
+    def test_the_ubuntu_workflow_carries_the_pinned_shard_count_and_the_tail_steps_once(self) -> None:
+        # The job's two tool lines, its strategy block (the light shards plus one tail shard), the unittest
+        # step's `if` and the tail step's `if` are pinned character for character, so the matrix, `--of` and
+        # the tail shard cannot move one without the others; every tail command still runs, once, in the
+        # tail shard.
+        job = _workflow_job(UBUNTU_SHARD_JOB)
+        problems: list[str] = []
+        allowed = {_UBUNTU_RUN_VERIFY.strip(), _UBUNTU_RUN_SHARD.strip()}
+        for line in (_UBUNTU_RUN_VERIFY, _UBUNTU_RUN_SHARD):
+            if job.count(line + "\n") != 1:
+                problems.append(f"the ubuntu job lacks exactly one line {line.strip()!r}")
+        for line in job.splitlines():
+            text = line.strip()
+            if text.startswith("#") or text in allowed:
+                continue
+            if "ci_unittest_shard" in text or re.search(r"--`?o`?f?\b", text):
+                problems.append(f"another ubuntu job line names the tool or an --of/--o option: {text}")
+        tail_shard = UBUNTU_LIGHT_SHARDS + 1
+        if _strategy_block("shard", tail_shard) not in job:
+            problems.append(f"the ubuntu strategy block is not just shard 1..{tail_shard}")
+        step = (
+            f"      - name: Run repo hygiene unittest shard ${{{{ matrix.shard }}}}/{UBUNTU_LIGHT_SHARDS}\n"
+            f"        if: matrix.shard <= {UBUNTU_LIGHT_SHARDS}\n"
+        )
+        if step not in job:
+            problems.append("the ubuntu unittest step is not the pinned name and `if` for the light shard count")
+        if f"    name: Repo Hygiene Python ubuntu shard ${{{{ matrix.shard }}}}/{tail_shard}\n" not in job:
+            problems.append("the ubuntu job name does not carry the pinned matrix size")
+        if _ubuntu_tail_shard(job) != tail_shard:
+            problems.append(f"the tail steps do not run in shard {tail_shard}")
+        for command in UBUNTU_TAIL_COMMANDS:
+            if job.count(f"          {command}\n") != 1:
+                problems.append(f"the tail command is not present exactly once: {command}")
+        self.assertEqual(problems, [])
+
+    def test_the_budget_row_fails_for_a_heavier_ubuntu_shard(self) -> None:
+        # A partition the budget must refuse: the former three light shards, 1274 s of weight each.
+        job = _workflow_job(UBUNTU_SHARD_JOB)
+        three_way = job.replace(f"--of {UBUNTU_LIGHT_SHARDS} --shard", "--of 3 --shard")
+        self.assertNotEqual(three_way, job)
+        budget = int(re.search(r"(?m)^    timeout-minutes: (\d+)$", job).group(1)) * 60 * UBUNTU_CAP_SHARE
+        self.assertGreater(max(_ubuntu_expected_seconds(three_way)), budget)
 
 
 class JobCapPinTests(unittest.TestCase):
