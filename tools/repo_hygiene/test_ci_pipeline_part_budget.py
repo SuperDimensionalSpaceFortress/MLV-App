@@ -36,6 +36,46 @@ def _workflow_job(workflow: str, job_id: str) -> str:
     return workflow[start : start + 1 + following.start()] if following else workflow[start:]
 
 
+# The planning logic of the step, comment and blank lines dropped and indentation stripped, from
+# `$partCount` through the assignment loop. The mirror in ci_pipeline_part_plan.py repeats exactly
+# this; a changed line (a scaled weight, another tie-break, another default) would make the budget
+# below describe a plan CI no longer runs, so any edit here must be made there too.
+EXPECTED_PLANNING_LOGIC = (
+    "$partCount = 3",
+    "$part = [int]'${{ matrix.part }}'",
+    "$weightTable = Get-Content -LiteralPath 'tools\\testing\\pipeline_test_weights.json' -Raw | ConvertFrom-Json -AsHashtable",
+    "if ($weightTable.schema -ne 1 -or $weightTable.unit -ne 'milliseconds') { throw \"pipeline test weights have an unexpected schema or unit\" }",
+    "$partLoad = @($weightTable.partSeedMillis | ForEach-Object { [long]$_ })",
+    "if ($partLoad.Count -ne $partCount) { throw \"pipeline part seeds must have one entry per part (seeds=$($partLoad.Count) parts=$partCount)\" }",
+    "$defaultTestMillis = [long]$weightTable.defaultTestMillis",
+    "foreach ($planned in $shards) {",
+    "$weight = [long]0",
+    "foreach ($plannedTest in ($planned.Filter -split ':')) {",
+    "$weight += $(if ($weightTable.testMillis.ContainsKey($plannedTest)) { [long]$weightTable.testMillis[$plannedTest] } else { $defaultTestMillis })",
+    "}",
+    "$planned.Weight = $weight",
+    "}",
+    "$partOf = @{}",
+    "$planOrder = @($shards | Sort-Object @{ Expression = { $_.Weight }; Descending = $true }, @{ Expression = { $_.Index }; Descending = $false })",
+    "foreach ($planned in $planOrder) {",
+    "$target = 0",
+    "for ($candidate = 1; $candidate -lt $partCount; $candidate++) {",
+    "if ($partLoad[$candidate] -lt $partLoad[$target]) { $target = $candidate }",
+    "}",
+    "$partOf[$planned.Name] = $target + 1",
+    "$partLoad[$target] += $planned.Weight",
+    "}",
+)
+
+
+def _planning_logic(part_job: str) -> tuple[str, ...]:
+    lines = [line.strip() for line in part_job.splitlines()]
+    start = next(i for i, line in enumerate(lines) if line.startswith("$partCount = "))
+    end = next(i for i, line in enumerate(lines) if line.startswith("$partLoad[$target] +=")) + 1
+    logic = [line for line in lines[start : end + 1] if line and not line.startswith("#")]
+    return tuple(logic)
+
+
 def _solo_pattern(part_job: str) -> str:
     match = re.search(r"(?m)^\s*\$soloPattern = '([^\n]*)'$", part_job)
     assert match, "the pipeline step lost its $soloPattern line"
@@ -145,6 +185,36 @@ class PipelinePartBudgetTests(unittest.TestCase):
         self.assertNotIn("$partLoad = @(200.0, 140.0, 0.0)", self.part_job)
         # Shards carry their plan index, which breaks weight ties the same way here and there.
         self.assertEqual(self.part_job.count("Index = $shards.Count"), 2)
+
+    def test_the_planning_logic_is_exactly_what_the_mirror_repeats(self) -> None:
+        self.assertEqual(_planning_logic(self.part_job), EXPECTED_PLANNING_LOGIC)
+
+    def test_a_scaled_weight_in_the_workflow_is_refused(self) -> None:
+        # adversary A1: `$planned.Weight = $weight * 0.4` priced part 3 at 2,541 s while every other
+        # pinned line, and the budget, still passed.
+        for original, mutated in (
+            ("$planned.Weight = $weight", "$planned.Weight = $weight * 0.4"),
+            ("$weight += $(if", "$weight += 0.4 * $(if"),
+            ("else { $defaultTestMillis })", "else { 0 })"),
+            ("$partLoad[$target] += $planned.Weight", "$partLoad[$target] += $planned.Weight / 2"),
+            ("Descending = $true }", "Descending = $false }"),
+        ):
+            with self.subTest(mutated=mutated):
+                self.assertIn(original, self.part_job)
+                self.assertNotEqual(_planning_logic(self.part_job.replace(original, mutated, 1)), EXPECTED_PLANNING_LOGIC)
+
+    def test_a_fractional_default_is_refused(self) -> None:
+        # adversary A2: PowerShell `[long]0.5` is 0 while Python kept 0.5; every number must be a
+        # whole millisecond so both read the same value.
+        for key in ("defaultTestMillis",):
+            self.assertIsInstance(self.weights[key], int)
+            self.assertNotIsInstance(self.weights[key], bool)
+        for seed in self.weights["partSeedMillis"]:
+            self.assertIsInstance(seed, int)
+        for value in self.weights["testMillis"].values():
+            self.assertIsInstance(value, int)
+        with self.assertRaises(ValueError):
+            plan.load_weights_from_text('{"schema": 1, "unit": "milliseconds", "partSeedMillis": [1, 2, 3], "defaultTestMillis": 0.5, "testMillis": {}}')
 
     def test_the_mirror_reproduces_the_window_cut(self) -> None:
         # Windows are consecutive slices of the sorted names; a solo test leaves its window's

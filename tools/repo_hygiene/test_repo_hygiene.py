@@ -1579,6 +1579,8 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertIn("$partLoad = @($weightTable.partSeedMillis | ForEach-Object { [long]$_ })", part)
         weights = json.loads((ROOT / "tools" / "testing" / "pipeline_test_weights.json").read_text(encoding="utf-8"))
         self.assertEqual(len(weights["partSeedMillis"]), len(part_numbers))
+        self.assertTrue(all(isinstance(seed, int) for seed in weights["partSeedMillis"]))
+        self.assertIsInstance(weights["defaultTestMillis"], int)
         # Coverage: the plan is split by an assignment over the full plan, proven a disjoint
         # cover in every part, and each part runs only its own shards.
         self.assertIn("pipeline parts do not cover each shard exactly once", part)

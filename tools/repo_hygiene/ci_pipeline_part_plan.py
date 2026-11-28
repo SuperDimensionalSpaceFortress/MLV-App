@@ -69,11 +69,23 @@ class Shard:
         return ":".join(self.tests)
 
 
-def load_weights(path: Path = WEIGHTS_PATH) -> dict:
-    data = json.loads(path.read_text(encoding="utf-8"))
+def _is_whole(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def load_weights_from_text(text: str) -> dict:
+    """Parse the weight table; every number is a whole millisecond, as `[long]` reads it in the workflow."""
+    data = json.loads(text)
     if data.get("schema") != 1 or data.get("unit") != "milliseconds":
-        raise ValueError(f"{path}: unexpected schema or unit")
+        raise ValueError("pipeline test weights: unexpected schema or unit")
+    numbers = [data.get("defaultTestMillis"), *data.get("partSeedMillis", []), *data.get("testMillis", {}).values()]
+    if not data.get("partSeedMillis") or not all(_is_whole(number) and number >= 0 for number in numbers):
+        raise ValueError("pipeline test weights: every weight and seed must be a whole, non-negative number of milliseconds")
     return data
+
+
+def load_weights(path: Path = WEIGHTS_PATH) -> dict:
+    return load_weights_from_text(path.read_text(encoding="utf-8"))
 
 
 def build_shards(test_names: list[str], tests_per_shard: int, solo_pattern: str) -> list[Shard]:
