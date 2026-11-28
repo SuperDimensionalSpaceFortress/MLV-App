@@ -14,6 +14,7 @@
 #include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
+#include <QRegularExpression>
 #include <QString>
 #include <QStringList>
 #include <QTextStream>
@@ -411,6 +412,17 @@ TEST(Debayered16HonourScaleWiring, DrawFrameReportsADebayeredFrameOnlyFromThisDr
     ASSERT_TRUE(branchAt > fallbackDeclAt);
     ASSERT_TRUE(resetAt > branchAt);
     ASSERT_TRUE(gpuAt > resetAt);
+    // Advisory 50130df4 A1: the reset is the branch's first statement, unconditional: between the branch's opening brace
+    // and its first declaration there is nothing but comments and that one call.
+    const QString branchHead = QStringLiteral(
+        "else if ( outputMode == OutputDebayered16 && !slot.rawImage16.empty() )\n"
+        "    {\n");
+    const int firstDeclAt = body.indexOf(QStringLiteral("bool usedGpuBilinearDebayer = false;"), branchAt);
+    ASSERT_TRUE(firstDeclAt > resetAt);
+    QString preamble = body.mid(branchAt + branchHead.size(), firstDeclAt - branchAt - branchHead.size());
+    preamble.remove(QRegularExpression(QStringLiteral("/\\*.*?\\*/"), QRegularExpression::DotMatchesEverythingOption));
+    preamble.remove(QRegularExpression(QStringLiteral("//[^\\n]*")));
+    ASSERT_EQ(std::string("resetMlvLastDebayerStageMilliseconds();"), preamble.simplified().toStdString());
     ASSERT_TRUE(bilinearStartAt > gpuAt);
     ASSERT_TRUE(bilinearReadAt > bilinearStartAt);
     ASSERT_TRUE(cpuFallbackAt > bilinearReadAt);
