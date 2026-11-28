@@ -22474,6 +22474,18 @@ class TeamPartitionLegSpecTests(unittest.TestCase):
                 self.assertIs(twin["criteria"]["acceptance"]["cuda"][0]["value"], True)   # lookAssistForced eq true: Look Assist ON (D4b)
                 self.assertEqual(twin["look"]["lookFlavor"], "cinematic")
 
+    def test_the_sweep_card_declares_its_venue_roles_like_its_teampart_source(self) -> None:
+        """Adversary A1 on 17a37331: the sweep legs carry card PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1, which venues.json did not name, so Get-DvVenueRole gave every
+        sweep leg defaultRole supplementary on BOTH venues and none could supply acceptance evidence. Their sources (card DUAL-VENUE-DISPLAY-MATRIX-1) are
+        bachelor acceptance; the sweep card declares the same roles, and EVERY card a sweep leg or its source carries is named in the table."""
+        venues = json.loads((DV / "venues.json").read_text(encoding="utf-8"))
+        self.assertEqual(venues["roles"]["PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+        for rel, source_rel in OMP_SWEEP_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                source = json.loads((DV / source_rel).read_text(encoding="utf-8"))
+                self.assertEqual(venues["roles"][twin["card"]], venues["roles"][source["card"]], "a twin plays the role of the source it twins")
+
     def test_no_other_leg_sets_the_keys(self) -> None:
         for path in sorted((DV / "legs").glob("*.json")):
             if "legs/" + path.name in TEAMPART_LEGS or "legs/" + path.name in OMP_SWEEP_LEGS:   # (the sweep twins set them on purpose: test_each_omp_sweep_twin...)
