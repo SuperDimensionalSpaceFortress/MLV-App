@@ -275,7 +275,10 @@ param(
     # path of any script (a line-ending change defeated every such inference). Refused with the real um-run.ps1, and with -CommittedSpecRepoRoot (which asks for the preflight).
     [switch]$SkipCommittedSpecPreflight,
     # r2 (adversary A3): the bounded child the committed-spec preflight runs (default: Test-LegSpecCommitted.ps1 beside this script). Offline only: refused with the real um-run.ps1, so a test can time a lookup that overruns.
-    [string]$CommittedSpecScript = ''
+    [string]$CommittedSpecScript = '',
+    # r4 fix (adversary r4 pass 10 A2): stalls the worker that decides whether the stand-ins are outside every git work tree (Get-OfflineSeamLocationRefusal) for this many seconds, so a test can show the probe is
+    # bounded by the room before -DeadlineUtc and fails CLOSED. It can only make the probe slower, which refuses more: no real-um-run refusal is needed.
+    [ValidateRange(0, 600)][int]$LocationProbeDelaySec = 0
 )
 $ErrorActionPreference = 'Stop'
 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A3 sibling): a caller's $PSNativeCommandUseErrorActionPreference = $true is inherited by `& script`; with Stop it would turn the
@@ -319,12 +322,16 @@ $LegScript = (Resolve-Path -LiteralPath $LegScript).ProviderPath
 # PowerShell resolved, every link on the way followed) to a directory outside every git work tree, found by a .git entry on the way up AND by git itself (rev-parse --is-inside-work-tree, through the module's
 # hardened Invoke-DvGit, with the discovery variables that steer git scrubbed: pass 7 A1). A production-shaped checkout is a work tree whatever its bytes are; a git that cannot answer is "not shown to be outside"
 # (fail CLOSED), never "outside". Returns '' when every file is outside, else the reason.
-function Get-OfflineSeamLocationRefusal([string[]]$Files) {
+function Get-OfflineSeamLocationRefusal {
+    # (r4 fix, adversary r4 pass 10 A2: this function's TEXT runs on a bounded worker runspace below -- it is file-system work, a .git probe on every ancestor, a link target, git -- before -DeadlineUtc is read, so it
+    # carries its own param block and refers to nothing of this script's scope.)
+    param([string[]]$Files)
     $dirs = [Collections.Generic.List[string]]::new()
     # r4 (adversary r3 pass 9 A2): a link's TARGET is a place the stand-in lives in, so it gets the same .git walk as the stand-in's own path (every ancestor of the target, and every link on THAT way), not only git's
     # opinion; a worklist with a visited set, so a link that points back at itself ends
     $pending = [Collections.Generic.Queue[object]]::new()
-    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    # (ORDINAL, r4 fix, adversary r4 pass 10 A1: on a case-sensitive directory C:\cs\A and C:\cs\a are two trees, and a case-folding visited set made the second look walked. Where case does not matter a repeat is only a repeat.)
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     try {
         foreach ($f in $Files) {
             $full = [IO.Path]::GetFullPath($f)
@@ -357,7 +364,7 @@ function Get-OfflineSeamLocationRefusal([string[]]$Files) {
     [Environment]::SetEnvironmentVariable('GIT_DISCOVERY_ACROSS_FILESYSTEM', '1')
     [Environment]::SetEnvironmentVariable('LC_ALL', 'C')
     try {
-        foreach ($dir in ($dirs | Sort-Object -Unique)) {
+        foreach ($dir in ($dirs | Sort-Object -Unique -CaseSensitive)) {
             # a git that does not start or return is exit -1 with a typed stderr
             $g = & $module { param($d) Invoke-DvGit -RepoRoot $d -GitArgs @('rev-parse', '--is-inside-work-tree') } $dir
             $said = [Text.Encoding]::UTF8.GetString([byte[]]$g.bytes).Trim()
@@ -373,7 +380,21 @@ function Get-OfflineSeamLocationRefusal([string[]]$Files) {
 $umRunIsReal = ($umRunFull -ieq $realUmRun) -or ((Test-Path -LiteralPath $realUmRun -PathType Leaf) -and (Get-NormalisedFileSha256 $umRunFull) -ceq (Get-NormalisedFileSha256 $realUmRun))
 $locationRefusal = ''
 if (-not $umRunIsReal) {
-    $locationRefusal = Get-OfflineSeamLocationRefusal @($umRunFull, (Resolve-Path -LiteralPath $LegScript).ProviderPath)
+    # r4 fix (adversary r4 pass 10 A2): the location walk is file-system work and runs BEFORE -DeadlineUtc is read below, where nothing else holds it, so it runs on a bounded worker (the module's
+    # Invoke-VenueBoundedRead, as every claim-folder read does): at most 30 s and at most the room left before -DeadlineUtc less 2 s (at least 1 s). A probe that does not answer, or does not answer once, is
+    # "not shown to be outside" -- the same fail-closed answer as a git that cannot say. An abandoned worker is counted, and Complete-VenueProcess in Stop-Usage ends the process at once.
+    $locationCapSec = 30.0
+    $locationDeadline = [DateTimeOffset]::MinValue
+    if ($DeadlineUtc -and [DateTimeOffset]::TryParse($DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$locationDeadline)) {
+        $locationCapSec = [Math]::Min($locationCapSec, ($locationDeadline.UtcDateTime - [DateTime]::UtcNow).TotalSeconds - 2.0)
+    }
+    $locationCapSec = [Math]::Max(1.0, $locationCapSec)
+    $locationProbeText = 'param($a) $ErrorActionPreference = ''Stop''; Import-Module $a.module -Force -DisableNameChecking; if ($a.delaySec -gt 0) { [Threading.Thread]::Sleep([int]($a.delaySec * 1000)) }' + "`n" +
+        'function Get-OfflineSeamLocationRefusal {' + "`n" + (Get-Item -LiteralPath Function:Get-OfflineSeamLocationRefusal).ScriptBlock.ToString() + "`n}`n" + '[string](Get-OfflineSeamLocationRefusal -Files $a.files)'
+    $probe = & (Get-Module VenueChain) { param($t, $a, $s) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s } $locationProbeText @{ module = (Join-Path $here 'DualVenueRunner.psm1'); files = @($umRunFull, $LegScript); delaySec = $LocationProbeDelaySec } $locationCapSec
+    $locationRefusal = $(if (-not $probe.answered) { "its location could not be established within $([Math]::Round($locationCapSec, 1)) s ($($probe.error))" }
+                         elseif (@($probe.value).Count -ne 1) { 'its location could not be established (the probe gave no single answer)' }
+                         else { [string]@($probe.value)[0] })
     if ($locationRefusal) { $umRunIsReal = $true }   # not shown to be a stand-in by location: production-shaped, whatever its bytes are (every seam below, the skip switch among them, is refused)
 }
 if ($umRunIsReal -and $LeaseBudgetWindowSec -lt 10800) {
@@ -409,7 +430,8 @@ foreach ($seam in @(@('-CommittedSpecRepoRoot', $CommittedSpecRepoRoot), @('-Com
 # resolves for itself (its own ..\..\..), and the bounded child Test-LegSpecCommitted.ps1 resolves it from the leg script path, the seam value too: no file-system work on the root here, where no deadline holds yet.
 $script:CommittedSpecPreflightOn = -not $SkipCommittedSpecPreflight
 # as spelled, except that a RELATIVE root is made absolute against PowerShell's location (lexically: no file-system work here, before -DeadlineUtc), because the bounded child starts in the PROCESS directory (pass 8 A2); '' = the repo the leg script resolves for itself
-$script:CommittedSpecRepoRoot = $(if ($CommittedSpecRepoRoot -and -not [IO.Path]::IsPathRooted($CommittedSpecRepoRoot)) { [IO.Path]::GetFullPath($CommittedSpecRepoRoot, (Get-Location).ProviderPath) } else { $CommittedSpecRepoRoot })
+# (r4 fix, adversary r4 pass 10 A3: IsPathFullyQualified, not IsPathRooted -- `\repo` is rooted with no drive, which the child resolves on the PROCESS directory's drive)
+$script:CommittedSpecRepoRoot = $(if ($CommittedSpecRepoRoot -and -not [IO.Path]::IsPathFullyQualified($CommittedSpecRepoRoot)) { [IO.Path]::GetFullPath($CommittedSpecRepoRoot, (Get-Location).ProviderPath) } else { $CommittedSpecRepoRoot })
 $script:CommittedSpecLegScript = (Resolve-Path -LiteralPath $LegScript).ProviderPath   # the file Test-Path accepted above, as PowerShell resolved it (a leaf, not the ..\..\.. root, which the bounded child resolves)
 if ($umRunIsReal -and $CommittedSpecScript) { Stop-Usage '-CommittedSpecScript is an offline test seam: with the real um-run.ps1 the committed-spec preflight always runs Test-LegSpecCommitted.ps1' }
 $script:CommittedSpecScript = $(if ($CommittedSpecScript) { [IO.Path]::GetFullPath($CommittedSpecScript, (Get-Location).ProviderPath) } else { Join-Path $here 'Test-LegSpecCommitted.ps1' })   # (pass 8: a relative seam script is run by a child that starts in the PROCESS directory, so it is handed on as the path PowerShell's location gives it)

@@ -6425,6 +6425,59 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertNotIn("BATCH_USAGE SEAM_PATH_", r.stderr)
         self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
 
+    # ---- r4 fix (adversary r4 pass 10: A1, A2, advisory A3) ----
+    # A1: the location walk's visited set and the directory de-duplication folded case, so on a case-sensitive directory (C:\cs\A and C:\cs\a are two trees) the second stand-in's .git check was skipped
+    # and git was asked about one of the two. Ordinal everywhere a directory is compared there. (A case-sensitive directory needs `fsutil file setCaseSensitiveInfo`, which wants an elevated token, so the
+    # contract is pinned on the source text: a walk that compares directories by ordinal name and a de-duplication that keeps both spellings.)
+    def test_legspec_committed_r4b_a1_the_location_walk_never_folds_the_case_of_a_directory(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("function Get-OfflineSeamLocationRefusal")
+        walk = text[start:text.index("$umRunIsReal = ($umRunFull", start)]
+        self.assertRegex(walk, r"HashSet\[string\]\]::new\(\[StringComparer\]::Ordinal\)")
+        self.assertNotRegex(walk, r"OrdinalIgnoreCase")
+        self.assertRegex(walk, r"Sort-Object\s+-Unique\s+-CaseSensitive")
+        self.assertNotRegex(walk, r"Sort-Object\s+-Unique(?!\s+-CaseSensitive)")
+
+    # A2: the walk is file-system work (a .git probe on every ancestor, a link target) that runs BEFORE -DeadlineUtc is read, so a stalled share held the batch. It runs on a bounded worker, capped at 30 s and at
+    # the room left before -DeadlineUtc; a probe that does not answer is "not shown to be outside" (fail closed), as a git that does not answer is. -LocationProbeDelaySec stalls the worker for the test.
+    def test_legspec_committed_r4b_a2_a_location_probe_that_stalls_is_cut_off_at_the_deadline_and_refuses_the_switch(self) -> None:
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-LocationProbeDelaySec", "90", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=14)), *self._hermetic_receipt_root())
+        t0 = time.monotonic()
+        r = subprocess.run(args, capture_output=True, text=True, timeout=150, env=e)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(self._SEAM_NEEDLE, r.stderr)
+        self.assertIn("could not be established", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing claimed, leased, opened or run")
+        self.assertLess(elapsed, 40, f"the run outlived the deadline's room by far ({elapsed:.1f} s): the stalled probe held the batch")
+
+    def test_legspec_committed_r4b_a2_a_probe_that_answers_in_time_still_accepts_a_stand_in_outside_every_work_tree(self) -> None:
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._untracked_copy_of_a_committed_spec()], "-LocationProbeDelaySec", "1", *self._hermetic_receipt_root())
+        r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+        self.assertNotIn(self._SEAM_NEEDLE, r.stderr)
+
+    # A3 (advisory): a rooted path with no drive (\repo, /repo) passed IsPathRooted and was handed to the child as spelled, which resolves it on the PROCESS directory's drive, not PowerShell's
+    def test_legspec_committed_r4b_a3_a_drive_less_rooted_seam_root_reaches_the_child_fully_qualified(self) -> None:
+        child = self.case / "recording-root-a3.ps1"
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         "Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'child-root-a3.log') -Value ('RepoRoot=' + $RepoRoot)\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        log = self.case / "child-root-a3.log"
+        for spelled in ("\\repo", "/repo"):
+            with self.subTest(spelled=spelled):
+                self._reset_committed_case()
+                log.unlink(missing_ok=True)
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", spelled, "-CommittedSpecScript", str(child), *self._hermetic_receipt_root())
+                r = self._run_from_ps_location(args, e, self.tmp, ROOT)
+                self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+                self.assertTrue(log.exists(), "the preflight child ran")
+                got = log.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1]
+                self.assertRegex(got, r"^[A-Za-z]:\\", f"the child was handed {got!r}, which is resolved on the process directory's drive")
+                self.assertEqual(got.lower(), (Path(str(self.tmp)).drive + "\\repo").lower())
+
     # adversary r2 pass 4 A2: the canonical-receipt teardown check counts only what this harness wrote, so another process's receipt in the same directory is not a false failure
     def test_legspec_committed_r2_the_receipt_state_check_ignores_files_another_process_wrote(self) -> None:
         base = self.case / "receipts-under-watch"
