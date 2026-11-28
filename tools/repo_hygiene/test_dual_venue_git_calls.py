@@ -492,17 +492,38 @@ class GitCallsAreBoundedTests(unittest.TestCase):
 
     def read_child_probe(self, out: str) -> tuple[str, str]:
         """(in-job, alive) as the cleanup gate saw them, after proving IsProcessInJob itself answered: a failed call is reported with its Win32 error."""
-        seen = re.search(r"SEEN pid=(\d{2,}) ok=(\w+) win32=(\d+) injob=(\w+) alive=(\w+)", out)
+        # EXPORT-KILL-DESCENDANT-CONFIRM-1-R8-CI-RESIDUE-1: a positive pid of any width (hosted run 45712709620 read `SEEN pid=8 ok=True ...`, which `\d{2,}` refused as "never saw a child")
+        # r2 (sol r1 A5): anchored to a line start (an `UNSEEN pid=8 ...` substring is no record) and ASCII only (a non-ASCII digit such as U+0661 is no pid)
+        seen = re.search(r"(?m)^SEEN pid=([1-9][0-9]*) ok=(\w+) win32=([0-9]+) injob=(\w+) alive=(\w+)\r?$", out, re.ASCII)
         self.assertIsNotNone(seen, f"the cleanup gate never saw a created child: {out}")
+        # sol r2 A10: ONE observed membership and ONE termination result; contradictory repeats (SEEN twice, GONE True then GONE False) are not evidence
+        self.assertEqual(len(re.findall(r"(?m)^SEEN pid=", out)), 1, f"the cleanup gate reported more than one membership observation: {out}")
+        self.assertLessEqual(len(re.findall(r"(?m)^GONE ", out)), 1, f"more than one termination result: {out}")
+        gone = re.search(r"(?m)^GONE ", out)
+        self.assertTrue(gone is None or seen.start() < gone.start(), f"the child must be observed alive BEFORE it is reported gone: {out}")
         self.assertEqual(seen.group(2), "True", f"IsProcessInJob failed (GetLastError={seen.group(3)}), so its membership answer was never given: {out}")
         self.assertIn(seen.group(4), ("True", "False"), f"IsProcessInJob returned no 0/1 membership answer: {out}")
         return seen.group(4), seen.group(5)
+
+    def test_the_child_probe_reader_accepts_a_one_digit_pid_and_refuses_a_zero_or_missing_one(self) -> None:
+        # The reader parses the probe line the gate prints; a recycled one-digit pid is still a created child (the hosted shard-6 failure), a pid of 0 or none is not.
+        self.assertEqual(self.read_child_probe("SEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True"), ("False", "True"))
+        self.assertEqual(self.read_child_probe("SEEN pid=12044 ok=True win32=0 injob=True alive=True"), ("True", "True"))
+        # r2 (sol r1 A5): a CRLF line end is still a line start, but an `UNSEEN` substring and a mixed-script pid are refused
+        self.assertEqual(self.read_child_probe("HITS \r\nSEEN pid=8 ok=True win32=0 injob=False alive=True\r\nGONE True"), ("False", "True"))
+        for line in ("SEEN pid=0 ok=True win32=0 injob=False alive=True", "SEEN pid= ok=True win32=0 injob=False alive=True",
+                     "UNSEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True", "SEEN pid=8١ ok=True win32=0 injob=False alive=True", "SEEN pid=8 ok=True win32=0 injob=False alive=True!\r\nGONE Trueish",
+                     "SEEN pid=8 ok=True win32=0 injob=False alive=True\nGONE True\nSEEN pid=8 ok=True win32=0 injob=True alive=True\nGONE False",
+                     "GONE True\nSEEN pid=8 ok=True win32=0 injob=False alive=True"):
+            with self.assertRaises(AssertionError):
+                self.read_child_probe(line)
 
     def assert_child_was_unassigned_alive_then_gone(self, out: str) -> None:
         in_job, alive = self.read_child_probe(out)
         self.assertEqual(in_job, "False", "the child must be OUTSIDE the job when the cleanup starts: that is the case under test")
         self.assertEqual(alive, "True", "the suspended child must be alive when the cleanup starts")
-        self.assertIn("GONE True", out, "the unassigned child must be terminated by the failure cleanup (a job close does not reach it)")
+        # r2b (sol r2 A5): a whole line, never a `GONE Trueish` substring
+        self.assertRegex(out, r"(?m)^GONE True\r?$", "the unassigned child must be terminated by the failure cleanup (a job close does not reach it)")
 
     @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")
     def test_the_in_job_probe_reads_true_for_a_child_that_is_assigned_to_the_job(self) -> None:
@@ -516,7 +537,7 @@ class GitCallsAreBoundedTests(unittest.TestCase):
         in_job, alive = self.read_child_probe(out)
         self.assertEqual(in_job, "True", "a child assigned to the job must read in-job = true, or the probe cannot say yes")
         self.assertEqual(alive, "True", "the suspended child must be alive when the cleanup starts")
-        self.assertIn("GONE True", out, "the assigned child is still terminated by the failure cleanup")
+        self.assertRegex(out, r"(?m)^GONE True\r?$", "the assigned child is still terminated by the failure cleanup")
         self.assertEqual(spawns, [], "the suspended child must never run, and the Process.Start fallback must not start a second git")
 
     @unittest.skipUnless(sys.platform == "win32", "the suspended start is Windows only")

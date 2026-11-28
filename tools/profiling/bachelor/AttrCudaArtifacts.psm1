@@ -5071,6 +5071,358 @@ function Get-AttrCudaQuiescenceSample {
     }
 }
 
+function Get-AttrCudaProcessTreeSnapshot {
+    <#
+    .SYNOPSIS
+    EXPORT-KILL-DESCENDANT-CONFIRM-1: the descendants of a LIVE root, each {processId, creationTicks}, recorded BEFORE a tree kill (afterwards their parents are
+    gone and the tree cannot be walked), so Wait-AttrCudaProcessTreeGone can confirm every one of them gone. Kill($true) returning and the root's wait reading
+    true do not prove that: a descendant (ffmpeg under the export) can still run.
+    .DESCRIPTION
+    ONE Win32_Process scan (bounded by -OperationTimeoutSec), walked in memory from the root by ParentProcessId alone. Creation times are NOT used to order a child
+    after its parent (r1 fix iteration, adversary A2 on 2223cc4d): they are clock values, and a clock stepped back makes a real child read older than its parent. A
+    process that merely inherited a member's pid number is then adopted too; that can only make the kill UNCONFIRMED, never confirmed. Returns
+    [pscustomobject]@{ ok; rootProcessId; rootCreationTicks; members; error }. ok is $false -- the tree is NOT known and no caller may confirm it dead -- when the
+    scan throws, the root is not in it, or a row whose parent is a member has no readable pid or creation time. Never throws.
+    -Processes is the test seam: the rows of the scan (ProcessId, ParentProcessId, CreationDate).
+    A1-CLOCK-FREE-ANCESTRY-1 r1: ancestry is proved WITHOUT any clock. -BaselineOnly returns the identities (pid -> creation ticks, a hashtable; $null when the listing could not be
+    read) of every process alive BEFORE the root starts; a caller takes it ahead of the root's start and passes it back as -Baseline. A process whose pid AND creation stamp are
+    in that listing was alive, under that pid, since before the root existed, so it can never be a descendant (equality of two stamps of ONE process; no ordering of two stamps,
+    so a clock stepped back and a recycled parent number prove nothing). An OUTSIDER is only a row that is such a baseline process, or whose direct parent is one (a baseline
+    process holds its pid continuously, so the child's ParentProcessId can only have been that process). Anything else the walk did not reach is a MEMBER (unproven: the kill
+    is then unconfirmed): a recycled parent number or a grandchild of a process started after the root is never believed an outsider. No usable baseline is an unknown tree.
+    #>
+    [CmdletBinding(DefaultParameterSetName = 'Tree')]
+    param([Parameter(ParameterSetName = 'Tree', Mandatory = $true)][int]$RootProcessId, [Parameter(ParameterSetName = 'Baseline', Mandatory = $true)][switch]$BaselineOnly,
+          [Parameter(ParameterSetName = 'Tree')][AllowNull()][hashtable]$Baseline, [object[]]$Processes, [ValidateRange(1, 120)][int]$OperationTimeoutSec = 20, [int64]$NowTicks, [double]$BudgetMs = 0, [scriptblock]$Clock)
+    # R2-RESIDUE-3 r2 (sol r8 A3): a relative budget handed across this call boundary goes stale while the caller is suspended before the helper's first statement, and a stopwatch started HERE
+    # then reads the suspension as free time. A caller that owns a bound passes -Clock (a scriptblock reading the elapsed ms of ITS OWN clock, the one its bound is measured on) and
+    # -BudgetMs as the ABSOLUTE bound on that clock; every decision below (the dispatch guard and each deadline check) reads that clock at the moment of the decision, never a stopwatch started here.
+    # Without -Clock, -BudgetMs is the legacy relative budget on this body's own stopwatch; no call site in the tree uses it that way.
+    # R2-RESIDUE-2 r1 (sol B2): -BudgetMs (0 = none) bounds the whole tree decode, its own clock started at the first statement (-Clock is the test seam: a scriptblock returning elapsed ms). The CIM
+    # query has its own -OperationTimeoutSec; the rows it returns were then decoded with no deadline. Past the budget the answer is the typed unknown 'deadline-exceeded' (no caller may confirm
+    # a tree from it). The check is inline (no helper) because VenueChain embeds this function alone, by name.
+    $budgetClock = [Diagnostics.Stopwatch]::StartNew()
+    # r5 (sol r4 B2 sibling): a caller clock read that is not ONE finite number (nothing, $null, a string, NaN, two values) is a spent budget (the typed unknown), never 0 ms
+    $budgetElapsed = { if ($null -ne $Clock) { $read = @(& $Clock); $v = $(if ($read.Count -eq 1) { $read[0] } else { $null })
+            if (-not ($v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [single] -or $v -is [decimal]) -or [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { 1e15 } else { [double]$v } } else { $budgetClock.Elapsed.TotalMilliseconds } }
+    $overBudget = { [bool]($BudgetMs -gt 0 -and (& $budgetElapsed) -gt $BudgetMs) }
+    if ($BaselineOnly) {
+        try {
+            # R2-RESIDUE-3 r2 (adversary A2 on 3853fb75): the cold listing is a scan like the others. A caller that owns a bound passes it (-BudgetMs, -Clock) and the query is dispatched only while its own
+            # timeout still fits what is left of that bound at the dispatch; a listing that came back past the bound is no listing (the typed unknown: $null). No bound: as before.
+            if ($BudgetMs -ne 0 -and -not $PSBoundParameters.ContainsKey('Processes') -and (($BudgetMs - (& $budgetElapsed)) -lt ($OperationTimeoutSec * 1000.0))) { return $null }
+            $baseRows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -Property ProcessId, ParentProcessId, CreationDate -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return $null }
+            $baseTable = @{}
+            # sol A1 on 91e548f8: the identity is the pid, the creation stamp AND the parent pid (immutable for a process's whole life): a replacement that reuses the number and, after a
+            # rollback, even the stamp is another process unless it also names the same parent. A row with no readable parent is recorded by pid and stamp alone.
+            foreach ($baseRow in $baseRows) {
+                # R2-RESIDUE-3 r2 fix iteration 2 (adversary A2 on 342a1ac7): the decode is held to the bound row by row, and once more before the table is returned
+                if ($BudgetMs -ne 0 -and (& $overBudget)) { return $null }
+                if ($null -ne $baseRow -and $null -ne $baseRow.ProcessId -and $null -ne $baseRow.CreationDate) {
+                    $baseStamp = ([datetime]$baseRow.CreationDate).ToUniversalTime().Ticks
+                    $baseTable[[int64]$baseRow.ProcessId] = $(if ($null -eq $baseRow.ParentProcessId) { [int64[]]@($baseStamp) } else { [int64[]]@($baseStamp, [int64]$baseRow.ParentProcessId) })
+                }
+            }
+            if ($baseTable.Count -eq 0) { return $null }
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return $null }
+            return $baseTable
+        } catch { return $null }
+    }
+    $unknown = { param([string]$Why) [pscustomobject]@{ ok = $false; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $null; members = @(); error = $Why } }
+    try {
+        $baseTable = @{}
+        if ($null -ne $Baseline) { foreach ($bk in @($Baseline.Keys)) { if ($null -ne $Baseline[$bk]) { $baseTable[[int64]$bk] = [int64[]]@($Baseline[$bk]) } } }
+        if ($baseTable.Count -eq 0) { return (& $unknown 'baseline-unknown') }
+        # an entry is (stamp) or (stamp, parent pid): a row is that baseline process only when its pid, stamp AND (when the entry has one) parent pid all match
+        # R3 (sol r9 B1 on d35aca43) ORDERING BELT: a process in the listing taken BEFORE the root started was created strictly before it, so a baseline entry whose own stamp is at or after the
+        # root's ($rootTicks, read from the scan before any row is classified) contradicts 'alive before the root' (a stamp that collides with the root's, or a stepped-back clock) and matches nothing:
+        # the row stays unproven (a member), so the kill can only be UNCONFIRMED. The belt only ever removes an outsider; it never adds one, so it cannot confirm a kill.
+        $inBase = { param($BasePid, $BaseTicks, $BaseParent) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and ($null -ne $rootTicks) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid][0] -eq [int64]$BaseTicks) -and ([int64]$BaseTicks -lt [int64]$rootTicks) -and (($baseTable[[int64]$BasePid].Count -lt 2) -or (($null -ne $BaseParent) -and ([int64]$baseTable[[int64]$BasePid][1] -eq [int64]$BaseParent))) }
+        # (adversary A3 on 36c22ed2; pass 2 A1 on 9a98b537) the CIM query is dispatched only when what is LEFT of the budget (the budget less the time spent since the first statement) still holds its own
+        # timeout: a budget under it (a grant read just before the bound, or time already spent in this call) starts no scan
+        if ($BudgetMs -ne 0 -and -not $PSBoundParameters.ContainsKey('Processes') -and (($BudgetMs - (& $budgetElapsed)) -lt ($OperationTimeoutSec * 1000.0))) { return (& $unknown 'deadline-exceeded') }
+        $rows = if ($PSBoundParameters.ContainsKey('Processes')) { @($Processes) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $OperationTimeoutSec -ErrorAction Stop) }
+        if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
+        # r5b fix (adversary A1 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started, so the
+        # creation-time ordering the orphan classification below relies on is untrustworthy: the tree is unknown (fail closed), never classified by a rolled-back clock.
+        # -NowTicks is the test seam; the check is inline because VenueChain and DualVenueRunner embed this function alone, by name.
+        $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [DateTime]::UtcNow.Ticks })
+        # A1-CLOCK-FREE-ANCESTRY-1 r1: $skewTicks (2 s) now serves ONLY the future-row check above (a stamp ahead of the clock makes the tree unknown). It decides no ancestry: that is
+        # proved by the listing taken before the root started (see .DESCRIPTION), so an unbounded rollback cannot make a live orphan look like an outsider.
+        $skewTicks = 20000000L
+        foreach ($row in $rows) {
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
+            if ($null -ne $row -and $null -ne $row.CreationDate -and ([datetime]$row.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + $skewTicks)) { return (& $unknown "clock-stepped-back pid=$($row.ProcessId)") }
+        }
+        $byParent = @{}
+        $rootTicks = $null
+        foreach ($row in $rows) {
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
+            if ($null -eq $row) { continue }
+            if ($null -ne $row.ProcessId -and [int64]$row.ProcessId -eq [int64]$RootProcessId) {
+                if ($null -eq $row.CreationDate) { return (& $unknown 'root-creation-unreadable') }
+                $rootTicks = ([datetime]$row.CreationDate).ToUniversalTime().Ticks
+            }
+            if ($null -eq $row.ParentProcessId) { continue }
+            $parentKey = [int64]$row.ParentProcessId
+            if (-not $byParent.ContainsKey($parentKey)) { $byParent[$parentKey] = [System.Collections.Generic.List[object]]::new() }
+            $byParent[$parentKey].Add($row)
+        }
+        if ($null -eq $rootTicks) { return (& $unknown "root-not-in-scan pid=$RootProcessId") }
+        # a root that is itself in the baseline was NOT started after it: the listing proves nothing about this tree (fail closed)
+        if ($baseTable.ContainsKey([int64]$RootProcessId) -and ([int64]$baseTable[[int64]$RootProcessId][0] -eq [int64]$rootTicks)) { return (& $unknown "root-in-baseline pid=$RootProcessId") }
+        $members = [System.Collections.Generic.List[object]]::new()
+        $seen = [System.Collections.Generic.HashSet[int64]]::new()
+        [void]$seen.Add([int64]$RootProcessId)
+        $queue = [System.Collections.Generic.Queue[object]]::new()
+        $queue.Enqueue([pscustomobject]@{ processId = [int64]$RootProcessId; creationTicks = $rootTicks })
+        while ($queue.Count -gt 0) {
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
+            $parent = $queue.Dequeue()
+            if (-not $byParent.ContainsKey($parent.processId)) { continue }
+            foreach ($child in $byParent[$parent.processId]) {
+                if ($null -eq $child.ProcessId -or $null -eq $child.CreationDate) { return (& $unknown "descendant-unreadable parent=$($parent.processId)") }
+                $childPid = [int64]$child.ProcessId
+                $childTicks = ([datetime]$child.CreationDate).ToUniversalTime().Ticks
+                # r2 (sol r2 A1 on b428e461): a child of the root or of a member is ALWAYS a member, even when its pid, stamp and parent number match a baseline row. No process alive before the root
+                # started can be a real child of the root (or of a process it started), so such a row is a recycled-number impostor, or an old process whose parent number the root reused: the two read
+                # the same from a scan, and the kill is then unconfirmed (fail closed), never confirmed on a baseline match.
+                if ($seen.Contains($childPid)) { continue }
+                [void]$seen.Add($childPid)
+                $member = [pscustomobject]@{ processId = $childPid; creationTicks = $childTicks }
+                $members.Add($member)
+                $queue.Enqueue($member)
+            }
+        }
+        # r3 fix 2 (adversary A1 on 4d69f211 and on 6b788356): every proven outsider is recorded in .others by identity (pid -> creation ticks): the processes known to exist outside
+        # the tree BEFORE the kill. The wait then needs no clock to judge a later orphan: one that is not a known outsider is unproven, whatever its creation time reads.
+        $memberIds = @{}
+        $memberIds[[int64]$RootProcessId] = $rootTicks
+        foreach ($m in $members) { $memberIds[$m.processId] = $m.creationTicks }
+        $rowTicks = @{}
+        $rowParent = @{}
+        foreach ($row in $rows) {
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
+            if ($null -eq $row) { continue }
+            # r5 (sol r4 B3 sibling): a row with no readable pid (under a member it already failed the walk above) cannot be classified: it is unreadable evidence, so the tree is unknown
+            if ($null -eq $row.ProcessId) { return (& $unknown "unreadable-row row-without-pid parent=$($row.ParentProcessId)") }
+            $rp = [int64]$row.ProcessId
+            $rowTicks[$rp] = $(if ($null -eq $row.CreationDate) { $null } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
+            $rowParent[$rp] = $(if ($null -eq $row.ParentProcessId) { $null } else { [int64]$row.ParentProcessId })
+        }
+        # A1-CLOCK-FREE-ANCESTRY-1 r1: no climb and no stamp ordering. A row the walk did not reach is an OUTSIDER only when it is a baseline process (same pid and stamp, alive before the
+        # root started) or its DIRECT parent is one; every other row is a member (unproven).
+        $late = @{}
+        foreach ($start in @($rowTicks.Keys)) {
+            # (this ancestry section is pinned to hold no ordering comparison of any kind, so its budget check is the scriptblock form of the inline check used elsewhere)
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
+            if ($memberIds.ContainsKey([int64]$start)) { continue }
+            $outsider = [bool](& $inBase $start $rowTicks[$start] $rowParent[$start])
+            if (-not $outsider) {
+                $up = $rowParent[$start]
+                if ($null -ne $up -and [int64]$up -ne [int64]$start -and $rowTicks.ContainsKey([int64]$up) -and (& $inBase $up $rowTicks[[int64]$up] $rowParent[[int64]$up])) { $outsider = $true }
+            }
+            $late[[int64]$start] = -not $outsider
+        }
+        $others = @{}
+        foreach ($q in @($late.Keys)) {
+            if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
+            # r2 (sol r2 A2): an outsider is recorded by pid, stamp AND parent pid (immutable): a replacement that reuses the number and, after a rollback, the stamp is another process unless it names the same parent
+            if ($late[$q]) { $members.Add([pscustomobject]@{ processId = [int64]$q; creationTicks = $rowTicks[$q] }) }
+            else { $others[[int64]$q] = $(if ($null -eq $rowTicks[$q]) { $null } elseif ($null -eq $rowParent[$q]) { [int64[]]@($rowTicks[$q]) } else { [int64[]]@($rowTicks[$q], $rowParent[$q]) }) }
+        }
+        if ($BudgetMs -ne 0 -and (& $overBudget)) { return (& $unknown 'deadline-exceeded') }
+        [pscustomobject]@{ ok = $true; rootProcessId = [int64]$RootProcessId; rootCreationTicks = $rootTicks; members = @($members); others = $others; baseline = $baseTable; error = $null }
+    } catch { & $unknown "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
+}
+
+function Wait-AttrCudaProcessTreeGone {
+    <#
+    .SYNOPSIS
+    EXPORT-KILL-DESCENDANT-CONFIRM-1: confirm that every member of a Get-AttrCudaProcessTreeSnapshot is gone, one Win32_Process scan every 250 ms for at most -WaitMs.
+    .DESCRIPTION
+    A SURVIVOR, in one scan, is (a) a recorded member (or the root) whose pid shows with its recorded creation time, or with no readable creation time (a reuse
+    cannot be told apart then), or (b) r1 fix iteration (adversary A1 on 2223cc4d): any live process whose ParentProcessId chain reaches the root or a recorded
+    member, so a child started after the snapshot by a member that then exited is still found, or (c) r3 (adversary A1 on 4d69f211; A1-CLOCK-FREE-ANCESTRY-1 r1): any live
+    process whose ancestry cannot be proved. An outsider is only a process the snapshot recorded in .others by pid and creation stamp, or a baseline process (same pid AND
+    stamp in .baseline, the listing taken before the root started), or a direct child of one; there is no climb and no ordering of two stamps, so a clock stepped back by any
+    amount, and a recycled parent number, prove nothing -- a grandchild whose parents both exited is never confirmed gone. The same
+    pid with ANOTHER creation time is a reused number, not a survivor by (a); it is still adopted by (b) or (c) on its own row (r3, adversary A2 on 4d69f211: identity
+    is pid and creation time, a recorded number never hides a new process), which can only leave the kill unconfirmed. A survivor (b) or (c) finds stays recorded for
+    every later scan. Budget (adversary A3 on 2223cc4d, A2 on 348c4357): a scan starts only while CIM's 1 s floor is left, under a timeout no longer than what is left; a scan
+    that ENDS past -WaitMs confirms nothing, and a -WaitMs under 1 s is no time to confirm. Returns
+    [pscustomobject]@{ confirmed; survivors; error }: confirmed is $true only when the snapshot's ok is the boolean $true and a scan that ended inside -WaitMs showed
+    no survivor. Anything else is $false (fail closed). Never throws. -Scan is the test seam: a scriptblock returning the rows of one scan.
+    #>
+    param([Parameter(Mandatory = $true)][AllowNull()]$Snapshot, [ValidateRange(0, 600000)][int]$WaitMs = 15000, [scriptblock]$Scan, [int64]$NowTicks, [scriptblock]$Clock)
+    # sol A3 on 91e548f8: the bound's clock starts at the FIRST statement, so the time spent decoding the snapshot (members, outsiders, the listing before the root) is spent from -WaitMs, never
+    # added to it: a scan is granted only what the caller's shared cleanup budget still holds.
+    # R2-RESIDUE-3 r2 (sol r8 A3): a caller that owns a bound passes -Clock (a scriptblock reading the elapsed ms of ITS OWN clock) and -WaitMs as the ABSOLUTE bound on that clock; every read below
+    # (the loop test, each scan's grant, the post-scan check, the sleep) is then taken from that clock at the moment of the decision, so time the caller spent before this call (a suspension
+    # between its read and this first statement) is never forgotten. Without -Clock, -WaitMs is relative to the stopwatch started here (the job's own 15 s wait, which has no outer bound).
+    # (PowerShell names are case-insensitive: the stopwatch is $ownStopwatch because $clock would overwrite the -Clock parameter)
+    $ownStopwatch = [Diagnostics.Stopwatch]::StartNew()
+    # (adversary A6 on 3853fb75: the helper never throws, so a caller clock that throws reads as no time at all: the bound is spent and nothing is scanned)
+    # r5 (sol r4 B2 on eb70c475): `-Clock {}` returned nothing, which [double] turns into 0 on every read, so with a survivor that never went the loop kept the whole bound and never returned. A read
+    # that is not ONE finite number (nothing, $null, a string, NaN, a throw, two values) is a spent bound ('clock-unreadable'), and every read is held to this body's own stopwatch: a caller clock
+    # started before this call can never read less than it, so the larger of the two changes nothing for a real clock and a clock that stands still cannot hold the wait open ('clock-not-advancing').
+    $clockSeen = @{ unreadable = $false; ownWon = $false }
+    $elapsedMs = { $own = $ownStopwatch.Elapsed.TotalMilliseconds; if ($null -eq $Clock) { return $own }; $read = @(try { & $Clock } catch { $clockSeen['unreadable'] = $true }); $v = $(if ($read.Count -eq 1) { $read[0] } else { $null })
+        # (adversary A3 on 1c3c94f9) a block that wrote a number and THEN threw is unreadable too, and once unreadable the clock stays spent: the flag is checked before the value
+        if ($clockSeen['unreadable'] -or -not ($v -is [double] -or $v -is [int] -or $v -is [long] -or $v -is [single] -or $v -is [decimal]) -or [double]::IsNaN([double]$v) -or [double]::IsInfinity([double]$v)) { $clockSeen['unreadable'] = $true; return 1e15 }
+        $clockSeen['ownWon'] = ($own -gt [double]$v); [Math]::Max([double]$v, $own) }
+    # r3 fix 2 (adversary A2 advisory on 6b788356): every snapshot field is read through PSObject.Properties, so a snapshot missing one (under strict mode) is an
+    # unknown tree, never a throw. r5b fix (adversary A4 on 2420b65f): a property getter that throws is read inside the same guard.
+    $snapProps = $null
+    try {
+        if ($null -ne $Snapshot) { $snapProps = $Snapshot.PSObject.Properties }
+        $snapOk = ($null -ne $snapProps) -and ($null -ne $snapProps['ok']) -and ($snapProps['ok'].Value -is [bool]) -and [bool]$snapProps['ok'].Value
+        if (-not $snapOk -or $null -eq $snapProps['rootProcessId'] -or $null -eq $snapProps['rootProcessId'].Value -or $null -eq $snapProps['rootCreationTicks'] -or $null -eq $snapProps['rootCreationTicks'].Value) {
+            $why = $(if ($null -eq $Snapshot) { 'no snapshot' } elseif ($null -ne $snapProps -and $null -ne $snapProps['error']) { [string]$snapProps['error'].Value } else { 'snapshot fields missing' })
+            return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: $why" }
+        }
+    } catch { return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: unreadable snapshot" } }
+    # r1 fix 2 (adversary A3 advisory on 348c4357): a snapshot whose identities do not convert is an unknown tree, never a throw.
+    $recorded = @{}
+    $known = @{}
+    $baseTable = @{}
+    # R3 (sol r9 B1 on d35aca43) ORDERING BELT, as in the snapshot: a baseline entry whose own stamp is at or after the root's ($rootStamp, the snapshot's rootCreationTicks) was not alive
+    # before the root, so it matches nothing and the row stays a survivor (an unconfirmed kill). It only removes outsiders; it never confirms one.
+    $rootStamp = $null
+    $inBase = { param($BasePid, $BaseTicks, $BaseParent) ($null -ne $BasePid) -and ($null -ne $BaseTicks) -and ($null -ne $rootStamp) -and $baseTable.ContainsKey([int64]$BasePid) -and ([int64]$baseTable[[int64]$BasePid][0] -eq [int64]$BaseTicks) -and ([int64]$BaseTicks -lt [int64]$rootStamp) -and (($baseTable[[int64]$BasePid].Count -lt 2) -or (($null -ne $BaseParent) -and ([int64]$baseTable[[int64]$BasePid][1] -eq [int64]$BaseParent))) }
+    $skewTicks = 20000000L
+    try {
+        $rootStamp = [int64]$Snapshot.rootCreationTicks
+        $recorded[[int64]$Snapshot.rootProcessId] = [int64]$Snapshot.rootCreationTicks
+        # r2b (sol r2 A6): a snapshot with no members field is an unknown tree, not an empty one
+        # sol r2-b A7: a members field that is present but $null is as unknown as a missing one
+        if ($null -eq $snapProps['members'] -or $null -eq $snapProps['members'].Value) { throw [System.InvalidOperationException]::new('snapshot members missing') }
+        foreach ($m in @($(if ($null -ne $snapProps['members']) { $snapProps['members'].Value } else { @() }))) { $recorded[[int64]$m.processId] = $(if ($null -eq $m.creationTicks) { $null } else { [int64]$m.creationTicks }) }
+        # r3 fix 2 (adversary A1 on 6b788356): the outsiders the snapshot saw (pid -> creation ticks). A snapshot without them knows no outsider: every orphan is unproven.
+        $othersRaw = $(if ($null -ne $snapProps['others']) { $snapProps['others'].Value } else { $null })
+        # r2 (sol r2 A2): an entry is (stamp) or (stamp, parent pid); a bare number is the older stamp-only form
+        if ($othersRaw -is [hashtable]) { foreach ($k in @($othersRaw.Keys)) { $known[[int64]$k] = $(if ($null -eq $othersRaw[$k]) { $null } else { [int64[]]@($othersRaw[$k]) }) } }
+        # A1-CLOCK-FREE-ANCESTRY-1 r1: the listing taken before the root started (pid -> creation ticks). A snapshot without it proves no baseline process.
+        $baseRaw = $(if ($null -ne $snapProps['baseline']) { $snapProps['baseline'].Value } else { $null })
+        if ($baseRaw -is [hashtable]) { foreach ($k in @($baseRaw.Keys)) { if ($null -ne $baseRaw[$k]) { $baseTable[[int64]$k] = [int64[]]@($baseRaw[$k]) } } }
+    } catch { return [pscustomobject]@{ confirmed = $false; survivors = @(); error = "tree-unknown: unreadable snapshot identity" } }
+    # r1 fix 2 (adversary A2 on 348c4357): a scan is STARTED only while at least $scanFloorMs (CIM's own 1 s OperationTimeoutSec floor) is left, under a timeout no
+    # longer than what is left, and no sleep runs into that floor; so no scan is granted past the bound. A bound under 1 s is no time to confirm.
+    # r2 (sol r1 A2): a scan costs CIM's 1 s floor PLUS the time between reading the clock and dispatching the call, so it starts only with $scanFloorMs + $scanMarginMs left and
+    # its timeout is the whole seconds of the exact remaining milliseconds (a double) less that margin; a truncated clock read granted 1 s with 999.8 ms left.
+    $scanFloorMs = 1000
+    # r2b (sol r2 A3): the margin is 100 ms and the timeout is read AGAIN inside the call's own argument, so only a pause between that read and the dispatch itself can start a late scan;
+    # a scan that then ends past the bound confirms nothing (below), and a grant under 1 s is refused by the cmdlet's own validation (an unconfirmed kill).
+    $scanMarginMs = 100
+    $survivors = @()
+    $lastError = 'no-time-to-confirm'
+    # r7b (adversary A3 on 1413e30f): the clock is read to the fraction of a millisecond; ElapsedMilliseconds truncates, so 1200.6 ms read as inside a 1200 ms bound.
+    while (($WaitMs - (& $elapsedMs)) -ge ($scanFloorMs + $scanMarginMs)) {
+        try {
+            # r5b fix 2 (adversary A2 on e75704ae): the floor is re-checked at the moment the scan's timeout is granted (the 250 ms sleep and the work since the loop
+            # test have used budget), so a scan never starts, or is granted its 1 s minimum, with less than $scanFloorMs left.
+            $remainMs = $WaitMs - (& $elapsedMs)
+            if ($remainMs -lt ($scanFloorMs + $scanMarginMs)) { break }
+            # r2c (sol r3 A2): the grant is read AGAIN here, and a grant under one whole second starts no scan (an OperationTimeoutSec of 0 selects the provider's server-default timeout, which
+            # is unbounded for this purpose); only the guard statement sits between this read and the dispatch.
+            $leftSec = [int][Math]::Floor(($WaitMs - (& $elapsedMs) - $scanMarginMs) / 1000.0)
+            if ($leftSec -lt 1) { break }
+            $rows = if ($null -ne $Scan) { @(& $Scan) } else { @(Get-CimInstance -ClassName Win32_Process -OperationTimeoutSec $leftSec -ErrorAction Stop) }
+            # r5b fix (adversary A2 on 2420b65f; r6 tolerance 10 s -> 2 s): a creation time AHEAD of the clock (beyond 2 s of skew) proves the clock was stepped back after that process started; the
+            # creation-time ordering of the climb below is then untrustworthy, so the kill is UNCONFIRMED (fail closed), whatever the other rows show.
+            $nowTicks = $(if ($PSBoundParameters.ContainsKey('NowTicks')) { [int64]$NowTicks } else { [DateTime]::UtcNow.Ticks })
+            foreach ($futureRow in $rows) {
+                if ($null -ne $futureRow -and $null -ne $futureRow.CreationDate -and ([datetime]$futureRow.CreationDate).ToUniversalTime().Ticks -gt ($nowTicks + $skewTicks)) {
+                    return [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = "clock-stepped-back pid=$($futureRow.ProcessId)" }
+                }
+            }
+            $byParent = @{}
+            $rowTicks = @{}
+            $rowParent = @{}
+            $found = [System.Collections.Generic.List[int64]]::new()
+            # r7 (sol r6d hardening, fable EKDC-WAIT-NULL-PID-ROW-FAIL-CLOSED-1): a row with no readable pid is kept by its parent, and one under the tree (checked once the
+            # walk below has found the tree) makes this scan unable to confirm, as the snapshot's descendant-unreadable does; it was dropped and the kill confirmed.
+            $noPidParents = [System.Collections.Generic.List[int64]]::new()
+            # r2 (sol r2 A9): a row with neither a pid nor a parent is no evidence at all, so a scan holding one cannot confirm (it was dropped, and an otherwise empty scan confirmed)
+            $blindRow = $false
+            foreach ($row in $rows) {
+                if ($null -ne $row -and $null -eq $row.ProcessId -and $null -eq $row.ParentProcessId) { $blindRow = $true }
+                if ($null -ne $row -and $null -eq $row.ProcessId -and $null -ne $row.ParentProcessId) { $noPidParents.Add([int64]$row.ParentProcessId) }
+                if ($null -eq $row -or $null -eq $row.ProcessId) { continue }
+                $rowPid = [int64]$row.ProcessId
+                $ticks = $(if ($null -eq $row.CreationDate) { $null } else { ([datetime]$row.CreationDate).ToUniversalTime().Ticks })
+                $rowTicks[$rowPid] = $ticks
+                $rowParent[$rowPid] = $(if ($null -eq $row.ParentProcessId) { $null } else { [int64]$row.ParentProcessId })
+                # a recorded identity with no known creation time ($null: found by the walk with none readable) matches its pid whatever the creation time
+                if ($recorded.ContainsKey($rowPid) -and ($null -eq $ticks -or $null -eq $recorded[$rowPid] -or [int64]$ticks -eq [int64]$recorded[$rowPid])) { $found.Add($rowPid) }
+                if ($null -ne $row.ParentProcessId) {
+                    $parentKey = [int64]$row.ParentProcessId
+                    if (-not $byParent.ContainsKey($parentKey)) { $byParent[$parentKey] = [System.Collections.Generic.List[int64]]::new() }
+                    $byParent[$parentKey].Add($rowPid)
+                }
+            }
+            # r3 (adversary A2 on 4d69f211): identity is (pid, creation time). The walk is seeded by the recorded pid NUMBERS ($expanded: whose children were read), but a
+            # live row is adopted by its own entry in $adopted, never pre-seeded, so a NEW process on a reused member number whose parent is a member is a survivor.
+            $expanded = [System.Collections.Generic.HashSet[int64]]::new()
+            $adopted = [System.Collections.Generic.HashSet[int64]]::new()
+            $queue = [System.Collections.Generic.Queue[int64]]::new()
+            foreach ($k in @($recorded.Keys)) { [void]$expanded.Add([int64]$k); $queue.Enqueue([int64]$k) }
+            $discovered = [System.Collections.Generic.List[int64]]::new()
+            while ($queue.Count -gt 0) {
+                $parentPid = $queue.Dequeue()
+                if (-not $byParent.ContainsKey($parentPid)) { continue }
+                foreach ($childPid in $byParent[$parentPid]) {
+                    # r2 (sol r2 A1 on b428e461): a child of a recorded member (or the root) is a survivor even when it matches a baseline row: see the snapshot's walk
+                    if ($adopted.Add($childPid)) { $found.Add($childPid); $discovered.Add($childPid) }
+                    if ($expanded.Add($childPid)) { $queue.Enqueue($childPid) }
+                }
+            }
+            # r3 (adversary A1 on 4d69f211): a live row the walk did not reach can still descend from the tree when its chain is broken (202 started 203, then 201 and 202
+            # exited). Climb ParentProcessId while the parent is in this scan and no younger than the child (a younger holder of the number is a reuse, not the parent).
+            # Where the climb stops, the top's parent is gone or unprovable; unless that top is an outsider the snapshot saw (same pid AND creation time, both
+            # readable), ancestry is unproven and every row on the climb is a survivor (fail closed), recorded from then on. r3 fix 2 (adversary A1 on 6b788356): no
+            # wall-clock comparison decides this, so a clock stepped back cannot make a late orphan read as older than the tree. r7 (sol r6d B1 sibling): the climb follows
+            # only a STRICTLY older parent; one with the child's own creation time is a reused number, so a late orphan never climbs to a known outsider through it.
+            # A1-CLOCK-FREE-ANCESTRY-1 r1: no climb and no stamp ordering. A live row the walk did not reach is an OUTSIDER only when the snapshot PROVED it one (same pid and stamp in
+            # .others), or it is a baseline process (same pid and stamp in .baseline: alive before the root started), or its DIRECT parent is such a baseline process. Anything else,
+            # a recycled parent number reading older included, is unproven: a survivor.
+            $unproven = @{}
+            foreach ($start in @($rowTicks.Keys)) {
+                if ($adopted.Contains([int64]$start)) { continue }
+                $startTicks = $rowTicks[$start]
+                $outsider = [bool](& $inBase $start $startTicks $rowParent[$start]) -or (($null -ne $startTicks) -and $known.ContainsKey([int64]$start) -and ($null -ne $known[[int64]$start]) -and ([int64]$known[[int64]$start][0] -eq [int64]$startTicks) -and (($known[[int64]$start].Count -eq 1) -or (($null -ne $rowParent[$start]) -and ([int64]$known[[int64]$start][1] -eq [int64]$rowParent[$start]))))
+                if (-not $outsider) {
+                    $up = $rowParent[$start]
+                    if ($null -ne $up -and [int64]$up -ne [int64]$start -and $rowTicks.ContainsKey([int64]$up) -and (& $inBase $up $rowTicks[[int64]$up] $rowParent[[int64]$up])) { $outsider = $true }
+                }
+                if (-not $outsider) { $unproven[[int64]$start] = $true }
+            }
+            foreach ($q in @($unproven.Keys)) { if ($unproven[$q] -and $adopted.Add([int64]$q)) { $found.Add([int64]$q); $discovered.Add([int64]$q) } }
+            # r1 fix 2 (adversary A1 on 348c4357): a descendant the walk found is recorded from then on, so a later scan still sees it after its parent exits.
+            foreach ($d in $discovered) { $recorded[$d] = $rowTicks[$d] }
+            $survivors = @($found | Sort-Object -Unique)
+            $lastError = 'survivors'
+            $noPidUnder = $null
+            foreach ($np in $noPidParents) { if ($expanded.Contains($np) -or $adopted.Contains($np)) { $noPidUnder = $np; break } }
+            if ($blindRow -and $null -eq $noPidUnder) { $noPidUnder = 'none'; $lastError = 'descendant-unreadable row-without-pid' }
+            elseif ($null -ne $noPidUnder) { $lastError = "descendant-unreadable parent=$noPidUnder" }
+            # r5 (sol r4 B3 on eb70c475): a row with no readable pid whose parent the walk did not reach (absent, unrecorded, or an outsider's number that may have been recycled) was dropped and
+            # the kill confirmed. Its ancestry cannot be proved from a row that carries no identity, so it is unreadable evidence wherever it sits: this scan confirms nothing.
+            elseif ($noPidParents.Count -gt 0) { $noPidUnder = $noPidParents[0]; $lastError = "unreadable-row row-without-pid parent=$noPidUnder" }
+            if ((& $elapsedMs) -gt $WaitMs) { $lastError = 'scan-ended-past-the-bound'; break }
+            if ($survivors.Count -eq 0 -and $null -eq $noPidUnder) { return [pscustomobject]@{ confirmed = $true; survivors = @(); error = $null } }
+        } catch { $lastError = "scan-failed: $([string]$_.Exception.Message -replace '\s+', ' ')" }
+        # r2 (sol r1 A2): the sleep is read from the exact remaining milliseconds (a double), floored, so it never runs into the scan floor and margin.
+        $sleepMs = [Math]::Floor([Math]::Min(250.0, $WaitMs - (& $elapsedMs) - $scanFloorMs - $scanMarginMs))
+        if ($sleepMs -lt 0) { break }
+        if ($sleepMs -gt 0) { Start-Sleep -Milliseconds ([int]$sleepMs) }
+    }
+    # r5 (sol r4 B2): a bound that ended on an unusable caller clock, or on this body's own stopwatch because the caller's clock stood still, is typed as such (still unconfirmed)
+    if ($clockSeen['unreadable']) { $lastError = 'clock-unreadable' } elseif ($clockSeen['ownWon'] -and $lastError -ne 'scan-ended-past-the-bound') { $lastError = 'clock-not-advancing' }
+    [pscustomobject]@{ confirmed = $false; survivors = @($survivors); error = $lastError }
+}
+
 function Get-AttrCudaProcessCpuSnapshot {
     <#
     .SYNOPSIS
@@ -8728,6 +9080,8 @@ Export-ModuleMember -Function `
     Stop-AttrCudaDisplayWakeKeepAlive, `
     Get-AttrCudaQuiescenceSample, `
     Get-AttrCudaProcessCpuSnapshot, `
+    Get-AttrCudaProcessTreeSnapshot, `
+    Wait-AttrCudaProcessTreeGone, `
     Get-AttrCudaTopCpuProcesses, `
     Get-AttrCudaWindowsDisplayInventory, `
     Get-AttrCudaMeasurementVenue, `

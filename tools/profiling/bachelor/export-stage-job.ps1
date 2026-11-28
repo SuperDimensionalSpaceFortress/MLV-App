@@ -332,16 +332,29 @@ try {
         $psi.Environment['MLVAPP_STAGE_TIMING_FILE'] = $stageLog
     }
     Write-JobTrace "step export start format=$Format maxFrames=$MaxFrames timeoutSec=$ExportTimeoutSec"
+    # A1-CLOCK-FREE-ANCESTRY-1 r1: the identities (pid + creation stamp) of every process alive BEFORE the export root starts. The kill confirmation below calls only those, and what they
+    # started directly, outsiders: no clock ordering decides ancestry. No listing ($null) is an unknown tree: an unconfirmed kill, never a confirmed one.
+    # sol A4 on 91e548f8: a helper the job does not carry (its source could not be read while the job was generated) is an unknown tree and an unconfirmed kill, never an abort before the
+    # root starts or before the typed terminal result (every call below is guarded).
+    $exportBaseline = $null
+    try { $exportBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 10 } catch { Write-JobTrace "step export baseline listing unavailable error=$([string]$_.CategoryInfo.Reason)" }
     $exportWatch = [Diagnostics.Stopwatch]::StartNew()
     $app = [Diagnostics.Process]::Start($psi)
     $timedOut = -not $app.WaitForExit([int]($ExportTimeoutSec * 1000))
     # r8 (adversary r7 pass A2): the kill is CONFIRMED or it is typed. A tree kill that threw (access denied: ffmpeg or a child may still hold the output), a fallback root-only
     # kill (the descendants are unknown) or a root still running after 30 s used to be swallowed: the job then read changing output, tried to delete it and published an ordinary
     # EXPORT_TIMEOUT. Now any of them ends EXPORT_KILL_UNCONFIRMED (exit 48, an INVALID export: no measurement and no FAIL claim about the product).
+    # EXPORT-KILL-DESCENDANT-CONFIRM-1 (adversary pass 26 A1 on 559536d7): Kill($true) may return and the root's wait read true while a descendant (ffmpeg) is still alive, so
+    # the root alone confirmed the tree. The descendants are recorded BEFORE the kill (pid + creation time: a reused pid is no survivor) and each must be seen gone within 15 s
+    # after the root's wait. A survivor, or a tree that could not be read, leaves the kill unconfirmed (EXPORT_KILL_UNCONFIRMED, exit 48) and the survivors are traced.
     $killConfirmed = $true
     if ($timedOut) {
+        # r2 (sol r2 A3): the record before the kill is read under a 5 s CIM timeout (it was 20 s), so a slow provider delays the kill by seconds, not tens of seconds; no record is an unknown tree
+        $exportTree = try { Get-AttrCudaProcessTreeSnapshot -RootProcessId $app.Id -Baseline $exportBaseline -OperationTimeoutSec 5 } catch { $null }
         try { $app.Kill($true) } catch { $killConfirmed = $false; Write-JobTrace "step export kill tree error=$([string]$_.CategoryInfo.Reason)"; try { $app.Kill() } catch { Write-JobTrace "step export kill root error=$([string]$_.CategoryInfo.Reason)" } }
         if (-not $app.WaitForExit(30000)) { $killConfirmed = $false }
+        $exportTreeGone = try { Wait-AttrCudaProcessTreeGone -Snapshot $exportTree -WaitMs 15000 } catch { [pscustomobject]@{ confirmed = $false; survivors = @(); error = 'tree-unknown: helper unavailable' } }
+        if (-not $exportTreeGone.confirmed) { $killConfirmed = $false; Write-JobTrace "step export kill descendants unconfirmed reason=$($exportTreeGone.error) survivors=$(@($exportTreeGone.survivors) -join ',')" }
     }
     $exportWatch.Stop()
     $appExitCode = if ($timedOut) { $null } else { $app.ExitCode }

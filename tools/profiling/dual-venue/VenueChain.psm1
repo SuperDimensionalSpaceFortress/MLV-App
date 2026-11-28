@@ -2581,12 +2581,41 @@ function Resolve-VenueLeaseCaps {
     [pscustomobject]@{ ok = $true; error = $null; cooldownSec = [int]$cd; budgetSec = [int]$bud; capSec = [int][Math]::Min($CapSec, $Caps.capSec) }
 }
 
+$script:VenueProcessTreeModulePath = Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1'
+function Get-VenueProcessTreeHelperSource {
+    # EXPORT-KILL-DESCENDANT-CONFIRM-1: the verbatim text of Get-AttrCudaProcessTreeSnapshot and Wait-AttrCudaProcessTreeGone, extracted from AttrCudaArtifacts.psm1 by the same
+    # column-0 contract as Get-VenueClaimShapeSource (read as text, never imported: this module imports nothing from the bachelor tree). It is read before a bounded child
+    # starts (r7, sol r6d B2); a file that will not read or a missing function throws, and the caller then counts the tree as unknown (an unconfirmed kill on timeout).
+    param([string]$Path = $script:VenueProcessTreeModulePath)
+    $src = [IO.File]::ReadAllText($Path)
+    @(foreach ($name in 'Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone') {
+        $mm = [regex]::Match($src, '(?ms)^function\s+' + [regex]::Escape($name) + '\s*\{.*?^\}')
+        if (-not $mm.Success) { throw "VENUE_PROCESS_TREE_HELPER_MISSING AttrCudaArtifacts.psm1 defines no extractable $name" }
+        $mm.Value
+    }) -join "`n`n"
+}
+# r7b (adversary A2 on 1413e30f): the two helpers are read and defined ONCE, when this module loads, so no Invoke-VenueBoundedProcess call pays a file read: not before
+# its child starts (that delayed a start its caller timed against an absolute deadline) and not after the timeout (that spent the cleanup allowance before the kill,
+# sol r6d B2). They stay module-private (Export-ModuleMember names neither). A source that will not load leaves every timed-out tree unknown: an unconfirmed kill.
+$script:VenueProcessTreeHelpersLoaded = $false
+$script:VenueBaseline = $null
+$script:VenueBaselineClock = $null
+try { . ([scriptblock]::Create((Get-VenueProcessTreeHelperSource))); $script:VenueProcessTreeHelpersLoaded = $true } catch { $script:VenueProcessTreeHelpersLoaded = $false }
+
+# R2-RESIDUE-2 r1 (test seams, module-private, never exported): the ONE clock of an Invoke-VenueBoundedProcess call and its timed wait for the root's exit. A test replaces either in the
+# module's own scope to place a clock read or an exit on either side of the bound without a real sleep; production behavior is the Stopwatch and Process.WaitForExit.
+function New-VenueBoundedClock { [Diagnostics.Stopwatch]::StartNew() }
+# R2-RESIDUE-3 r2 (adversary A1 on 3853fb75): the wait takes the caller's clock and the ABSOLUTE bound on it, and reads the clock ONCE here, at the dispatch, so a caller suspended between its own
+# earlier read and this call hands the wait nothing stale: the grant is the whole milliseconds left NOW, rounded up (nothing left grants no wait).
+function Wait-VenueBoundedExit { param([Parameter(Mandatory)]$Process, [Parameter(Mandatory)][scriptblock]$Clock, [Parameter(Mandatory)][double]$BoundMs) $leftMs = $BoundMs - [double](& $Clock); if ($leftMs -le 0.0) { return $false }; [bool]$Process.WaitForExit([int][Math]::Ceiling($leftMs)) }
+
 function Invoke-VenueBoundedProcess {
     <#
     .SYNOPSIS
     Run one child process and give up on it after -TimeoutSec (the child and its tree are killed). .exit is $null when it timed out.
     .OUTPUTS
-    [pscustomobject]@{ exit; timedOut; killConfirmed; stdout; stderr }. killConfirmed (EXPORT-VENUE-LEG-1 r11) is $true when the child exited on its own, or was killed and HasExited read true after the 15 s wait; a caller that
+    [pscustomobject]@{ exit; timedOut; started; killConfirmed; stdout; stderr }. started is $false only when the process listing before the launch used the whole allowance: nothing was launched, timedOut is
+    $true (the typed refusal) and killConfirmed is $false (no kill happened; a caller words it as not started). killConfirmed (EXPORT-VENUE-LEG-1 r11) is $true when the child exited on its own, or was killed and HasExited read true after the 15 s wait and every descendant recorded before the kill was seen gone (EXPORT-KILL-DESCENDANT-CONFIRM-1); a caller that
     must not leave a child behind reads it.
     #>
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
@@ -2596,15 +2625,79 @@ function Invoke-VenueBoundedProcess {
     $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
     foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
+    # A1-CLOCK-FREE-ANCESTRY-1 r1: ancestry is proved from a listing of the identities (pid + creation stamp) taken BEFORE the root starts, never from comparing creation stamps. One listing is
+    # reused for 30 s (a process in it was alive before ANY later root started, so reuse stays sound; a process started since is simply not an outsider: an unconfirmed kill, never a
+    # false confirmation), so a quick child pays no scan. A listing that cannot be read is cached as unknown for the same 30 s: the tree is then unknown.
+    # sol A2 on 91e548f8: the listing may not push this call past the caller's absolute deadline. It is refreshed only when the caller granted at least 3 s, under a 1 s CIM timeout, and the
+    # time it took is taken OFF the child's wait below (the call still ends $TimeoutSec after it began); under 3 s the listing already cached (or none: an unknown tree on a timeout) is used.
+    # r2 (sol r2 A4 on b428e461): ONE clock for the whole call, started first; the child's wait is what is left of -TimeoutSec after the listing, the launch and the stream setup, so none of them
+    # can push a successful run past the caller's deadline. The census runs only when the caller granted 5 s or more (a cold listing costs up to its 1 s CIM timeout plus decoding).
+    $censusClock = New-VenueBoundedClock
+    # R2-RESIDUE-3 r2 (sol r8 A3): the snapshot helpers get this ONE clock and the ABSOLUTE bound on it ($TimeoutSec * 1000 for the call, -CleanupWaitMs for the cleanup), never a relative allowance:
+    # a caller suspended between reading the allowance and the helper's first statement would otherwise hand over a figure that is already stale, and the helper's own stopwatch would read
+    # the suspension as free time. Each helper decides at the moment of dispatch against this clock.
+    $callMs = { $censusClock.Elapsed.TotalMilliseconds }.GetNewClosure()
+    if ($script:VenueProcessTreeHelpersLoaded -and $TimeoutSec -ge 5 -and ($null -eq $script:VenueBaselineClock -or $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30)) {
+        $script:VenueBaseline = $null
+        try { $script:VenueBaseline = Get-AttrCudaProcessTreeSnapshot -BaselineOnly -OperationTimeoutSec 1 -BudgetMs ($TimeoutSec * 1000.0) -Clock $callMs } catch { $script:VenueBaseline = $null }
+        $script:VenueBaselineClock = [Diagnostics.Stopwatch]::StartNew()
+    } elseif ($TimeoutSec -lt 5 -and $null -ne $script:VenueBaselineClock -and $script:VenueBaselineClock.Elapsed.TotalSeconds -gt 30) {
+        # sol r2-b A4 on ac0d5b6d: a short grant refreshes nothing, but it never reuses a listing older than 30 s either (none: an unknown tree on a timeout)
+        $script:VenueBaseline = $null; $script:VenueBaselineClock = $null
+    }
+    # sol r2-b A2: a listing that returned after the caller's whole allowance starts no child (nothing was started, so nothing is left behind)
+    # R2-RESIDUE-2 r1 (sol B3 = key3 H5): the typed refusal stays (timedOut), but nothing was launched, so no kill is claimed: started=$false and killConfirmed=$false (callers read started first)
+    if ($censusClock.Elapsed.TotalMilliseconds -ge $TimeoutSec * 1000.0) { return [pscustomobject]@{ exit = $null; timedOut = $true; started = $false; killConfirmed = $false; stdout = ''; stderr = '' } }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
-    $timedOut = -not $p.WaitForExit($TimeoutSec * 1000)
+    # r2 (sol r2 A3 on b428e461): the descendants must be recorded while their parents live, but the kill belongs at the bound, not after a scan that can take seconds. The tree is recorded
+    # ONE LEAD (2 s) BEFORE the bound (a 1 s CIM timeout), the child keeps running for the rest of its allowance, and the kill follows at the bound itself. A child that exits first costs
+    # nothing; a descendant it starts after the record is found by the wait (a child of a recorded member, or an unproven row). A call granted under 5 s records the tree at its timeout instead (below).
+    $tree = $null
+    $exitedEarly = $false
+    $earlyRecord = $script:VenueProcessTreeHelpersLoaded -and $TimeoutSec -ge 5
+    if ($earlyRecord) {
+        $leadWaitMs = $TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds - 2000.0
+        if ($leadWaitMs -ge 1.0) { $exitedEarly = Wait-VenueBoundedExit -Process $p -Clock $callMs -BoundMs ($TimeoutSec * 1000.0 - 2000.0) }
+        # R2-RESIDUE r1 (sol A3 on 96cbe079): the record is a scan like the others: it starts only when its 1 s CIM timeout (and 100 ms of slack) still fits what is left of the allowance, read at the
+        # moment it is granted; a caller resumed at or past the bound launches no scan (the tree is then unknown, an unconfirmed kill, never a scan that delays the kill past the deadline).
+        # R2-RESIDUE-2 r1 (sol B2): the snapshot decodes its rows under -BudgetMs (what is left of the allowance at the dispatch; past it the tree is unknown), and a snapshot that came back past the bound is
+        # never used, so a record dispatched in time cannot hold the kill past the deadline and then feed late evidence to the cleanup.
+        if (-not $exitedEarly) { try { $earlyGrantSec = [int][Math]::Min(1.0, [Math]::Floor(($TimeoutSec * 1000.0 - $censusClock.Elapsed.TotalMilliseconds - 100.0) / 1000.0)); if ($earlyGrantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -Baseline $script:VenueBaseline -OperationTimeoutSec $earlyGrantSec -BudgetMs ($TimeoutSec * 1000.0) -Clock $callMs; if ($censusClock.Elapsed.TotalMilliseconds -gt $TimeoutSec * 1000.0) { $tree = $null } } } catch { $tree = $null } }
+    }
+    # sol r2-b A2: a root seen exiting only after the call's allowance ran out is not a success: with no time left the run counts as timed out (the kill then reaches an exited root, or its tree)
+    # R2-RESIDUE-2 r1 (sol B1 = key3 B1, refiled A2): ONE clock read fixes the grant (the whole milliseconds left, rounded UP, so a child due inside the allowance is waited for: the old floor polled
+    # for 0 ms with 0.65 ms left and rejected an exit 0.55 ms away; nothing left grants no wait), and the clock is read AGAIN when the wait returns: a root seen exiting past the bound (the wait's
+    # timer-tick slack, or a poll between two reads that straddled it) is a timeout whatever the wait said. A root that exited during the lead wait above is judged by the same second read.
+    # R2-RESIDUE-3 r2 (adversary A1 on 3853fb75): that one read is now taken INSIDE the wait seam, at the dispatch, from the caller's clock and the absolute bound; no figure read here crosses the call.
+    $exited = $exitedEarly -or (Wait-VenueBoundedExit -Process $p -Clock $callMs -BoundMs ($TimeoutSec * 1000.0))
+    $timedOut = (-not $exited) -or ($censusClock.Elapsed.TotalMilliseconds -gt $TimeoutSec * 1000.0)
     $killErrored = $false
+    $treeGone = $true
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
-    if ($timedOut) { try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit($CleanupWaitMs) }
-    [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
-    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
+    $cleanupMs = { $cleanup.Elapsed.TotalMilliseconds }.GetNewClosure()
+    if ($timedOut) {
+        # EXPORT-KILL-DESCENDANT-CONFIRM-1 (adversary pass 26 A1 sibling): the root's exit alone confirmed the tree, while Kill($true) may return with a descendant alive. The
+        # descendants are recorded before the kill and each must be seen gone inside the same -CleanupWaitMs budget; a survivor or an unreadable tree is an unconfirmed kill.
+        # (r1 fix iteration, adversary A3 on 2223cc4d: a snapshot that ends past the budget is no snapshot, and the tree wait gets only what is left; each CIM scan has a 1 s floor)
+        # (r2: with 5 s or more granted the tree was already recorded before the bound, above, so the kill is at the bound; only a call granted under 5 s records it here, at the timeout, under the budget rules below)
+        # (r1 fix 2, adversary A2 on 348c4357: the snapshot scan starts only when CIM's 1 s floor fits the budget; under 1 s the tree is unknown, an unconfirmed kill)
+        # (r3, adversary A3 on 4d69f211: the budget is re-read from the one $cleanup stopwatch, and the scan gets only the whole seconds still left; when less than the
+        # 1 s floor is left no scan starts and the tree is unknown. r7b: the helpers were defined when this module loaded, above; the clock is read to the fraction of
+        # a millisecond (adversary A3 on 1413e30f: a truncated 500.6 ms granted a 1 s scan with 999.4 ms left))
+        # (r6, adversary pass 7 A2 sibling: the whole seconds left are read at the moment the scan's timeout is granted, not from a value taken earlier, and under the 1 s floor no scan starts)
+        if (-not $earlyRecord -and $script:VenueProcessTreeHelpersLoaded -and $CleanupWaitMs -ge 1000) { try { $grantSec = [int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0); if ($grantSec -ge 1) { $tree = Get-AttrCudaProcessTreeSnapshot -RootProcessId $p.Id -Baseline $script:VenueBaseline -OperationTimeoutSec ([int][Math]::Floor(($CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds - 100.0) / 1000.0)) -BudgetMs $CleanupWaitMs -Clock $cleanupMs } } catch { $tree = $null } }
+        if ($cleanup.Elapsed.TotalMilliseconds -ge $CleanupWaitMs) { $tree = $null }
+        # r2 (sol r1 A2): every grant below is the whole milliseconds of the exact remaining time (a double); a truncated ElapsedMilliseconds read granted up to a millisecond too much.
+        try { $p.Kill($true) } catch { $killErrored = $true }; [void]$p.WaitForExit([int][Math]::Floor([Math]::Max(0.0, $CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds)))
+        $treeGone = $(if ($null -eq $tree) { $false } else { [bool](Wait-AttrCudaProcessTreeGone -Snapshot $tree -WaitMs $CleanupWaitMs -Clock $cleanupMs).confirmed })
+        # r7b (adversary A3 on 1413e30f): the wait's own clock starts after its -WaitMs was read from this one, so its bound can end past this allowance; a confirmation
+        # that returns past the one cleanup allowance is late evidence and confirms nothing.
+        if ($cleanup.Elapsed.TotalMilliseconds -gt $CleanupWaitMs) { $treeGone = $false }
+    }
+    [void]$outTask.Wait([int][Math]::Floor([Math]::Max(0.0, $CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds))); [void]$errTask.Wait([int][Math]::Floor([Math]::Max(0.0, $CleanupWaitMs - $cleanup.Elapsed.TotalMilliseconds)))
+    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; started = $true; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited -and $treeGone } else { $true })
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }) }
 }
 

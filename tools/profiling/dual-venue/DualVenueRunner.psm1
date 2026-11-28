@@ -7679,6 +7679,14 @@ function New-DvHealthProbeJobText {
     $root = $AgentRoot.Replace("'", "''")
     Import-Module (Join-Path $PSScriptRoot '..\bachelor\AttrCudaArtifacts.psm1')
     $sessionLockedSource = Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaSessionLocked')
+    # EXPORT-KILL-DESCENDANT-CONFIRM-1 r2 (hosted CI, test_a_dynamic_splice_source_embeds_only_bodies_the_scan_already_enumerates): export-stage-job.ps1 embeds these two helpers
+    # by a computed name closure the ATTR-3 spliced-body scan cannot read, and the scan learns a body only from a LITERAL -Name list in a listed splice source. They are listed
+    # here, beside the other read-only venue helper, so the scan reads and clears both bodies (read-only process tables, no write). r7 (sol r6d B3): the probe never calls
+    # them, so the text is discarded and the probe carries neither (test_r7_b3_the_health_probe_carries_no_process_tree_helper_and_the_scan_still_reads_both).
+    # r7b (adversary A4 on 1413e30f): a read that fails here (the module locked between the two extractions) can never cost the probe, which needs neither body.
+    # r2 (sol r1 A3): the listing is a script block that is NEVER invoked: it costs the probe's path nothing (no synchronous source read, nothing to stall or throw), and the scan
+    # still reads its literal -Name list from the file text.
+    $null = { Get-AttrCudaEmbeddedFunctionSource -Name @('Get-AttrCudaProcessTreeSnapshot', 'Wait-AttrCudaProcessTreeGone') }
     $body = @"
 `$ErrorActionPreference = 'Stop'
 `$AgentRoot = '$root'

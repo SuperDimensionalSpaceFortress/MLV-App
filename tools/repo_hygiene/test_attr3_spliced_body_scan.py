@@ -129,6 +129,15 @@ INERT_INSTANCE |= frozenset("""
 # IsNaN / IsInfinity because Windows PowerShell 5.1 has no double::IsFinite. A side-effecting call in the same body is still a finding
 # (test_a_raw_pub_write_added_to_a_real_spliced_helper_is_caught; ...IsNaNIsAPurePredicateButAWriteBesideItIsStillCaught below).
 INERT_STATIC |= frozenset("double::IsNaN".split())
+# EXPORT-KILL-DESCENDANT-CONFIRM-1 r2: the process-tree helpers (Get-AttrCudaProcessTreeSnapshot, Wait-AttrCudaProcessTreeGone) walk the rows of one Win32_Process scan in memory.
+# Math::Floor / Max / Min are the same pure arithmetic as Math::Abs / Ceiling / Round above; HashSet / List / Queue of int64 or object are the same in-memory collections as the
+# HashSet[int] / List[string] / Stack[...] entries above, and .Enqueue() / .Dequeue() are the queue twins of .Push() / .Pop(). None opens, writes, moves or deletes anything. A
+# side-effecting call in the same body is still a finding (the allowlist rows below pin each body's exact set).
+INERT_STATIC |= frozenset("""
+Math::Floor Math::Max Math::Min System.Collections.Generic.HashSet[int64]::new System.Collections.Generic.List[int64]::new
+System.Collections.Generic.Queue[int64]::new System.Collections.Generic.Queue[object]::new
+""".split())
+INERT_INSTANCE |= frozenset(".Dequeue() .Enqueue()".split())
 # Read-only: they return data and cannot create, write, move or delete anything.
 INERT_STATIC |= frozenset("""
 Environment::GetFolderPath IO.DriveInfo::new IO.File::OpenRead IO.File::ReadAllBytes IO.File::ReadAllLines
@@ -341,6 +350,33 @@ for _name, _count in (("ConvertFrom-GuiSmokeDisplayLog", 3), ("Find-AttrCudaFail
 _allow("ConvertFrom-GuiSmokeDisplayLog", _IN_MEMORY, ("R1", "New-Object System.Collections.Generic.List[object]", 1))
 _allow("Find-AttrCudaFailedSmokeDisplayLog", _IN_MEMORY, ("R1", "New-Object System.Collections.Generic.List[string]", 1))
 _allow("Get-AttrCudaEligibilityVerdict", _LOCAL_BLOCK, ("R3", "& $read", 8))
+# EXPORT-KILL-DESCENDANT-CONFIRM-1 r2: $unknown is the body's own `{ param([string]$Why) [pscustomobject]@{ ... } }` (defined on its first line, a pure object builder).
+# r6b: 5 calls; r5b (e75704ae) added the fifth, the clock-stepped-back return (a row created ahead of the clock).
+# A1-CLOCK-FREE-ANCESTRY-1 r1: 7 calls (two more returns: baseline-unknown, root-in-baseline). $inBase is the body's own pure comparison block, defined near the top of the body:
+# `{ param($BasePid, $BaseTicks) ... $baseTable.ContainsKey(...) -and ([int64]$baseTable[...] -eq [int64]$BaseTicks) }` (an identity test against the listing taken before the root started).
+# sol r2 on b428e461 (A1): the two walks no longer call $inBase (a child of a member is always a member), so each body holds 2 calls (late classification, direct-parent check).
+# R2-RESIDUE-2 r1 (sol B2): -BudgetMs bounds the decode. 16 $unknown calls = the 7 above + 9 'deadline-exceeded' returns (before the CIM dispatch, after its rows, in each of the row loops, and at the end).
+# $overBudget and $budgetElapsed are the body's own pure blocks (defined beside $unknown): $budgetElapsed reads one Stopwatch (or the -Clock test seam) and $overBudget is
+# `{ [bool]($BudgetMs -gt 0 -and (& $budgetElapsed) -gt $BudgetMs) }`; 8 $overBudget calls (one per row-loop / result check) and 2 $budgetElapsed calls (that block, and the pre-dispatch guard of the CIM query).
+# R2-RESIDUE-3 r2 (adversary A2 on 3853fb75): the -BaselineOnly branch carries the bound too, so $budgetElapsed and $overBudget are defined BEFORE it (still pure blocks) and the branch reads them once
+# each: 3 $budgetElapsed calls (the $overBudget block, the baseline dispatch guard, the tree dispatch guard) and 9 $overBudget calls (the 8 above and the baseline's post-query check).
+# r5 (sol r4 B3 sibling): 17 $unknown calls = the 16 above plus the typed unknown for a row with no readable pid (unreadable evidence the decode cannot classify).
+_allow("Get-AttrCudaProcessTreeSnapshot", _LOCAL_BLOCK, ("R3", "& $unknown", 17), ("R3", "& $inBase", 2), ("R3", "& $overBudget", 11), ("R3", "& $budgetElapsed", 3))
+# R2-RESIDUE-3 r2 fix iteration 2 (adversary A2 on 342a1ac7): 11 $overBudget calls = the 9 above plus the baseline decode's per-row check and its check before the table is returned.
+_allow("Get-AttrCudaProcessTreeSnapshot",
+       "test-only seam: runs the caller's -Clock block (a stand-in for the elapsed-milliseconds read of the decode budget) only when a test passed one; production passes none and reads a Stopwatch",
+       ("R3", "& $Clock", 1))
+_allow("Wait-AttrCudaProcessTreeGone",
+       "test-only seam: runs the caller's -Scan block (a stand-in for the Win32_Process scan) only when a test passed one; production passes none and reads Get-CimInstance, a read-only query",
+       ("R3", "& $Scan", 1))
+_allow("Wait-AttrCudaProcessTreeGone", _LOCAL_BLOCK, ("R3", "& $inBase", 2))
+# R2-RESIDUE-3 r2 (sol r8 A3): -Clock is the caller's own clock (a block reading the elapsed ms of the bound -WaitMs is measured on). $elapsedMs is the body's pure block, defined on its second
+# statement: `{ if ($null -ne $Clock) { [double](& $Clock) } else { $ownStopwatch.Elapsed.TotalMilliseconds } }`. 5 calls: the loop test, the scan grant (twice: the floor re-check and the whole seconds
+# left), the post-scan check and the sleep. It reads a clock and runs nothing else. r5 (sol r4 B2): the block now also refuses a read that is not one finite number and takes the larger
+# of that read and the body's own stopwatch; still one `& $Clock` inside it and still 5 calls of it, so the counts are unchanged.
+_allow("Wait-AttrCudaProcessTreeGone",
+       "runs the caller's -Clock block (the elapsed milliseconds of the caller's own clock, the one the bound -WaitMs is measured on) and the body's pure $elapsedMs reader of it; a clock read only",
+       ("R3", "& $Clock", 1), ("R3", "& $elapsedMs", 5))
 _allow("Get-AttrCudaPresentMonDisplayReport", _LOCAL_BLOCK, ("R3", "& $buildWindow", 2), ("R3", "& $unavailable", 7))
 _allow("Get-AttrCudaSelfHealMetrics", _LOCAL_BLOCK,
        ("R3", "& $count", 4), ("R3", "& $field", 2), ("R3", "& $fps", 2), ("R3", "& $iniFlag", 2), ("R3", "& $readJson", 3),

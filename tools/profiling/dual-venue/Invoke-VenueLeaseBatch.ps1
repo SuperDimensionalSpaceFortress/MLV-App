@@ -1629,7 +1629,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor   # (in range: the floor is between 1 and the 120 s cap)
     $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
-    if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
+    if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', $(if ($bp.started -eq $false) { "'$Path' cannot be run: the export budget preflight was not started: the process listing before its launch used the whole $boundSec s allowance (nothing was launched, so nothing was killed)" } else { "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }) }
     $text = (@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n"
     if ($text -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: $($Matches[0] -replace '\s+', ' ')" }
     if ($bp.exit -eq 0) { return '', '' }
@@ -1642,7 +1642,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $boundSec = [int]$boundFloor
     $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
-    if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
+    if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', $(if ($fp.started -eq $false) { "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started: the process listing before its launch used the whole $boundSec s allowance (nothing was launched, so nothing was killed)" } else { "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }) }
     $floorText = (@($fp.stdout, $fp.stderr) | Where-Object { $_ }) -join "`n"
     if ($floorText -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: the clip did not resolve here, and the clip-independent floor alone (a 0-byte clip) is refused: $($Matches[0] -replace '\s+', ' ')" }
     # (adversary pass 19 A1: the floor reads no clip, so a floor child that ends with no answer -- a nonzero exit and no marker, e.g. its module import held without read sharing -- is
@@ -3041,6 +3041,14 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {
                     if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
                     throw
+                }
+                # R2-RESIDUE-2 r1 (adversary A2 on 36c22ed2): a call whose process listing used the whole allowance launched NOTHING (started=$false): the leg is not consumed (no LEASE_EXPIRED row, no
+                # cancel, nothing removed from pending) and goes to the next batch, exactly as a launch with too little room does above
+                if ($lp.started -eq $false) {
+                    $b.legsAttempted--; $launchShort = $true; $inFlightLeg = $null
+                    $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "at the launch of leg $($leg.name): the process listing before its launch used the whole $legBoundSec s allowance (nothing was launched): it goes to the next batch"
+                    L "LEG $($leg.name) NOT_LAUNCHED batch=$batchNo boundSec=$legBoundSec (the process listing before the launch used the whole allowance; nothing was launched, so nothing was killed)"
+                    break
                 }
                 $legReturnTs = [Diagnostics.Stopwatch]::GetTimestamp()   # r6 (adversary-848f6559.json A1): the child's return; the idle anchor is placed from the leg job's own result below
                 $text =[string]$lp.stdout + [string]$lp.stderr   # r7: read from the child, never back from the file, whose write the guard may refuse
