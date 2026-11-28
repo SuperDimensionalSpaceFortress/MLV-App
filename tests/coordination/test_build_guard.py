@@ -1238,7 +1238,10 @@ def test_the_assembler_takes_no_deadline_parameter_so_no_caller_default_can_supp
     assert [p for p in params if "deadline" in p.lower()] == [], params
     text = ATTR3_ASSEMBLE.read_text(encoding="utf-8")
     assert "HeavySlotDeadlineUtc" not in text and "caller-parameter-default" not in text
-    assert re.search(r"\$guardOptions = @\{\}\r?\nInvoke-BuildGuard -Label \"attr3-assemble:\$\(\$names\.shortSha\)\" -RequestedJobs \$MakeJobs "
+    # VENUE-STAGE-HEAVY-SLOT-RESERVE-FOR-VENUE-CHAINS-1: the table carries the heavy-slot class and its eta (exclusive-short, 12 min), and still no
+    # deadline key: the pin is on the table's exact two entries, so a deadline option added here is a red test, as before.
+    assert re.search(r"\$guardOptions = @\{ HeavySlotClass = 'exclusive-short'; HeavySlotEtaMinutes = 12 \}\r?\n"
+                     r"Invoke-BuildGuard -Label \"attr3-assemble:\$\(\$names\.shortSha\)\" -RequestedJobs \$MakeJobs "
                      r"-Options \$guardOptions -Action", text), "the build runs under the guard with no deadline option of its own"
 
 
@@ -2227,7 +2230,10 @@ def test_a_stop_file_that_cannot_be_written_still_ends_the_holder(box) -> None:
     )
     assert "holder-ended=True" in done.stdout, done.stdout + done.stderr
     assert "stop file not written" in done.stderr, done.stderr
-    assert "BUILD_HEAVY_SLOT_" not in done.stdout, "admitted and built, never refused"
+    # The informational BUILD_HEAVY_SLOT_CLASS line (VENUE-STAGE-HEAVY-SLOT-RESERVE-FOR-VENUE-CHAINS-1) is printed on every admission; any OTHER
+    # BUILD_HEAVY_SLOT_ line is a refusal or a requeue.
+    typed = [l for l in done.stdout.splitlines() if l.startswith("BUILD_HEAVY_SLOT_") and not l.startswith("BUILD_HEAVY_SLOT_CLASS ")]
+    assert typed == [], "admitted and built, never refused: " + repr(typed)
 
 
 def test_a_heavy_slot_lost_while_waiting_for_memory_is_a_requeue_before_the_action(box) -> None:
@@ -4494,3 +4500,219 @@ class TestLocalLaunchersRouteThroughTheGuard:
             ]
         )
         assert done.returncode == 0, done.stdout + done.stderr
+
+
+# --- VENUE-STAGE-HEAVY-SLOT-RESERVE-FOR-VENUE-CHAINS-1: Options.HeavySlotClass ---------------------------------------------
+# A venue stage assemble asks heavy-slot for --class exclusive-short (promoted at the next job boundary ahead of shared tickets younger
+# than 60 min; README.md:103-109). Everything else stays shared, byte for byte (the argv pin in
+# test_heavy_slot_is_outermost_and_the_build_exit_passes_through is untouched). The class is an explicit option only.
+
+CLASS_LANE_ENV = {"MLV_LANE_RUN_DIR": "lane-CARD-HS-1-r2-20261027T1420Z"}
+CLASS_LINE = re.compile(r"^BUILD_HEAVY_SLOT_CLASS label=(\S+) class=(\S+) eta=(\S+) utc=\d{4}-\d\d-\d\dT[\d:.]+Z$")
+
+
+def _class_attempt(box: dict, opts_line: str = "", extra: dict = None) -> subprocess.CompletedProcess:
+    return _library_driver(
+        box,
+        f"{opts_line}"
+        f"Invoke-BuildGuard -Label 'build' -Options $opts -Action {{ param($Jobs) Set-Content -LiteralPath '{box['marker']}' -Value ran -Encoding ascii }}\n",
+        str(box["lock"]),
+        extra={**CLASS_LANE_ENV, **(extra or {})},
+    )
+
+
+def _class_line(done: subprocess.CompletedProcess) -> re.Match:
+    [line] = [l.strip() for l in done.stdout.splitlines() if l.startswith("BUILD_HEAVY_SLOT_CLASS ")]
+    found = CLASS_LINE.match(line)
+    assert found, line
+    return found
+
+
+def _argv_head(call: dict) -> list:
+    return call["argv"][:call["argv"].index("--exit-file")]
+
+
+def test_the_default_class_is_shared_and_the_class_line_says_so(box) -> None:
+    done = _class_attempt(box)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert box["marker"].exists()
+    assert _class_line(done).groups() == ("mlv:CARD-HS-1:build", "shared", "20m")
+    [call] = _stub_calls(box)
+    assert _argv_head(call) == ["run", "--class", "shared", "--label", "mlv:CARD-HS-1:build", "--eta", "20m", "--wait", "60m"]
+
+
+def test_exclusive_short_with_a_12_minute_eta_is_the_venue_stage_key(box) -> None:
+    done = _class_attempt(box, "$opts.HeavySlotClass = 'exclusive-short'; $opts.HeavySlotEtaMinutes = 12\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert box["marker"].exists()
+    assert _class_line(done).groups() == ("mlv:venue-stage:CARD-HS-1", "exclusive-short", "12m")
+    [call] = _stub_calls(box)
+    assert _argv_head(call) == ["run", "--class", "exclusive-short", "--label", "mlv:venue-stage:CARD-HS-1", "--eta", "12m", "--wait", "60m"]
+    assert "heavy-slot: waiting label=mlv:venue-stage:CARD-HS-1 " in done.stderr, done.stderr
+
+
+def test_command_mode_takes_the_class_from_its_parameter_and_prints_the_class_line(box) -> None:
+    done = _heavy(box, "run", ["-HeavySlotClass", "exclusive-short", "-HeavySlotEtaMinutes", "10", "-Command", "cmd /c exit 0"])
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    argv = call["argv"]
+    sep = argv.index("--")
+    assert argv[:sep] == ["run", "--class", "exclusive-short", "--label", "mlv:venue-stage:CARD-HS-1", "--eta", "10m", "--wait", "60m",
+                          "--exit-file", argv[sep - 1]]
+    assert _class_line(done).groups() == ("mlv:venue-stage:CARD-HS-1", "exclusive-short", "10m")
+
+
+def test_command_mode_defaults_to_shared_and_prints_the_class_line(box) -> None:
+    done = _heavy(box, "run", ["-Command", "cmd /c exit 0"])
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _class_line(done).groups() == ("mlv:CARD-HS-1:build", "shared", "20m")
+
+
+@pytest.mark.parametrize("eta, arg", [("15", "15m"), ("0.5", "0.5m"), ("10", "10m")])
+def test_exclusive_short_accepts_every_eta_up_to_15_minutes(box, eta, arg) -> None:
+    done = _class_attempt(box, f"$opts.HeavySlotClass = 'exclusive-short'; $opts.HeavySlotEtaMinutes = {eta}\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert call["argv"][call["argv"].index("--eta") + 1] == arg
+    assert call["argv"][call["argv"].index("--class") + 1] == "exclusive-short"
+
+
+@pytest.mark.parametrize("eta", ["0", "16", "45"])
+def test_a_shared_class_keeps_its_own_eta_range(box, eta) -> None:
+    # The 15 min cap is exclusive-short's (heavy-slot promotes no longer unit); a shared build keeps the 0..10080 range it always had.
+    done = _class_attempt(box, f"$opts.HeavySlotClass = 'shared'; $opts.HeavySlotEtaMinutes = {eta}\n")
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _class_line(done).group(2) == "shared"
+
+
+@pytest.mark.parametrize("klass, eta, shown", [
+    ("'bulk'", "20", "HeavySlotClass=bulk "),
+    ("'Exclusive-Short'", "10", "HeavySlotClass=Exclusive-Short "),
+    ("'SHARED'", "20", "HeavySlotClass=SHARED "),
+    ("' shared'", "20", "HeavySlotClass= shared "),
+    ("'exclusive-short '", "10", "HeavySlotClass=exclusive-short  "),
+    ("('shared' + [char]0x00AD)", "20", "HeavySlotClass=shared"),
+    ("('exclusive-short' + [char]0x00AD)", "10", "HeavySlotClass=exclusive-short"),
+    ("''", "20", "HeavySlotClass= "),
+    ("$null", "20", "HeavySlotClass= "),
+    ("'exclusive-short'", "16", "HeavySlotClass=exclusive-short "),
+    ("'exclusive-short'", "15.01", "HeavySlotClass=exclusive-short "),
+    ("'exclusive-short'", "0", "HeavySlotClass=exclusive-short "),
+    ("'exclusive-short'", "-1", "HeavySlotClass=exclusive-short "),
+])
+def test_a_class_or_class_eta_pair_heavy_slot_would_not_promote_is_refused_before_heavy_slot_starts(box, klass, eta, shown) -> None:
+    # Never clamped and never a silent fall-back to shared: a typed refusal, exit 2, heavy-slot never started, nothing built.
+    done = _class_attempt(box, f"$opts.HeavySlotClass = {klass}; $opts.HeavySlotEtaMinutes = {eta}\n")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option HeavySlotWaitMinutes=60 HeavySlotEtaMinutes=" in done.stdout, done.stdout
+    assert shown in done.stdout, done.stdout
+    assert "BUILD_HEAVY_SLOT_CLASS" not in done.stdout
+    assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+@pytest.mark.parametrize("name", ["HEAVY_SLOT_CLASS", "MLV_HEAVY_SLOT_CLASS", "HeavySlotClass", "MLV_HEAVY_SLOT_ETA_MINUTES", "BUILD_GUARD_HEAVY_SLOT_CLASS"])
+def test_an_environment_variable_named_like_the_option_has_no_effect(box, name) -> None:
+    # The class comes ONLY from explicit Options: an env value would leak into every nested or sibling guard call.
+    done = _class_attempt(box, extra={name: "exclusive-short"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert _class_line(done).groups() == ("mlv:CARD-HS-1:build", "shared", "20m")
+    [call] = _stub_calls(box)
+    assert _argv_head(call) == ["run", "--class", "shared", "--label", "mlv:CARD-HS-1:build", "--eta", "20m", "--wait", "60m"]
+
+
+def test_an_invalid_environment_value_is_not_judged_at_all(box) -> None:
+    done = _class_attempt(box, extra={"HEAVY_SLOT_CLASS": "bogus", "MLV_HEAVY_SLOT_CLASS": "bogus"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED" not in done.stdout
+
+
+# Adversary e6b3762c, A1 (a class judged after the fail-open returns) and A2/A3 (an [int] parameter rounds the eta before any check sees it).
+
+
+@pytest.mark.parametrize("klass, eta", [
+    ("bulk", "12"), ("Exclusive-Short", "12"), ("exclusive-short", "16"), ("exclusive-short", "15.49"), ("exclusive-short", "0"),
+])
+def test_a_refused_class_is_refused_on_a_host_without_heavy_slot_too(box, klass, eta) -> None:
+    # A1: with no heavy-slot shim the guard fails open and builds WITHOUT the slot. The class (and exclusive-short's eta cap) is judged before
+    # that, so the refusal does not depend on the host having heavy-slot installed. Also the siblings: a shim path with '%', a lease dir
+    # that cannot be made, are fail-open returns of the same function and come after the class check.
+    done = _heavy(box, "run", ["-HeavySlotClass", klass, "-HeavySlotEtaMinutes", eta, "-Command", _marker_command(box)], shim=NO_HEAVY_SLOT)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option" in done.stdout, done.stdout
+    assert f"HeavySlotClass={klass} " in done.stdout, done.stdout
+    assert not box["marker"].exists(), "the build action never ran"
+    assert _stub_calls(box) == []
+
+
+def test_a_refused_class_is_refused_when_the_shim_path_holds_a_percent_sign(box) -> None:
+    pct = box["dir"] / "100%" / "heavy-slot.cmd"
+    done = _heavy(box, "run", ["-HeavySlotClass", "bulk", "-Command", _marker_command(box)], shim=pct)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option" in done.stdout
+    assert not box["marker"].exists()
+
+
+@pytest.mark.parametrize("eta", ["15.49", "15.5", "15.01"])
+def test_command_mode_never_rounds_an_exclusive_short_eta_into_promotion(box, eta) -> None:
+    # A2: [int]$HeavySlotEtaMinutes bound 15.49 as 15, so the stub saw --eta 15m. The parameter is a [double] now.
+    done = _heavy(box, "run", ["-HeavySlotClass", "exclusive-short", "-HeavySlotEtaMinutes", eta, "-Command", _marker_command(box)])
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option" in done.stdout, done.stdout
+    assert f"HeavySlotEtaMinutes={eta} " in done.stdout, done.stdout
+    assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+@pytest.mark.parametrize("eta, arg", [("15", "15m"), ("14.99", "14.99m"), ("0.5", "0.5m")])
+def test_command_mode_passes_a_fractional_eta_through_unrounded(box, eta, arg) -> None:
+    done = _heavy(box, "run", ["-HeavySlotClass", "exclusive-short", "-HeavySlotEtaMinutes", eta, "-Command", "cmd /c exit 0"])
+    assert done.returncode == 0, done.stdout + done.stderr
+    [call] = _stub_calls(box)
+    assert call["argv"][call["argv"].index("--eta") + 1] == arg
+
+
+@pytest.mark.parametrize("option, value", [
+    ("HeavySlotEtaMinutes", "10080.49"), ("HeavySlotWaitMinutes", "10080.49"), ("HeavySlotWaitMinutes", "-0.49"), ("HeavySlotEtaMinutes", "-0.49"),
+])
+def test_command_mode_refuses_a_shared_minutes_value_that_integer_binding_used_to_round_into_range(box, option, value) -> None:
+    # A3 (pre-existing sibling, same binding): 10080.49 bound as 10080 and -0.49 as 0, skipping the 0..10080 refusal.
+    done = _heavy(box, "run", [f"-{option}", value, "-Command", _marker_command(box)])
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option" in done.stdout, done.stdout
+    assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+def test_an_exclusive_short_eta_that_formats_as_zero_is_refused(box) -> None:
+    # Precision note of the same pass: 1e-12 is above 0 but goes to heavy-slot as '0m'; exclusive-short needs 0 < eta as SENT.
+    done = _class_attempt(box, "$opts.HeavySlotClass = 'exclusive-short'; $opts.HeavySlotEtaMinutes = 1e-12\n")
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option" in done.stdout, done.stdout
+    assert _stub_calls(box) == [] and not box["marker"].exists()
+
+
+# Adversary db7a9734, A1/A2: the durations were judged after the fail-open returns too, and a [double] parameter lets NaN and 1e100 reach them.
+
+
+@pytest.mark.parametrize("args", [
+    ["-HeavySlotEtaMinutes", "NaN"], ["-HeavySlotWaitMinutes", "NaN"],
+    ["-HeavySlotEtaMinutes", "1e100"], ["-HeavySlotWaitMinutes", "1e100"],
+    ["-HeavySlotEtaMinutes", "-1"], ["-HeavySlotWaitMinutes", "10081"],
+    ["-HeavySlotClass", "exclusive-short", "-HeavySlotEtaMinutes", "NaN"],
+    ["-HeavySlotClass", "exclusive-short", "-HeavySlotEtaMinutes", "1e-12"],
+], ids=lambda a: " ".join(a))
+def test_a_duration_heavy_slot_cannot_hold_is_refused_on_a_host_without_heavy_slot_too(box, args) -> None:
+    # The shim is absent, so every fail-open return of Enter-HeavySlot is reachable: the build would run WITHOUT the slot on a figure heavy-slot
+    # (or the guard's own range) would have refused. The durations are judged before the shim is looked for, like the deadline and the class.
+    done = _heavy(box, "run", [*args, "-Command", _marker_command(box)], shim=NO_HEAVY_SLOT)
+    assert done.returncode == 2, done.stdout + done.stderr
+    assert "BUILD_HEAVY_SLOT_REFUSED label=build reason=invalid-option" in done.stdout, done.stdout
+    assert not box["marker"].exists(), "the build action never ran"
+    assert _stub_calls(box) == []
+
+
+def test_a_valid_exclusive_short_request_on_a_host_without_heavy_slot_still_fails_open(box) -> None:
+    # The refusal is for what is WRONG with the request; a good one on a host without heavy-slot keeps today's fail-open (one WARN, builds).
+    done = _heavy(box, "run", ["-HeavySlotClass", "exclusive-short", "-HeavySlotEtaMinutes", "12", "-Command", _marker_command(box)], shim=NO_HEAVY_SLOT)
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert "HEAVY_SLOT_WARN" in done.stderr and "fail open" in done.stderr, done.stderr
+    assert box["marker"].exists()
+    assert "BUILD_HEAVY_SLOT_CLASS" not in done.stdout, "no heavy-slot was started, so there is no class to name"
