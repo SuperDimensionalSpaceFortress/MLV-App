@@ -405,7 +405,7 @@ TEST(Debayered16HonourScaleWiring, DrawFrameReportsADebayeredFrameOnlyFromThisDr
     ASSERT_TRUE(flagAt > cpuFallbackMsAt);
     ASSERT_TRUE(cpuBranchAt > flagAt);
     ASSERT_TRUE(dispatchAt > cpuBranchAt);
-    ASSERT_EQ(1, body.count(QStringLiteral("debayered16CpuEntryRan = ")));
+    ASSERT_EQ(2, body.count(QStringLiteral("debayered16CpuEntryRan = "))); // the declaration and the one assignment
     ASSERT_EQ(1, body.count(QStringLiteral("debayered16GpuBranchCpuDebayerMs = (")));
     const int readAt = body.indexOf(QStringLiteral(
         "const double debayeredFrameMs =\n"

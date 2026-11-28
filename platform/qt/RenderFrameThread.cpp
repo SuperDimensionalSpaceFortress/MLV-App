@@ -5219,6 +5219,11 @@ void RenderFrameThread::drawFrame( int slotIndex,
      * thread-local and stale otherwise. */
     bool renderThreadProcessed8StageRan = false;
     bool renderThreadProcessed16StageRan = false;
+    /* CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: false when the OutputDebayered16 branch's GPU branch
+     * rendered the frame, so no CPU Debayered16 entry recorded this draw's debayered-frame total; the
+     * draw then reports only that branch's own CPU debayer (debayered16DrawDebayeredFrameMs). */
+    bool debayered16CpuEntryRan = true;
+    double debayered16GpuBranchCpuDebayerMs = 0.0;
     /* CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (Part A, r1 adversary pass 2 A1): set only where this
      * render actually consumed the worker's reconstruction; a refused reuse leaves it false. */
     bool renderConsumedWorkerRecon = false;
@@ -5264,6 +5269,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
     }
     else if ( outputMode == OutputDebayered16 && !slot.rawImage16.empty() )
     {
+        /* CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: the GPU branch below runs no CPU Debayered16 entry, so the
+         * thread's debayer-stage records would be a previous frame's; every entry resets and rewrites them. */
+        resetMlvLastDebayerStageMilliseconds();
         bool usedGpuBilinearDebayer = false;
         bool usedGpuAmazeDebayer = false;
         bool renderedDebayeredFrame = false;
@@ -5397,6 +5405,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
             const int height = getMlvHeight( m_pMlvObject );
             const size_t pixelCount = static_cast<size_t>(width) * static_cast<size_t>(height);
             m_gpuBilinearDebayerRawFrame.resize( pixelCount );
+            const double gpuBilinearFrameStart = mlv_stage_timing_now();
             getMlvRawFrameFloat( m_pMlvObject,
                                  frameNumber,
                                  m_gpuBilinearDebayerRawFrame.data() );
@@ -5432,6 +5441,9 @@ void RenderFrameThread::drawFrame( int slotIndex,
                               width,
                               height,
                               1 );
+                /* CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: this CPU debayer's total contains its own decode and
+                 * llrawproc, as a CPU Debayered16 entry's does. */
+                debayered16GpuBranchCpuDebayerMs = ( mlv_stage_timing_now() - gpuBilinearFrameStart ) * 1000.0;
                 renderedDebayeredFrame = true;
                 slot.usedGpuBilinearDebayer = false;
                 slot.gpuBilinearRendererDescription = rendererDescription;
@@ -5458,6 +5470,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
         Debayered16ReconRefusal phase3ReconReuseOutcome =
             Debayered16ReconRefusal::GpuDebayerRendered;
         Debayered16RenderedDims debayered16Dims;
+        debayered16CpuEntryRan = !renderedDebayeredFrame;
         if ( !renderedDebayeredFrame )
         {
             const size_t reconPixelCount =
@@ -6566,8 +6579,12 @@ void RenderFrameThread::drawFrame( int slotIndex,
     const double debayerCaMs = getMlvLastDebayerCaMilliseconds();
     const double debayerKernelMs = getMlvLastDebayerKernelMilliseconds();
     const double debayerWbUndoMs = getMlvLastDebayerWbUndoMilliseconds();
+    const double debayeredFrameMs =
+        debayered16DrawDebayeredFrameMs( debayered16CpuEntryRan,
+                                         getMlvLastDebayeredFrameMilliseconds(),
+                                         debayered16GpuBranchCpuDebayerMs );
     const double debayerExclusiveMs = qMax( 0.0,
-                                            getMlvLastDebayeredFrameMilliseconds()
+                                            debayeredFrameMs
                                                 - renderThreadRawUint16Ms
                                                 - renderThreadLlrawprocMs );
     const double debayerKnownMs =
@@ -7073,7 +7090,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
     slot.stageTimingTelemetry.insert( QStringLiteral("dual_iso_preview_rowscale_ms"),
                                       slot.dualIsoPreviewRowscaleMs );
     slot.stageTimingTelemetry.insert( QStringLiteral("debayered_frame_ms"),
-                                      getMlvLastDebayeredFrameMilliseconds() );
+                                      debayeredFrameMs );
     slot.stageTimingTelemetry.insert( QStringLiteral("raw_float_convert_ms"),
                                       rawFloatConvertMs );
     slot.stageTimingTelemetry.insert( QStringLiteral("debayer_exclusive_ms"),

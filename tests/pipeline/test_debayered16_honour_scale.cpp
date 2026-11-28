@@ -1637,6 +1637,34 @@ TEST(Debayered16ReconReuse, InlineDebayerRefusingAFrameLeavesNoStaleDebayeredFra
     ASSERT_TRUE(processingMs == 0.0);
 }
 
+// CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: what drawFrame reports for an OutputDebayered16 draw
+// (debayered16DrawDebayeredFrameMs; Debayered16HonourScaleWiring.DrawFrameReportsADebayeredFrameOnlyFromThisDrawsOwnDebayer
+// pins the call). After a heavy debayer on this thread, a frame the GPU branch rendered reports 0 (the GPU debayered it) or
+// its own CPU fallback's time, never the thread's record; a frame the CPU branch rendered reports that branch's own record.
+TEST(Debayered16ReconReuse, DrawFrameDebayeredFrameIsOnlyThisDrawsOwnDebayer)
+{
+    EnvGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    ASSERT_TRUE(poisonFrameAndProcessingRecords(fixture));
+    const double poisonMs = getMlvLastDebayeredFrameMilliseconds();
+    ASSERT_TRUE(poisonMs > 0.0);
+    ASSERT_TRUE(debayered16DrawDebayeredFrameMs(false, getMlvLastDebayeredFrameMilliseconds(), 0.0) == 0.0);
+    ASSERT_TRUE(debayered16DrawDebayeredFrameMs(false, getMlvLastDebayeredFrameMilliseconds(), 1.25) == 1.25);
+    const size_t n = fullPixels(fixture);
+    std::vector<uint16_t> slot(n * 3u, 0u);
+    std::vector<float> scratch;
+    resetMlvCachedFrame(fixture.video());
+    const double renderStart = mlv_stage_timing_now();
+    renderDebayered16FromSlot(fixture.video(), 2, Debayered16ReconReuseInputs(), slot.data(), n, scratch, nullptr);
+    const double renderMs = (mlv_stage_timing_now() - renderStart) * 1000.0;
+    const double drawMs = debayered16DrawDebayeredFrameMs(true, getMlvLastDebayeredFrameMilliseconds(), 0.0);
+    std::printf("[debayered16-stale-residue] draw helper: poison=%.4f cpu-branch draw=%.4f render=%.4f\n", poisonMs, drawMs,
+                renderMs);
+    ASSERT_TRUE(drawMs == getMlvLastDebayeredFrameMilliseconds());
+    ASSERT_TRUE(drawMs <= renderMs);
+}
+
 // The prep's reduced-source config: only a SourceAlreadyReduced decision at x2/x4 whose
 // source is exactly the clip divided by that scale; otherwise nothing is built.
 TEST(Debayered16ReconReuse, HonourScalePrepReducedSourceConfigOnlyForAnExactlyReducedSource)

@@ -7002,6 +7002,10 @@ static int mlv_render_scaled_rgb16(mlvObject_t * video,
 
 void getMlvRawFrameDebayered(mlvObject_t * video, uint64_t frameIndex, uint16_t * outputFrame)
 {
+    /* CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: a frame refused below runs no debayer either, so the thread's
+     * debayered-frame and processing records are cleared before the refusal, not after it. */
+    g_mlv_last_debayered_frame_ms = 0.0;
+    g_mlv_last_processing_ms = 0.0;
     int width = getMlvWidth(video);
     int height = getMlvHeight(video);
     if (!outputFrame || width <= 0 || height <= 0
