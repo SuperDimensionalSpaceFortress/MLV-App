@@ -2547,7 +2547,7 @@ function Invoke-VenueBoundedProcess {
     if ($TestAfterStartDelayMs -gt 0) { [Threading.Thread]::Sleep($TestAfterStartDelayMs) }
     $waitSw = [Diagnostics.Stopwatch]::StartNew()   # the relative -TimeoutSec runs from here
     $waitMs = [double]$TimeoutSec * 1000.0
-    if ($null -ne $Clock) { $waitMs = [Math]::Min($waitMs, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
+    if ($null -ne $Clock) { $waitMs = [Math]::Min([double]$waitMs, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
     $pastEnd = ($null -ne $Clock -and -not ($waitMs -gt 0))
     if ($TestBeforeWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($TestBeforeWaitDelayMs) }   # (offline seam: a parent descheduled after the wait was computed and before it begins)
     # r8 (adversary r8 pass 18 A1): a wait sized once and begun later is stale by whatever happened between (a parent descheduled after it was computed got the whole stale wait past the end). With a clock the wait is taken in
@@ -2574,7 +2574,7 @@ function Invoke-VenueBoundedProcess {
         foreach ($stream in @($outTask, $errTask)) {
             while (-not $stream.IsCompleted) {
                 $m = [double]($CleanupWaitMs - $cleanup.ElapsedMilliseconds)
-                if ($null -ne $Clock) { $m = [Math]::Min($m, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
+                if ($null -ne $Clock) { $m = [Math]::Min([double]$m, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
                 if (-not ($m -gt 0)) { break }
                 if ($TestBeforeDrainDelayMs -gt 0 -and -not $drainPaused) { $drainPaused = $true; [Threading.Thread]::Sleep($TestBeforeDrainDelayMs) }
                 [void]$stream.Wait([int][Math]::Ceiling([Math]::Min(250.0, $m)))

@@ -401,7 +401,7 @@ if (-not $umRunIsReal) {
     $locationCapSec = 30.0
     $locationDeadline = [DateTimeOffset]::MinValue
     if ($DeadlineUtc -and [DateTimeOffset]::TryParse($DeadlineUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$locationDeadline)) {
-        $locationCapSec = [Math]::Min($locationCapSec, ($locationDeadline.UtcDateTime - [DateTime]::UtcNow).TotalSeconds - 2.0)
+        $locationCapSec = [Math]::Min([double]$locationCapSec, ($locationDeadline.UtcDateTime - [DateTime]::UtcNow).TotalSeconds - 2.0)
     }
     if ($locationCapSec -ge 1.0) {
     $locationProbeText ='param($a) $ErrorActionPreference = ''Stop''; Import-Module $a.module -Force -DisableNameChecking; if ($a.delaySec -gt 0) { [Threading.Thread]::Sleep([int]($a.delaySec * 1000)) }' + "`n" +

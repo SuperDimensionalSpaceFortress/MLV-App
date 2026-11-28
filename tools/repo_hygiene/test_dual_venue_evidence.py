@@ -4063,7 +4063,8 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         real = self.prod_repo(records=[])                       # the repo the validator is told to use: no record
         env = {"GIT_DIR": str(forged_repo.root / ".git")}
         self.assertNotValid(receipt, real, "is not a blob of this repository", "INVALID", env=env)
-        mutated = self.mutated_module([("[void]$psi.Environment.Remove($name)", "$null = $name")])
+        # (r9: the anchor is the GIT_DIR/GIT_TRACE/GIT_REDIRECT scrub's own line: the GIT_CONFIG* scrub the batch card added after it ends with the same call, so the bare call is no longer unique)
+        mutated = self.mutated_module([("$_ -match '^GIT_REDIRECT_' })) { [void]$psi.Environment.Remove($name) }", "$_ -match '^GIT_REDIRECT_' })) { $null = $name }")])
         status, valid, reasons = self.status(receipt, real, module=mutated, env=env)
         self.assertEqual((status, valid), ("ADVISORY", False), "with the scrub removed GIT_DIR makes the forger's repo the committed one -- so the scrub is guarded")
 
