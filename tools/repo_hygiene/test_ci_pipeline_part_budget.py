@@ -36,11 +36,60 @@ def _workflow_job(workflow: str, job_id: str) -> str:
     return workflow[start : start + 1 + following.start()] if following else workflow[start:]
 
 
-# The planning logic of the step, comment and blank lines dropped and indentation stripped, from
-# `$partCount` through the assignment loop. The mirror in ci_pipeline_part_plan.py repeats exactly
-# this; a changed line (a scaled weight, another tie-break, another default) would make the budget
-# below describe a plan CI no longer runs, so any edit here must be made there too.
-EXPECTED_PLANNING_LOGIC = (
+# The whole run body of the step, from its first line through the close of
+# `foreach ($shard in $myShards) { ... }`, comment and blank lines dropped and indentation stripped.
+# The mirror in ci_pipeline_part_plan.py repeats the discovery, the windows and the assignment
+# below; a changed or added line anywhere in this body (a scaled weight, another tie-break, a second
+# `$myShards`, a `$script:` or `Set-Variable` spelling of a pinned variable, a new `$testsPerShard`)
+# would make the budget describe a plan CI no longer runs. Pinning the whole body, rather than named
+# lines or counts of named assignments, is what closes that whole class (adversary r1 passes 1-3 each
+# found one more spelling of it). Any edit here must be made in ci_pipeline_part_plan.py too.
+#
+# Two lines are compared by shape, not text, because a card legitimately changes them:
+# `$soloPattern = '<regex>'` (a card that adds a solo class edits the regex) and
+# `$testsPerShard = <n>` (another test pins n to 12). Each must still occur exactly once, so the
+# placeholder appears exactly once in the tuple.
+SOLO_PLACEHOLDER = "$soloPattern = '<regex>'"
+TESTS_PER_SHARD_PLACEHOLDER = "$testsPerShard = <n>"
+EXPECTED_STEP_BODY: tuple[str, ...] = (
+    "$env:PATH = \"$env:QT_ROOT_DIR\\bin;$env:MINGW_ROOT\\bin;$env:PATH\"",
+    "$env:MLVAPP_CRASH_FORENSICS_AUTOINSTALL = \"1\"",
+    "$env:MLVAPP_CRASH_FORENSICS_LOG_DIR = Join-Path $env:RUNNER_TEMP \"pipeline-crash-forensics\"",
+    "New-Item -ItemType Directory -Force $env:MLVAPP_CRASH_FORENSICS_LOG_DIR | Out-Null",
+    "$suiteOutput = Join-Path $env:RUNNER_TEMP \"pipeline-tests-output.txt\"",
+    "New-Item -ItemType File -Force $suiteOutput | Out-Null",
+    "$testNames = @(",
+    "foreach ($file in Get-ChildItem tests\\pipeline -Filter *.cpp) {",
+    "$text = Get-Content -LiteralPath $file.FullName -Raw",
+    "foreach ($match in [regex]::Matches($text, 'TEST(?:_[FP])?\\(\\s*([A-Za-z0-9_]+)\\s*,\\s*([A-Za-z0-9_]+)')) {",
+    "\"{0}.{1}\" -f $match.Groups[1].Value.Trim(), $match.Groups[2].Value.Trim()",
+    "}",
+    "}",
+    ") | Sort-Object -Unique",
+    "if ($testNames.Count -eq 0) { throw \"pipeline test registry discovery returned no tests\" }",
+    TESTS_PER_SHARD_PLACEHOLDER,
+    SOLO_PLACEHOLDER,
+    "$shards = @()",
+    "for ($offset = 0; $offset -lt $testNames.Count; $offset += $testsPerShard) {",
+    "$end = [Math]::Min($offset + $testsPerShard, $testNames.Count)",
+    "$window = @($testNames[$offset..($end - 1)])",
+    "$windowIndex = [int]($offset / $testsPerShard)",
+    "$shared = @($window | Where-Object { $_ -notmatch $soloPattern })",
+    "if ($shared.Count -gt 0) {",
+    "$shards += @{ Name = (\"exact-{0:D2}\" -f $windowIndex); Filter = ($shared -join ':'); Index = $shards.Count }",
+    "}",
+    "$solo = @($window | Where-Object { $_ -match $soloPattern })",
+    "for ($i = 0; $i -lt $solo.Count; $i++) {",
+    "$shards += @{ Name = (\"exact-{0:D2}-solo{1}\" -f $windowIndex, ($i + 1)); Filter = $solo[$i]; Index = $shards.Count }",
+    "}",
+    "}",
+    "$shardedNames = @($shards | ForEach-Object { $_.Filter -split ':' })",
+    "if ($shardedNames.Count -ne $testNames.Count -or",
+    "@($shardedNames | Sort-Object -Unique).Count -ne $testNames.Count -or",
+    "@(Compare-Object $testNames ($shardedNames | Sort-Object -Unique)).Count -ne 0) {",
+    "throw \"pipeline shards do not cover each test exactly once (tests=$($testNames.Count) sharded=$($shardedNames.Count))\"",
+    "}",
+    "Write-Output (\"pipeline shard plan: tests={0} shards={1}\" -f $testNames.Count, $shards.Count)",
     "$partCount = 3",
     "$part = [int]'${{ matrix.part }}'",
     "$weightTable = Get-Content -LiteralPath 'tools\\testing\\pipeline_test_weights.json' -Raw | ConvertFrom-Json -AsHashtable",
@@ -65,21 +114,119 @@ EXPECTED_PLANNING_LOGIC = (
     "$partOf[$planned.Name] = $target + 1",
     "$partLoad[$target] += $planned.Weight",
     "}",
+    "$partShardCounts = @(1..$partCount | ForEach-Object { $number = $_; @($shards | Where-Object { $partOf[$_.Name] -eq $number }).Count })",
+    "if ($partOf.Count -ne $shards.Count -or",
+    "(($partShardCounts | Measure-Object -Sum).Sum) -ne $shards.Count -or",
+    "@($partShardCounts | Where-Object { $_ -eq 0 }).Count -ne 0) {",
+    "throw \"pipeline parts do not cover each shard exactly once (shards=$($shards.Count) parts=$($partShardCounts -join ','))\"",
+    "}",
+    "$myShards = @($shards | Where-Object { $partOf[$_.Name] -eq $part })",
+    "$myTestNames = @($myShards | ForEach-Object { $_.Filter -split ':' })",
+    "Write-Output (\"PIPELINE-PART-PLAN part={0}/{1} shards={2}/{3} tests={4}/{5} estimatedSeconds={6}\" -f $part, $partCount, $myShards.Count, $shards.Count, $myTestNames.Count, $testNames.Count, ($partLoad[$part - 1] / 1000))",
+    "Write-Output (\"PIPELINE-PART-SHARDS part={0} {1}\" -f $part, (($myShards | ForEach-Object { $_.Name }) -join ','))",
+    "Write-Output (\"PIPELINE-PART-TESTS part={0} {1}\" -f $part, ($myTestNames -join ','))",
+    "function Invoke-BoundedPipelineShard {",
+    "param(",
+    "[string]$Name,",
+    "[string[]]$Arguments,",
+    "[string]$OutputPath,",
+    "[int]$WaitMilliseconds = 240000",
+    ")",
+    "$psi = [System.Diagnostics.ProcessStartInfo]::new()",
+    "$psi.FileName = (Resolve-Path \"tests\\build-ci-pipeline\\release\\pipeline_tests.exe\").Path",
+    "$psi.WorkingDirectory = $env:GITHUB_WORKSPACE",
+    "$psi.UseShellExecute = $false",
+    "$psi.RedirectStandardOutput = $true",
+    "$psi.RedirectStandardError = $true",
+    "foreach ($argument in $Arguments) {",
+    "[void]$psi.ArgumentList.Add($argument)",
+    "}",
+    "$process = [System.Diagnostics.Process]::new()",
+    "$process.StartInfo = $psi",
+    "if (-not $process.Start()) { throw \"failed to start pipeline shard $Name\" }",
+    "$stdoutTask = $process.StandardOutput.ReadToEndAsync()",
+    "$stderrTask = $process.StandardError.ReadToEndAsync()",
+    "$timedOut = -not $process.WaitForExit($WaitMilliseconds)",
+    "if ($timedOut) {",
+    "try { $process.Kill($true) } catch { }",
+    "}",
+    "$process.WaitForExit()",
+    "$stdout = $stdoutTask.GetAwaiter().GetResult()",
+    "$stderr = $stderrTask.GetAwaiter().GetResult()",
+    "$combined = $stdout + $stderr",
+    "Set-Content -Path $OutputPath -Value $combined -Encoding utf8",
+    "return [pscustomobject]@{",
+    "ExitCode = if ($timedOut) { 124 } else { $process.ExitCode }",
+    "Output = $combined",
+    "TimedOut = $timedOut",
+    "}",
+    "}",
+    "foreach ($shard in $myShards) {",
+    "$shardOutput = Join-Path $env:RUNNER_TEMP (\"pipeline-tests-{0}.txt\" -f $shard.Name)",
+    "Add-Content -Path $suiteOutput -Value (\"===== SHARD {0} FILTER {1} =====\" -f $shard.Name, $shard.Filter)",
+    "$shardResult = Invoke-BoundedPipelineShard -Name $shard.Name -Arguments @(\"--gtest_filter=$($shard.Filter)\") -OutputPath $shardOutput",
+    "Add-Content -Path $suiteOutput -Value (\"===== SHARD {0} FILTER {1} EXIT {2} =====\" -f $shard.Name, $shard.Filter, $shardResult.ExitCode)",
+    "Add-Content -Path $suiteOutput -Value $shardResult.Output",
+    "Write-Output (\"===== SHARD {0} FILTER {1} EXIT {2} =====\" -f $shard.Name, $shard.Filter, $shardResult.ExitCode)",
+    "Write-Output $shardResult.Output",
+    "$shardExit = $shardResult.ExitCode",
+    "if ($shardResult.TimedOut) {",
+    "throw \"pipeline_tests shard $($shard.Name) exceeded 240 seconds (exit 124; output retained)\"",
+    "}",
+    "if ($shardExit -notin @(0, 1)) {",
+    "throw \"pipeline_tests shard $($shard.Name) failed outside the expected-failure contract (exit $shardExit)\"",
+    "}",
+    "}",
 )
 
-
-def _planning_logic(part_job: str) -> tuple[str, ...]:
-    lines = [line.strip() for line in part_job.splitlines()]
-    start = next(i for i, line in enumerate(lines) if line.startswith("$partCount = "))
-    end = next(i for i, line in enumerate(lines) if line.startswith("$partLoad[$target] +=")) + 1
-    logic = [line for line in lines[start : end + 1] if line and not line.startswith("#")]
-    return tuple(logic)
+STEP_NAME = "Run pipeline_tests --check-golden (bounded shards)"
+# One PowerShell single-quoted literal and nothing after it: a lone quote inside would be the end of
+# the string and the start of more code (`$soloPattern = 'x'; $testsPerShard = 240; $y = 'z'`).
+_SOLO_SHAPE = re.compile(r"\$soloPattern = '(?:[^']|'')*'")
+_TESTS_PER_SHARD_SHAPE = re.compile(r"\$testsPerShard = \d+")
 
 
-def _assignments_to(part_job: str, variable: str) -> int:
-    """Lines of the step that assign `$variable` or one of its elements (`=`, `+=`, ...)."""
-    pattern = rf"(?m)^\s*\${variable}(\[[^\]\n]*\])?\s*(\+=|-=|\*=|/=|=)(?!=)"
-    return len(re.findall(pattern, part_job))
+def _step_span(lines: list[str]) -> tuple[int, int]:
+    """First and last line index of the step's pinned body, or ValueError when the step moved."""
+    named = [i for i, line in enumerate(lines) if line.strip() == f"- name: {STEP_NAME}"]
+    if len(named) != 1:
+        raise ValueError(f"step {STEP_NAME!r} must appear exactly once in the job (found {len(named)})")
+    step_end = next((i for i in range(named[0] + 1, len(lines)) if lines[i].startswith("      - name:")), len(lines))
+    run = next((i for i in range(named[0] + 1, step_end) if lines[i].strip() == "run: |"), None)
+    if run is None:
+        raise ValueError("the pipeline step lost its `run: |` block")
+    loop = next((i for i in range(run + 1, step_end) if lines[i].strip() == "foreach ($shard in $myShards) {"), None)
+    if loop is None:
+        raise ValueError("the pipeline step lost its `foreach ($shard in $myShards) {` loop")
+    indent = lines[loop][: len(lines[loop]) - len(lines[loop].lstrip())]
+    close = next((i for i in range(loop + 1, step_end) if lines[i] == indent + "}"), None)
+    if close is None:
+        raise ValueError("the `foreach ($shard in $myShards)` loop has no closing brace at its own indent")
+    return run + 1, close
+
+
+def _step_body(part_job: str) -> tuple[str, ...]:
+    lines = part_job.splitlines()
+    try:
+        first, last = _step_span(lines)
+    except ValueError as error:
+        return (f"MISSING: {error}",)
+    body: list[str] = []
+    for line in lines[first : last + 1]:
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        if _SOLO_SHAPE.fullmatch(text):
+            text = SOLO_PLACEHOLDER
+        elif _TESTS_PER_SHARD_SHAPE.fullmatch(text):
+            text = TESTS_PER_SHARD_PLACEHOLDER
+        body.append(text)
+    return tuple(body)
+
+
+def _guard_flags(part_job: str) -> bool:
+    """True when the guard would refuse this job text."""
+    return _step_body(part_job) != EXPECTED_STEP_BODY
 
 
 def _solo_pattern(part_job: str) -> str:
@@ -192,8 +339,8 @@ class PipelinePartBudgetTests(unittest.TestCase):
         # Shards carry their plan index, which breaks weight ties the same way here and there.
         self.assertEqual(self.part_job.count("Index = $shards.Count"), 2)
 
-    def test_the_planning_logic_is_exactly_what_the_mirror_repeats(self) -> None:
-        self.assertEqual(_planning_logic(self.part_job), EXPECTED_PLANNING_LOGIC)
+    def test_the_step_body_is_exactly_what_the_mirror_repeats(self) -> None:
+        self.assertEqual(_step_body(self.part_job), EXPECTED_STEP_BODY)
 
     def test_a_scaled_weight_in_the_workflow_is_refused(self) -> None:
         # adversary A1: `$planned.Weight = $weight * 0.4` priced part 3 at 2,541 s while every other
@@ -207,7 +354,7 @@ class PipelinePartBudgetTests(unittest.TestCase):
         ):
             with self.subTest(mutated=mutated):
                 self.assertIn(original, self.part_job)
-                self.assertNotEqual(_planning_logic(self.part_job.replace(original, mutated, 1)), EXPECTED_PLANNING_LOGIC)
+                self.assertTrue(_guard_flags(self.part_job.replace(original, mutated, 1)))
 
     def test_a_fractional_default_is_refused(self) -> None:
         # adversary A2: PowerShell `[long]0.5` is 0 while Python kept 0.5; every number must be a
@@ -234,20 +381,6 @@ class PipelinePartBudgetTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             plan.load_weights_from_text(base.replace("[1, 2, 3]", "[1, 2, 9223372036854775808]") % (1400, 3000))
 
-    def test_nothing_else_assigns_the_variables_the_selection_depends_on(self) -> None:
-        # adversary pass 2 A2: a later `$myShards = @($shards)` ran every shard on every part
-        # and every pinned line, the cover proof and the budget still passed.
-        for variable, expected in (("myShards", 1), ("partOf", 2), ("partLoad", 2), ("shards", 3), ("planOrder", 1), ("part", 1), ("partCount", 1)):
-            with self.subTest(variable=variable):
-                self.assertEqual(_assignments_to(self.part_job, variable), expected)
-        self.assertEqual(self.part_job.count("foreach ($shard in $myShards) {"), 1)
-        mutated = self.part_job.replace(
-            "$myShards = @($shards | Where-Object { $partOf[$_.Name] -eq $part })",
-            "$myShards = @($shards | Where-Object { $partOf[$_.Name] -eq $part })\n          $myShards = @($shards)",
-            1,
-        )
-        self.assertEqual(_assignments_to(mutated, "myShards"), 2)
-
     def test_the_solo_match_is_case_insensitive_like_powershell(self) -> None:
         # adversary pass 2 A3: PowerShell -match ignores case, so does the mirror.
         pattern = _solo_pattern(self.part_job)
@@ -263,6 +396,94 @@ class PipelinePartBudgetTests(unittest.TestCase):
         flat = [name for key in sorted(per_window) for name in per_window[key]]
         self.assertEqual(sorted(flat), sorted(self.test_names))
         self.assertTrue(all(len(v) <= 12 for v in per_window.values()))
+
+
+def _insert_before(part_job: str, anchor: str, new_line: str) -> str:
+    """Put `new_line` on its own line, at the step's indentation, just before the line starting `anchor`."""
+    marker = "          " + anchor
+    assert marker in part_job, f"no line starts with {anchor!r}"
+    return part_job.replace(marker, "          " + new_line + "\n" + marker, 1)
+
+
+class PipelineStepBodyPinTests(unittest.TestCase):
+    """Adversary r1 pass 3 (A1, A2): a NEW line anywhere in the step body changed the plan unseen."""
+
+    # (label, line the new line goes before, the new line)
+    INSERTIONS = (
+        ("A1 upper-case $MYSHARDS", "$myTestNames = ", "$MYSHARDS = @($shards)"),
+        ("A1 $script: scope", "$myTestNames = ", "$script:myShards = @($shards)"),
+        ("A1 Set-Variable", "$myTestNames = ", "Set-Variable -Name myShards -Value $shards"),
+        ("A1 New-Variable", "$myTestNames = ", "New-Variable -Name myShards -Value $shards -Force"),
+        ("A2 second $soloPattern before $shards", "$shards = @()", "$soloPattern = '^$'"),
+        ("A2 $testsPerShard *= before $shards", "$shards = @()", "$testsPerShard *= 20"),
+        ("case-variant $TestsPerShard", "$shards = @()", "$TestsPerShard = 240"),
+        ("second $soloPattern after $shards", "for ($offset = 0;", "$soloPattern = '^$'"),
+        ("second $soloPattern before the first", "$soloPattern = '", "$soloPattern = '^$'"),
+        ("second $testsPerShard", "$shards = @()", "$testsPerShard = 240"),
+        ("a pinned name reassigned late", "$myTestNames = ", "$partOf = @{}"),
+        ("a function shadowing a cmdlet", "$shards = @()", "function Sort-Object { $input }"),
+    )
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.part_job = _workflow_job(_read_workflow(), "windows-product-oracles-part")
+        cls.lines = cls.part_job.splitlines()
+        cls.first, cls.last = _step_span(cls.lines)
+        cls.code = [
+            i for i in range(cls.first, cls.last + 1) if cls.lines[i].strip() and not cls.lines[i].strip().startswith("#")
+        ]
+
+    def _flags(self, lines: list[str]) -> bool:
+        return _guard_flags("\n".join(lines))
+
+    def test_the_real_workflow_is_accepted(self) -> None:
+        self.assertFalse(_guard_flags(self.part_job))
+
+    def test_a_line_added_to_the_step_is_refused_whatever_its_spelling(self) -> None:
+        for label, anchor, new_line in self.INSERTIONS:
+            with self.subTest(label):
+                self.assertTrue(_guard_flags(_insert_before(self.part_job, anchor, new_line)))
+
+    def test_a_second_statement_on_the_solo_pattern_line_is_refused(self) -> None:
+        smuggled = self.part_job.replace(
+            "$soloPattern = '^(", "$soloPattern = 'x'; $testsPerShard = 240; $y = '^(", 1
+        )
+        self.assertNotEqual(smuggled, self.part_job)
+        self.assertTrue(_guard_flags(smuggled))
+
+    def test_every_body_line_is_pinned_against_deletion_duplication_and_case_change(self) -> None:
+        for index in self.code:
+            line = self.lines[index]
+            with self.subTest(line=line.strip()[:70]):
+                self.assertTrue(self._flags(self.lines[:index] + self.lines[index + 1 :]), "deleted")
+                if index != self.last:  # a copy of the closing brace lands after the pinned body
+                    self.assertTrue(self._flags(self.lines[: index + 1] + [line] + self.lines[index + 1 :]), "duplicated")
+                if line.swapcase() != line:
+                    self.assertTrue(self._flags(self.lines[:index] + [line.swapcase()] + self.lines[index + 1 :]), "case changed")
+
+    def test_a_statement_inserted_at_any_position_in_the_body_is_refused(self) -> None:
+        for position in range(self.first, self.last + 1):
+            with self.subTest(position=position):
+                self.assertTrue(self._flags(self.lines[:position] + ["          $injected = 1"] + self.lines[position:]))
+
+    def test_what_a_card_may_change_stays_accepted(self) -> None:
+        # A card that adds a solo class edits the regex; comments and blank lines are not code.
+        wider = self.part_job.replace("|^Debayered16ReconReuse\\.", "|^Debayered16ReconReuse\\.|^ANewSoloClass\\.", 1)
+        self.assertNotEqual(wider, self.part_job)
+        self.assertFalse(_guard_flags(wider))
+        self.assertFalse(_guard_flags(_insert_before(self.part_job, "$shards = @()", "# a comment")))
+        self.assertFalse(_guard_flags(_insert_before(self.part_job, "$shards = @()", "")))
+        # The shape of $testsPerShard is free here; test_the_workflow_uses_the_table_the_mirror_prices
+        # holds the value itself at 12.
+        self.assertFalse(_guard_flags(self.part_job.replace("$testsPerShard = 12", "$testsPerShard = 14", 1)))
+
+    def test_a_step_that_moved_or_lost_its_loop_is_refused(self) -> None:
+        for original, mutated in (
+            (STEP_NAME, STEP_NAME + " renamed"),
+            ("foreach ($shard in $myShards) {", "foreach ($shard in @($myShards)) {"),
+        ):
+            with self.subTest(original=original):
+                self.assertTrue(_guard_flags(self.part_job.replace(original, mutated, 1)))
 
 
 if __name__ == "__main__":
