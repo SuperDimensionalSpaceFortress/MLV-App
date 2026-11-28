@@ -300,14 +300,19 @@ QString playbackHandlingBody( const QString & source )
 // prove each handled case on fixtures). Also not handled, in the model above: frame numbers near the top of the int range
 // (EveryFrameModel's `target + 1` lookahead request and the `last - first + 1` frame count in
 // assertEveryFramePresentedOnceInOrder overflow signed int when `last` is INT_MAX; adversary pass 11 A5). No test reaches it: every
-// model range here is small and fixed.
-// r9 re-check (Grok CoS G12) against the adversary advisories still OPEN on this card: two are in these test helpers, both minor and
-// introduced, both listed above as not handled and owned by EVERY-FRAME-TARGET-GATE-WIRING-SPLICE-HARDEN-1: pass 11 A1 (the bare
-// CR, stripComments) and pass 11 A5 (the int range, EveryFrameModel). Fixed here earlier: pass 8 A1, pass 9 A1 (a char literal
-// with a user-defined-literal suffix in front of a quote), pass 9 A2 (the `<%` / `%>` digraph braces in enclosingBlockHeaders),
-// pass 10 A1 (a raw-string prefix after a char literal: the floor) and pass 10 A2 (a next signature inside a comment or literal in
-// functionBody). The rest are product-path gaps in MainWindow.cpp / GpuDisplayWindow.cpp / RenderFrameThread.cpp, outside these
-// helpers: pass 8 A2 / pass 9 A3 / pass 10 A3, pass 6 A3, pass 7 A5 / pass 9 A4 / pass 10 A4, and pass 11 A2 / A3 / A4.
+// model range here is small and fixed. Also not handled, in functionBody above: an empty signature or next signature (an empty
+// needle matches at every offset, including the end of the source, one past indexOfInCode's code mask, so
+// `functionBody( QString(), QString(), QString() )` reads codeAt[0] of an empty mask; adversary pass 12 A3). Every caller passes a
+// non-empty literal signature into a non-empty source.
+// r9 re-check (Grok CoS G12), done after the last adversary pass (pass 12 on 03ff5c86), against the advisories still OPEN on
+// this card: three are in these test helpers, all minor and introduced, all listed above as not handled and owned by
+// EVERY-FRAME-TARGET-GATE-WIRING-SPLICE-HARDEN-1: the bare CR in stripComments (pass 11 A1 = pass 12 A1), the int range in
+// EveryFrameModel (pass 11 A5 = pass 12 A2) and the empty signature in functionBody (pass 12 A3). Fixed here earlier: pass 8
+// A1, pass 9 A1 (a char literal with a user-defined-literal suffix in front of a quote), pass 9 A2 (the `<%` / `%>` digraph
+// braces in enclosingBlockHeaders), pass 10 A1 (a raw-string prefix after a char literal: the floor) and pass 10 A2 (a next
+// signature inside a comment or literal in functionBody). The rest are product-path gaps in MainWindow.cpp /
+// GpuDisplayWindow.cpp / RenderFrameThread.cpp, outside these helpers: pass 8 A2 / pass 9 A3 / pass 10 A3, pass 6 A3, pass 7 A5
+// / pass 9 A4 / pass 10 A4, pass 11 A2 / A3 / A4, and pass 12 A4 / A5 (= pass 11 A2 / A3).
 int skipLineSplices( const QString & s, int i )
 {
     const int n = s.size();
