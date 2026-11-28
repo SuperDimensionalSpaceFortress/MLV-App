@@ -321,16 +321,29 @@ $LegScript = (Resolve-Path -LiteralPath $LegScript).ProviderPath
 # (fail CLOSED), never "outside". Returns '' when every file is outside, else the reason.
 function Get-OfflineSeamLocationRefusal([string[]]$Files) {
     $dirs = [Collections.Generic.List[string]]::new()
+    # r4 (adversary r3 pass 9 A2): a link's TARGET is a place the stand-in lives in, so it gets the same .git walk as the stand-in's own path (every ancestor of the target, and every link on THAT way), not only git's
+    # opinion; a worklist with a visited set, so a link that points back at itself ends
+    $pending = [Collections.Generic.Queue[object]]::new()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     try {
         foreach ($f in $Files) {
-            $cur = [IO.Path]::GetFullPath($f)
-            $dirs.Add([IO.Path]::GetDirectoryName($cur))
+            $full = [IO.Path]::GetFullPath($f)
+            $dirs.Add([IO.Path]::GetDirectoryName($full))
+            $pending.Enqueue(@($full, $f))
+        }
+        while ($pending.Count -gt 0) {
+            $work = $pending.Dequeue(); $cur = $work[0]; $f = $work[1]
             while ($cur) {
+                if (-not $seen.Add($cur)) { break }   # (an ancestor already walked, by this stand-in or another, was answered then)
                 if (Test-Path -LiteralPath (Join-Path $cur '.git')) { return "'$cur' holds a .git entry, so '$f' is inside a git work tree" }
                 $item = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
                 if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
                     $final = $item.ResolveLinkTarget($true)   # the link's last target: a junction or symlink into a work tree is a place in that work tree
-                    if ($null -ne $final) { $dirs.Add($(if ($final -is [IO.DirectoryInfo]) { $final.FullName } else { $final.DirectoryName })) }
+                    if ($null -ne $final) {
+                        $targetDir = $(if ($final -is [IO.DirectoryInfo]) { $final.FullName } else { $final.DirectoryName })
+                        $dirs.Add($targetDir)
+                        $pending.Enqueue(@($targetDir, "$f (through the link '$cur')"))
+                    }
                 }
                 $cur = [IO.Path]::GetDirectoryName($cur)   # $null at a root: the loop ends
             }
@@ -349,7 +362,8 @@ function Get-OfflineSeamLocationRefusal([string[]]$Files) {
             $g = & $module { param($d) Invoke-DvGit -RepoRoot $d -GitArgs @('rev-parse', '--is-inside-work-tree') } $dir
             $said = [Text.Encoding]::UTF8.GetString([byte[]]$g.bytes).Trim()
             if ($g.exitCode -eq 0 -and $said -ceq 'true') { return "'$dir' is inside a git work tree" }
-            if (-not ($g.exitCode -eq 128 -and [string]$g.stderr -match 'not a git repository')) {
+            # r4 (adversary r3 pass 9 A2): git's own answer is a LINE that starts "fatal: not a git repository"; the same words inside another message ("error: key does not contain a section: not a git repository") are not it
+            if (-not ($g.exitCode -eq 128 -and [string]$g.stderr -cmatch '(?m)^fatal: not a git repository')) {
                 return "git could not show that '$dir' is outside every git work tree (exit $($g.exitCode): $(([string]$g.stderr -replace '\s+', ' ').Trim()))"
             }
         }
@@ -371,6 +385,24 @@ if ($umRunIsReal -and $ExportBudgetSpecReadFault) { Stop-Usage '-ExportBudgetSpe
 if ($umRunIsReal -and $ExportBudgetSpecReadDelaySec -gt 0) { Stop-Usage '-ExportBudgetSpecReadDelaySec is an offline test seam: with the real um-run.ps1 the export budget preflight reads the spec as it is' }
 if ($umRunIsReal -and $CommittedSpecRepoRoot) { Stop-Usage '-CommittedSpecRepoRoot is an offline test seam: with the real um-run.ps1 the committed-spec preflight reads this checkout''s own HEAD' }
 if ($SkipCommittedSpecPreflight -and $CommittedSpecRepoRoot) { Stop-Usage '-SkipCommittedSpecPreflight contradicts -CommittedSpecRepoRoot: that seam asks for the committed-spec preflight' }
+# VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r4 (Grok CoS G4): the two path seams (-CommittedSpecRepoRoot, -CommittedSpecScript) are made absolute below with .NET (lexically, no file-system work before -DeadlineUtc) and
+# handed to a child that starts in the PROCESS directory. A spelling that PowerShell reads one way and .NET or that child reads another is refused here, each with a typed reason, before anything is claimed:
+#   SEAM_PATH_DRIVE_RELATIVE  C:rel, C:    (that drive's own current directory: a process state PowerShell's location does not track)
+#   SEAM_PATH_TILDE           ~, ~\x, ~/x  (PowerShell's home; .NET reads it as a directory literally named ~)
+#   SEAM_PATH_PSDRIVE         Env:\x, Temp:\x, HKLM:\..., Provider\FileSystem::C:\x, and a one-letter PSDrive that is not a drive of this host (a place only this PowerShell session can resolve)
+function Get-SeamPathSpellingRefusal([string]$Path) {
+    if ($Path -match '^[A-Za-z]:(?![\\/])') { return 'SEAM_PATH_DRIVE_RELATIVE' }
+    if ($Path -match '^~(?:$|[\\/])') { return 'SEAM_PATH_TILDE' }
+    $letter = ''
+    $rest = $Path
+    if ($Path -match '^(?:[\\/]{2}\?[\\/])?([A-Za-z]):[\\/]') { $letter = $Matches[1]; $rest = $Path.Substring($Matches[0].Length) }   # (the drive's own colon, plain or in the \\?\C:\ form, is not a provider's)
+    if ($rest.Contains(':')) { return 'SEAM_PATH_PSDRIVE' }
+    if ($letter -and (Get-PSDrive -Name $letter -ErrorAction SilentlyContinue) -and -not ([IO.DriveInfo]::GetDrives() | Where-Object { $_.Name -ieq "${letter}:\" })) { return 'SEAM_PATH_PSDRIVE' }
+    ''
+}
+foreach ($seam in @(@('-CommittedSpecRepoRoot', $CommittedSpecRepoRoot), @('-CommittedSpecScript', $CommittedSpecScript))) {
+    if ($seam[1]) { $why = Get-SeamPathSpellingRefusal $seam[1]; if ($why) { Stop-Usage "$why $($seam[0]) '$($seam[1])' is spelled in a way PowerShell, .NET and the preflight child do not resolve alike: give a full path or a path relative to the current location" } }
+}
 # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the real leg refuses an uncommitted spec (LEG_SPEC_NOT_COMMITTED, Invoke-VenueLeg.ps1, outside -OfflineTestMode, which this script never forwards) only
 # after the lease is open, so the preflight is ON in every mode. r2 (adversary A1, A2): it is turned off only by the explicit -SkipCommittedSpecPreflight; NOTHING is inferred from the bytes or the path of
 # the um-run or leg script (a complete second checkout whose scripts differ by line endings classified as a stand-in and silently ran with no gate). The repo whose HEAD it reads is the one THE LEG THAT RUNS

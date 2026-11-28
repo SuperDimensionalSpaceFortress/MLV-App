@@ -6313,7 +6313,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         r = self._run_from_ps_location(args, e, self.tmp, ROOT)
         self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
         self.assertTrue(log.exists(), "the preflight child ran")
-        self.assertEqual(log.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1].lower().rstrip("\\"), str(self.tmp).lower().rstrip("\\"))
+        # (r4, hosted CI: TEMP may be spelled with an 8.3 short name -- C:\Users\RUNNER~1 -- which .NET's GetFullPath keeps and PowerShell's location may give long: the same directory either way, so compare what each names)
+        spelled = log.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1].rstrip("\\")
+        self.assertEqual(os.path.normcase(os.path.realpath(spelled)), os.path.normcase(os.path.realpath(self.tmp)))
 
     def test_legspec_committed_r3_a_git_that_cannot_answer_refuses_the_switch(self) -> None:
         # fail CLOSED: with no git on PATH the location is unknown, which is not "outside"
@@ -6322,6 +6324,106 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         e = dict(e)
         e["PATH"] = str(Path(PWSH).parent) + os.pathsep + str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32")
         self._assert_switch_refused_by_location("no git on PATH", args, e, needle="git could not show that")
+
+    # ---- r4 (adversary r3 pass 9 A1, A2; Grok CoS 7232347897 G2, G4) ----
+    # A2: git's "not a git repository" was read as a substring of its stderr, from a git that still honoured the caller's GIT_CONFIG_* variables, so a forged config key printed that text with exit 128 and
+    # a link into a checkout was taken for "outside"; a link's TARGET was only asked of git, never walked for a .git entry the way the stand-in's own path is.
+    _FORGED_CONFIG_ENV = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "not a git repository", "GIT_CONFIG_VALUE_0": "true"}
+
+    def _junction(self, link: Path, target: Path) -> None:
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, timeout=60)
+        if made.returncode != 0:
+            self.skipTest("cannot create a directory junction here: " + made.stdout + made.stderr)
+
+    def test_legspec_committed_r4_a2_a_junction_into_a_checkout_is_refused_whatever_git_is_made_to_say(self) -> None:
+        for label, forged in (("clean environment", {}), ("forged GIT_CONFIG_COUNT/KEY_0/VALUE_0", self._FORGED_CONFIG_ENV)):
+            for target_kind in ("checkout root", "a directory inside the checkout"):
+                with self.subTest(env=label, target=target_kind):
+                    wt = self._git_work_tree(f"wt-r4-{abs(hash((label, target_kind)))}")
+                    target = wt if target_kind == "checkout root" else wt / "inner"
+                    target.mkdir(exist_ok=True)
+                    (target / "fake-umrun.ps1").write_bytes((self.tmp / "fake-umrun.ps1").read_bytes())
+                    link = self.case / f"junction-r4-{abs(hash((label, target_kind)))}"
+                    self._junction(link, target)
+                    self._reset_committed_case()
+                    args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+                    e = {**e, **forged}
+                    args[args.index("-UmRunScript") + 1] = str(link / "fake-umrun.ps1")
+                    # the .git walk on the link's target is what names it (git's own answer is the second opinion, and a forged one)
+                    self._assert_switch_refused_by_location("stand-in reached through a junction into a checkout", args, e, needle="holds a .git entry")
+
+    def test_legspec_committed_r4_a2_invoke_dvgit_gives_git_none_of_the_callers_git_config_variables(self) -> None:
+        broken = self.case / "broken.gitconfig"
+        broken.write_text("[unterminated\n", encoding="utf-8")
+        cases = {"count-key-value": self._FORGED_CONFIG_ENV, "parameters": {"GIT_CONFIG_PARAMETERS": "'not a git repository'='true'"},
+                 "global": {"GIT_CONFIG_GLOBAL": str(broken)}, "system": {"GIT_CONFIG_SYSTEM": str(broken)}, "nosystem": {"GIT_CONFIG_NOSYSTEM": "1"}}
+        script = (f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                  f"$g = & (Get-Module DualVenueRunner) {{ Invoke-DvGit -RepoRoot '{psq(ROOT)}' -GitArgs @('rev-parse', '--is-inside-work-tree') }}\n"
+                  "'{0}|{1}' -f $g.exitCode, [Text.Encoding]::UTF8.GetString([byte[]]$g.bytes).Trim()")
+        for label, extra in cases.items():
+            with self.subTest(variable=label):
+                e = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, **extra}
+                r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180, env=e)
+                self.assertEqual(r.stdout.strip(), "0|true", r.stdout + r.stderr)
+
+    def test_legspec_committed_r4_a2_only_a_line_that_starts_with_the_fatal_text_is_git_saying_it_is_outside(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("(?m)^fatal: not a git repository", text)
+        self.assertNotRegex(text, r"(?i)-c?match\s+'not a git repository'")
+
+    # A1: the preflight and the leg that runs must name ONE repo for one leg script: a directory whose name holds a wildcard character (repo[1]) was literal in the preflight and a pattern in the leg (repo1)
+    def test_legspec_committed_r4_a1_the_preflight_and_the_leg_resolve_the_same_repo_for_a_bracketed_directory(self) -> None:
+        plain, bracketed = self.case / "repo1", self.case / "repo[1]"
+        for repo in (plain, bracketed):
+            (repo / "tools" / "profiling" / "dual-venue").mkdir(parents=True)
+        leg_dir = bracketed / "tools" / "profiling" / "dual-venue"
+        pre = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "Test-LegSpecCommitted.ps1"), "-LegSpecSha256", "0" * 64,
+                              "-LegScript", str(leg_dir / "Invoke-VenueLeg.ps1")], capture_output=True, text=True, timeout=180)
+        found = re.search(r"root=(.*)$", pre.stdout.strip(), re.M)
+        self.assertIsNotNone(found, pre.stdout + pre.stderr)
+        # the leg's own line, evaluated as the leg evaluates it (-RepoRoot not given, $here = the leg script's directory)
+        line = next(x for x in LEG.read_text(encoding="utf-8").splitlines() if x.startswith("if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = "))
+        leg = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                              f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking; $here = '{psq(leg_dir)}'; $RepoRoot = ''\n{line}\n$RepoRoot"],
+                             capture_output=True, text=True, timeout=180)
+        self.assertEqual(leg.returncode, 0, leg.stdout + leg.stderr)
+        self.assertEqual(found.group(1).strip().lower(), str(bracketed).lower(), pre.stdout)
+        self.assertEqual(leg.stdout.strip().lower(), found.group(1).strip().lower(), "the leg ran in another repo than the one the preflight read")
+
+    # G4: a seam path is judged as the PowerShell the batch runs in resolves it, and some spellings resolve elsewhere in the bounded child: a drive-relative C:rel (that drive's own current directory), ~
+    # (the PowerShell home, a literal directory name to .NET), a PSDrive (Env:\x, Temp:\x) or a provider-qualified path. Each is refused with its own typed reason, before anything is claimed.
+    def test_legspec_committed_r4_g4_a_seam_path_in_a_spelling_that_resolves_elsewhere_is_refused_with_a_typed_reason(self) -> None:
+        spellings = {"drive-relative": ("C:rel\\x", "SEAM_PATH_DRIVE_RELATIVE"), "drive-only": ("C:", "SEAM_PATH_DRIVE_RELATIVE"), "tilde": ("~\\x", "SEAM_PATH_TILDE"), "tilde-alone": ("~", "SEAM_PATH_TILDE"),
+                     "tilde-forward": ("~/x", "SEAM_PATH_TILDE"), "env-psdrive": ("Env:\\x", "SEAM_PATH_PSDRIVE"), "registry-psdrive": ("HKLM:\\Software", "SEAM_PATH_PSDRIVE"),
+                     "named-psdrive": ("Temp:\\x", "SEAM_PATH_PSDRIVE"), "provider-qualified": ("Microsoft.PowerShell.Core\\FileSystem::" + str(ROOT), "SEAM_PATH_PSDRIVE")}
+        for flag in ("-CommittedSpecRepoRoot", "-CommittedSpecScript"):
+            for label, (spelled, code) in spellings.items():
+                with self.subTest(seam=flag, spelling=label):
+                    self._reset_committed_case()
+                    args, e = self.batch_cmd([self._COMMITTED_SPEC], flag, spelled, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+                    r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+                    self._assert_nothing_claimed_or_leased(f"{flag} {spelled}", r)
+                    self.assertIn(f"BATCH_USAGE {code}", r.stderr)
+                    self.assertIn(flag, r.stderr)
+
+    def test_legspec_committed_r4_g4_a_single_letter_psdrive_that_dotnet_does_not_know_is_refused(self) -> None:
+        letter = next(c for c in "QPXYWVU" if not Path(f"{c}:\\").exists())
+        for flag in ("-CommittedSpecRepoRoot", "-CommittedSpecScript"):
+            with self.subTest(seam=flag):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], flag, f"{letter}:\\x", *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+                runner_at = args.index("-File") + 1
+                command = (f"New-PSDrive -Name {letter} -PSProvider FileSystem -Root '{psq(self.tmp)}' | Out-Null; & '{psq(args[runner_at])}' "
+                           + " ".join(a if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", a) else f"'{psq(a)}'" for a in args[runner_at + 1:]) + "; exit $LASTEXITCODE")
+                r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=300, env=e, cwd=str(ROOT))
+                self._assert_nothing_claimed_or_leased(f"{flag} {letter}:\\x", r)
+                self.assertIn("BATCH_USAGE SEAM_PATH_PSDRIVE", r.stderr)
+
+    def test_legspec_committed_r4_g4_plain_absolute_and_relative_seam_paths_are_still_accepted(self) -> None:
+        self._reset_committed_case()
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT), *self._hermetic_receipt_root())
+        self.assertNotIn("BATCH_USAGE SEAM_PATH_", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
 
     # adversary r2 pass 4 A2: the canonical-receipt teardown check counts only what this harness wrote, so another process's receipt in the same directory is not a false failure
     def test_legspec_committed_r2_the_receipt_state_check_ignores_files_another_process_wrote(self) -> None:

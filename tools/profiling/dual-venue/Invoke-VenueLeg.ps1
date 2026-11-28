@@ -131,7 +131,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Set') {
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = (Resolve-Path (Join-Path $here '..\..\..')).Path }
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = Resolve-DvLegRepoRoot -ScriptDirectory $here }   # (the one resolution the lease batch's committed-spec preflight shares: a literal path, so `repo[1]` is not the pattern `repo1`)
 if ([string]::IsNullOrWhiteSpace($UmRunScript)) { $UmRunScript = Join-Path $here '..\um-run.ps1' }
 # EXPORT-VENUE-LEG-1: an export leg's default generator is ..\bachelor\export-stage-job.ps1 (chosen once the spec is read, below)
 $generatorDefaulted = [string]::IsNullOrWhiteSpace($GeneratorScript)

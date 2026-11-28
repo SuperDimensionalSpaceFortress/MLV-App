@@ -509,6 +509,10 @@ function Invoke-DvGit {
     # the file instead; git reads those three from the environment BEFORE the config, so each is forced to 0 (off) below. Git for Windows' GIT_REDIRECT_STDIN / STDOUT /
     # STDERR send git's streams to a file the caller names, so they are dropped too.)
     foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|REPLACE_REF_BASE|NO_REPLACE_OBJECTS)$' -or $_ -match '^GIT_TRACE' -or $_ -match '^GIT_REDIRECT_' })) { [void]$psi.Environment.Remove($name) }
+    # (VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r4, adversary r3 pass 9 A2: and no GIT_CONFIG* variable -- GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n / GIT_CONFIG_VALUE_n, GIT_CONFIG_PARAMETERS, GIT_CONFIG_GLOBAL,
+    # GIT_CONFIG_SYSTEM, GIT_CONFIG_NOSYSTEM and the old GIT_CONFIG: a forged key made git exit 128 printing "not a git repository" inside a checkout, and a config file the caller names can set core.* / trace2 /
+    # include.path for a reader that must read the repo as the repo says. git reads its own user and system config, which no caller's environment names.)
+    foreach ($name in @($psi.Environment.Keys | Where-Object { $_ -match '^GIT_CONFIG' })) { [void]$psi.Environment.Remove($name) }
     foreach ($name in @('GIT_TRACE', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF')) { $psi.Environment[$name] = '0' }
     if (-not [string]::IsNullOrEmpty($script:DvGitTraceFile)) { $psi.Environment['GIT_TRACE'] = $script:DvGitTraceFile }
     # (r4, adversary A4 on 7c66c004: in a partial clone a read of a blob the clone lacks made git FETCH it from the promisor remote and write it into the object store, so
@@ -692,6 +696,19 @@ function Read-DvCommittedLookReceipt {
     $sha = Get-DvSha256OfBytes $blob.bytes
     if ($sha -cne $want) { return $bad }
     [pscustomobject]@{ ok = $true; present = $true; bytes = $blob.bytes; sha256 = $sha }
+}
+
+function Resolve-DvLegRepoRoot {
+    <#
+    .SYNOPSIS
+    The repo a leg script runs in: <leg script directory>\..\..\.. , resolved LITERALLY (VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r4, adversary r3 pass 9 A1).
+
+    .DESCRIPTION
+    ONE resolution for the leg itself (the leg script's -RepoRoot default) and for the lease batch's committed-spec preflight (Test-LegSpecCommitted.ps1), so they can never name two repos for one
+    leg script. A wildcard Resolve-Path read a directory called `repo[1]` as the pattern `repo1` and ran the leg in a different checkout than the one the preflight read. Throws when it does not resolve.
+    #>
+    param([Parameter(Mandatory)][string]$ScriptDirectory)
+    (Resolve-Path -LiteralPath (Join-Path $ScriptDirectory '..\..\..') -ErrorAction Stop).Path
 }
 
 function Find-DvCommittedLegSpec {
@@ -8416,7 +8433,7 @@ Export-ModuleMember -Function Test-DvOrdinalIn, Get-DvLastWrittenReceiptSha256, 
     ConvertTo-DvLfBytes, Get-DvLegSpecSha256, Get-DvDerivedBackend, Get-DvBackendNotDerivable, Read-DvContactFrames, Get-DvLegSpecShapeRefusal, Get-DvPngImageProblem, Get-DvPairedSeekVerdict, Get-DvSubjectDigest,
     Get-DvVisualViewportPixels, Get-DvVisualMeanAbsDiff, Get-DvExposureMedian, Get-DvVisualExposureStats, Get-DvExposureBand, Get-DvVisualVerdict, Get-DvVisualSourceDifference, Get-DvFrameNumber, New-DvVisualStrip, Read-DvVisualCaptures, ConvertTo-DvOneLineText, Get-DvVisualCaptureRequest, Read-DvVenueTable, ConvertFrom-DvVenueTableText, Get-DvVenueRole, Get-DvProp, Get-DvCommittedFile, Resolve-DvAdmissionSources,
     Test-DvUnderClaudeState, Test-DvLocalReceiptRoot, Read-DvClipConsent, Get-DvClipAdmission, Get-DvSmokeSummaryFields, Get-DvConformPaceProof, Get-DvConformArmVerdict, Get-DvMinPlaySeconds, Get-DvPlaybackProblems,
-    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Test-DvHostLoadRowClean, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, ConvertTo-DvMatrixHostLoadTable,Get-DvBlobById, Find-DvCommittedLegSpec, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
+    Get-DvPlaybackEvidence, Get-DvScaleEvidence, Get-DvScaleLabel, Get-DvDisplayEvidence, Get-DvUnpacedEvidence, Get-DvLookLabelEvidence, Get-DvWorkerThreadsEvidence, Get-DvPrepConflatedMoveEvidence, Get-DvReconReleaseDeferredEvidence, Get-DvDueWakeDeliveryEvidence, Get-DvWindowToggleRequestEvidence, Get-DvWindowToggleReconcileEvidence, Get-DvTeamPartitionEvidence, Get-DvLookAssistEvidence, Test-DvLookFlavorSame, Test-DvAppliedLookFlavor, Get-DvLegSetPlan, Get-DvSmokeSessionLineFields, Get-DvSmokeSessionLineRead, Get-DvLogRecordBody, Get-DvMatrixRates, Get-DvMatrixRow, Test-DvMatrixRowMeasured, Test-DvHostLoadRowClean, Get-DvMatrixMeasuredCount, Get-DvMedian, ConvertTo-DvMatrixTable, ConvertTo-DvMatrixHostLoadTable,Get-DvBlobById, Find-DvCommittedLegSpec, Resolve-DvLegRepoRoot, Read-DvCommittedLookReceipt, Read-DvEvidenceSet, Test-DvJsonEquivalent, Test-DvReceiptValid, Get-DvJobNotAfter, Get-DvUmRunNotAfterArgs, Get-DvUmRunDropVisibleUtc, Get-DvUmRunDropNotAfter, Test-DvNotAfterCoversDrop, Get-DvHealthVerdict,
     New-DvHealthProbeJobText, ConvertFrom-DvProbeStdout,
     Get-DvResultToken, Resolve-DvJobOutcome, Get-DvExportEvidence, Get-DvExportOutcome, Test-DvCriteria, Get-DvPresentMonGapVerdict, Get-DvVerbatimMetrics, Get-DvCriteriaMetrics, New-DvReceipt, Write-DvReceipt, Get-DvAcceptanceVerdict, Get-DvStoredPlaybackFieldProblems,
     Read-DvReceiptDisplayPath, New-DvDisplayPathBlock

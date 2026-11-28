@@ -81,7 +81,7 @@ def _inside_git_work_tree(path: Path) -> bool:
 def offline_tmp_root() -> str | None:
     """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r3: the `dir=` for the temp directory that holds an offline stand-in um-run / leg script.
 
-    Invoke-VenueLeaseBatch.ps1 accepts -SkipCommittedSpecPreflight only for stand-ins outside every git work tree. A lane that points TEMP into its own worktree
+    The lease batch script accepts -SkipCommittedSpecPreflight only for stand-ins outside every git work tree. A lane that points TEMP into its own worktree
     (.claude-state\\ls\\..., git-ignored but inside the work tree) would have every stand-in refused, so then the user-profile temp directory is used. None = the default
     temp directory is already outside every work tree (hosted CI)."""
     default = Path(tempfile.gettempdir()).resolve()
