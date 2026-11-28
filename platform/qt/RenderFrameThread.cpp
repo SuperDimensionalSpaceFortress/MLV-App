@@ -5409,6 +5409,7 @@ void RenderFrameThread::drawFrame( int slotIndex,
             getMlvRawFrameFloat( m_pMlvObject,
                                  frameNumber,
                                  m_gpuBilinearDebayerRawFrame.data() );
+            const double gpuBilinearRawFloatMs = ( mlv_stage_timing_now() - gpuBilinearFrameStart ) * 1000.0;
 
             QString gpuReason;
             QString rendererDescription;
@@ -5436,14 +5437,17 @@ void RenderFrameThread::drawFrame( int slotIndex,
             }
             else
             {
+                const double cpuFallbackStart = mlv_stage_timing_now();
                 debayerBasic( slot.rawImage16.data(),
                               m_gpuBilinearDebayerRawFrame.data(),
                               width,
                               height,
                               1 );
                 /* CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: this CPU debayer's total contains its own decode and
-                 * llrawproc, as a CPU Debayered16 entry's does. */
-                debayered16GpuBranchCpuDebayerMs = ( mlv_stage_timing_now() - gpuBilinearFrameStart ) * 1000.0;
+                 * llrawproc (the raw-float read), as a CPU Debayered16 entry's does, and never the failed GPU
+                 * attempt between the two (adversary 3b8a688e A1). */
+                debayered16GpuBranchCpuDebayerMs =
+                    gpuBilinearRawFloatMs + ( mlv_stage_timing_now() - cpuFallbackStart ) * 1000.0;
                 renderedDebayeredFrame = true;
                 slot.usedGpuBilinearDebayer = false;
                 slot.gpuBilinearRendererDescription = rendererDescription;
