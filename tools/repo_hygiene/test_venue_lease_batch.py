@@ -6276,6 +6276,45 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
             with self.assertRaises(RuntimeError):
                 offline_tmp_root()
 
+    def _run_from_ps_location(self, args: list, e: dict, location: Path, native_cwd: Path) -> subprocess.CompletedProcess:
+        """Run the runner from PowerShell location `location` while the PROCESS directory (what a child process inherits) is `native_cwd`."""
+        runner_at = args.index("-File") + 1
+        command = f"Set-Location -LiteralPath '{psq(location)}'; & '{psq(args[runner_at])}' " + " ".join(a if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", a) else f"'{psq(a)}'" for a in args[runner_at + 1:]) + "; exit $LASTEXITCODE"
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=300, env=e, cwd=str(native_cwd))
+
+    # adversary r3 pass 8 A1: the preflight bound the leg PowerShell resolved (relative to the PowerShell location), but the leg was dispatched as the spelled relative path in a child process that
+    # inherits the PROCESS directory: another leg ran, after the claim and the lease. The same file now is checked and run (and so is the quiet probe).
+    def test_legspec_committed_r3_a_relative_leg_script_runs_the_file_the_preflight_checked(self) -> None:
+        other = self.case / "process-dir"
+        other.mkdir()
+        marker = self.case / "ran-in-process-dir.txt"
+        for name in ("fake-leg.ps1", "fake-quiet.ps1"):
+            (other / name).write_text("Set-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'ran-in-process-dir.txt') -Value '" + name + "'\nexit 0\n", encoding="utf-8")
+        self._reset_committed_case()
+        marker.unlink(missing_ok=True)
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+        args[args.index("-LegScript") + 1] = ".\\fake-leg.ps1"
+        args[args.index("-QuietScript") + 1] = ".\\fake-quiet.ps1"
+        r = self._run_from_ps_location(args, e, self.tmp, other)
+        self.assertFalse(marker.exists(), "a script of the PROCESS directory ran, not the one PowerShell resolved: " + (marker.read_text(encoding="utf-8") if marker.exists() else ""))
+        self.assertTrue(any(k.startswith("LEG:") for k in self.kinds()), "the leg PowerShell resolved ran: " + r.stdout[-1500:] + r.stderr[-1500:])
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+
+    # adversary r3 pass 8 A2: a relative -CommittedSpecRepoRoot was handed on as spelled, and the child resolves it in the PROCESS directory, not where PowerShell resolved it
+    def test_legspec_committed_r3_a_relative_seam_root_reaches_the_child_as_the_path_powershell_resolves(self) -> None:
+        child = self.case / "recording-root.ps1"
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         "Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'child-root.log') -Value ('RepoRoot=' + $RepoRoot)\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        log = self.case / "child-root.log"
+        self._reset_committed_case()
+        log.unlink(missing_ok=True)
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", ".", "-CommittedSpecScript", str(child), *self._hermetic_receipt_root())
+        r = self._run_from_ps_location(args, e, self.tmp, ROOT)
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+        self.assertTrue(log.exists(), "the preflight child ran")
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1].lower().rstrip("\\"), str(self.tmp).lower().rstrip("\\"))
+
     def test_legspec_committed_r3_a_git_that_cannot_answer_refuses_the_switch(self) -> None:
         # fail CLOSED: with no git on PATH the location is unknown, which is not "outside"
         self._reset_committed_case()

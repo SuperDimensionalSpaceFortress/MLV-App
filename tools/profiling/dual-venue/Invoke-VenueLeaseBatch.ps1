@@ -309,6 +309,11 @@ $realUmRun = [IO.Path]::GetFullPath((Join-Path $here '..\um-run.ps1'))
 function Get-NormalisedFileSha256([string]$Path) { Get-DvLegSpecSha256 ([IO.File]::ReadAllBytes($Path)) }
 # (pass 5 A1: the path is the one PowerShell resolved, the one Test-Path above accepted: a RELATIVE -UmRunScript is relative to PowerShell's location, which Set-Location moves and .NET's current directory does not)
 $umRunFull = (Resolve-Path -LiteralPath $UmRunScript).ProviderPath
+# r3 (adversary pass 8 A1): the file that is checked is the file that RUNS. A relative script path is relative to PowerShell's location, which a child process (the leg, the quiet probe) does not inherit: it starts
+# in the PROCESS directory, so the spelled path would name another file there, after the claim and the lease. Every script is handed on as the full path PowerShell resolved.
+$UmRunScript = $umRunFull
+$QuietScript = (Resolve-Path -LiteralPath $QuietScript).ProviderPath
+$LegScript = (Resolve-Path -LiteralPath $LegScript).ProviderPath
 # r3 (adversary r2 pass 6 A1, the 4th run of one class: raw bytes -> line-ending-normalised hash -> BOM -> ...; r3 pass 7 A2: the same BOM defeated every other seam): ANY byte test of "is this the real
 # um-run" is defeated by one more byte-level change, so the bytes are no longer the last word. A run is production-shaped ("real") unless BOTH stand-ins are stand-ins by LOCATION: each resolves (the path
 # PowerShell resolved, every link on the way followed) to a directory outside every git work tree, found by a .git entry on the way up AND by git itself (rev-parse --is-inside-work-tree, through the module's
@@ -371,10 +376,11 @@ if ($SkipCommittedSpecPreflight -and $CommittedSpecRepoRoot) { Stop-Usage '-Skip
 # the um-run or leg script (a complete second checkout whose scripts differ by line endings classified as a stand-in and silently ran with no gate). The repo whose HEAD it reads is the one THE LEG THAT RUNS
 # resolves for itself (its own ..\..\..), and the bounded child Test-LegSpecCommitted.ps1 resolves it from the leg script path, the seam value too: no file-system work on the root here, where no deadline holds yet.
 $script:CommittedSpecPreflightOn = -not $SkipCommittedSpecPreflight
-$script:CommittedSpecRepoRoot = $CommittedSpecRepoRoot   # as spelled; '' = the repo the leg script resolves for itself
+# as spelled, except that a RELATIVE root is made absolute against PowerShell's location (lexically: no file-system work here, before -DeadlineUtc), because the bounded child starts in the PROCESS directory (pass 8 A2); '' = the repo the leg script resolves for itself
+$script:CommittedSpecRepoRoot = $(if ($CommittedSpecRepoRoot -and -not [IO.Path]::IsPathRooted($CommittedSpecRepoRoot)) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CommittedSpecRepoRoot) } else { $CommittedSpecRepoRoot })
 $script:CommittedSpecLegScript = (Resolve-Path -LiteralPath $LegScript).ProviderPath   # the file Test-Path accepted above, as PowerShell resolved it (a leaf, not the ..\..\.. root, which the bounded child resolves)
 if ($umRunIsReal -and $CommittedSpecScript) { Stop-Usage '-CommittedSpecScript is an offline test seam: with the real um-run.ps1 the committed-spec preflight always runs Test-LegSpecCommitted.ps1' }
-$script:CommittedSpecScript = $(if ($CommittedSpecScript) { $CommittedSpecScript } else { Join-Path $here 'Test-LegSpecCommitted.ps1' })
+$script:CommittedSpecScript = $(if ($CommittedSpecScript) { $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($CommittedSpecScript) } else { Join-Path $here 'Test-LegSpecCommitted.ps1' })   # (pass 8: a relative seam script is run by a child that starts in the PROCESS directory, so it is handed on as the path PowerShell's location gives it)
 if (-not $ExportBudgetScript) { $ExportBudgetScript = Join-Path $here '..\bachelor\export-stage-job.ps1' }
 # r11 (sol r9 B1): the export-budget preflight child's bounds (Get-ExportBudgetRefusal): a hard cap per child, and the seconds kept back from the room before -DeadlineUtc for the typed refusal
 $script:ExportBudgetPreflightCapSec = 120
