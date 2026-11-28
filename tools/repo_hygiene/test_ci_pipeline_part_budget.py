@@ -180,10 +180,16 @@ EXPECTED_STEP_BODY: tuple[str, ...] = (
 )
 
 STEP_NAME = "Run pipeline_tests --check-golden (bounded shards)"
-# One PowerShell single-quoted literal and nothing after it: a lone quote inside would be the end of
-# the string and the start of more code (`$soloPattern = 'x'; $testsPerShard = 240; $y = 'z'`).
-_SOLO_SHAPE = re.compile(r"\$soloPattern = '(?:[^']|'')*'")
-_TESTS_PER_SHARD_SHAPE = re.compile(r"\$testsPerShard = \d+")
+# The one free-text line may hold only characters that PowerShell's lexer and `-match` (.NET regex)
+# read exactly as the mirror's Python `re` does. Letters, digits, `_`, `|`, `^`, `$`, `(`, `)` and an
+# escaped dot (`\.`) are enough to name solo classes and tests. Anything else is refused, not
+# policed one spelling at a time (adversary r2 pass 4): PowerShell reads U+2018..U+201B as single
+# quotes, so `'..’; $testsPerShard *= 20; ..‘..'` hid a second statement (A1); it decodes `''` to
+# `'` while Python kept both (A2); and `(?`, `\d`, `\w`, `\p{..}`, `[..]`, `{n}`, `*`, `+`, `?` and
+# non-ASCII letters mean different things in the two engines. A card that really needs more
+# widens this set and the mirror together.
+_SOLO_SHAPE = re.compile(r"\$soloPattern = '((?:[A-Za-z0-9_|^$()]|\\\.)*)'")
+_TESTS_PER_SHARD_SHAPE = re.compile(r"\$testsPerShard = [0-9]+")
 
 
 def _step_span(lines: list[str]) -> tuple[int, int]:
@@ -229,16 +235,23 @@ def _guard_flags(part_job: str) -> bool:
     return _step_body(part_job) != EXPECTED_STEP_BODY
 
 
+def _step_code_lines(part_job: str) -> list[str]:
+    lines = part_job.splitlines()
+    first, last = _step_span(lines)
+    return [line.strip() for line in lines[first : last + 1]]
+
+
 def _solo_pattern(part_job: str) -> str:
-    match = re.search(r"(?m)^\s*\$soloPattern = '([^\n]*)'$", part_job)
-    assert match, "the pipeline step lost its $soloPattern line"
-    return match.group(1)
+    """The regex the mirror uses: read from the one line the body pin lets through by shape."""
+    found = [m.group(1) for m in map(_SOLO_SHAPE.fullmatch, _step_code_lines(part_job)) if m]
+    assert len(found) == 1, "the pipeline step must set $soloPattern exactly once, from the allowed characters"
+    return found[0]
 
 
 def _tests_per_shard(part_job: str) -> int:
-    found = re.findall(r"(?m)^\s*\$testsPerShard = (\d+)$", part_job)
-    assert len(found) == 1, "the pipeline step must set $testsPerShard exactly once"
-    return int(found[0])
+    found = [line for line in _step_code_lines(part_job) if line.startswith("$testsPerShard = ")]
+    assert len(found) == 1 and _TESTS_PER_SHARD_SHAPE.fullmatch(found[0]), "the pipeline step must set $testsPerShard exactly once"
+    return int(found[0].rsplit(" ", 1)[1])
 
 
 class PipelinePartBudgetTests(unittest.TestCase):
@@ -450,6 +463,37 @@ class PipelineStepBodyPinTests(unittest.TestCase):
         )
         self.assertNotEqual(smuggled, self.part_job)
         self.assertTrue(_guard_flags(smuggled))
+
+    def test_a_solo_pattern_the_two_engines_could_read_differently_is_refused(self) -> None:
+        # adversary r2 pass 4 A1: PowerShell reads U+2018..U+201B as single quotes, so a "second
+        # statement" hid behind curly quotes; A2: PowerShell decodes `''` to `'` and the mirror
+        # kept both. The free-text line may hold only characters both engines read the same way.
+        original = _solo_pattern(self.part_job)
+        literal = "$soloPattern = '" + original + "'"
+        self.assertIn(literal, self.part_job)
+        values = [("A1 curly-quote statement", original + "’; $testsPerShard *= 20; $soloPattern = 0; $y = ‘z")]
+        values += [(f"quote U+{code:04X}", original + chr(code) + "x") for code in (0x2018, 0x2019, 0x201A, 0x201B)]
+        values += [
+            ("A2 doubled apostrophe", "^(?!''?)(?:" + original + ")"),
+            ("doubled apostrophe", original + "''"),
+            ("look-ahead", "^(?!x)" + original),
+            ("inline option", "(?i)" + original),
+            ("digit class", original + "|^\\d"),
+            ("word class", original + "|^\\w"),
+            ("unicode class", original + "|^\\p{L}"),
+            ("set", original + "|^[A-Z]"),
+            ("quantifier", original + "|^x{2}"),
+            ("star", original + "|^x*"),
+            ("plus", original + "|^x+"),
+            ("optional", original + "|^x?"),
+            ("non-ASCII letter", original + "|^é"),
+            ("space", original + "| ^x"),
+        ]
+        for label, value in values:
+            with self.subTest(label):
+                mutated = self.part_job.replace(literal, "$soloPattern = '" + value + "'", 1)
+                self.assertNotEqual(mutated, self.part_job)
+                self.assertTrue(_guard_flags(mutated))
 
     def test_every_body_line_is_pinned_against_deletion_duplication_and_case_change(self) -> None:
         for index in self.code:
