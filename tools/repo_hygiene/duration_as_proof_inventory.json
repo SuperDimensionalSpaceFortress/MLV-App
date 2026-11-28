@@ -2761,6 +2761,48 @@
       ]
     },
     {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "ASSERT_TRUE ( poisonMs > 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: premise of each of the three tests (the thread's previous-frame debayered-frame record, published by a scaled Processed8/Processed16 render, is nonzero before the call under test); proves nothing about the call under test.",
+      "lines": [
+        1614,
+        1635,
+        1651
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "ASSERT_TRUE ( servedMs == 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: negative-lane check that a renderDebayered16FromSlot call served from the current-frame copy (the same frame again, so getMlvRawFrameDebayered memcpys and returns) reports no debayer, instead of the previous call's record; the record's reset is the contract under test, and the first call's run is proved by its outcome (NotReconned, the full fallback) and the ownMs <= renderMs bound, not by a duration.",
+      "lines": [
+        1617
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "ASSERT_TRUE ( frameMs == 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: negative-lane check that getMlvRawFrameDebayered refusing a frame index past the clip (it renders nothing) reports no debayer instead of the poisoned previous-frame record; the reset is the contract under test, not a run-proof.",
+      "lines": [
+        1636
+      ]
+    },
+    {
+      "path": "tests/pipeline/test_debayered16_honour_scale.cpp",
+      "anchor": "ASSERT_TRUE ( processingMs == 0.0 ) ;",
+      "class": "not_run_proof_structural",
+      "clock": "qpc_stage_clock",
+      "justification": "CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: the same negative-lane check for the processing record of the refused frame (no processing stage runs on this route, and none ran for a refused frame).",
+      "lines": [
+        1637
+      ]
+    },
+    {
       "path": "platform/qt/RenderFrameThread.cpp",
       "anchor": "const double llrawprocResidualSubstageMs = llrawprocMs > 0.0",
       "class": "run_proof",
