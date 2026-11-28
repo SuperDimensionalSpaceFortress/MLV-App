@@ -282,7 +282,9 @@ QString playbackHandlingBody( const QString & source )
 // code (the stripper does not preprocess). No pin depends on these: MainWindow.cpp has no splice, raw string, digit separator,
 // universal-character-name or header-name with `//` or `/*` (the EveryFrameTargetGate.StripComments* tests below prove each
 // handled case on fixtures). r8 re-check against the adversary advisories still OPEN on this card: none is in these helpers
-// (pass 8 A1 is fixed here; pass 8 A2, pass 6 A3 and pass 7 A5 are product-path gaps in MainWindow.cpp / GpuDisplayWindow.cpp).
+// (pass 8 A1 is fixed here, and so are pass 9 A1, a char literal with a user-defined-literal suffix in front of a quote, and pass 9
+// A2, the `<%` / `%>` digraph braces in enclosingBlockHeaders; pass 8 A2 / pass 9 A3, pass 6 A3 and pass 7 A5 / pass 9 A4 are
+// product-path gaps in MainWindow.cpp / GpuDisplayWindow.cpp, outside these helpers).
 int skipLineSplices( const QString & s, int i )
 {
     const int n = s.size();
@@ -358,6 +360,19 @@ QString tokenBefore( const QString & s, int i )
         }
         else if( kind == Kind::Identifier && isIdentifierChar( c ) )
             continue;
+        if( c == QLatin1Char( '\'' ) )
+        {
+            // r8 (adversary pass 9 A1 on db196611): a `'` that does not continue a pp-number opens a char literal; skip to its
+            // closing quote, so a literal inside the run (`'1'_e+` before `'x'`) is never read as the digits of a pp-number. What
+            // follows the literal (a user-defined-literal suffix, `_e`) is not an encoding prefix and not a pp-number.
+            int close = j + 1;
+            while( close < run.size() && run.at( close ) != QLatin1Char( '\'' ) ) ++close;
+            j = close;   // past the literal's closing quote (or the end of the run)
+            start = j + 1;
+            kind = Kind::Other;
+            while( j + 1 < run.size() && isIdentifierChar( run.at( j + 1 ) ) ) ++j;   // the suffix, if any
+            continue;
+        }
         start = j;
         if( c.isDigit() || ( c == QLatin1Char( '.' ) && j + 1 < run.size() && run.at( j + 1 ).isDigit() ) ) kind = Kind::PpNumber;
         else if( isIdentifierChar( c ) ) kind = Kind::Identifier;
@@ -536,17 +551,33 @@ QStringList enclosingBlockHeaders( const QString & code, int pos )
                 continue;
             }
         }
-        if( c == QLatin1Char( '{' ) )
+        // r8 (adversary pass 9 A2 on db196611): the digraphs `<%` and `%>` ([lex.digraph], read after splicing) are `{` and `}`,
+        // so `if( false ) <% ... %>` around a pinned statement is on the path of blocks too. Maximal munch always reads `<%` and `%>`
+        // as digraphs (the `<::` exception is for `<:` only).
+        int digraphEnd = -1;
+        if( ( c == QLatin1Char( '<' ) || c == QLatin1Char( '%' ) ) )
+        {
+            const int second = skipLineSplices( code, i + 1 );
+            if( second < code.size()
+                && ( ( c == QLatin1Char( '<' ) && code.at( second ) == QLatin1Char( '%' ) )
+                     || ( c == QLatin1Char( '%' ) && code.at( second ) == QLatin1Char( '>' ) ) ) )
+                digraphEnd = second;
+        }
+        const bool opens = c == QLatin1Char( '{' ) || ( digraphEnd >= 0 && c == QLatin1Char( '<' ) );
+        const bool closes = c == QLatin1Char( '}' ) || ( digraphEnd >= 0 && c == QLatin1Char( '%' ) );
+        if( opens )
         {
             const QString header = code.mid( lastSeparator + 1, i - lastSeparator - 1 ).simplified();
             QStringList full = chain.back();
             full << header;
             open.push_back( { header, header.startsWith( elseWord ) ? full.join( link ) : header } );
             chain.emplace_back();
+            if( digraphEnd >= 0 ) i = digraphEnd;   // the loop's ++i lands just past the digraph
             lastSeparator = i;
         }
-        else if( c == QLatin1Char( '}' ) )
+        else if( closes )
         {
+            if( digraphEnd >= 0 ) i = digraphEnd;
             if( !open.empty() )
             {
                 const OpenBlock closed = open.back();
@@ -1147,6 +1178,10 @@ TEST( EveryFrameTargetGate, StripCommentsKeepsCodeAfterALiteralThatHoldsAComment
         { QStringLiteral( "t = 1'/'; forbidden_code(); // gone\n" ), QStringLiteral( "t = 1'/'; forbidden_code(); \n" ) },
         // a sign joins a pp-number only after its e/E/p/P: `e-'0'` is the identifier e, '-', and the literal '0'
         { QStringLiteral( "v = e-'/'; forbidden_code(); // gone\n" ), QStringLiteral( "v = e-'/'; forbidden_code(); \n" ) },
+        // adversary pass 9 A1 on db196611: `'1'_e` is a char literal with a user-defined-literal suffix, not the digits of a
+        // pp-number, so the `'` after `+` opens the literal '/'
+        { QStringLiteral( "auto n = '1'_e+'/'; forbidden_code(); // gone\n" ),
+          QStringLiteral( "auto n = '1'_e+'/'; forbidden_code(); \n" ) },
     };
     for( const Case & item : cases )
     {
@@ -1180,6 +1215,14 @@ TEST( EveryFrameTargetGate, StripCommentsSiblingHelpersLexLiteralsLikeTheCompile
         // r8 sibling of G11 (adversary pass 8 A1 sibling :435): enclosingBlockHeaders reads `0xA'B'C` as one pp-number too
         { QStringLiteral( "void f() { const int n = 0xA'B'C; if( a ) { target(); } }\n" ), "void f() | if( a )" },
         { QStringLiteral( "void f() { const char c = 1'{'; if( a ) { target(); } }" ), "void f() | if( a )" },
+        // adversary pass 9 A1 on db196611: a char literal with a user-defined-literal suffix in front of another char literal
+        { QStringLiteral( "void f() { const auto n = '1'_e+'{'; if( a ) { target(); } }\n" ), "void f() | if( a )" },
+        // adversary pass 9 A2 on db196611: the digraphs <% and %> are braces (also when spliced), so a dead guard written with them
+        // is on the path, and a closed digraph block leaves it
+        { QStringLiteral( "void f() { x = 1; if( false ) <% if( a ) { target(); } %> }" ), "void f() | if( false ) | if( a )" },
+        { QStringLiteral( "void f() <% if( a ) <% target(); %> %>" ), "void f() | if( a )" },
+        { QStringLiteral( "void f() { if( false ) <\\\n% if( a ) { target(); } %\\\n> }" ), "void f() | if( false ) | if( a )" },
+        { QStringLiteral( "void f() { if( false ) <% x(); %> if( a ) { target(); } }" ), "void f() | if( a )" },
     };
     for( const Case & item : cases )
     {
@@ -1240,7 +1283,9 @@ TEST( EveryFrameTargetGate, StripCommentsGeneratedPpNumbersAndCharLiteralsMatchT
         const QString prefix = QStringList{ QString(), QStringLiteral( "L" ), QStringLiteral( "u" ), QStringLiteral( "U" ),
                                             QStringLiteral( "u8" ) }.at( static_cast<int>( rng() % 5u ) );
         const QString literal = prefix + QLatin1Char( '\'' ) + pick( QStringLiteral( "/{}*'" ) ) + QLatin1Char( '\'' );
-        const QString fixedLiteral = literal.endsWith( QStringLiteral( "'''" ) ) ? prefix + QStringLiteral( "'\\''" ) : literal;
+        QString fixedLiteral = literal.endsWith( QStringLiteral( "'''" ) ) ? prefix + QStringLiteral( "'\\''" ) : literal;
+        // adversary pass 9 A1 on db196611: optionally a digit char literal with a user-defined-literal suffix in front of it
+        if( rng() % 2u ) fixedLiteral = QLatin1Char( '\'' ) + pick( decimalDigits ) + QStringLiteral( "'_e+" ) + fixedLiteral;
         const QString code = QStringLiteral( "n = " ) + spliced + QStringLiteral( "; c = " ) + fixedLiteral
                              + QStringLiteral( "; forbidden_code(); " );
         const QString input = code + QStringLiteral( "// gone ' \" /*\n" );
