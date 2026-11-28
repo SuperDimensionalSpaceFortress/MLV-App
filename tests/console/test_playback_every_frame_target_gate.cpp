@@ -240,10 +240,24 @@ int countOccurrences( const QString & haystack, const QString & needle )
     return count;
 }
 
+QString stripComments( const QString & s, std::vector<char> * codeAt );
+
+// r8 (adversary pass 10 A2 on fbf06187): the signature and the next signature count only where they start in code. A
+// `// bool A::conform( double position )` line inside the body (or the text in a literal) used to end the body early, so a negative
+// check after it read a truncated body and passed on a live reference below the comment.
+int indexOfInCode( const QString & source, const QString & needle, int from, const std::vector<char> & codeAt )
+{
+    int at = source.indexOf( needle, from );
+    while( at >= 0 && !codeAt[static_cast<size_t>( at )] ) at = source.indexOf( needle, at + 1 );
+    return at;
+}
+
 QString functionBody( const QString & source, const QString & signature, const QString & nextSignature )
 {
-    const int at = source.indexOf( signature );
-    const int next = source.indexOf( nextSignature, at );
+    std::vector<char> codeAt;
+    stripComments( source, &codeAt );
+    const int at = indexOfInCode( source, signature, 0, codeAt );
+    const int next = at < 0 ? -1 : indexOfInCode( source, nextSignature, at, codeAt );
     if( at < 0 || next <= at ) return QString();
     return source.mid( at, next - at );
 }
@@ -283,8 +297,9 @@ QString playbackHandlingBody( const QString & source )
 // universal-character-name or header-name with `//` or `/*` (the EveryFrameTargetGate.StripComments* tests below prove each
 // handled case on fixtures). r8 re-check against the adversary advisories still OPEN on this card: none is in these helpers
 // (pass 8 A1 is fixed here, and so are pass 9 A1, a char literal with a user-defined-literal suffix in front of a quote, and pass 9
-// A2, the `<%` / `%>` digraph braces in enclosingBlockHeaders; pass 8 A2 / pass 9 A3, pass 6 A3 and pass 7 A5 / pass 9 A4 are
-// product-path gaps in MainWindow.cpp / GpuDisplayWindow.cpp, outside these helpers).
+// A2, the `<%` / `%>` digraph braces in enclosingBlockHeaders, and pass 10 A1, a raw-string prefix after a char literal (the floor),
+// and pass 10 A2, a next signature inside a comment or literal in functionBody; pass 8 A2 / pass 9 A3 / pass 10 A3, pass 6 A3 and
+// pass 7 A5 / pass 9 A4 / pass 10 A4 are product-path gaps in MainWindow.cpp / GpuDisplayWindow.cpp, outside these helpers).
 int skipLineSplices( const QString & s, int i )
 {
     const int n = s.size();
@@ -326,18 +341,21 @@ int skipLineSplicesBackward( const QString & s, int i )
 // e/E/p/P) ending at \a i, read after splicing. A pp-number with several separators (`0xA'B'C`, `1'000'000`, `0b1'0`) or a
 // signed exponent (`1e+1'0`) is therefore one token. The old backward walk stopped at the earlier separator and returned `B`, so
 // the second `'` of `0xA'B'C` opened a char literal that ran to the newline and kept a // comment as code.
-QString tokenBefore( const QString & s, int i )
+// r8 (adversary pass 9 A1 / pass 10 A1): the run never reads back past \a floor, the index just past the last literal the forward
+// scanner (lexSpans, enclosingBlockHeaders) passed. In `'1'_e+'x'` and `'\0'+R"x(...)x"` the run would otherwise cross the char
+// literal before it ('1' with its suffix _e, or '\0') and read its quote as a digit separator or its digits as a pp-number.
+QString tokenBefore( const QString & s, int i, int floor = 0 )
 {
     QString run;
     int k = skipLineSplicesBackward( s, i );
-    while( k > 0 )
+    while( k > floor )
     {
         const QChar c = s.at( k - 1 );
         if( !isIdentifierChar( c ) && c != QLatin1Char( '.' ) && c != QLatin1Char( '\'' ) && c != QLatin1Char( '+' )
             && c != QLatin1Char( '-' ) )
             break;
         run.prepend( c );
-        k = skipLineSplicesBackward( s, k - 1 );
+        k = std::max( floor, skipLineSplicesBackward( s, k - 1 ) );
     }
     // the run starts after a character no token here can contain, so a token starts there; lex it forward to its last token
     enum class Kind
@@ -360,19 +378,8 @@ QString tokenBefore( const QString & s, int i )
         }
         else if( kind == Kind::Identifier && isIdentifierChar( c ) )
             continue;
-        if( c == QLatin1Char( '\'' ) )
-        {
-            // r8 (adversary pass 9 A1 on db196611): a `'` that does not continue a pp-number opens a char literal; skip to its
-            // closing quote, so a literal inside the run (`'1'_e+` before `'x'`) is never read as the digits of a pp-number. What
-            // follows the literal (a user-defined-literal suffix, `_e`) is not an encoding prefix and not a pp-number.
-            int close = j + 1;
-            while( close < run.size() && run.at( close ) != QLatin1Char( '\'' ) ) ++close;
-            j = close;   // past the literal's closing quote (or the end of the run)
-            start = j + 1;
-            kind = Kind::Other;
-            while( j + 1 < run.size() && isIdentifierChar( run.at( j + 1 ) ) ) ++j;   // the suffix, if any
-            continue;
-        }
+        // (a `'` that does not continue a pp-number is punctuation here: the run never holds a literal's characters, because it
+        // stops at \a floor, the end of the last literal the forward scanner passed -- r8, adversary pass 9 A1 and pass 10 A1)
         start = j;
         if( c.isDigit() || ( c == QLatin1Char( '.' ) && j + 1 < run.size() && run.at( j + 1 ).isDigit() ) ) kind = Kind::PpNumber;
         else if( isIdentifierChar( c ) ) kind = Kind::Identifier;
@@ -388,14 +395,15 @@ QString tokenBefore( const QString & s, int i )
 //     characters other than space, parentheses, backslash and control characters (so `"` is allowed: `R""(a)""`);
 //   - in an ordinary literal, phase-2 splices come first: a backslash followed by a splice escapes the character after the splice
 //     (`"a\\` + newline + `b"` is `"a\b"`), and a splice continues the literal; an unspliced newline ends an unterminated one.
-int literalEnd( const QString & s, int i )
+// \a floor: the index just past the last literal the caller's forward scan passed (r8, adversary pass 10 A1; see tokenBefore).
+int literalEnd( const QString & s, int i, int floor = 0 )
 {
     const int n = s.size();
     const QChar quote = s.at( i );
     if( quote == QLatin1Char( '\'' ) )
     {
         // a separator continues a pp-number only as `' digit` or `' nondigit` (r8): `1'/'` is the pp-number 1 and the literal '/'
-        const QString token = tokenBefore( s, i );
+        const QString token = tokenBefore( s, i, floor );
         const int after = skipLineSplices( s, i + 1 );
         const bool digitSeparator = !token.isEmpty()
                                     && ( token.at( 0 ).isDigit()
@@ -405,7 +413,7 @@ int literalEnd( const QString & s, int i )
     }
     else
     {
-        const QString prefix = tokenBefore( s, i );
+        const QString prefix = tokenBefore( s, i, floor );
         const bool raw = prefix == QLatin1String( "R" ) || prefix == QLatin1String( "LR" ) || prefix == QLatin1String( "uR" )
                          || prefix == QLatin1String( "UR" ) || prefix == QLatin1String( "u8R" );
         if( raw )
@@ -447,11 +455,19 @@ int literalEnd( const QString & s, int i )
     return n;
 }
 
-QString stripComments( const QString & s )
+// \a codeAt (r8, adversary pass 10 A2): when given, set to one entry per character of \a s, 1 where the character is code and 0 where
+// it is inside a comment or a string/char/raw literal, by the same lexing (functionBody uses it to skip a signature in a comment).
+QString stripComments( const QString & s, std::vector<char> * codeAt = nullptr )
 {
     QString out;
     out.reserve( s.size() );
     const int n = s.size();
+    if( codeAt ) codeAt->assign( static_cast<size_t>( n ), 1 );
+    const auto notCode = [codeAt]( int from, int to ) {
+        if( codeAt )
+            for( int p = from; p < to; ++p ) ( *codeAt )[static_cast<size_t>( p )] = 0;
+    };
+    int floor = 0;   // just past the last literal (r8, adversary pass 10 A1)
     int i = 0;
     while( i < n )
     {
@@ -465,11 +481,13 @@ QString stripComments( const QString & s )
         }
         if( c == QLatin1Char( '"' ) || c == QLatin1Char( '\'' ) )
         {
-            const int end = literalEnd( s, i );   // -1: a digit separator, which is code
+            const int end = literalEnd( s, i, floor );   // -1: a digit separator, which is code
             if( end >= 0 )
             {
                 out.append( s.mid( i, end - i ) );   // the literal, verbatim (its splices included)
+                notCode( i, end );
                 i = end;
+                floor = end;
                 continue;
             }
         }
@@ -491,6 +509,7 @@ QString stripComments( const QString & s )
                     if( s.at( k ) == QLatin1Char( '\n' ) ) break;
                     ++k;
                 }
+                notCode( i, k );
                 i = k;   // the newline itself is code (kept)
                 continue;
             }
@@ -511,6 +530,7 @@ QString stripComments( const QString & s )
                     }
                     ++k;
                 }
+                notCode( i, end );
                 i = end;
                 out.append( QLatin1Char( ' ' ) );
                 continue;
@@ -537,6 +557,7 @@ QStringList enclosingBlockHeaders( const QString & code, int pos )
     const QString elseWord = QStringLiteral( "else" );
     const QString link = QStringLiteral( " / " );
     int lastSeparator = -1;
+    int floor = 0;   // just past the last literal (r8, adversary pass 10 A1 sibling)
     for( int i = 0; i < pos && i < code.size(); ++i )
     {
         const QChar c = code.at( i );
@@ -544,9 +565,10 @@ QStringList enclosingBlockHeaders( const QString & code, int pos )
         // so a brace inside `R"x({")x"` or after `1'000` is read as the compiler reads it.
         if( c == QLatin1Char( '"' ) || c == QLatin1Char( '\'' ) )
         {
-            const int end = literalEnd( code, i );
+            const int end = literalEnd( code, i, floor );
             if( end >= 0 )
             {
+                floor = end;
                 i = end - 1;   // the loop's ++i lands just past the literal
                 continue;
             }
@@ -1182,6 +1204,11 @@ TEST( EveryFrameTargetGate, StripCommentsKeepsCodeAfterALiteralThatHoldsAComment
         // pp-number, so the `'` after `+` opens the literal '/'
         { QStringLiteral( "auto n = '1'_e+'/'; forbidden_code(); // gone\n" ),
           QStringLiteral( "auto n = '1'_e+'/'; forbidden_code(); \n" ) },
+        // adversary pass 10 A1 on fbf06187: the run stops at the end of '\0', so R is the raw-string prefix
+        { QStringLiteral( "auto p = '\\0'+R\"x(a \" // b)x\"; forbidden_code(); // gone\n" ),
+          QStringLiteral( "auto p = '\\0'+R\"x(a \" // b)x\"; forbidden_code(); \n" ) },
+        { QStringLiteral( "auto p = '0'+1'0; q = '\\''+0xA'B; forbidden_code(); // gone '\n" ),
+          QStringLiteral( "auto p = '0'+1'0; q = '\\''+0xA'B; forbidden_code(); \n" ) },
     };
     for( const Case & item : cases )
     {
@@ -1223,6 +1250,8 @@ TEST( EveryFrameTargetGate, StripCommentsSiblingHelpersLexLiteralsLikeTheCompile
         { QStringLiteral( "void f() <% if( a ) <% target(); %> %>" ), "void f() | if( a )" },
         { QStringLiteral( "void f() { if( false ) <\\\n% if( a ) { target(); } %\\\n> }" ), "void f() | if( false ) | if( a )" },
         { QStringLiteral( "void f() { if( false ) <% x(); %> if( a ) { target(); } }" ), "void f() | if( a )" },
+        // adversary pass 10 A1 sibling on fbf06187
+        { QStringLiteral( "void f() { auto p = '\\0'+R\"x(\"})x\"; if( a ) { target(); } }" ), "void f() | if( a )" },
     };
     for( const Case & item : cases )
     {
@@ -1232,6 +1261,31 @@ TEST( EveryFrameTargetGate, StripCommentsSiblingHelpersLexLiteralsLikeTheCompile
     }
     ASSERT_EQ( 0, countOccurrences( QStringLiteral( "x" ), QString() ) );
     ASSERT_EQ( 2, countOccurrences( QStringLiteral( "a1'0a" ), QStringLiteral( "a" ) ) );
+}
+
+// r8 (adversary pass 10 A2 on fbf06187): functionBody takes the signature and the next signature only where they are code, so a
+// comment or a literal naming the next signature inside the body does not truncate it before a live reference.
+TEST( EveryFrameTargetGate, StripCommentsFunctionBodySkipsASignatureInACommentOrLiteral )
+{
+    const QStringList decoys = {
+        QStringLiteral( "    // bool A::conform( double position )\n" ),
+        QStringLiteral( "    /* bool A::conform( double position ) */\n" ),
+        QStringLiteral( "    log( \"bool A::conform( double position )\" );\n" ),
+        QStringLiteral( "    // a spliced comment \\\nbool A::conform( double position )\n" ),
+    };
+    for( const QString & decoy : decoys )
+    {
+        const QString fixture = QStringLiteral( "// bool A::neutral( int target ) named in a comment first\n"
+                                                "bool A::neutral( int target )\n{\n" )
+                                + decoy
+                                + QStringLiteral( "    use( m_newPosDropMode );\n    return true;\n}\n"
+                                                  "bool A::conform( double position ) {}\n" );
+        const QString body = functionBody( fixture, QStringLiteral( "bool A::neutral( int target )" ),
+                                           QStringLiteral( "bool A::conform( double position )" ) );
+        ASSERT_TRUE( body.startsWith( QStringLiteral( "bool A::neutral( int target )\n{" ) ) );
+        ASSERT_TRUE( stripComments( body ).contains( QStringLiteral( "use( m_newPosDropMode );" ) ) );
+        ASSERT_TRUE( body.contains( QStringLiteral( "return true;\n}\n" ) ) );
+    }
 }
 
 // r8 (Grok CoS G11; FIX-ROUND-CLASS-SWEEP-1 item 4, a lexer defect gets a generated-input test against an exact oracle): seeded
