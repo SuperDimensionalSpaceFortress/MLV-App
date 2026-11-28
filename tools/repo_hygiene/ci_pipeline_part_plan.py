@@ -69,6 +69,11 @@ class Shard:
         return ":".join(self.tests)
 
 
+# A weight above the 3,600,000 ms job cap is a typo, and one past Int64 is a PowerShell `[long]`
+# conversion error in the workflow that this loader would otherwise accept.
+MAX_MILLIS = 3_600_000
+
+
 def _is_whole(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
 
@@ -79,8 +84,10 @@ def load_weights_from_text(text: str) -> dict:
     if data.get("schema") != 1 or data.get("unit") != "milliseconds":
         raise ValueError("pipeline test weights: unexpected schema or unit")
     numbers = [data.get("defaultTestMillis"), *data.get("partSeedMillis", []), *data.get("testMillis", {}).values()]
-    if not data.get("partSeedMillis") or not all(_is_whole(number) and number >= 0 for number in numbers):
-        raise ValueError("pipeline test weights: every weight and seed must be a whole, non-negative number of milliseconds")
+    if not data.get("partSeedMillis") or not all(_is_whole(number) and 0 <= number <= MAX_MILLIS for number in numbers):
+        raise ValueError(
+            f"pipeline test weights: every weight and seed must be a whole number of milliseconds from 0 to {MAX_MILLIS}"
+        )
     return data
 
 
@@ -89,7 +96,8 @@ def load_weights(path: Path = WEIGHTS_PATH) -> dict:
 
 
 def build_shards(test_names: list[str], tests_per_shard: int, solo_pattern: str) -> list[Shard]:
-    solo = re.compile(solo_pattern)
+    # PowerShell `-match` is case-insensitive; so is this.
+    solo = re.compile(solo_pattern, re.IGNORECASE)
     shards: list[Shard] = []
     for offset in range(0, len(test_names), tests_per_shard):
         window = test_names[offset : offset + tests_per_shard]

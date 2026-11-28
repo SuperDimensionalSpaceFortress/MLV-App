@@ -76,6 +76,12 @@ def _planning_logic(part_job: str) -> tuple[str, ...]:
     return tuple(logic)
 
 
+def _assignments_to(part_job: str, variable: str) -> int:
+    """Lines of the step that assign `$variable` or one of its elements (`=`, `+=`, ...)."""
+    pattern = rf"(?m)^\s*\${variable}(\[[^\]\n]*\])?\s*(\+=|-=|\*=|/=|=)(?!=)"
+    return len(re.findall(pattern, part_job))
+
+
 def _solo_pattern(part_job: str) -> str:
     match = re.search(r"(?m)^\s*\$soloPattern = '([^\n]*)'$", part_job)
     assert match, "the pipeline step lost its $soloPattern line"
@@ -215,6 +221,38 @@ class PipelinePartBudgetTests(unittest.TestCase):
             self.assertIsInstance(value, int)
         with self.assertRaises(ValueError):
             plan.load_weights_from_text('{"schema": 1, "unit": "milliseconds", "partSeedMillis": [1, 2, 3], "defaultTestMillis": 0.5, "testMillis": {}}')
+
+    def test_a_weight_the_workflow_cannot_read_is_refused(self) -> None:
+        # adversary pass 2 A1: a default of 2**63 loads here but is a [long] conversion error in
+        # the workflow, which converts every seed and the default unconditionally.
+        base = '{"schema": 1, "unit": "milliseconds", "partSeedMillis": [1, 2, 3], "defaultTestMillis": %s, "testMillis": {"A.B": %s}}'
+        plan.load_weights_from_text(base % (1400, 3000))
+        for default, listed in ((2**63, 3000), (1400, 2**63), (-1, 3000), (1400, plan.MAX_MILLIS + 1), (True, 3000)):
+            with self.subTest(default=default, listed=listed):
+                with self.assertRaises(ValueError):
+                    plan.load_weights_from_text(base % (str(default).lower(), listed))
+        with self.assertRaises(ValueError):
+            plan.load_weights_from_text(base.replace("[1, 2, 3]", "[1, 2, 9223372036854775808]") % (1400, 3000))
+
+    def test_nothing_else_assigns_the_variables_the_selection_depends_on(self) -> None:
+        # adversary pass 2 A2: a later `$myShards = @($shards)` ran every shard on every part
+        # and every pinned line, the cover proof and the budget still passed.
+        for variable, expected in (("myShards", 1), ("partOf", 2), ("partLoad", 2), ("shards", 3), ("planOrder", 1), ("part", 1), ("partCount", 1)):
+            with self.subTest(variable=variable):
+                self.assertEqual(_assignments_to(self.part_job, variable), expected)
+        self.assertEqual(self.part_job.count("foreach ($shard in $myShards) {"), 1)
+        mutated = self.part_job.replace(
+            "$myShards = @($shards | Where-Object { $partOf[$_.Name] -eq $part })",
+            "$myShards = @($shards | Where-Object { $partOf[$_.Name] -eq $part })\n          $myShards = @($shards)",
+            1,
+        )
+        self.assertEqual(_assignments_to(mutated, "myShards"), 2)
+
+    def test_the_solo_match_is_case_insensitive_like_powershell(self) -> None:
+        # adversary pass 2 A3: PowerShell -match ignores case, so does the mirror.
+        pattern = _solo_pattern(self.part_job)
+        shards = plan.build_shards(["lookassistfixturescene.A", "lookassistfixturescene.B"], 12, pattern)
+        self.assertEqual([shard.name for shard in shards], ["exact-00-solo1", "exact-00-solo2"])
 
     def test_the_mirror_reproduces_the_window_cut(self) -> None:
         # Windows are consecutive slices of the sorted names; a solo test leaves its window's
