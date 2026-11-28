@@ -284,6 +284,11 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in HFR_NATIVE_S1_LEGS if rel not in
 FSTOGGLE_LEGS = {"legs/m16-1457-native-windowed-s2-fstoggle.json": "legs/m16-1457-native-windowed-s2.json",
                  "legs/m16-1457-native-windowed-s1-fstoggle.json": "legs/m16-1457-native-windowed-s1.json"}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *FSTOGGLE_LEGS)
+# BACHELOR-1457-WINDOWED-SWAP0-LEG-SPEC-1 r1: the swap-interval-0 twin of the paced windowed M16-1457 native s1 cell (generatorArgs.swapInterval 0 -> MLVAPP_SWAP_INTERVAL=0),
+# keyed to the cell it twins. It differs from it only in legId and that one key; it stays paced (no unpaced, so no presentTearingExpectedReason). The swap-wait split bench's
+# S arm needs it committed (Invoke-VenueLeg.ps1 refuses LEG_SPEC_NOT_COMMITTED); test_the_swap0_leg_is_its_plain_cell_with_only_legid_and_swap_interval pins the shape.
+SWAP0_LEGS = {"legs/m16-1457-native-windowed-s1-swap0.json": "legs/m16-1457-native-windowed-s1.json"}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *SWAP0_LEGS)
 # EXPORT-VENUE-LEG-1: the four export legs (two clips x CDNG lossless / ProRes); test_dual_venue_export_leg pins their shape.
 EXPORT_VENUE_LEGS = tuple(f"legs/m16-{clip}-export-{fmt}.json" for clip in ("1243", "1456") for fmt in ("cdng-lossless", "prores"))
 SHIPPED_LEGS = (*SHIPPED_LEGS, *(rel for rel in EXPORT_VENUE_LEGS if rel not in SHIPPED_LEGS))
@@ -9288,9 +9293,11 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-145[67]-conform-(fullscreen|windowed)-s1$", path.name)
             elif spec["card"] == "HFR-NATIVE-60FPS-FULLRES-1":   # the native-HFR capture-free speed legs on M16-1457, named by cell and lever
                 self.assertEqual(spec["legId"], path.stem, path.name)
-                self.assertRegex(spec["legId"], r"^m16-1457-native-(fullscreen|windowed)-s1(-nola|-la3|-heavy|-wake-post)?$", path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-native-(fullscreen|windowed)-s1(-nola|-la3|-heavy|-wake-post|-swap0)?$", path.name)
                 # -wake-post: the posted-due-wake isolation twin (HFR-NATIVE-M16-1457-FULLSCREEN-S1S2-PRESENT-GAP-1 r1, WAKE_POST_LEGS); no other leg sets it
                 self.assertEqual(spec["generatorArgs"].get("dueWakeDeliveryPost", False), spec["legId"].endswith("-wake-post"), path.name)
+                # -swap0: the swap-interval-0 twin of the paced windowed s1 cell (BACHELOR-1457-WINDOWED-SWAP0-LEG-SPEC-1 r1, SWAP0_LEGS); no other leg of this card sets swapInterval
+                self.assertEqual(spec["generatorArgs"].get("swapInterval"), 0 if spec["legId"].endswith("-swap0") else None, path.name)
             elif spec["card"] == "CPU-DUALISO-REDUCED-ISO-NOTCH-1":   # the cpu-only legs that engage the CPU reduced recon, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-cpu-reduced-(fullscreen|windowed)-s[24]$", path.name)
@@ -17771,6 +17778,41 @@ class MidPlayWindowToggleLegSpecTests(unittest.TestCase):
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
             self.assertEqual((spec["backends"], spec["displayMode"], spec["playSeconds"]), (["cuda"], "windowed", 25))
             self.assertNotIn("visualCapture", spec, "visual capture stays at its default (on)")
+
+
+class Swap0LegSpecTests(unittest.TestCase):
+    """BACHELOR-1457-WINDOWED-SWAP0-LEG-SPEC-1 r1: the swap-interval-0 twin of the paced windowed M16-1457 native s1 cell. The swap-wait split bench's S arm runs it, and
+    Invoke-VenueLeg.ps1 refuses a spec that is not committed (LEG_SPEC_NOT_COMMITTED), so it ships tracked. It is the cell with only legId and generatorArgs.swapInterval 0
+    changed; it stays paced, so it carries no unpaced key and no presentTearingExpectedReason (the schema allows that reason only on an unpaced leg)."""
+
+    def test_the_swap0_leg_is_its_plain_cell_with_only_legid_and_swap_interval(self) -> None:
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is required")
+        schema = json.loads((DV / "leg-spec.schema.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(SWAP0_LEGS), 1)
+        for rel, cell_rel in SWAP0_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                cell = json.loads((DV / cell_rel).read_text(encoding="utf-8"))
+                jsonschema.validate(twin, schema)
+                self.assertNotIn("swapInterval", cell["generatorArgs"], cell_rel)
+                self.assertEqual(twin["legId"], cell["legId"] + "-swap0")
+                self.assertEqual(Path(rel).stem, twin["legId"], "the file is named for its legId")
+                self.assertIs(type(twin["generatorArgs"].pop("swapInterval")), int)
+                self.assertEqual(dict(twin, legId=cell["legId"]), cell)
+                self.assertEqual(list(twin), list(cell), "the cell's keys in the cell's order")
+                self.assertNotIn("unpaced", twin["generatorArgs"])
+                self.assertNotIn("presentTearingExpectedReason", twin)
+                self.assertEqual((twin["backends"], twin["displayMode"], twin["scaleFactor"], twin["playSeconds"], twin["clipId"]),
+                                 (["cuda"], "windowed", 1, 25, "M16-1457"))
+
+    def test_the_swap0_leg_requests_swap_interval_zero(self) -> None:
+        for rel in SWAP0_LEGS:
+            spec = json.loads((DV / rel).read_text(encoding="utf-8"))
+            self.assertEqual(spec["generatorArgs"]["swapInterval"], 0, rel)
+            self.assertIs(type(spec["generatorArgs"]["swapInterval"]), int)
 
 
 @requires_windows_pwsh
