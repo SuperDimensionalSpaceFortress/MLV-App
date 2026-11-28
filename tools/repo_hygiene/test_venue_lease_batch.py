@@ -270,6 +270,10 @@ switch ($mode) {
         "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=301"; exit 0
     }
     'UNKNOWN' { "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=1 reason=probe-failed"; exit 6 }
+    # r7 (Grok G11 prevention): the probe's other documented exits (Wait-VenueQuiet.ps1: 2 usage, 4 gate unreadable, 5 host mismatch), each a typed stop of the batch
+    'PROBEUSAGE' { "fake probe: usage"; exit 2 }
+    'PROBEGATEUNREADABLE' { "fake probe: gate unreadable"; exit 4 }
+    'PROBEHOSTMISMATCH' { "fake probe: host mismatch"; exit 5 }
     'STEAL' {
         # r5b (Grok G1): another owner's claim replaces the run's mid-batch (another nonce; its owner pid is dead, so the next batch may break it). The probe
         # itself reads QUIET; it waits long enough for a 1 s claim keeper to see the claim NOT_OURS.
@@ -716,6 +720,45 @@ def batch_result(stdout: str) -> dict:
     if not lines:
         raise AssertionError("no LEASE_BATCH_RESULT line in:\n" + stdout)
     return json.loads(lines[-1][len("LEASE_BATCH_RESULT="):])
+
+
+# r7 (Grok G11 prevention): a plain text scan of the batch script's typed ends. A STOP pair is a `Set-Stop '<reason>' <code>` call (the code of an `$(if (...) { 7 } else { 3 })` expression is both codes); an END pair
+# is a `$b.endReason = '<reason>'` assignment. The scan asks of every pair whether some batch test names it (_g11_named_pairs), so a NEW branch cannot ship with only its sibling tested.
+# The pair is the unit (a second site that reuses a reason and code is not told apart from the first: the scan cannot see a site, only what it ends the run with).
+def _g11_pairs(runner_text: str) -> tuple[set, set]:
+    code = "\n".join(l for l in runner_text.splitlines() if not l.lstrip().startswith("#"))
+    stops = set()
+    for m in re.finditer(r"Set-Stop '([A-Z][A-Z0-9_]+)' (?:(\d+)\b|\$\(if .*?\{ (\d+) \} else \{ (\d+) \}\))", code):
+        for c in m.groups()[1:]:
+            if c is not None:
+                stops.add((m.group(1), int(c)))
+    ends = {m.group(1) for m in re.finditer(r"\$b\.endReason = '([A-Z][A-Z0-9_]+)'", code, flags=re.IGNORECASE)}
+    return stops, ends
+
+
+def _g11_named_pairs(test_text: str, stops: set, ends: set) -> tuple[set, set]:
+    """The stop pairs and end reasons that some test method names: the reason as a string literal, on a line a negative assertion does not own, in a method that reads the run's end (endReason, stopReason or returncode);
+    and for a stop pair, the code too: on a returncode line of that method, or as the `<code>, "<REASON>"` pair of a tuple (the end-state assertions and the table-driven cases use it)."""
+    named_stops, named_ends = set(), set()
+    for method in re.split(r"\n    def test", test_text)[1:]:
+        lines = [l for l in method.splitlines() if not re.search(r"assertNot(?:In|Equal|Regex)|assertFalse|assertIsNone", l)]
+        body = "\n".join(lines)
+        if not re.search(r"endReason|stopReason|returncode", body):
+            continue
+        for reason, c in stops:
+            if re.search(r"""["']""" + re.escape(reason) + r"""["']""", body) and (
+                    any("returncode" in l and re.search(r"(?<![\w.])" + str(c) + r"(?![\w.])", l) for l in lines)
+                    or re.search(r"(?<![\w.])" + str(c) + r"""\s*,\s*["']""" + re.escape(reason) + r"""["']""", body)):
+                named_stops.add((reason, c))
+        for reason in ends:
+            if re.search(r"""["']""" + re.escape(reason) + r"""["']""", body):
+                named_ends.add(reason)
+    return named_stops, named_ends
+
+
+# Pairs no batch test names yet, each with the card that owes the test (a row leaves this list when a test names it: the scan fails on a stale row too). Module level on purpose: the scan reads the test METHODS only.
+_G11_UNNAMED_STOPS: dict = {}
+_G11_UNNAMED_ENDS: dict = {}
 
 
 # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r10: numeric-contract scanners for the dual-venue PowerShell. Both are tested on their own spellings below, so a pin cannot go blind
@@ -2327,7 +2370,21 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual([x.split(":")[0] for x in k], ["OPEN", "QUIET", "CLOSE"], k)
         [b] = self.batches()
         self.assertEqual(b["endReason"], "PROBE_VENUE_QUIET_UNKNOWN")
+        self.assertEqual(batch_result(r.stdout)["stopReason"], "VENUE_QUIET_UNKNOWN")   # r7 (G11 prevention): the stop's typed reason and its exit code 6 are named together
         self.assertFalse(self.claim_path.exists())
+
+    def test_r7_g11_each_documented_probe_exit_is_a_typed_stop_with_its_own_code_and_the_lease_is_still_closed(self) -> None:
+        for mode, code, stop, end in (("PROBEUSAGE", 2, "USAGE", "PROBE_USAGE"), ("PROBEGATEUNREADABLE", 4, "GATE_UNREADABLE", "PROBE_GATE_UNREADABLE"), ("PROBEHOSTMISMATCH", 5, "HOST_MISMATCH", "PROBE_HOST_MISMATCH")):
+            with self.subTest(probe_exit=code):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))   # a fresh share, claim dir and event log per probe exit
+                r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES=mode)
+                out = r.stdout + r.stderr
+                self.assertEqual(r.returncode, code, out)
+                self.assertEqual(batch_result(r.stdout)["stopReason"], stop, out)
+                self.assertEqual([x.split(":")[0] for x in self.kinds()], ["OPEN", "QUIET", "CLOSE"], self.kinds())
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["legsAttempted"]), (end, 0), out)
+                self.assertFalse(self.claim_path.exists())
 
     def test_a_leg_budget_no_fresh_lease_can_hold_stops_instead_of_opening_lease_after_lease(self) -> None:
         r = self.run_batch([self.specs[0]], FAKE_LEASE_REMAIN="30")
@@ -3816,6 +3873,20 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         [bt] = self.batches()
         self.assertEqual([l["arm"] for l in bt["legs"]], ["A", "B", "A", "B"])
         self.assertEqual(batch_result(r.stdout)["legPlan"]["order"], "Interleave", "the receipt names the canonical order, not the spelling typed")
+
+    def test_r7_a6_a_thermal_spread_order_in_any_letter_case_is_the_canonical_order_and_reads_heat_from(self) -> None:
+        # adversary r6 pass 15 A6 (pre-existing, carried OPEN by r6): the sibling spelling of test_r3_a1. $PlanOrder is canonicalised once at the top (Invoke-VenueLeaseBatch.ps1, "-PlanOrder binds case-insensitively"), so
+        # 'thermalspread' is the ThermalSpread order (the receipt names it) and -HeatFrom is accepted with it, while -HeatFrom with another order is still the usage refusal.
+        for spelling in ("thermalspread", "THERMALSPREAD"):
+            with self.subTest(spelling=spelling):
+                r = self.run_plan(self.ab_block_plan(), "-PlanOrder", spelling)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(batch_result(r.stdout)["legPlan"]["order"], "ThermalSpread", "the receipt names the canonical order, not the spelling typed")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "interleave", "-HeatFrom", str(self.case))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("-HeatFrom is read only by -PlanOrder ThermalSpread", r.stderr)
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "thermalspread", "-HeatFrom", str(self.case))
+        self.assertNotIn("-HeatFrom is read only by -PlanOrder ThermalSpread", r.stderr, "a lower-case thermalspread is the ThermalSpread order, so -HeatFrom is read")
 
     def test_r3_a2_arms_that_differ_only_in_case_are_separate_arms(self) -> None:
         # sol r3 A2: the arm label is validated case-sensitively (A and a are both legal) but the interleave keyed its queues case-insensitively, merging them.
@@ -6680,6 +6751,85 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("killed", dl[0])
         self.assertIn("kill confirmed", dl[0])
         self.assertNotIn("no leg launched", dl[0])
+
+    # r7 (Grok G11): the ROOM-late KILLED_AT_START branches at the leg launch (lateKind ROOM: the LEASE's sampled end, not the run deadline, was spent between the helper's check and Process.Start). The start-delay seam
+    # holds the parent just before Process.Start for as long as the 66 s lease lasts (the run deadline is 10 min away, so lateKind is ROOM and never DEADLINE): the child is started, then killed at once.
+    def _g11_room_late_run(self, specs: list[Path], *extra: str) -> tuple[subprocess.CompletedProcess, str]:
+        self._reset_committed_case()
+        r = self.run_batch(specs, "-BoundedChildStartDelaySec", "66", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=600)), *extra, FAKE_LEASE_REMAIN="66,2700")
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8") if (self.run_dir / "batch.log").exists() else ""
+        return r, log
+
+    def test_legspec_committed_r7_g11_a_leg_killed_at_start_for_the_leases_room_with_an_unconfirmed_kill_stops_the_run_with_exit_7(self) -> None:
+        r, log = self._g11_room_late_run([self.specs[0]], "-BoundedChildKillFails")
+        out = r.stdout[-2500:] + r.stderr[-2500:] + log[-2500:]
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"]), (7, "LEG_KILL_UNCONFIRMED"), out)
+        [leg] = res["legs"]
+        self.assertEqual((leg["status"], leg["class"], leg["killConfirmed"], leg["lateKind"]), ("LEG_FAILED", "KILL_UNCONFIRMED", False, "ROOM"), out)
+        self.assertGreater(int(leg["childPid"]), 0, out)
+        [b] = self.batches()
+        self.assertEqual((b["legsAttempted"], b["endReason"]), (1, "LEG_KILL_UNCONFIRMED"), "the leg was started: it is never un-counted\n" + out)
+        self.assertIn("with the lease's sampled end already used up", b["endDetail"], out)
+        self.assertIn("kill UNCONFIRMED", b["endDetail"], out)
+        self.assertEqual((res["notRun"], res["failed"]), (0, 1), "the killed leg is not put back in the queue\n" + out)
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, "no second lease is opened while a child may still be running\n" + out)
+        self.assertTrue([l for l in log.splitlines() if "KILL_UNCONFIRMED" in l and "reason=KILLED_AT_START" in l and "no leg launched" not in l], out)
+
+    def test_legspec_committed_r7_g11_a_leg_killed_at_start_for_the_leases_room_with_a_confirmed_kill_ends_the_batch_short_and_the_next_batch_runs_the_rest(self) -> None:
+        r, log = self._g11_room_late_run(self.specs[:2])
+        out = r.stdout[-3000:] + r.stderr[-2500:] + log[-2500:]
+        res = batch_result(r.stdout)
+        self.assertEqual(r.returncode, 7, out)
+        self.assertIsNone(res["stopReason"], "no stop: the run goes on\n" + out)
+        b1, b2 = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsAttempted"]), ("LEASE_REMAINING_SHORT", 1), "the leg was started: it is never un-counted\n" + out)
+        [row] = b1["legs"]
+        self.assertEqual((row["status"], row["class"], row["killConfirmed"], row["lateKind"]), ("LEG_FAILED", "KILLED_AT_START", True, "ROOM"), out)
+        self.assertGreater(int(row["childPid"]), 0, out)
+        self.assertIn("with the lease's sampled end already used up", b1["endDetail"], out)
+        self.assertIn("kill confirmed", b1["endDetail"], out)
+        self.assertEqual((b2["endReason"], b2["legsCounted"], b2["legsAttempted"]), ("ALL_LEGS_DONE", 1, 1), "the next batch runs the remaining leg\n" + out)
+        self.assertEqual([x["status"] for x in res["legs"]], ["LEG_FAILED", "RAN"], out)
+        self.assertEqual((res["notRun"], res["failed"], res["counted"]), (0, 1, 1), out)
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 2, out)
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("LEG:fx-b:")]), 1, "the remaining leg ran once, in the second lease\n" + out)
+        self.assertTrue([l for l in log.splitlines() if "LEG_FAILED" in l and "class=KILLED_AT_START" in l and "kill confirmed" in l], out)
+
+    # r7 (Grok G11 prevention): every typed end of the batch script is named by at least one batch test, or is on the module-level allowlist with the card that owes its test.
+    def test_legspec_committed_r7_g11_every_stop_and_end_pair_of_the_batch_script_is_named_by_a_batch_test_or_is_on_the_allowlist(self) -> None:
+        stops, ends = _g11_pairs(RUNNER.read_text(encoding="utf-8"))
+        named_stops, named_ends = _g11_named_pairs(Path(__file__).read_text(encoding="utf-8"), stops, ends)
+        self.assertGreaterEqual((len(stops), len(ends)), (15, 19), "the scan went blind: " + repr((sorted(stops), sorted(ends))))
+        new_stops = sorted(stops - named_stops - set(_G11_UNNAMED_STOPS))
+        new_ends = sorted(ends - named_ends - set(_G11_UNNAMED_ENDS))
+        self.assertEqual((new_stops, new_ends), ([], []), "a branch of Invoke-VenueLeaseBatch.ps1 has no batch test naming it: write one (a test that asserts the run's end reason or stop reason and, for a stop, its exit code), "
+                         "or add it to _G11_UNNAMED_* with the card that owes the test")
+        self.assertEqual((sorted((stops & named_stops) & set(_G11_UNNAMED_STOPS)), sorted((ends & named_ends) & set(_G11_UNNAMED_ENDS))), ([], []), "an allowlisted pair is named by a test now: remove its row")
+        self.assertEqual((sorted(set(_G11_UNNAMED_STOPS) - stops), sorted(set(_G11_UNNAMED_ENDS) - ends)), ([], []), "an allowlisted pair is no longer in the script: remove its row")
+        for card in (*_G11_UNNAMED_STOPS.values(), *_G11_UNNAMED_ENDS.values()):
+            self.assertRegex(card, r"^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+-\d+$", "each allowlist row names a successor card id")
+
+    def test_legspec_committed_r7_g11_the_pair_scan_sees_a_new_branch_and_a_test_that_only_names_its_sibling(self) -> None:
+        script = ("$b.endReason = 'SIBLING_END'; Set-Stop 'SIBLING_STOP' 3\n"
+                  "$b.endReason = 'NEW_END'\n"
+                  "Set-Stop 'SIBLING_STOP' 9\n"
+                  "Set-Stop 'DYNAMIC_STOP' $(if ($x -ceq 'ROOM') { 7 } else { 3 })\n"
+                  "# Set-Stop 'COMMENTED_STOP' 5\n")
+        stops, ends = _g11_pairs(script)
+        self.assertEqual((stops, ends), ({("SIBLING_STOP", 3), ("SIBLING_STOP", 9), ("DYNAMIC_STOP", 7), ("DYNAMIC_STOP", 3)}, {"SIBLING_END", "NEW_END"}))
+        tests = ("\n    def test_sibling(self):\n"
+                 "        self.assertEqual((r.returncode, res[\"stopReason\"]), (3, \"SIBLING_STOP\"))\n"
+                 "        self.assertEqual(b[\"endReason\"], \"SIBLING_END\")\n"
+                 "        self.assertNotIn(\"NEW_END\", b[\"endReason\"])\n"
+                 "\n    def test_dynamic(self):\n"
+                 "        self.assertEqual(r.returncode, 7)\n"
+                 "        self.assertEqual(res[\"stopReason\"], \"DYNAMIC_STOP\")\n"
+                 "\n    def test_no_end_read(self):\n"
+                 "        self.assertEqual(x, \"NEW_END\")\n")
+        named_stops, named_ends = _g11_named_pairs(tests, stops, ends)
+        self.assertEqual(named_stops, {("SIBLING_STOP", 3), ("DYNAMIC_STOP", 7)}, "the (SIBLING_STOP, 9) branch and the (DYNAMIC_STOP, 3) branch are named by no test")
+        self.assertEqual(named_ends, {"SIBLING_END"}, "a negative assertion, or a method that reads no end, does not name a branch")
 
     def test_legspec_committed_r6_g10_a_preflight_child_killed_at_start_is_a_started_and_killed_refusal_never_a_not_started_one(self) -> None:
         child, _pid = self._g5_found_child("g10-committed.ps1")
