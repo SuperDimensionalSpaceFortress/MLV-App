@@ -387,9 +387,22 @@ TEST(Debayered16HonourScaleWiring, DrawFrameReportsADebayeredFrameOnlyFromThisDr
     const int gpuAt = body.indexOf(QStringLiteral("if ( useGpuAmazeDebayer && m_pMlvObject )"), branchAt);
     const int bilinearStartAt = body.indexOf(QStringLiteral("const double gpuBilinearFrameStart = mlv_stage_timing_now();"), gpuAt);
     const int bilinearReadAt = body.indexOf(QStringLiteral("m_gpuBilinearDebayerRawFrame.data() );"), gpuAt);
+    // Adversary 3b8a688e A1: the fallback's total is its own decode + llrawproc (the raw-float read) plus its own CPU
+    // debayer, never the failed GPU attempt between them.
+    const int rawFloatMsAt = body.indexOf(QStringLiteral(
+        "const double gpuBilinearRawFloatMs = ( mlv_stage_timing_now() - gpuBilinearFrameStart ) * 1000.0;"), gpuAt);
+    const int gpuAttemptAt = body.indexOf(QStringLiteral("gpuBilinearDebayerApplyGpuOffscreen( m_gpuBilinearDebayerRawFrame.data(),"), gpuAt);
+    const int fallbackStartAt = body.indexOf(QStringLiteral("const double cpuFallbackStart = mlv_stage_timing_now();"), gpuAt);
     const int cpuFallbackAt = body.indexOf(QStringLiteral("debayerBasic( slot.rawImage16.data(),"), gpuAt);
     const int cpuFallbackMsAt = body.indexOf(QStringLiteral(
-        "debayered16GpuBranchCpuDebayerMs = ( mlv_stage_timing_now() - gpuBilinearFrameStart ) * 1000.0;"), gpuAt);
+        "debayered16GpuBranchCpuDebayerMs =\n"
+        "                    gpuBilinearRawFloatMs + ( mlv_stage_timing_now() - cpuFallbackStart ) * 1000.0;"), gpuAt);
+    ASSERT_TRUE(rawFloatMsAt > bilinearReadAt);
+    ASSERT_TRUE(gpuAttemptAt > rawFloatMsAt);
+    ASSERT_TRUE(fallbackStartAt > gpuAttemptAt);
+    ASSERT_TRUE(cpuFallbackAt > fallbackStartAt);
+    ASSERT_EQ(2, body.count(QStringLiteral("gpuBilinearFrameStart"))); // its declaration and the raw-float interval
+    ASSERT_EQ(2, body.count(QStringLiteral("cpuFallbackStart")));      // its declaration and the fallback interval
     const int flagAt = body.indexOf(QStringLiteral("debayered16CpuEntryRan = !renderedDebayeredFrame;"), gpuAt);
     const int cpuBranchAt = body.indexOf(QStringLiteral("if ( !renderedDebayeredFrame )"), gpuAt);
     const int dispatchAt = body.indexOf(QStringLiteral("renderDebayered16FromSlot("), gpuAt);
@@ -406,7 +419,7 @@ TEST(Debayered16HonourScaleWiring, DrawFrameReportsADebayeredFrameOnlyFromThisDr
     ASSERT_TRUE(cpuBranchAt > flagAt);
     ASSERT_TRUE(dispatchAt > cpuBranchAt);
     ASSERT_EQ(2, body.count(QStringLiteral("debayered16CpuEntryRan = "))); // the declaration and the one assignment
-    ASSERT_EQ(1, body.count(QStringLiteral("debayered16GpuBranchCpuDebayerMs = (")));
+    ASSERT_EQ(1, body.count(QStringLiteral("debayered16GpuBranchCpuDebayerMs =\n")));
     const int readAt = body.indexOf(QStringLiteral(
         "const double debayeredFrameMs =\n"
         "        debayered16DrawDebayeredFrameMs( debayered16CpuEntryRan,\n"
