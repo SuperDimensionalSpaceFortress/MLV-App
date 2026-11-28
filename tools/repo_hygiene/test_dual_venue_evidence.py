@@ -9660,6 +9660,9 @@ NO_PACE_TWIN_BY_DESIGN = {
     # CPU-S1-FS-SPIKE-TEAM-PARTITION-1 (adversary A5 on 84d66a4b): the six team-partition arms of the display matrix.
     **{f"m16-1243-display-{mode}-s{scale}-teampart": "team-partition A/B arm: its figures compare it with its display-matrix cell on the same contact-sheet schedule, so a capture-free twin waits for the first PR that cites an absolute figure from it"
        for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)},
+    # PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1: the OpenMP team-size sweep arms (t16 / t8 / t4) and the LIGHT utilisation-sampler twin (util-light) of the two s1 -teampart sources.
+    **{f"m16-1243-display-{mode}-s1-teampart-{arm}": "OpenMP team-size / utilisation-sampler A/B arm of the s1 team-partition source: its figures compare it with that source on the same contact-sheet schedule, so a capture-free twin waits for the first PR that cites an absolute figure from it"
+       for mode in ("fullscreen", "windowed") for arm in ("t16", "t8", "t4", "util-light")},
 }
 
 
