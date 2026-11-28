@@ -2517,7 +2517,10 @@ function Invoke-VenueBoundedProcess {
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
           [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000,
           [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [Nullable[DateTime]]$StartBeforeUtc = $null,
-          [ValidateRange(0, 600000)][int]$TestStartDelayMs = 0, [switch]$TestKillThrows)
+          [ValidateRange(0, 600000)][int]$TestStartDelayMs = 0, [switch]$TestKillThrows, [ValidateRange(0, 600000)][int]$TestAfterStartDelayMs = 0)
+    # r6 fix (adversary r6 pass 15 A1, A2): right after Process.Start the child is also late when the caller's SAMPLED END is already used up (lateKind ROOM, as a passed -StartBeforeUtc is lateKind DEADLINE): it is killed at
+    # once and reported KILLED_AT_START, so nothing runs on with no room. And a child that exited on its own is no answer when the wait began with no room left (WaitForExit(0) is true for an exited child): it is timedOut,
+    # exit $null, never accepted. -TestAfterStartDelayMs (held right after Process.Start's late check) stands in for a parent descheduled between the launch and the wait.
     # r6 (Grok G10): a child that came to life only after -StartBeforeUtc WAS started and is killed at once: it is reported notStarted with reason KILLED_AT_START (not DEADLINE, which means nothing was started),
     # with killConfirmed and childPid (the pid of the process that was started; $null in every return where none was). A caller never reads an unconfirmed KILLED_AT_START as "no child".
     # -TestStartDelayMs (held after the checks, just before Process.Start) and -TestKillThrows (the tree kill throws) are offline seams for the batch's tests; a caller that passes neither is unchanged.
@@ -2529,22 +2532,25 @@ function Invoke-VenueBoundedProcess {
     $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
     foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
-    if ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'DEADLINE'; childPid = $null } }
-    if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -lt 1) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'ROOM'; childPid = $null } }
+    if ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'DEADLINE'; lateKind = ''; childPid = $null } }
+    if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -lt 1) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'ROOM'; lateKind = ''; childPid = $null } }
     if ($TestStartDelayMs -gt 0) { [Threading.Thread]::Sleep($TestStartDelayMs) }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
-    $lateStart = ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc)
+    $lateKind = $(if ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc) { 'DEADLINE' } elseif ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -le 0) { 'ROOM' } else { '' })
+    $lateStart = [bool]$lateKind
+    if ($TestAfterStartDelayMs -gt 0) { [Threading.Thread]::Sleep($TestAfterStartDelayMs) }
     $waitMs = [double]$TimeoutSec * 1000.0
     if ($null -ne $Clock) { $waitMs = [Math]::Min($waitMs, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
-    $timedOut = $(if ($lateStart) { $true } else { -not $p.WaitForExit([int][Math]::Max(0.0, [Math]::Min([double][int]::MaxValue, $waitMs))) })
+    $pastEnd = ($null -ne $Clock -and $waitMs -le 0)
+    $timedOut = $(if ($lateStart -or $pastEnd) { $true } else { -not $p.WaitForExit([int][Math]::Max(0.0, [Math]::Min([double][int]::MaxValue, $waitMs))) })
     $killErrored = $false
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
-    if ($timedOut) { if ($TestKillThrows) { $killErrored = $true } else { try { $p.Kill($true) } catch { $killErrored = $true } }; [void]$p.WaitForExit($CleanupWaitMs) }   # (-TestKillThrows: the kill is not made and reads as failed)
+    if ($timedOut) { if ($TestKillThrows) { $killErrored = $true } elseif (-not $p.HasExited) { try { $p.Kill($true) } catch { $killErrored = $true } }; [void]$p.WaitForExit($CleanupWaitMs) }   # (-TestKillThrows: the kill is not made and reads as failed; a child that already exited needs none)
     [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
     [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
-        stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }); notStarted = $lateStart; reason = $(if ($lateStart) { 'KILLED_AT_START' } else { '' }); childPid = $p.Id }
+        stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }); notStarted = $lateStart; reason = $(if ($lateStart) { 'KILLED_AT_START' } else { '' }); lateKind = $lateKind; childPid = $p.Id }
 }
 
 function Get-VenueDriverScriptMissing {

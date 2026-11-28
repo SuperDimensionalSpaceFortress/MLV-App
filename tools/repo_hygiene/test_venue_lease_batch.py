@@ -6668,6 +6668,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         out = r.stdout[-2500:] + r.stderr[-2500:] + log[-2500:]
         res = batch_result(r.stdout)
         self.assertEqual((r.returncode, res["stopReason"]), (3, "DEADLINE"), out)
+        # r6 fix (adversary r6 pass 15 A3): a child that was started and killed is a launched leg even when the kill is confirmed: a LEG_FAILED row (class KILLED_AT_START), counted as attempted, never NOT_RUN
+        [leg] = res["legs"]
+        self.assertEqual((leg["status"], leg["class"], leg["killConfirmed"], leg["lateKind"]), ("LEG_FAILED", "KILLED_AT_START", True, "DEADLINE"), out)
+        [b] = self.batches()
+        self.assertEqual((b["legsAttempted"], b["endReason"]), (1, "DEADLINE"), out)
+        self.assertEqual((res["notRun"], res["failed"]), (0, 1), out)
         dl = [l for l in log.splitlines() if " DEADLINE batch=" in l and "phase=launch" in l]
         self.assertEqual(len(dl), 1, out)
         self.assertIn("was started", dl[0])
@@ -6716,11 +6722,12 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(len(re.findall(r"if \(-not \$(bp|fp)\.started -and \$\1\.reason -ceq 'KILLED_AT_START'\) \{ return '[A-Z_]+', ", code)), 3, "each preflight types KILLED_AT_START before its not-started wording")
         leg = code[code.index("if (-not $lp.started) {"):]
         leg = leg[:leg.index("                    break\n                }")]
-        self.assertLess(leg.index("$lp.reason -ceq 'KILLED_AT_START' -and -not $lp.killConfirmed"), leg.index("$b.legsAttempted--"), "an unconfirmed kill is decided before the leg is un-counted")
-        unconfirmed = leg[:leg.index("$inFlightLeg = $null; $b.legsAttempted--")]
-        self.assertNotIn("legsAttempted--", unconfirmed)
-        self.assertNotIn("$pending.Add", unconfirmed)
-        self.assertNotIn("no leg launched", unconfirmed)
+        self.assertLess(leg.index("if ($lp.reason -ceq 'KILLED_AT_START') {"), leg.index("$b.legsAttempted--"), "a child that was started is decided before the leg is un-counted")
+        started = leg[:leg.index("$inFlightLeg = $null; $b.legsAttempted--")]
+        self.assertNotIn("legsAttempted--", started)
+        self.assertNotIn("$pending.Add", started)
+        self.assertNotIn("no leg launched", started)
+        self.assertIn("Add-Result $leg 'LEG_FAILED' $row", started, "a started-and-killed leg has a result row, confirmed or not (never NOT_RUN)")
         chain = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         body = chain[chain.index("function Invoke-VenueBoundedProcess"):chain.index("function Get-VenueDriverScriptMissing")]
         self.assertIn("'KILLED_AT_START'", body)

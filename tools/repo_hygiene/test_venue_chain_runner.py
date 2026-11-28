@@ -1628,6 +1628,22 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         never = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','exit 0') -TimeoutSec 60 -StartBeforeUtc ([DateTime]::UtcNow.AddSeconds(-1)); \"$($r.notStarted) $($r.reason) [$($r.childPid)]\"")
         self.assertEqual(never, "True DEADLINE []")
 
+    def test_r6_fix_a_child_started_with_the_sampled_end_used_up_is_killed_at_start_and_an_answer_after_that_end_is_never_accepted(self) -> None:
+        """r6 fix (adversary r6 pass 15 A1, A2). A1: the sampled-end check ran before Process.Start, so a parent descheduled between them started a child with no room left and reported it an ordinary start.
+        A2: a child that exited on its own while the parent was descheduled past the sampled end read as timedOut=$false, exit 0 (WaitForExit(0) is true for an exited child) and the answer was accepted.
+        Both are now a child that is KILLED_AT_START (lateKind ROOM) and a timedOut answer; a run deadline that passed is lateKind DEADLINE; a plain timeout carries no lateKind."""
+        lead = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        tail = "; \"$($r.notStarted) $($r.reason) [$($r.lateKind)] $($r.timedOut) $($r.exit) $($r.killConfirmed) $($r.childPid -gt 0)\"; if ($r.childPid) { Stop-Process -Id $r.childPid -Force -ErrorAction SilentlyContinue }; exit 0"
+        room = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 2 -Clock $c -EndSec 2 -StartBeforeUtc ([DateTime]::UtcNow.AddHours(1)) -TestStartDelayMs 3000 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(room, "True KILLED_AT_START [ROOM] True  True True", "a child started after the sampled end was used up is KILLED_AT_START with lateKind ROOM")
+        late = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 60 -StartBeforeUtc ([DateTime]::UtcNow.AddSeconds(1)) -TestStartDelayMs 2000 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(late, "True KILLED_AT_START [DEADLINE] True  True True")
+        # A2: the child exits at once; the parent is held (after Process.Start) until the sampled end is past: a finished child's answer is still late
+        answer = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 3 -TestAfterStartDelayMs 6000 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(answer, "False  [] True  True True", "an answer in hand only after the sampled end is a timeout (no exit), and a child that had exited on its own is a confirmed kill")
+        plain = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 600 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(plain, "False  [] False 0 True True", "an answer inside the sampled end is accepted")
+
     def test_r11_bounded_process_cleanup_waits_share_one_budget_and_a_failed_tree_kill_is_never_confirmed(self) -> None:
         """EXPORT-VENUE-LEG-1 r11 (adversary r11 A5, A6). A6: after the bound, the kill wait and both stream waits shared 3 x 15 s past a caller's deadline; a grandchild that outlives its parent
         and holds the inherited stdout (Start-Process -NoNewWindow, 40 s) now costs the ONE -CleanupWaitMs budget, not 15 s per wait. A5: a tree kill that threw is never `killConfirmed`
