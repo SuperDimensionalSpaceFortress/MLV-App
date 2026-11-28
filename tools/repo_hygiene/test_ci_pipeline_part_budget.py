@@ -36,8 +36,11 @@ def _workflow_job(workflow: str, job_id: str) -> str:
     return workflow[start : start + 1 + following.start()] if following else workflow[start:]
 
 
-# The whole run body of the step, from its first line through the close of
-# `foreach ($shard in $myShards) { ... }`, comment and blank lines dropped and indentation stripped.
+# The WHOLE step: its header keys (`- name:`, `if:`, `run: |`) and every line of its run block, through
+# the part-2 golden and stress legs to the expected-failure check, comment and blank lines dropped and
+# indentation stripped. Header and tail are pinned because an `if:` false on pull_request, or a second
+# loop over `$shards` after the pinned one, changes the work a part does as surely as a weight does
+# (adversary r2 pass 5 A1, A2). The `$goldenKeyToProducer` rows are data, compared by shape.
 # The mirror in ci_pipeline_part_plan.py repeats the discovery, the windows and the assignment
 # below; a changed or added line anywhere in this body (a scaled weight, another tie-break, a second
 # `$myShards`, a `$script:` or `Set-Variable` spelling of a pinned variable, a new `$testsPerShard`)
@@ -51,7 +54,11 @@ def _workflow_job(workflow: str, job_id: str) -> str:
 # placeholder appears exactly once in the tuple.
 SOLO_PLACEHOLDER = "$soloPattern = '<regex>'"
 TESTS_PER_SHARD_PLACEHOLDER = "$testsPerShard = <n>"
+GOLDEN_ENTRY_PLACEHOLDER = "'<golden key>' = '<producer test>'"
 EXPECTED_STEP_BODY: tuple[str, ...] = (
+    "- name: Run pipeline_tests --check-golden (bounded shards)",
+    "if: needs.protected-check-route.outputs.product == 'true'",
+    "run: |",
     "$env:PATH = \"$env:QT_ROOT_DIR\\bin;$env:MINGW_ROOT\\bin;$env:PATH\"",
     "$env:MLVAPP_CRASH_FORENSICS_AUTOINSTALL = \"1\"",
     "$env:MLVAPP_CRASH_FORENSICS_LOG_DIR = Join-Path $env:RUNNER_TEMP \"pipeline-crash-forensics\"",
@@ -177,6 +184,108 @@ EXPECTED_STEP_BODY: tuple[str, ...] = (
     "throw \"pipeline_tests shard $($shard.Name) failed outside the expected-failure contract (exit $shardExit)\"",
     "}",
     "}",
+    "if ($part -eq 2) {",
+    "$goldenKeyToProducer = [ordered]@{",
+    GOLDEN_ENTRY_PLACEHOLDER,
+    "}",
+    "$goldenPath = (Resolve-Path 'tests\\fixtures\\golden\\pipeline_hashes.json').Path",
+    "$goldenExpected = Get-Content -LiteralPath $goldenPath -Raw | ConvertFrom-Json -AsHashtable",
+    "$expectedGoldenKeys = @($goldenExpected.Keys | Sort-Object)",
+    "$mappedGoldenKeys = @($goldenKeyToProducer.Keys | Sort-Object)",
+    "$mappingDelta = @(Compare-Object -ReferenceObject $expectedGoldenKeys -DifferenceObject $mappedGoldenKeys)",
+    "if ($mappingDelta.Count -ne 0) {",
+    "throw \"golden key-to-producer coverage mismatch: $($mappingDelta | Out-String)\"",
+    "}",
+    "$goldenProducerTests = @($goldenKeyToProducer.Values | Sort-Object -Unique)",
+    "if ($goldenProducerTests.Count -ne 7) {",
+    "throw \"golden producer count changed: expected 7, actual $($goldenProducerTests.Count)\"",
+    "}",
+    "$goldenProducerFilter = $goldenProducerTests -join ':'",
+    "$goldenOutput = Join-Path $env:RUNNER_TEMP 'pipeline-tests-golden-producers.txt'",
+    "$goldenActualOutput = Join-Path $env:RUNNER_TEMP 'pipeline-golden-actual.json'",
+    "$goldenResult = Invoke-BoundedPipelineShard -Name 'golden-producers' -Arguments @(",
+    "'--check-golden',",
+    "'--hash-output', $goldenActualOutput,",
+    "\"--gtest_filter=$goldenProducerFilter\"",
+    ") -OutputPath $goldenOutput",
+    "Add-Content -Path $suiteOutput -Value (\"===== GOLDEN PRODUCERS FILTER {0} EXIT {1} =====\" -f $goldenProducerFilter, $goldenResult.ExitCode)",
+    "Add-Content -Path $suiteOutput -Value $goldenResult.Output",
+    "Write-Output (\"===== GOLDEN PRODUCERS FILTER {0} EXIT {1} =====\" -f $goldenProducerFilter, $goldenResult.ExitCode)",
+    "Write-Output $goldenResult.Output",
+    "if ($goldenResult.TimedOut) {",
+    "throw 'pipeline golden producer job exceeded 240 seconds (exit 124; output retained)'",
+    "}",
+    "switch ($goldenResult.ExitCode) {",
+    "0 { }",
+    "2 { throw 'pipeline golden producer job could not write its actual-key artifact (exit 2)' }",
+    "3 { throw 'pipeline golden producer job found a missing key, mismatch, or unexpected key (exit 3)' }",
+    "5 { throw 'pipeline golden producer job refused a dirty or unverifiable oracle (exit 5)' }",
+    "default { throw \"pipeline golden producer job failed outside the golden contract (exit $($goldenResult.ExitCode))\" }",
+    "}",
+    "$stressFilter = 'ProcessingFilters.AggressiveX*'",
+    "$stressBatchCount = 4",
+    "$stressBatchSize = 6",
+    "$stressPlannedAttempts = $stressBatchCount * $stressBatchSize",
+    "$stressAchievedAttempts = 0",
+    "$powerDisclosure = 'STRESS-PREREG targetPower=95% historicalContendedRate=2/72 historicalLoad=24-way derivedN=107 cp95Lower=0.0033819 lowerBoundN=885 ciLoad=6-way ciN=24 pointPower=49.1% lowerBoundPower=7.8% dependence=within-batch-correlated'",
+    "Add-Content -Path $suiteOutput -Value $powerDisclosure",
+    "Write-Output $powerDisclosure",
+    "for ($batch = 1; $batch -le $stressBatchCount; $batch++) {",
+    "$stressProcesses = @()",
+    "for ($run = 1; $run -le $stressBatchSize; $run++) {",
+    "$attempt = (($batch - 1) * $stressBatchSize) + $run",
+    "$name = \"stress-b{0:D2}-r{1:D2}-a{2:D3}\" -f $batch, $run, $attempt",
+    "$psi = [System.Diagnostics.ProcessStartInfo]::new()",
+    "$psi.FileName = (Resolve-Path \"tests\\build-ci-pipeline\\release\\pipeline_tests.exe\").Path",
+    "$psi.WorkingDirectory = $env:GITHUB_WORKSPACE",
+    "$psi.UseShellExecute = $false",
+    "$psi.RedirectStandardOutput = $true",
+    "$psi.RedirectStandardError = $true",
+    "[void]$psi.ArgumentList.Add(\"--gtest_filter=$stressFilter\")",
+    "$process = [System.Diagnostics.Process]::new()",
+    "$process.StartInfo = $psi",
+    "if (-not $process.Start()) { throw \"failed to start stress repetition $name\" }",
+    "$stressProcesses += [pscustomobject]@{",
+    "Name = $name",
+    "Process = $process",
+    "Stdout = $process.StandardOutput.ReadToEndAsync()",
+    "Stderr = $process.StandardError.ReadToEndAsync()",
+    "}",
+    "}",
+    "$batchFailures = @()",
+    "foreach ($stress in $stressProcesses) {",
+    "$timedOut = -not $stress.Process.WaitForExit(240000)",
+    "if ($timedOut) {",
+    "try { $stress.Process.Kill($true) } catch { }",
+    "}",
+    "$stress.Process.WaitForExit()",
+    "$stressOutput = $stress.Stdout.GetAwaiter().GetResult() + $stress.Stderr.GetAwaiter().GetResult()",
+    "$stressExit = if ($timedOut) { 124 } else { $stress.Process.ExitCode }",
+    "$stressOutputPath = Join-Path $env:RUNNER_TEMP (\"pipeline-tests-{0}.txt\" -f $stress.Name)",
+    "Set-Content -Path $stressOutputPath -Value $stressOutput -Encoding utf8",
+    "Add-Content -Path $suiteOutput -Value (\"===== STRESS {0} FILTER {1} EXIT {2} =====\" -f $stress.Name, $stressFilter, $stressExit)",
+    "Add-Content -Path $suiteOutput -Value $stressOutput",
+    "Write-Output (\"===== STRESS {0} FILTER {1} EXIT {2} =====\" -f $stress.Name, $stressFilter, $stressExit)",
+    "Write-Output $stressOutput",
+    "$stressAchievedAttempts++",
+    "if ($stressExit -ne 0) {",
+    "$batchFailures += \"$($stress.Name):$stressExit\"",
+    "}",
+    "}",
+    "if ($batchFailures.Count -ne 0) {",
+    "$abort = \"STRESS-ABORT achieved=$stressAchievedAttempts planned=$stressPlannedAttempts failures=$($batchFailures -join ',')\"",
+    "Add-Content -Path $suiteOutput -Value $abort",
+    "throw $abort",
+    "}",
+    "}",
+    "$stressComplete = \"STRESS-COMPLETE achieved=$stressAchievedAttempts planned=$stressPlannedAttempts failures=0\"",
+    "Add-Content -Path $suiteOutput -Value $stressComplete",
+    "Write-Output $stressComplete",
+    "}",
+    "& tools\\testing\\check-expected-failures.ps1 -SuiteOutput $suiteOutput",
+    "if ($LASTEXITCODE -ne 0) {",
+    "exit $LASTEXITCODE",
+    "}",
 )
 
 STEP_NAME = "Run pipeline_tests --check-golden (bounded shards)"
@@ -190,10 +299,20 @@ STEP_NAME = "Run pipeline_tests --check-golden (bounded shards)"
 # widens this set and the mirror together.
 _SOLO_SHAPE = re.compile(r"\$soloPattern = '((?:[A-Za-z0-9_|^$()]|\\\.)*)'")
 _TESTS_PER_SHARD_SHAPE = re.compile(r"\$testsPerShard = [0-9]+")
+# `$goldenKeyToProducer` rows (part 2): data, compared by shape and collapsed to one placeholder, so a
+# new golden key does not need an edit here. The workflow compares the keys with pipeline_hashes.json
+# itself and pins the producer count on its own (pinned) line.
+_GOLDEN_ENTRY_SHAPE = re.compile(r"'[a-z0-9_.]+' = '[A-Za-z0-9_.]+'")
 
 
-def _step_span(lines: list[str]) -> tuple[int, int]:
-    """First and last line index of the step's pinned body, or ValueError when the step moved."""
+def _step_span(lines: list[str]) -> tuple[int, int, int]:
+    """Index of the step's `- name:` line, of its `run: |` line and of its last line (ValueError if it moved).
+
+    The whole step is pinned, not only the planning prefix and the shard loop (adversary r2 pass 5):
+    its header keys (`if:` decides whether any shard runs on pull_request, push and merge_group) and
+    everything after the loop (a second loop over `$shards`, an early `exit`) change the work a part
+    does as surely as a changed weight.
+    """
     named = [i for i, line in enumerate(lines) if line.strip() == f"- name: {STEP_NAME}"]
     if len(named) != 1:
         raise ValueError(f"step {STEP_NAME!r} must appear exactly once in the job (found {len(named)})")
@@ -201,20 +320,13 @@ def _step_span(lines: list[str]) -> tuple[int, int]:
     run = next((i for i in range(named[0] + 1, step_end) if lines[i].strip() == "run: |"), None)
     if run is None:
         raise ValueError("the pipeline step lost its `run: |` block")
-    loop = next((i for i in range(run + 1, step_end) if lines[i].strip() == "foreach ($shard in $myShards) {"), None)
-    if loop is None:
-        raise ValueError("the pipeline step lost its `foreach ($shard in $myShards) {` loop")
-    indent = lines[loop][: len(lines[loop]) - len(lines[loop].lstrip())]
-    close = next((i for i in range(loop + 1, step_end) if lines[i] == indent + "}"), None)
-    if close is None:
-        raise ValueError("the `foreach ($shard in $myShards)` loop has no closing brace at its own indent")
-    return run + 1, close
+    return named[0], run, step_end - 1
 
 
 def _step_body(part_job: str) -> tuple[str, ...]:
     lines = part_job.splitlines()
     try:
-        first, last = _step_span(lines)
+        first, _run, last = _step_span(lines)
     except ValueError as error:
         return (f"MISSING: {error}",)
     body: list[str] = []
@@ -226,6 +338,10 @@ def _step_body(part_job: str) -> tuple[str, ...]:
             text = SOLO_PLACEHOLDER
         elif _TESTS_PER_SHARD_SHAPE.fullmatch(text):
             text = TESTS_PER_SHARD_PLACEHOLDER
+        elif _GOLDEN_ENTRY_SHAPE.fullmatch(text):
+            if body and body[-1] == GOLDEN_ENTRY_PLACEHOLDER:
+                continue  # the map may gain or lose entries; the workflow checks it against the golden file
+            text = GOLDEN_ENTRY_PLACEHOLDER
         body.append(text)
     return tuple(body)
 
@@ -237,7 +353,7 @@ def _guard_flags(part_job: str) -> bool:
 
 def _step_code_lines(part_job: str) -> list[str]:
     lines = part_job.splitlines()
-    first, last = _step_span(lines)
+    first, _run, last = _step_span(lines)
     return [line.strip() for line in lines[first : last + 1]]
 
 
@@ -441,7 +557,7 @@ class PipelineStepBodyPinTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.part_job = _workflow_job(_read_workflow(), "windows-product-oracles-part")
         cls.lines = cls.part_job.splitlines()
-        cls.first, cls.last = _step_span(cls.lines)
+        cls.first, _run, cls.last = _step_span(cls.lines)
         cls.code = [
             i for i in range(cls.first, cls.last + 1) if cls.lines[i].strip() and not cls.lines[i].strip().startswith("#")
         ]
@@ -463,6 +579,45 @@ class PipelineStepBodyPinTests(unittest.TestCase):
         )
         self.assertNotEqual(smuggled, self.part_job)
         self.assertTrue(_guard_flags(smuggled))
+
+    def test_the_step_header_and_everything_after_the_shard_loop_are_pinned(self) -> None:
+        # adversary r2 pass 5: A1 a second `foreach ($again in $shards)` after the pinned loop ran
+        # every shard on every part (3 x the priced work); A2 an `if:` that is false on pull_request,
+        # push and merge_group skipped the step entirely. Both sat outside the span pinned before.
+        header = "- name: " + STEP_NAME + "\n        if: needs.protected-check-route.outputs.product == 'true'"
+        self.assertIn(header, self.part_job)
+        second_loop = (
+            "foreach ($again in $shards) {\n"
+            '            $extra = Invoke-BoundedPipelineShard -Name $again.Name -Arguments @("--gtest_filter=$($again.Filter)") -OutputPath $suiteOutput\n'
+            "          }"
+        )
+        cases = [
+            ("A1 second shard loop after the first", _insert_before(self.part_job, "# Part 2 owns", second_loop)),
+            ("A1 second shard loop at the end of the step", _insert_before(self.part_job, "& tools\\testing\\check-expected-failures.ps1", second_loop)),
+            ("A1 exit before the expected-failure check", _insert_before(self.part_job, "& tools\\testing\\check-expected-failures.ps1", "exit 0")),
+            ("A2 if: limited to workflow_dispatch", self.part_job.replace(header, header + " && github.event_name == 'workflow_dispatch'", 1)),
+            ("A2 if: removed", self.part_job.replace("\n        if: needs.protected-check-route.outputs.product == 'true'\n        run: |\n          $env:PATH", "\n        run: |\n          $env:PATH", 1)),
+            ("A2 continue-on-error added", self.part_job.replace(header, header + "\n        continue-on-error: true", 1)),
+            ("golden producer count changed", self.part_job.replace("-ne 7", "-ne 8", 1)),
+            ("stress batches changed", self.part_job.replace("$stressBatchCount = 4", "$stressBatchCount = 1", 1)),
+        ]
+        for label, mutated in cases:
+            with self.subTest(label):
+                self.assertNotEqual(mutated, self.part_job)
+                self.assertTrue(_guard_flags(mutated))
+
+    def test_the_golden_map_may_grow_and_a_value_may_change(self) -> None:
+        # The map's entries are data the workflow itself checks against pipeline_hashes.json.
+        entry = "              'tiny_dual_iso.preview_processing.cpu.frame0' = "
+        self.assertIn(entry, self.part_job)
+        grown = self.part_job.replace(entry, "              'tiny_dual_iso.some_new_key.frame0' = 'NewSuite.NewTest'\n" + entry, 1)
+        self.assertNotEqual(grown, self.part_job)
+        self.assertFalse(_guard_flags(grown))
+        shrunk = "\n".join(
+            line for line in self.part_job.splitlines() if not line.strip().startswith("'tiny_dual_iso.gpu_preview_subset.signature.frame1'")
+        )
+        self.assertNotEqual(shrunk, self.part_job)
+        self.assertFalse(_guard_flags(shrunk))
 
     def test_a_solo_pattern_the_two_engines_could_read_differently_is_refused(self) -> None:
         # adversary r2 pass 4 A1: PowerShell reads U+2018..U+201B as single quotes, so a "second
@@ -498,15 +653,16 @@ class PipelineStepBodyPinTests(unittest.TestCase):
     def test_every_body_line_is_pinned_against_deletion_duplication_and_case_change(self) -> None:
         for index in self.code:
             line = self.lines[index]
+            if _GOLDEN_ENTRY_SHAPE.fullmatch(line.strip()):
+                continue  # data rows of the golden map; test_the_golden_map_may_grow_and_a_value_may_change
             with self.subTest(line=line.strip()[:70]):
                 self.assertTrue(self._flags(self.lines[:index] + self.lines[index + 1 :]), "deleted")
-                if index != self.last:  # a copy of the closing brace lands after the pinned body
-                    self.assertTrue(self._flags(self.lines[: index + 1] + [line] + self.lines[index + 1 :]), "duplicated")
+                self.assertTrue(self._flags(self.lines[: index + 1] + [line] + self.lines[index + 1 :]), "duplicated")
                 if line.swapcase() != line:
                     self.assertTrue(self._flags(self.lines[:index] + [line.swapcase()] + self.lines[index + 1 :]), "case changed")
 
     def test_a_statement_inserted_at_any_position_in_the_body_is_refused(self) -> None:
-        for position in range(self.first, self.last + 1):
+        for position in range(self.first + 1, self.last + 1):  # before `- name:` is outside the step
             with self.subTest(position=position):
                 self.assertTrue(self._flags(self.lines[:position] + ["          $injected = 1"] + self.lines[position:]))
 
