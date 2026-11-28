@@ -507,7 +507,15 @@ class CompleteChainSingleReadTests(_PwshCase):
         # many times the BYTES are read, so part 0 is a genuine ~30 s clip: its header AND that many VIDF blocks
         # (GUI-SMOKE-LENGTH-GATE-VIDF-COUNT-1: the gate counts the blocks the app plays, so a header in front of
         # a random body is refused as header_vidf_count_mismatch before the runner reads anything).
-        self.data = [mlv_bytes_with_random_vidf_payload(FRAMES_30S_AT_23976, 700_000), os.urandom(4_321)]
+        # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r2: part 1 is a real continuation too. The gate now probes <base>.M00 by
+        # NAME, as src/mlv/video_mlv.c load_all_chunks opens it, and the app refuses any opened part that does not start with
+        # MLVI ("File header is missing, invalid MLV", video_mlv.c); a random-bytes .M00 is a clip the app cannot open, so the
+        # gate (rightly) refuses it as part_bad_magic before the runner reads a byte. Both parts carry the set's header
+        # (fileCount 2, one GUID) and VIDF blocks of random payload at the same fixed sizes, so the bytes stay incompressible.
+        self.data = [
+            mlv_bytes_with_random_vidf_payload(FRAMES_30S_AT_23976, 700_000, file_num=0, file_count=2),
+            mlv_bytes_with_random_vidf_payload(10, 4_321, file_num=1, file_count=2),
+        ]
         self.parts = [
             self.clip_dir / ("owner-clip" + _BASE_EXT),
             self.clip_dir / ("owner-clip" + _CONT_EXT),

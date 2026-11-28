@@ -1427,6 +1427,24 @@ $launchInputBindings = [pscustomobject]@{
     receipt = if ($smokeReceiptPath) { Get-GuiSmokeImmutableFileBinding -Path $smokeReceiptPath } else { $null }
 }
 
+# GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r4 (Grok G1, adversary pass 4 A1): the length gate counted the parts the app
+# opens (probed by name, as the file system resolves it), and the binding above lists the parts by an exact-case base name.
+# On NTFS the two can disagree (a first part plus a continuation whose base differs in case: the gate admits it, the binding
+# records only the first part). A binding that is not the gate's counted set is refused, before anything is staged or launched.
+# The gate is skipped under -LaunchOnlyProbe (no parts to compare); a -DryRun with no bindable part keeps its own contract above.
+if ($clipLengthGate.PSObject.Properties['parts'] -and -not ($DryRun -and $clipParts.Count -eq 0)) {
+    $gateCountedParts = @($clipLengthGate.parts | ForEach-Object { [string]$_ })
+    $boundParts = @($clipParts | ForEach-Object { [string]$_.path })
+    # Compared as the files the names open, not as case-folded paths: a case-sensitive directory can hold two case variants of one
+    # part name, and the gate counts one (hidden files included) while the binding lists the other (adversary ff851a0b A1).
+    $clipDirectoryEntries = @(Get-ChildItem -LiteralPath (Split-Path -Parent $inputPath) -Force | ForEach-Object { $_.Name })
+    $partsAgree = Test-GuiSmokeBindingMatchesGateParts -GateParts $gateCountedParts -BoundParts $boundParts -DirectoryEntries $clipDirectoryEntries
+    if (-not $partsAgree) {
+        [Console]::Error.WriteLine("PLAYBACK-CLIP-LENGTH-ENFORCE-1: CLIP_LENGTH_UNKNOWN (reason=binding_parts_mismatch gate_parts=$($gateCountedParts.Count) bound_parts=$($boundParts.Count))")
+        exit (Get-GuiSmokeGateExitCode -Verdict 'CLIP_LENGTH_UNKNOWN')
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($Output)) {
     $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
     $clipBase = [IO.Path]::GetFileNameWithoutExtension($inputPath)
@@ -2622,6 +2640,10 @@ $loopPaceFps = Get-ObjectPropertyValue $playbackSummary "pace_fps"
 $loopFpsOverride = Get-ObjectPropertyValue $playbackSummary "fps_override"
 $invalidLooped = $false
 $invalidSourceFrames = $false
+# GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1: a measured Play must stop at its window (PLAY_OVERRAN_WINDOW, exit 43). A launch-only
+# probe plays nothing, and a lifecycle-stress run switches clips mid-play, so neither is held to the window stop.
+$playOverranWindow = $false
+$windowStopRequired = (-not [bool]$LaunchOnlyProbe) -and (-not [bool]$ExerciseClipLifecycleStress)
 $gateFrames = Get-ObjectPropertyValue $clipLengthGate "frames"
 # HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the playback_smoke.conform line the app logged for the summary's own session (the last one wins);
 # the source-frame oracle relaxes its native-pace rule only on a conform line it can prove (Get-GuiSmokeConformPaceProof), never on its absence.
@@ -2630,7 +2652,7 @@ $loopConformLine = ''
 if ($loopSummarySession -ne '') {
     $loopConformLine = [string](@($recentLines | Where-Object { $_ -match ('playback_smoke\.conform session=' + [regex]::Escape($loopSummarySession) + '(\s|$)') } | Select-Object -Last 1) -join '')
 }
-$loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary -WindowSeconds $Seconds -ExpectedRunNonce $runNonce -LaunchOnlyProbe ([bool]$LaunchOnlyProbe) -ClipFrames $(if ($null -ne $gateFrames) { [int64]$gateFrames } else { [int64]0 }) -ConformLine $loopConformLine
+$loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary -WindowSeconds $Seconds -ExpectedRunNonce $runNonce -LaunchOnlyProbe ([bool]$LaunchOnlyProbe) -ClipFrames $(if ($null -ne $gateFrames) { [int64]$gateFrames } else { [int64]0 }) -ConformLine $loopConformLine -RequireWindowStop $windowStopRequired
 # PLAYBACK-CLIP-LENGTH-ENFORCE-4: a summary without wrapped / wrap_count (a build that predates the wrap fields) is no
 # longer a WARNING that falls back to the header-based checks: the loop verdict above fails it (RECEIPT_FIELD_ABSENT,
 # INVALID_LOOPED, exit 43). "The app was silent" is never "the app did not wrap".
@@ -2640,6 +2662,7 @@ if ($loopVerdict.invalid) {
     # run was paced by anything but the clip's native fps) are both decided by Get-GuiSmokeLoopVerdict.
     $invalidLooped = -not $LaunchOnlyProbe
     $invalidSourceFrames = (-not $LaunchOnlyProbe) -and (@($loopVerdict.failures | Where-Object { $_ -like 'INVALID_SOURCE_FRAMES*' }).Count -gt 0)
+    $playOverranWindow = (-not $LaunchOnlyProbe) -and (@($loopVerdict.failures | Where-Object { $_ -like 'PLAY_OVERRAN_WINDOW*' }).Count -gt 0)
     $validationFailures += $loopVerdict.failures
 }
 if ($LaunchOnlyProbe -and ($playbackStartLine -or $summaryLine)) {
@@ -2988,6 +3011,9 @@ $result = [pscustomobject]@{
         conformClipFps = $loopVerdict.conformClipFps
         runtimeFpsOverride = $loopFpsOverride
         invalidSourceFrames = $invalidSourceFrames
+        # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1: the measured Play ran past its window (exit 43), and whether the run was held to it.
+        playOverranWindow = $playOverranWindow
+        windowStopRequired = $windowStopRequired
     }
     playbackFps = [pscustomobject]@{
         requestedPlaybackSeconds = $Seconds

@@ -161,15 +161,16 @@ class ClipLengthGateTests(_TmpCase):
         incomplete = _gate(first, 24)
         self.assertEqual(incomplete["verdict"], "CLIP_LENGTH_UNKNOWN", incomplete)
         self.assertEqual(incomplete["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)")
-        # Both parts: 400 + 400 = 800 frames = 33.37 s.
-        write_synthetic_mlv(self.tmp / "span.M00", 400, file_num=1, file_count=2, guid=guid)
+        # Both parts: 400 + 400 = 800 frames = 33.37 s. (The part is named exactly as the app probes it, the first part's own
+        # case, so this holds on the case-sensitive ubuntu shard too: GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1, adversary A1.)
+        write_synthetic_mlv(self.tmp / ("span" + self._probed(0)), 400, file_num=1, file_count=2, guid=guid)
         complete = _gate(first, 24)
         self.assertEqual(complete["verdict"], "OK", complete)
         self.assertAlmostEqual(complete["clipSeconds"], 33.37, places=2)
 
     def test_a_spanned_set_from_two_recordings_is_unknown(self) -> None:
         first = write_synthetic_mlv(self.tmp / ("mix" + MLV_EXTENSION), 400, file_num=0, file_count=2, guid=1)
-        write_synthetic_mlv(self.tmp / "mix.M00", 400, file_num=1, file_count=2, guid=2)
+        write_synthetic_mlv(self.tmp / ("mix" + self._probed(0)), 400, file_num=1, file_count=2, guid=2)
         verdict = _gate(first, 24)
         self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_mismatch)")
 
@@ -200,11 +201,134 @@ class ClipLengthGateTests(_TmpCase):
         guid = 0x1122334455667788
         first = write_synthetic_mlv_with_blocks(self.tmp / ("vspan" + MLV_EXTENSION), 200, 400,
                                                 file_num=0, file_count=3, guid=guid)
-        write_synthetic_mlv_with_blocks(self.tmp / "vspan.M00", 200, 300, file_num=1, file_count=3, guid=guid)
-        write_synthetic_mlv_with_blocks(self.tmp / "vspan.M01", 212, 237, file_num=2, file_count=3, guid=guid)
+        write_synthetic_mlv_with_blocks(self.tmp / ("vspan" + self._probed(0)), 200, 300, file_num=1, file_count=3, guid=guid)
+        write_synthetic_mlv_with_blocks(self.tmp / ("vspan" + self._probed(1)), 212, 237, file_num=2, file_count=3, guid=guid)
         verdict = _gate(first, 24)
         self.assertEqual(verdict["frames"], 937, verdict)
         self.assertAlmostEqual(verdict["clipSeconds"], 39.08, places=2)
+
+    # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 (d2): the app opens the first part, then probes <base>.M00, .M01 ... by NAME
+    # until one is missing (src/mlv/video_mlv.c load_all_chunks); it reads no fileNum / fileCount. Bachelor M16-1457's first
+    # part declares fileCount <= 1, so the header-led gate counted 1671 frames where the app plays 2859.
+    def _span(self, name: str, first_count: int, parts: dict, guid: int = 0x5A5A0001) -> Path:
+        """The first part (400 VIDF, file_count=first_count) plus each `parts` suffix -> (file_num, file_count, guid)."""
+        first = write_synthetic_mlv(self.tmp / (name + MLV_EXTENSION), 400, file_num=0, file_count=first_count, guid=guid)
+        for suffix, (num, count, part_guid) in parts.items():
+            write_synthetic_mlv(self.tmp / (name + suffix), 400, file_num=num, file_count=count, guid=part_guid)
+        return first
+
+    # The name the app probes for part n: the first part's path with its LAST TWO characters replaced by the two-digit
+    # number (load_all_chunks: strcpy(&filename[strlen(filename) - 2], seq_name)), so it keeps the first part's own case.
+    # MLV_EXTENSION is lower case, so the probed names here end ".m00", ".m01" ... and hold on a case-sensitive file system.
+    @staticmethod
+    def _probed(n: int) -> str:
+        return MLV_EXTENSION[:-2] + f"{n:02d}"
+
+    def _case_insensitive_tmp(self) -> bool:
+        probe = self.tmp / "case-probe-lower"
+        probe.write_bytes(b"")
+        try:
+            return (self.tmp / "CASE-PROBE-LOWER").exists()
+        finally:
+            probe.unlink()
+
+    def test_g1_an_under_declaring_first_part_still_counts_the_probed_m00(self) -> None:
+        verdict = _gate(self._span("g1", 1, {self._probed(0): (1, 1, 0x5A5A0001)}), 24)
+        self.assertEqual(verdict["verdict"], "OK", verdict)
+        self.assertEqual(verdict["frames"], 800, verdict)
+
+    def test_g2_a_zero_file_count_header_still_counts_the_probed_m00(self) -> None:
+        verdict = _gate(self._span("g2", 0, {self._probed(0): (1, 0, 0x5A5A0001)}), 24)
+        self.assertEqual(verdict["frames"], 800, verdict)
+
+    def test_g3_a_probed_part_from_another_recording_fails_closed(self) -> None:
+        verdict = _gate(self._span("g3", 1, {self._probed(0): (1, 1, 0x5A5A0002)}), 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_mismatch)")
+
+    def test_g4_a_gap_ends_the_probed_set_as_it_does_in_the_app(self) -> None:
+        verdict = _gate(self._span("g4", 1, {self._probed(0): (1, 1, 0x5A5A0001), self._probed(2): (3, 1, 0x5A5A0001)}), 24)
+        self.assertEqual(verdict["frames"], 800, verdict)
+
+    def test_g5_a_sibling_in_the_other_case_counts_only_where_the_app_can_open_it(self) -> None:
+        # adversary e8eeaee1 A1: the app opens the probed NAME, so a sibling whose extension differs in case from the first
+        # part's is a part only on a case-insensitive volume (the venues' NTFS). On a case-sensitive one (the ubuntu CI shard)
+        # fopen misses it and the app plays the first part alone.
+        other_case = self._probed(0).swapcase()
+        verdict = _gate(self._span("g5", 1, {other_case: (1, 1, 0x5A5A0001)}), 24)
+        self.assertEqual(verdict["frames"], 800 if self._case_insensitive_tmp() else 400, verdict)
+
+    def test_g7_a_sibling_whose_base_differs_in_case_counts_only_where_the_app_can_open_it(self) -> None:
+        # The same rule from the base-name side: on a case-insensitive volume fopen("g7" + probed) opens "G7" + probed, so the
+        # app plays it and the count must include it; on a case-sensitive volume it does not exist for the app.
+        first = write_synthetic_mlv(self.tmp / ("g7" + MLV_EXTENSION), 400, file_num=0, file_count=1, guid=0x5A5A0001)
+        write_synthetic_mlv(self.tmp / ("G7" + self._probed(0)), 400, file_num=1, file_count=1, guid=0x5A5A0001)
+        verdict = _gate(first, 24)
+        self.assertEqual(verdict["frames"], 800 if self._case_insensitive_tmp() else 400, verdict)
+
+    def test_g6_a_declared_three_part_set_with_a_gap_is_incomplete(self) -> None:
+        verdict = _gate(self._span("g6", 3, {self._probed(0): (1, 3, 0x5A5A0001), self._probed(2): (2, 3, 0x5A5A0001)}), 24)
+        self.assertEqual(verdict["verdict"], "CLIP_LENGTH_UNKNOWN", verdict)
+        self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)")
+
+    # adversary f408901c A1: a header that DECLARES the set is followed by the same probed names (the app reads no fileCount),
+    # so its parts are found exactly as the app finds them: by the probed name, as the file system resolves it.
+    def test_g8_a_declared_part_whose_base_differs_in_case_counts_only_where_the_app_can_open_it(self) -> None:
+        first = write_synthetic_mlv(self.tmp / ("g8" + MLV_EXTENSION), 400, file_num=0, file_count=2, guid=0x5A5A0001)
+        write_synthetic_mlv(self.tmp / ("G8" + self._probed(0)), 400, file_num=1, file_count=2, guid=0x5A5A0001)
+        verdict = _gate(first, 24)
+        if self._case_insensitive_tmp():
+            self.assertEqual(verdict["frames"], 800, verdict)
+        else:
+            self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)")
+
+    def test_g9_a_declared_part_in_the_other_case_counts_only_where_the_app_can_open_it(self) -> None:
+        verdict = _gate(self._span("g9", 2, {self._probed(0).swapcase(): (1, 2, 0x5A5A0001)}), 24)
+        if self._case_insensitive_tmp():
+            self.assertEqual(verdict["frames"], 800, verdict)
+        else:
+            self.assertEqual(verdict["message"], "CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)")
+
+    # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r4 (adversary ff851a0b A1/A2). A case-sensitive directory cannot be made without
+    # elevation, so the parity decision is a pure function over the directory's entry names and is driven with the listings
+    # such a directory would give.
+    def _binding_matches(self, gate_parts: list, bound_parts: list, entries: list) -> bool:
+        def arr(items: list) -> str:
+            return "@(" + ",".join(_q(item) for item in items) + ")" if items else "@()"
+        proc = _pwsh(f". {_q(GATE)}; Test-GuiSmokeBindingMatchesGateParts -GateParts {arr(gate_parts)} "
+                     f"-BoundParts {arr(bound_parts)} -DirectoryEntries {arr(entries)}")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout.strip() == "True"
+
+    def test_r4_a1_the_binding_must_be_the_files_the_gate_counted_not_a_case_variant_of_them(self) -> None:
+        d = str(self.tmp) + os.sep
+        mlv, hidden_m00, other_m00 = d + "clip.MLV", d + "clip.M00", d + "clip.m00"
+        # A case-sensitive directory holding the counted (hidden) clip.M00 AND a visible, different clip.m00: the binding
+        # lists the visible one. Equal counts and equal case-folded paths, yet not the file the gate counted.
+        self.assertFalse(self._binding_matches([mlv, hidden_m00], [mlv, other_m00], ["clip.MLV", "clip.M00", "clip.m00"]))
+        # The binding that lists the counted file passes, even though a case variant sits beside it.
+        self.assertTrue(self._binding_matches([mlv, hidden_m00], [mlv, hidden_m00], ["clip.MLV", "clip.M00", "clip.m00"]))
+        # A case-insensitive volume: one entry, resolved from another spelling of its name, is that file.
+        self.assertTrue(self._binding_matches([mlv, d + "clip.m00"], [mlv, hidden_m00], ["clip.MLV", "clip.M00"]))
+        # Two case variants and neither is the spelling the gate used: ambiguous, so refused.
+        self.assertFalse(self._binding_matches([d + "clip.mlv"], [d + "clip.MLV"], ["clip.MLV", "clip.Mlv"]))
+        # Counts differ (the G8 case: the gate counts a part the binding never lists), and an empty binding.
+        self.assertFalse(self._binding_matches([mlv, hidden_m00], [mlv], ["clip.MLV", "clip.M00"]))
+        self.assertFalse(self._binding_matches([mlv], [], ["clip.MLV"]))
+        # A name the directory does not hold is not a counted file.
+        self.assertFalse(self._binding_matches([mlv], [mlv], []))
+
+    def test_r4_a2_the_gates_parts_are_full_paths_even_for_a_relative_input(self) -> None:
+        clip = write_synthetic_mlv(self.tmp / ("rel" + MLV_EXTENSION), 400, file_num=0, file_count=1, guid=0x5A5A0001)
+        proc = subprocess.run(
+            [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command",
+             f". {_q(GATE)}; (Get-GuiSmokeClipLength -Path ('.' + [IO.Path]::DirectorySeparatorChar + {_q(clip.name)})).parts "
+             "| ConvertTo-Json -Compress"],
+            capture_output=True, text=True, timeout=120, cwd=str(self.tmp))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        parts = json.loads(proc.stdout)
+        parts = parts if isinstance(parts, list) else [parts]
+        self.assertEqual([p.lower() for p in parts], [str(clip).lower()])
 
     def test_other_blocks_are_skipped_and_only_vidf_is_counted(self) -> None:
         path = self.tmp / ("mixed" + MLV_EXTENSION)
@@ -423,6 +547,11 @@ class ClipLengthGateTests(_TmpCase):
         self.assertEqual(lines[0], "41,41,42")
         self.assertEqual(lines[1], "PLAY_WINDOW_TOO_SHORT,REPLAY_REFUSED,EXIT_43,NONE")
 
+    def test_exit_43_types_a_play_that_overran_its_window(self) -> None:
+        proc = _pwsh(f". {_q(GATE)}; Get-GuiSmokeRefusalReason -ExitCode 43 -Message 'PLAY_OVERRAN_WINDOW: x'")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "PLAY_OVERRAN_WINDOW")
+
     def test_an_autoplay_variable_inherited_from_the_parent_environment_is_refused(self) -> None:
         def check(extra_env: dict, call: str = "Test-GuiSmokeParentEnvironment") -> dict:
             env = {k: v for k, v in os.environ.items() if not k.upper().startswith("MLVAPP_AUTOPLAY_")}
@@ -519,6 +648,50 @@ class RunnerChokePointTests(_TmpCase):
         proc = self.run_runner(TRACKED_LARGE_FIXTURE, "-Seconds", "40")
         self.assertEqual(proc.returncode, EXIT_TOO_SHORT, proc.stdout + proc.stderr)
         self.assertIn("CLIP_TOO_SHORT (clip=0.667 window=40)", proc.stderr)
+
+    # GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1 r4 (Grok G1, adversary pass 4 A1): the gate's counted parts and the runner's
+    # immutable binding must be the same set. The binding lists parts by an exact-case base name; the gate (like the app's
+    # fopen) resolves the probed name through the file system, so on NTFS a continuation whose base differs in case is counted
+    # by the gate and absent from the binding. That run is refused, typed, before anything is staged or launched.
+    @staticmethod
+    def _continuation_extension() -> str:
+        return MLV_EXTENSION[:-2] + "00"
+
+    def _case_insensitive_volume(self) -> bool:
+        probe = self.tmp / "case-probe-lower"
+        probe.write_bytes(b"")
+        try:
+            return (self.tmp / "CASE-PROBE-LOWER").exists()
+        finally:
+            probe.unlink()
+
+    def test_r4_g1_a_continuation_whose_base_differs_in_case_is_refused_by_the_runner_not_bound_partially(self) -> None:
+        first = write_synthetic_mlv(self.tmp / ("g8" + MLV_EXTENSION), 400, file_num=0, file_count=2, guid=0x5A5A0001)
+        write_synthetic_mlv(self.tmp / ("G8" + self._continuation_extension()), 400, file_num=1, file_count=2, guid=0x5A5A0001)
+        proc = self.run_runner(first)
+        self.assertEqual(proc.returncode, EXIT_UNKNOWN, proc.stdout + proc.stderr)
+        if self._case_insensitive_volume():
+            # The gate counts both parts (800 frames, 33 s) and the binding holds one: the typed parity refusal.
+            self.assertIn("CLIP_LENGTH_UNKNOWN (reason=binding_parts_mismatch", proc.stderr)
+        else:
+            # A case-sensitive volume: the app cannot open it either, so the gate itself refuses it as an incomplete set.
+            self.assertIn("CLIP_LENGTH_UNKNOWN (reason=spanned_set_incomplete)", proc.stderr)
+        self.assertNotIn(str(self.tmp), proc.stderr)
+
+    def test_r4_g1_a_set_the_gate_and_the_binding_agree_on_proceeds(self) -> None:
+        first = write_synthetic_mlv(self.tmp / ("agree" + MLV_EXTENSION), 400, file_num=0, file_count=2, guid=0x5A5A0001)
+        write_synthetic_mlv(self.tmp / ("agree" + self._continuation_extension()), 400, file_num=1, file_count=2, guid=0x5A5A0001)
+        proc = self.run_runner(first)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(json.loads(proc.stdout)["clipLengthGate"], "OK")
+
+    def test_r4_g1_the_gate_returns_the_parts_it_counted_in_probe_order(self) -> None:
+        first = write_synthetic_mlv(self.tmp / ("order" + MLV_EXTENSION), 400, file_num=0, file_count=2, guid=0x5A5A0001)
+        second = write_synthetic_mlv(self.tmp / ("order" + self._continuation_extension()), 400, file_num=1, file_count=2,
+                                     guid=0x5A5A0001)
+        proc = _pwsh(f". {_q(GATE)}; (Get-GuiSmokeClipLength -Path {_q(first)}).parts | ConvertTo-Json -Compress")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual([p.lower() for p in json.loads(proc.stdout)], [str(first).lower(), str(second).lower()])
 
     def test_a_thirty_second_clip_is_refused_for_a_longer_window(self) -> None:
         proc = self.run_runner(self.clip("thirty", FRAMES_30S_AT_23976), "-Seconds", "45")
@@ -676,12 +849,16 @@ def _summary_line(**values: object) -> str:
 
 
 def _loop_verdict(line: str, window: float, launch_only: bool = False, gate: Path = GATE, clip_frames: int = 0,
-                  nonce: str = RUN_NONCE) -> dict:
-    """Runs the shared parser + Get-GuiSmokeLoopVerdict (the code the runner calls) on a summary line."""
+                  nonce: str = RUN_NONCE, require_window_stop: bool = False) -> dict:
+    """Runs the shared parser + Get-GuiSmokeLoopVerdict (the code the runner calls) on a summary line.
+    -RequireWindowStop is passed only when the keyword is True, so every other row calls the base signature."""
+    window_stop = " -RequireWindowStop $true" if require_window_stop else ""
+    # r6 (sol r1 B3): the runner runs under $ErrorActionPreference = 'Stop' (run-release-gui-smoke.ps1:149), where a cast that
+    # throws loses the verdict (no typed failure, no exit 43). Without it the exception is swallowed and the row looks fine.
     proc = _pwsh(
-        f". {_q(gate)}; $s = Convert-PlaybackLogLineToObject {_q(line)}; "
+        f"$ErrorActionPreference = 'Stop'; . {_q(gate)}; $s = Convert-PlaybackLogLineToObject {_q(line)}; "
         f"Get-GuiSmokeLoopVerdict -Summary $s -WindowSeconds {window} -ExpectedRunNonce {_q(nonce)} "
-        f"-LaunchOnlyProbe ${'true' if launch_only else 'false'} -ClipFrames {clip_frames} "
+        f"-LaunchOnlyProbe ${'true' if launch_only else 'false'} -ClipFrames {clip_frames}{window_stop} "
         "| ConvertTo-Json -Compress -Depth 4")
     assert proc.returncode == 0, proc.stdout + proc.stderr
     return json.loads(proc.stdout)
@@ -763,6 +940,128 @@ LOOP_VERDICT_CASES.extend(SOURCE_FRAME_CASES)
 def _case(row):
     fields, window, launch_only, expected, *rest = row
     return {**GOOD_SOURCE, **fields}, window, launch_only, expected, (rest[0] if rest else 0)
+
+
+# GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1: a measured Play that ran PAST its window. Bachelor M16-1457 fullscreen legs 8bcdb433
+# (F1) and c7948b18 (F3) played the whole two-part clip once (source_advanced 2859 of required 1499, wrap_count 0, reason play-stop):
+# no loop, but no measurement of the 25 s window either. NOT part of LOOP_VERDICT_CASES / SOURCE_FRAME_CASES (the parity test
+# iterates those, and the overrun oracle is the loop verdict's alone, behind -RequireWindowStop).
+_OVERRUN_BASE = dict(wrapped=0, wrap_count=0, total_frames=2859, clip_seconds=47.698, first_presented_frame=0,
+                     required_source_frames=1499, native_fps=59.94, pace_fps=59.94, fps_override=0)
+_OVERRUN_F1 = dict(_OVERRUN_BASE, presented_frames=1858, last_presented_frame=2856, source_advanced=2859,
+                   elapsed_ms=47904, reason="play-stop")
+_OVERRUN_VALID = dict(_OVERRUN_BASE, reason="visual-capture")
+_OVERRUN_2397 = dict(_OVERRUN_BASE, total_frames=1200, clip_seconds=50.05, required_source_frames=600, native_fps=23.976,
+                     pace_fps=23.976, presented_frames=600, last_presented_frame=640, reason="visual-capture")
+
+# (name, summary fields, window, launch_only, require_window_stop, clip_frames, expect invalid, expect PLAY_OVERRAN_WINDOW,
+#  expect INVALID_LOOPED)
+OVERRUN_CASES = [
+    ("O1 F1 8bcdb433, true count", _OVERRUN_F1, 25, False, True, 2859, True, True, False),
+    ("O2 F1 with the recorded 1671 count", _OVERRUN_F1, 25, False, True, 1671, True, True, False),
+    ("O3 F3 c7948b18", dict(_OVERRUN_F1, presented_frames=1862, last_presented_frame=2857, elapsed_ms=47880),
+     25, False, True, 2859, True, True, False),
+    ("O4 count fix without the oracle", _OVERRUN_F1, 25, False, False, 2859, False, False, False),
+    ("O5 1a667e8d", dict(_OVERRUN_VALID, presented_frames=1044, last_presented_frame=1496, source_advanced=1499,
+                         elapsed_ms=27556), 25, False, True, 2859, False, False, False),
+    ("O5 d2378536", dict(_OVERRUN_VALID, presented_frames=1226, last_presented_frame=1523, source_advanced=1525,
+                         elapsed_ms=25618), 25, False, True, 2859, False, False, False),
+    ("O5 62c557ff", dict(_OVERRUN_VALID, presented_frames=980, last_presented_frame=1509, source_advanced=1510,
+                         elapsed_ms=25363), 25, False, True, 2859, False, False, False),
+    ("O6 59.94 at the tolerance", dict(_OVERRUN_VALID, presented_frames=1000, last_presented_frame=1617, source_advanced=1619),
+     25, False, True, 2859, False, False, False),
+    ("O6 59.94 one over", dict(_OVERRUN_VALID, presented_frames=1000, last_presented_frame=1618, source_advanced=1620),
+     25, False, True, 2859, True, True, False),
+    ("O7 23.976 at the tolerance", dict(_OVERRUN_2397, source_advanced=648), 25, False, True, 1200, False, False, False),
+    ("O7 23.976 one over", dict(_OVERRUN_2397, source_advanced=649), 25, False, True, 1200, True, True, False),
+    ("O8 a real wrap", dict(_OVERRUN_F1, wrapped=1, wrap_count=1), 25, False, True, 2859, True, True, True),
+    ("O9 launch-only probe", dict(_OVERRUN_BASE, presented_frames=0, last_presented_frame=0, source_advanced=0,
+                                  required_source_frames=0), 25, True, True, 2859, False, False, False),
+    # adversary e8eeaee1 A2: a counter far outside any real Play (9e15) is still an overrun, never a silent pass.
+    ("O10 a counter of 9e15", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9000000000000000),
+     25, False, True, 1200, True, True, False),
+    # adversary f408901c A2: past 2^53 a double cannot hold the difference (49 frames read as 48); the overrun is exact.
+    ("O11 an exact overrun past 2^53", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9007199254741041,
+                                             required_source_frames=9007199254740992), 25, False, True, 1200, True, True, False),
+    ("O11 the same at the tolerance", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9007199254741040,
+                                            required_source_frames=9007199254740992), 25, False, True, 1200, False, False, False),
+    # r5 (sol r1 B1): the same exactness for a counter printed in DECIMAL form. The parser used to read "...1041.0" as a double
+    # (9007199254741040), so a 49-frame overrun read as 48 and passed.
+    ("O12 a decimal-form overrun past 2^53", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254741041.0",
+                                                   required_source_frames=9007199254740992), 25, False, True, 1200, True, True, False),
+    ("O12 the decimal form at the tolerance", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254741040.0",
+                                                    required_source_frames="9007199254740992.0"), 25, False, True, 1200, False, False, False),
+    # r5 (sol r1 B3): a counter outside the signed 64-bit range is a typed verdict, never an exception that loses it (exit 43).
+    ("O13 a counter past signed 64", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9223372036854775808),
+     25, False, True, 1200, True, True, False),
+    ("O14 a requirement past signed 64 is an unknown window",
+     dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=9223372036854775810, required_source_frames=9223372036854775808),
+     25, False, True, 1200, True, False, False),
+    ("O15 a wrap count past signed 64 is a wrap", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+                                                       wrap_count=9223372036854775808), 25, False, True, 1200, True, False, True),
+    ("O16 an fps override past signed 64 is an override", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+                                                              fps_override=9223372036854775808), 25, False, True, 1200, True, False, False),
+    ("O16 an fps override past signed 32 is an override", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+                                                              fps_override=3000000000), 25, False, True, 1200, True, False, False),
+    # r7 class sweep (sol r1 B3): the other counters the loop verdict narrows are bounds-checked too -- a presented count past signed
+    # 64 is an unreadable (looped-class) receipt, and a native fps past the cast range is an unknown floor, never a throw.
+    ("O17 a presented count past signed 64", dict(_OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+                                                  presented_frames=9223372036854775808), 25, False, True, 1200, True, False, True),
+    ("O18 a native fps past the cast range", dict(_OVERRUN_2397, native_fps="1e300", pace_fps=24, source_advanced=648),
+     25, False, True, 1200, True, False, False),
+    ("O19 an exact decimal counter inside the tolerance is still clean", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="648.0", required_source_frames="600.0", presented_frames=600),
+     25, False, True, 1200, False, False, False),
+    # r8 (adversary 3701447f A1): a double the parser made from exponent notation is read EXACTLY below 2^53 (a [decimal] cast
+    # rounds it to 15 digits) and refused at 2^53 (the parser rounded it, so its digits are unknown).
+    ("O20 reversed endpoints printed as doubles are a wrap", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+        first_presented_frame="9.007199254740991e15", last_presented_frame="9.007199254740990e15"),
+     25, False, True, 1200, True, False, True),
+    ("O21 a counter read as 2^53 is refused, not rounded into a pass", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254740993e0", required_source_frames=9007199254740944),
+     25, False, True, 1200, True, False, False),
+    ("O22 an exact double below 2^53 keeps its 49-frame overrun", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254740991e0", required_source_frames=9007199254740942),
+     25, False, True, 1200, True, True, False),
+    ("O22 the same at the tolerance", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254740990e0", required_source_frames=9007199254740942),
+     25, False, True, 1200, False, False, False),
+    # r8 (adversary 3701447f A1): the same endpoints spelled as whole-number doubles (the exponent form of an integer literal), where
+    # only the exact read of the double (not the text check) tells 9007199254740991 from 9007199254740990.
+    ("O25 reversed endpoints spelled as whole doubles are a wrap", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced=648,
+        first_presented_frame="9007199254740991e0", last_presented_frame="9007199254740990e0"),
+     25, False, True, 1200, True, False, True),
+    ("O25 a counter one frame short of the requirement is short, not rounded up", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="9007199254740989e0", required_source_frames=9007199254740990),
+     25, False, True, 1200, True, False, False),
+    # r8b (adversary 820377cc A1): the exponent counts -- a fraction written with a negative exponent is not an integer.
+    ("O26 a fractional counter in negative-exponent form is refused", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="59999999999999999999999999999999e-29"),
+     25, False, True, 1200, True, False, False),
+    ("O26 a whole counter in negative-exponent form is still clean", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="64800e-2", required_source_frames="6e2"),
+     25, False, True, 1200, False, False, False),
+    # r8 (adversary accac79e A1): a counter whose text is not an integer is refused even when rounding would make it one.
+    ("O23 a 29-digit fractional counter below the requirement is refused", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="599.99999999999999999999999999999"),
+     25, False, True, 1200, True, False, False),
+    ("O24 an integral counter in exponent form is still clean", dict(
+        _OVERRUN_2397, native_fps=24, pace_fps=24, source_advanced="648e0", required_source_frames="6e2"),
+     25, False, True, 1200, False, False, False),
+]
+
+
+def _overrun_outcome(row, gate: Path = GATE) -> tuple:
+    _name, fields, window, launch_only, require, clip_frames, *_expected = row
+    verdict = _loop_verdict(_summary_line(**fields), window, launch_only, gate=gate, clip_frames=clip_frames,
+                            require_window_stop=require)
+    failures = verdict.get("failures") or []
+    if isinstance(failures, str):
+        failures = [failures]
+    return (verdict["invalid"], any(f.startswith("PLAY_OVERRAN_WINDOW: ") for f in failures),
+            any(f.startswith("INVALID_LOOPED") for f in failures)), failures
 
 
 @requires_pwsh
@@ -847,6 +1146,71 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
                         flipped.append(fields)
                 self.assertTrue(flipped, f"mutation '{name}' survived the behaviour table")
 
+    def test_the_overrun_table(self) -> None:
+        for row in OVERRUN_CASES:
+            name, _fields, _window, _launch, _require, _clip, *expected = row
+            with self.subTest(name):
+                outcome, failures = _overrun_outcome(row)
+                self.assertEqual(outcome, tuple(expected), failures)
+
+    def test_r8_a1_a_counter_text_that_is_not_an_integer_is_refused_not_rounded(self) -> None:
+        # The profile receipt keeps a counter as TEXT; [decimal]::TryParse rounds a 29+ digit fraction to an integer, and the
+        # Truncate check then passes it. The text must be an integer literal (a fraction of zeros, an exponent) to be read as one.
+        for text, ok in (("599.99999999999999999999999999999", False), ("600.0000000000000000000000000000001", False),
+                         ("0.9999999999999999999999999999999", False), ("1.5", False), ("600.0", True), ("6e2", True),
+                         ("+600", True), ("600", True), ("59999999999999999999999999999999e-29", False), ("6.48e2", True),
+                         ("64800e-2", True), ("64801e-2", False), ("0e-9999", True), ("1e-1", False)):
+            with self.subTest(text):
+                proc = _pwsh(f". {_q(GATE)}; Get-GuiSmokeExactCounter -Value {_q(text)} | ConvertTo-Json -Compress")
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                read = json.loads(proc.stdout)
+                self.assertEqual(read["ok"], ok, read)
+                if not ok:
+                    self.assertEqual(read["reason"], "not_an_integer", read)
+
+    def test_the_overrun_failure_carries_its_numbers_and_says_what_it_means(self) -> None:
+        _outcome, failures = _overrun_outcome(OVERRUN_CASES[0])
+        overran = [f for f in failures if f.startswith("PLAY_OVERRAN_WINDOW: ")]
+        self.assertEqual(len(overran), 1, failures)
+        for token in ("source_advanced=2859", "required_source_frames=1499", "overrun=1360", "tolerance=120",
+                      "native_fps=59.94", "reason=play-stop", "elapsed_ms=47904", "ran past its window",
+                      "does not measure the requested window"):
+            self.assertIn(token, overran[0])
+        self.assertRegex(overran[0], r"tolerance=120 frames \(2(\.0)? s\b")
+
+    def test_a_real_wrap_is_reported_before_any_overrun(self) -> None:
+        row = next(r for r in OVERRUN_CASES if r[0] == "O8 a real wrap")
+        _outcome, failures = _overrun_outcome(row)
+        self.assertTrue(failures[0].startswith("INVALID_LOOPED"), failures)
+
+    def test_the_overrun_oracle_is_mutation_tested(self) -> None:
+        source = GATE.read_text(encoding="utf-8")
+        mutations = {
+            "overrun compare inverted": ("$overrun -gt $tolerance", "$overrun -le $tolerance"),
+            "tolerance replaced by 0": (
+                "$tolerance = [Math]::Ceiling($script:GuiSmokePlayOverrunToleranceSeconds * $overrunFps)",
+                "$tolerance = 0.0"),
+            "oracle guard always false": ("if ($RequireWindowStop -and ", "if ($false -and "),
+            "RequireWindowStop default ignored": ("if ($RequireWindowStop -and ", "if ($true -and "),
+            "presented-over-clip suppression dropped": (" -and -not $overranWithoutWrap", ""),
+            # r8 (adversary A1): the exact double read and its 2^53 bound
+            "double counter read through a 15-digit decimal cast": ("$exact = [decimal][int64]$d }", "$exact = [decimal]$d }"),
+            "2^53 double accepted as exact": ("[Math]::Abs($d) -ge 9007199254740992.0", "[Math]::Abs($d) -gt 9007199254740992.0"),
+            "a rounded fractional text read as an integer": ("-and (Test-GuiSmokeIntegerLiteral -Text ([string]$Value))", ""),
+            "parser keeps a rounded fractional literal as a double": (
+                "-not (Test-GuiSmokeIntegerLiteral -Text $rawValue)) { $result[$key] = $rawValue }",
+                "-not (Test-GuiSmokeIntegerLiteral -Text $rawValue) -and $false) { $result[$key] = $rawValue }"),
+            "overrun block reads a double through its printed digits": (
+                "[Math]::Abs([double]$v) -lt 9007199254740992.0) { [decimal][int64][double]$v }",
+                "[Math]::Abs([double]$v) -lt 0.0) { [decimal][int64][double]$v }"),
+        }
+        for name, (needle, replacement) in mutations.items():
+            with self.subTest(name):
+                self.assertEqual(source.count(needle), 1, f"mutation anchor not unique or vanished: {name}")
+                mutated = self.tmp_gate(source.replace(needle, replacement))
+                flipped = [row[0] for row in OVERRUN_CASES if _overrun_outcome(row, gate=mutated)[0] != tuple(row[6:])]
+                self.assertTrue(flipped, f"mutation '{name}' survived the overrun table")
+
     def test_exit_43_is_reachable_under_erroractionpreference_stop(self) -> None:
         # Fable r1: Write-Error under $ErrorActionPreference = "Stop" terminated the runner before the exit
         # code was assigned, so INVALID_LOOPED never exited 43. EXECUTE the runner's real tail block.
@@ -887,7 +1251,8 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
         end = text.index("if ($LaunchOnlyProbe -and ($playbackStartLine -or $summaryLine)) {", start)
         return text[start:end]
 
-    def _run_application_block(self, block: str, recent_lines: tuple = (), **summary_fields: object) -> dict:
+    def _run_application_block(self, block: str, recent_lines: tuple = (), stress: bool = False, seconds: float = 24,
+                               **summary_fields: object) -> dict:
         proc = _pwsh(
             f". {_q(GATE)}\n"
             "function Get-ObjectPropertyValue { param($Object, $Name) "
@@ -895,10 +1260,12 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
             f"$playbackSummary = Convert-PlaybackLogLineToObject {_q(_summary_line(**summary_fields))}\n"
             f"$recentLines = @({', '.join(_q(line) for line in recent_lines)})\n"
             f"$runNonce = {_q(RUN_NONCE)}; "
-            "$Seconds = 24; $LaunchOnlyProbe = $false; $validationFailures = @(); $validationWarnings = @(); "
+            f"$Seconds = {seconds}; $LaunchOnlyProbe = $false; $validationFailures = @(); $validationWarnings = @(); "
+            f"$ExerciseClipLifecycleStress = ${'true' if stress else 'false'}; "
             "$clipLengthGate = [pscustomobject]@{ frames = 720 }\n"
             f"{block}\n"
             "[pscustomobject]@{ invalidLooped = [bool]$invalidLooped; invalidSourceFrames = [bool]$invalidSourceFrames; "
+            "playOverranWindow = [bool]$playOverranWindow; windowStopRequired = [bool]$windowStopRequired; "
             "failures = @($validationFailures).Count; paceRule = $loopVerdict.paceRule } | ConvertTo-Json -Compress")
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return json.loads(proc.stdout)
@@ -947,6 +1314,36 @@ class RuntimeBackstopBehaviourTests(unittest.TestCase):
                             (fields is short and not outcome["invalidSourceFrames"]):
                         survived = False
                 self.assertFalse(survived, f"guard mutation '{name}' survived the application test")
+
+    def test_the_runner_requires_the_window_stop_except_for_launch_only_and_lifecycle_stress(self) -> None:
+        """GUI-SMOKE-OVERRUN-ORACLE-SPANNED-COUNT-1: the runner opts into the overrun oracle for a measured Play only. The call
+        passes -RequireWindowStop with an expression (directly, or through the one variable it assigns) naming both switches,
+        the receipt's clipLength block records it, and the executed block types the F1 overrun."""
+        text = RUNNER.read_text(encoding="utf-8")
+        block = self._application_block(text)
+        call = next(line for line in block.splitlines()
+                    if line.startswith("$loopVerdict = Get-GuiSmokeLoopVerdict -Summary $playbackSummary"))
+        match = re.search(r"-RequireWindowStop\s+(\$\w+|\(.*\))\s*$", call)
+        self.assertIsNotNone(match, call)
+        expression = match.group(1)
+        if re.fullmatch(r"\$\w+", expression):
+            assignment = re.search(rf"^\{expression}\s*=\s*(.+)$", block, re.MULTILINE)
+            self.assertIsNotNone(assignment, f"{expression} is never assigned in the application block")
+            expression = assignment.group(1)
+        self.assertIn("$LaunchOnlyProbe", expression)
+        self.assertIn("$ExerciseClipLifecycleStress", expression)
+        clip_length = text[text.index("    clipLength = [pscustomobject]@{"):]
+        clip_length = clip_length[:clip_length.index("\n    }\n")]
+        after = clip_length[clip_length.index("invalidSourceFrames = $invalidSourceFrames"):]
+        self.assertIn("playOverranWindow = $playOverranWindow", after)
+        self.assertRegex(after, r"windowStopRequired = \$\w+")
+
+        f1 = dict(_OVERRUN_F1)
+        got = self._run_application_block(block, seconds=25, **f1)
+        self.assertEqual((got["playOverranWindow"], got["windowStopRequired"], got["invalidLooped"]), (True, True, True), got)
+        self.assertFalse(got["invalidSourceFrames"], got)
+        got = self._run_application_block(block, seconds=25, stress=True, **f1)
+        self.assertEqual((got["playOverranWindow"], got["windowStopRequired"]), (False, False), got)
 
     def test_the_runner_hands_the_summarys_own_session_conform_line_to_the_verdict(self) -> None:
         """HFR-CONFORM-AWARE-RECEIPT-ORACLES-1: the runner picks the playback_smoke.conform line of the summary's session out of the run log and
