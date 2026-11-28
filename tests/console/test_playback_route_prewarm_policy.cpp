@@ -850,16 +850,38 @@ TEST(PlaybackWarmOutputReuseWiring, TheWarmKeysTheSlotOnlyAfterItsAmazeSucceeded
                               "key.blackLevel = blackLevel;", "key.wb[0] = wbMultipliers[0];", "key.wb[1] = wbMultipliers[1];",
                               "key.wb[2] = wbMultipliers[2];", "key.reducedHnyquist = reducedHnyquist;",
                               "key.setClipCountAfterWarm = setClipCountAfter;", "key.setLutsCountAfterWarm = setLutsCountAfter;",
+                              "key.setPatternCountAfterWarm = setPatternCountAfter;",
+                              "key.configureGenerationAfterWarm = configureGenerationAfter;",   // r22 adversary A1
                               "key.captureId = captureId;"})
         ASSERT_TRUE(warm.contains(QString::fromLatin1(field)));
-    // MainWindow hands the warm its frame and the counts read on the worker right after the run
+    // MainWindow hands the warm its frame and the KEY counts: r22 (sol r21 #1), the three counts the warm's own run
+    // read under the backend mutex after its configure, not the telemetry counts read after the run outside the lock
     const QString source = sourceFile("platform/qt/MainWindow.cpp");
     ASSERT_TRUE(source.contains(QStringLiteral(
-        "static_cast<uint64_t>( done.frameNumber ), outcome.setClipCountAfter, outcome.setLutsCountAfter,")));
+        "static_cast<uint64_t>( done.frameNumber ), outcome.keySetClipCount, outcome.keySetLutsCount,")));
+    ASSERT_TRUE(source.contains(QStringLiteral(
+        "outcome.keySetPatternCount, outcome.keyConfigureGeneration, &reuseCapture, &warmState );")));
+    ASSERT_FALSE(source.contains(QStringLiteral("outcome.setPatternCountAfter, &reuseCapture")));
     const QString core = sourceFile("platform/qt/PlaybackReconWarmRun.h");
+    const int run = core.indexOf(QStringLiteral("applyLLRawProcObjectWorker( video, raw.data()"));
+    // an earlier run's counts are dropped before this run, then this run's are taken after it
+    const int dropped = core.indexOf(QStringLiteral(
+        "(void)llrpGpuPlaybackReconTakeLastRunConfigureCounts( nullptr, nullptr, nullptr, nullptr );"));
+    const int taken = core.indexOf(QStringLiteral(
+        "llrpGpuPlaybackReconTakeLastRunConfigureCounts( &keyClip, &keyLuts, &keyPattern, &keyGeneration ) != 0;"));
+    ASSERT_TRUE(dropped >= 0);
+    ASSERT_TRUE(run > dropped);
+    ASSERT_TRUE(taken > run);
+    for (const char *field : {"out.keySetClipCount = keyed ? keyClip : kNoKeyCount;",
+                              "out.keySetLutsCount = keyed ? keyLuts : kNoKeyCount;",
+                              "out.keySetPatternCount = keyed ? keyPattern : kNoKeyCount;",
+                              "out.keyConfigureGeneration = keyed ? keyGeneration : kNoKeyCount;"})
+        ASSERT_TRUE(core.contains(QString::fromLatin1(field)));
+    // the telemetry counts stay, read on the same worker right after the same run
     const int after = core.indexOf(QStringLiteral("out.setClipCountAfter = llrpGpuPlaybackReconSetClipCount();"));
-    ASSERT_TRUE(after > core.indexOf(QStringLiteral("applyLLRawProcObjectWorker( video, raw.data()")));
+    ASSERT_TRUE(after > run);
     ASSERT_TRUE(core.contains(QStringLiteral("out.setLutsCountAfter = llrpGpuPlaybackReconSetLutsCount();")));
+    ASSERT_TRUE(core.contains(QStringLiteral("out.setPatternCountAfter = llrpGpuPlaybackReconSetIsoPatternCount();")));
 }
 
 TEST(PlaybackWarmOutputReuseWiring, TheKeyIsClearedWithTheSlotAndByAReRunPrewarm)
@@ -912,9 +934,12 @@ TEST(PlaybackWarmOutputReuseWiring, TheGateAndTheCompareComeBeforeTheDeviceAmaze
     const QString present = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
                                         QStringLiteral("double GpuDisplayWindow::verifyWarmOutputReuse("));
     const int dims = present.indexOf(QStringLiteral("          && deviceHeight == texHeight )"));
-    const int gate = present.indexOf(QStringLiteral("playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::preGate("));
-    const int onNone = present.indexOf(QStringLiteral("if ( reuseReason == playback_warm_output_reuse::Reason::None )"));
+    // sol r17 #2: preGate, the compare and the recheck after it are one call (PlaybackWarmOutputReusePolicy.h decide())
+    const int counts = present.indexOf(QStringLiteral("const auto readLiveConfigureCounts = []()"));
+    const int gate = present.indexOf(QStringLiteral("playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::decide("));
+    const int onNone = present.indexOf(QStringLiteral("[&](bool *sameInput, QString *compareWhy)"), gate);
     const int compare = present.indexOf(QStringLiteral("gpuAmazeDebayerInputBayer16MatchesCapture("));
+    const int decided = present.indexOf(QStringLiteral("&reuseCompareAttempted);"), gate);
     const int released = present.indexOf(QStringLiteral("if ( warmKey.valid ) gpuAmazeDebayerReleaseInputCapture();"));
     const int amaze = present.indexOf(QStringLiteral(
         "                warmOutputReused\n"
@@ -922,17 +947,37 @@ TEST(PlaybackWarmOutputReuseWiring, TheGateAndTheCompareComeBeforeTheDeviceAmaze
         "                    deviceBayer16,\n"
         "                    m_texture->textureId(),"));
     ASSERT_TRUE(dims >= 0);
-    ASSERT_TRUE(gate > dims);
+    ASSERT_TRUE(counts > dims);
+    ASSERT_TRUE(gate > counts);
     ASSERT_TRUE(onNone > gate);
     ASSERT_TRUE(compare > onNone);
-    ASSERT_TRUE(released > compare);
+    ASSERT_TRUE(decided > compare);
+    ASSERT_TRUE(released > decided);
     ASSERT_TRUE(amaze > released);
     // the gate reads the live state: the frame id, the dims, black, WB, H-Nyquist, the loss flag, the probe, the counts
     const QString gateCall = present.mid(gate, onNone - gate);
     for (const char *input : {"playbackWarmOutputReuseEnabled(),", "stagedAdopted,", "warmKey,", "presentKey,",
-                              "llrpGpuCudaSuppressed() != 0,", "validationProbeTexture,",
-                              "llrpGpuPlaybackReconSetClipCount(),", "llrpGpuPlaybackReconSetLutsCount());"})
+                              "llrpGpuCudaSuppressed() != 0,", "validationProbeTexture,", "readLiveConfigureCounts,"})
         ASSERT_TRUE(gateCall.contains(QString::fromLatin1(input)));
+    // the counts decide() reads (before the compare and again after it) are the three live process-wide ones
+    const QString countRead = present.mid(counts, gate - counts);
+    for (const char *read : {"now.setClip = llrpGpuPlaybackReconSetClipCount();",
+                             "now.setLuts = llrpGpuPlaybackReconSetLutsCount();",
+                             "now.setPattern = llrpGpuPlaybackReconSetIsoPatternCount();",
+                             "now.generation = llrpGpuPlaybackReconConfigureGeneration();"})
+        ASSERT_TRUE(countRead.contains(QString::fromLatin1(read)));
+    // r22 adversary A1: the generation is the LAST load of the read (a configure stored before it is always seen)
+    ASSERT_TRUE(countRead.indexOf(QStringLiteral("now.generation = llrpGpuPlaybackReconConfigureGeneration();"))
+                > countRead.indexOf(QStringLiteral("now.setPattern = llrpGpuPlaybackReconSetIsoPatternCount();")));
+    ASSERT_TRUE(countRead.indexOf(QStringLiteral("now.generation = llrpGpuPlaybackReconConfigureGeneration();"))
+                > countRead.indexOf(QStringLiteral("now.setClip = llrpGpuPlaybackReconSetClipCount();")));
+    ASSERT_TRUE(countRead.indexOf(QStringLiteral("now.generation = llrpGpuPlaybackReconConfigureGeneration();"))
+                > countRead.indexOf(QStringLiteral("now.setLuts = llrpGpuPlaybackReconSetLutsCount();")));
+    ASSERT_EQ(1, (int)present.count(QStringLiteral("llrpGpuPlaybackReconConfigureGeneration()")));
+    // no count is sampled anywhere else in the present (one stale read is what sol r17 #2 found)
+    ASSERT_EQ(1, (int)present.count(QStringLiteral("llrpGpuPlaybackReconSetIsoPatternCount()")));
+    ASSERT_EQ(1, (int)present.count(QStringLiteral("llrpGpuPlaybackReconSetClipCount()")));
+    ASSERT_EQ(1, (int)present.count(QStringLiteral("llrpGpuPlaybackReconSetLutsCount()")));
     for (const char *field : {"presentKey.frame = state->frame_id;", "presentKey.width = texWidth;", "presentKey.height = texHeight;",
                               "presentKey.blackLevel = blackLevel;", "presentKey.wb[2] = wbMultipliers[2];",
                               "presentKey.reducedHnyquist = reducedHnyquist;"})
@@ -1119,7 +1164,7 @@ TEST(PlaybackWarmReconDeterminismWiring, ThePreparedStateIsReadBeforeTheRestoreA
     const QString present = bodyBetween(window, QStringLiteral("bool GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture("),
                                         QStringLiteral("double GpuDisplayWindow::verifyWarmOutputReuse("));
     const int presentState = present.indexOf(QStringLiteral("presentKey.state = playback_warm_output_reuse::preparedStateFrom( *state );"));
-    const int gate = present.indexOf(QStringLiteral("playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::preGate("));
+    const int gate = present.indexOf(QStringLiteral("playback_warm_output_reuse::Reason reuseReason = playback_warm_output_reuse::decide("));
     const int compare = present.indexOf(QStringLiteral("gpuAmazeDebayerInputBayer16MatchesCapture("));
     const int states = present.indexOf(QStringLiteral("setupTiming.reuse_states = playback_warm_output_reuse::stateFields( reuseReason, warmKey, presentKey );"));
     ASSERT_TRUE(presentState >= 0);

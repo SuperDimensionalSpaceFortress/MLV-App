@@ -94,9 +94,13 @@ public:
             bool useAliasMap = false;
             bool useFullres = false;
             int chromaSmoothMethod = 0;
-            std::array<int, 4> isBright{{0, 0, 0, 0}};
+            /* adversary r13 A1: no ISO pattern in this key. The snapshot copies tables that do not depend on it (the
+             * texture state below carries the pattern), and a per-pattern snapshot would give the backend new table
+             * addresses on every pattern-only change, so its LUT key would re-upload unchanged tables. */
             bool applyDither = false;
             uint64_t processingGeneration = 0;
+            /* adversary r7 A1: llrpGpuPlaybackReconState_t::lut_generation of the source tables. */
+            uint64_t lutGeneration = 0;
 
             bool operator==( const LutSnapshotKey &other ) const
             {
@@ -117,9 +121,9 @@ public:
                     && useAliasMap == other.useAliasMap
                     && useFullres == other.useFullres
                     && chromaSmoothMethod == other.chromaSmoothMethod
-                    && isBright == other.isBright
                     && applyDither == other.applyDither
-                    && processingGeneration == other.processingGeneration;
+                    && processingGeneration == other.processingGeneration
+                    && lutGeneration == other.lutGeneration;
             }
         };
 
@@ -151,6 +155,8 @@ public:
          * the async-H2D preupload gate has a value it can trust regardless
          * of which thread ends up presenting this frame. */
         uint64_t frameId = 0;
+        /* adversary r7 A1: the source tables' lut_generation, handed to the backend's LUT key (MainWindow.cpp). */
+        uint64_t lutGeneration = 0;
         std::shared_ptr<const LutSnapshot> luts;
     };
 

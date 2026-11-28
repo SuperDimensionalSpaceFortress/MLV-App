@@ -191,6 +191,18 @@ int igpu_recon_allocated_bytes(igpu_recon_backend* b, uint64_t* bytes);
  * this symbol. Returns 0 on success. */
 int igpu_recon_set_reduced_iso_notch(igpu_recon_backend* b, int enable);
 
+/* Optional extension, resolved by name by MLVApp and outside the required
+ * ABI-v2 symbol set (DUALISO-CONFIGURE-CACHE-1). Updates only the per-(y%4)
+ * bright/dark ISO pattern of the clip last set with igpu_recon_set_clip: the
+ * dims, levels, buffers and LUTs are untouched, and no device call is made
+ * (the run pushes the pattern with the rest of its per-run constants). The
+ * dual-ISO prepare re-derives the pattern per frame, so a host whose clip
+ * differs from the last only in is_bright calls this instead of set_clip +
+ * set_luts. Each of is_bright[0..3] must be 0 or 1 and a clip must have been
+ * set; otherwise -1 and nothing changes. Older DLLs omit the symbol and the
+ * host then calls igpu_recon_set_clip as before. Returns 0 on success. */
+int igpu_recon_set_iso_pattern(igpu_recon_backend* b, const int* is_bright);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

@@ -27,3 +27,4 @@ EXPORTS
     igpu_recon_copy_last_device_output_to_gl_texture
     igpu_recon_allocated_bytes
     igpu_recon_set_reduced_iso_notch
+    igpu_recon_set_iso_pattern
