@@ -8035,6 +8035,29 @@ function Get-DvJsonTypeWord {
     return 'object'
 }
 
+function Get-DvJsonReasonTypeWord {
+    <#
+    .SYNOPSIS
+    EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r5 (Grok CoS #929 G5). The type word a refusal REASON prints for a value the reader did not accept: Get-DvJsonTypeWord, except
+    for a JSON number that has the wanted JSON type but no .NET type the reader takes (the readers take [int], [long] and [double] only). A JSON integer outside Int64 reads
+    as a [BigInteger]; calling it "a JSON number" next to "not a JSON number" or "not a JSON integer" names no cause, so the word is `integer outside Int64`; any other
+    integral .NET width is `integer not held as an int or a long`, and a [decimal] or a [single] is `number not held as a double`. A number that is of the wrong JSON type
+    for the field (a double for an integer field, any number for a bool or string field) stays `number`. Pure; never calls a method on the value; never throws.
+    #>
+    param($Value, [string]$Wanted)
+    $word = Get-DvJsonTypeWord $Value
+    if ($word -ne 'number') { return $word }
+    if (($Value -is [System.Numerics.BigInteger]) -or ($Value -is [uint64]) -or ($Value -is [int16]) -or ($Value -is [uint16]) -or ($Value -is [uint32]) -or ($Value -is [byte]) -or ($Value -is [sbyte])) {
+        # (an integer-shaped number is a wrong type only for a field that is not an integer or number field; there it is a plain `number`)
+        if (($Wanted -ne 'integer') -and ($Wanted -ne 'number')) { return 'number' }
+        $big = [System.Numerics.BigInteger]$Value
+        if (($big -lt [System.Numerics.BigInteger][long]::MinValue) -or ($big -gt [System.Numerics.BigInteger][long]::MaxValue)) { return 'integer outside Int64' }
+        return 'integer not held as an int or a long'
+    }
+    if ((($Value -is [decimal]) -or ($Value -is [single])) -and ($Wanted -eq 'number')) { return 'number not held as a double' }
+    return 'number'
+}
+
 function Get-DvJsonShownValue {
     <#
     .SYNOPSIS
@@ -8089,7 +8112,9 @@ function Get-DvTailRowTypeProblem {
             # r2 (sol A4 on e4958b93): the type is named without calling a method on the value (a JSON object may carry a member named GetType or ToString)
             # r4 (Grok CoS #929 G3, sol pass 3 A1): the type word and the shown value come from Get-DvJsonTypeWord and Get-DvJsonShownValue (a DateTime is a JSON string, a
             # BigInteger a JSON number, an integral double shows its `.0`); the refusal above is unchanged
-            return "$name=$(Get-DvJsonShownValue $value) (a JSON $(Get-DvJsonTypeWord $value)), not a JSON $wanted"
+            # r5 (Grok CoS #929 G5): a number the field's JSON type admits but no accepted .NET type holds (a BigInteger) is named for that cause by Get-DvJsonReasonTypeWord,
+            # never `(a JSON number), not a JSON number`; the refusal is unchanged
+            return "$name=$(Get-DvJsonShownValue $value) (a JSON $(Get-DvJsonReasonTypeWord $value $wanted)), not a JSON $wanted"
         }
     }
     return $null
@@ -8187,7 +8212,7 @@ function Get-DvTailVisualEvidence {
             if (([string]::Equals($kind, 'play', [StringComparison]::Ordinal) -or [string]::Equals($kind, 'play_unbound', [StringComparison]::Ordinal) -or
                  [string]::Equals($kind, 'play_first_unbound', [StringComparison]::Ordinal)) -and
                 (-not (($index -is [int]) -or ($index -is [long])) -or [int64]$index -lt 0)) {
-                return (& $refuse "TAIL_VISUAL_ROW_UNREADABLE: a $kind capture carries index=$(Get-DvJsonShownValue $index) (a JSON $(Get-DvJsonTypeWord $index)), not a non-negative JSON integer, so a paint it records cannot be ordered and the post-close tail is not credited")
+                return (& $refuse "TAIL_VISUAL_ROW_UNREADABLE: a $kind capture carries index=$(Get-DvJsonShownValue $index) (a JSON $(Get-DvJsonReasonTypeWord $index 'integer')), not a non-negative JSON integer, so a paint it records cannot be ordered and the post-close tail is not credited")
             }
             # EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1 (Grok CoS #913 G7): a play row whose ordering or binding field is PRESENT with the wrong JSON type is
             # read below as false or $null, so it would leave the credit's order and repeat checks (or be counted beside the rows that credit): it refuses the whole

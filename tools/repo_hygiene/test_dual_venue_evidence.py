@@ -24091,7 +24091,11 @@ class EveryFrameTailWrongTypeFieldRefusalTests(ModuleMutationMixin, unittest.Tes
         "string": ("play_active", "true", "play_active=true (a JSON string), not a JSON bool"),
         "datetime": ("serial", "2026-11-28T00:00:00Z", "(a JSON string), not a JSON integer"),
         "number": ("play_active", 1, "play_active=1 (a JSON number), not a JSON bool"),
-        "bigint": ("serial", 123456789012345678901234567890, "serial=123456789012345678901234567890 (a JSON number), not a JSON integer"),
+        # r5 (Grok CoS #929 G5): a JSON integer outside Int64 is a BigInteger the reader does not take; the reason names that cause, never `(a JSON number), not a JSON integer`
+        "bigint": ("serial", 123456789012345678901234567890, "serial=123456789012345678901234567890 (a JSON integer outside Int64), not a JSON integer"),
+        "bigint-negative": ("serial", -123456789012345678901234567890, "serial=-123456789012345678901234567890 (a JSON integer outside Int64), not a JSON integer"),
+        "bigint-just-past-int64": ("serial", 9223372036854775808, "serial=9223372036854775808 (a JSON integer outside Int64), not a JSON integer"),
+        "bigint-tail-elapsed-ms": ("tail_elapsed_ms", 123456789012345678901234567890, "tail_elapsed_ms=123456789012345678901234567890 (a JSON integer outside Int64), not a JSON number"),
         "double-integral": ("serial", 479.0, "serial=479.0 (a JSON number), not a JSON integer"),
         "double-fraction": ("serial", 485.5, "serial=485.5 (a JSON number), not a JSON integer"),
         "bool": ("serial", True, "serial=true (a JSON boolean), not a JSON integer"),
@@ -24141,7 +24145,9 @@ class EveryFrameTailWrongTypeFieldRefusalTests(ModuleMutationMixin, unittest.Tes
         """The same reader's other refusal of a value by a PowerShell type: a play row whose index is no non-negative JSON integer (`index=$([string]$index)` showed
         1.0 as `1` and a string "1" as `1`, with no type word). Each row is refused as before; the reason now carries the type word and the value as written."""
         cases = {"double-integral": (1.0, "index=1.0 (a JSON number)"), "string": ("1", "index=1 (a JSON string)"), "negative": (-1, "index=-1 (a JSON number)"),
-                 "bool": (True, "index=true (a JSON boolean)"), "null": (None, "index=null (a JSON null)"), "object": ({"a": 1}, "index=<object> (a JSON object)")}
+                 "bool": (True, "index=true (a JSON boolean)"), "null": (None, "index=null (a JSON null)"), "object": ({"a": 1}, "index=<object> (a JSON object)"),
+                 # r5 (Grok CoS #929 G5): the index is a JSON integer, only one Int64 cannot hold
+                 "bigint": (123456789012345678901234567890, "index=123456789012345678901234567890 (a JSON integer outside Int64)")}
         for name, (wrong, expected) in cases.items():
             with self.subTest(index=name):
                 out = self.out_for("tail", "index", wrong)
@@ -24149,6 +24155,76 @@ class EveryFrameTailWrongTypeFieldRefusalTests(ModuleMutationMixin, unittest.Tes
                 note = out["m"]["conformTailInFlightCreditNote"]
                 self.assertTrue(note.startswith("TAIL_VISUAL_ROW_UNREADABLE"), out)
                 self.assertIn(f"carries {expected}, not a non-negative JSON integer", note, out)
+
+    # ---- r5 (Grok CoS #929 G5): no reason names a value's type with the very word the field wanted ----
+    R5_VALUE_PROBE = (
+        f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+        "$m = Get-Module DualVenueRunner\n"
+        "$fields = & $m { @($script:TailRowFieldTypes.Keys) }\n"
+        # values as ConvertFrom-Json reads them (a date-shaped string is a DateTime, an integer past Int64 a BigInteger) ...
+        "$json = @{ 'null' = 'null'; 'string' = '\"text\"'; 'date' = '\"2026-11-28T00:00:00Z\"'; 'true' = 'true'; 'false' = 'false'; 'int' = '1'; 'negative' = '-1'; 'double' = '485.5'\n"
+        "  'double-integral' = '479.0'; 'big' = '123456789012345678901234567890'; 'big-negative' = '-123456789012345678901234567890'; 'past-int64' = '9223372036854775808'\n"
+        "  'below-int64' = '-9223372036854775809'; 'array' = '[1,2]'; 'object' = '{\"a\":1}' }\n"
+        "$values = [ordered]@{}\n"
+        "foreach ($k in $json.Keys) { $values[$k] = ('{\"v\":' + $json[$k] + '}' | ConvertFrom-Json).v }\n"
+        # ... and the .NET types ConvertFrom-Json does not produce today but the classifier names
+        "$values['decimal'] = [decimal]5.5; $values['decimal-integral'] = [decimal]5; $values['single'] = [single]1.5; $values['int16'] = [int16]1; $values['uint16'] = [uint16]1\n"
+        "$values['uint32'] = [uint32]1; $values['uint64'] = [uint64]1; $values['uint64-max'] = [uint64]::MaxValue; $values['byte'] = [byte]1; $values['sbyte'] = [sbyte]-1\n"
+        "$values['bigint-in-range'] = [System.Numerics.BigInteger]5; $values['datetime'] = [datetime]::UtcNow; $values['datetimeoffset'] = [datetimeoffset]::UtcNow\n"
+        "foreach ($f in $fields) { foreach ($k in $values.Keys) {\n"
+        "  $row = [pscustomobject]@{}; $row | Add-Member -NotePropertyName $f -NotePropertyValue $values[$k]\n"
+        "  $reason = & $m { param($r) Get-DvTailRowTypeProblem -Row $r } $row\n"
+        "  [pscustomobject]@{ field = $f; value = $k; reason = $reason } | ConvertTo-Json -Compress } }\n"
+    )
+
+    def test_r5_g5_no_reason_names_the_type_of_a_refused_value_with_the_word_the_field_wanted(self) -> None:
+        """G5, the property: every value of every arm of the type-word classifier (Get-DvJsonTypeWord), put into every field of the row through the real acceptance check
+        (Get-DvTailRowTypeProblem), either is accepted or is refused with a reason whose `(a JSON X)` is not the field's own `not a JSON X` (a BigInteger tail_elapsed_ms read
+        `(a JSON number), not a JSON number`). Every word the classifier can return must show up in some reason, so a new arm cannot go unprobed."""
+        proc = run_pwsh(["-Command", self.R5_VALUE_PROBE])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        records = [json.loads(line) for line in proc.stdout.splitlines() if line.startswith("{")]
+        self.assertEqual(len(records), 11 * 28, len(records))
+        shape = re.compile(r"\(a JSON (?P<word>[^)]+)\), not a JSON (?P<wanted>\S+)$")
+        seen: set[str] = set()
+        refused = 0
+        for rec in records:
+            reason = rec["reason"]
+            if reason is None:
+                continue
+            refused += 1
+            with self.subTest(field=rec["field"], value=rec["value"]):
+                m = shape.search(reason)
+                self.assertIsNotNone(m, reason)
+                word, wanted = m.group("word"), m.group("wanted")
+                seen.add(word.split(" ")[0])
+                self.assertNotEqual(word, {"bool": "boolean"}.get(wanted, wanted), f"{rec['field']}={rec['value']}: {reason}")
+        self.assertGreater(refused, 11 * 10, refused)
+        source = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        body = source.split("function Get-DvJsonTypeWord {", 1)[1].split("\nfunction ", 1)[0]
+        words = set(re.findall(r"return '(\w+)'", body))
+        self.assertEqual(words, {"null", "string", "boolean", "number", "array", "object"}, "a new arm of the classifier needs a probe value above")
+        self.assertEqual(words - seen, set(), f"a classifier word no probe value reached a reason with: {sorted(words - seen)}")
+        # the wording for each way a number of the wanted JSON type can still be refused
+        by_key = {(r["field"], r["value"]): r["reason"] for r in records}
+        for key, expected in {
+            ("tail_elapsed_ms", "big"): "(a JSON integer outside Int64), not a JSON number",
+            ("tail_elapsed_ms", "past-int64"): "(a JSON integer outside Int64), not a JSON number",
+            ("serial", "below-int64"): "(a JSON integer outside Int64), not a JSON integer",
+            ("serial", "uint64-max"): "(a JSON integer outside Int64), not a JSON integer",
+            ("serial", "int16"): "(a JSON integer not held as an int or a long), not a JSON integer",
+            ("tail_elapsed_ms", "bigint-in-range"): "(a JSON integer not held as an int or a long), not a JSON number",
+            ("tail_elapsed_ms", "decimal"): "(a JSON number not held as a double), not a JSON number",
+            ("tail_elapsed_ms", "single"): "(a JSON number not held as a double), not a JSON number",
+            ("serial", "decimal"): "(a JSON number), not a JSON integer",
+            ("serial", "double"): "(a JSON number), not a JSON integer",
+            ("play_active", "big"): "(a JSON number), not a JSON bool",
+            ("source_id", "big"): "(a JSON number), not a JSON string",
+        }.items():
+            with self.subTest(wording=key):
+                self.assertTrue(by_key[key].endswith(expected), by_key[key])
+        for key in (("tail_elapsed_ms", "double"), ("tail_elapsed_ms", "int"), ("serial", "int"), ("source_id", "date"), ("play_active", "true")):
+            self.assertIsNone(by_key[key], key)
 
     def test_an_absent_field_is_not_a_wrong_type_and_another_kind_of_row_is_not_read(self) -> None:
         for field in ("saved", "play_active", "label_bound", "painted_serial_valid", "forced_paints_before", "label_bound_basis", "serial", "painted_serial",
