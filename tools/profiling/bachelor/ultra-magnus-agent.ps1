@@ -2152,6 +2152,10 @@ $script:LeaseSnapshotSkipBelowSec = 70
 # r3 (Dot B1/B2): the snapshot probes in flight (Add-LeaseSlotSnapshot starts one, Update-LeaseSlotSnapshots polls them) and their bound.
 $script:LeaseSlotSnapshots = [System.Collections.Generic.List[object]]::new()
 $script:LeaseSnapshotProbeSec = 30
+# CI-FLAKE-HEAVY-SLOT-GATE-PURE-FUNCTION-CASES-1 r2 (test seam): $null in the agent, so Add-LeaseSlotSnapshot arms the real thread-pool timer. A
+# test sets an [Action[Threading.TimerCallback, long]] here to receive the bound's callback instead and fire it itself (LeaseProbeWatchdog's
+# scheduler overload). Nothing in the agent ever sets it.
+$script:LeaseProbeWatchdogScheduler = $null
 
 function Initialize-LeaseProbeWatchdog {
     # AGENT-LEASE-PENDING-HEAT-TRACE-1 r5 (sol r4 S1, adversary r4-e98a2780 A1): a snapshot probe's bound must hold whether or not the agent polls
@@ -2175,14 +2179,29 @@ namespace MlvApp.Agent {
         private bool _disarmed;
         private bool _fired;
         private long _killedAtMs = -1;
+        // CI-FLAKE-HEAVY-SLOT-GATE-PURE-FUNCTION-CASES-1 r2 (test seam): set only by the scheduler overload below; false on the real-timer path.
+        private readonly bool _scripted;
+        private long _scriptedAgeMs = -1;
         public LeaseProbeWatchdog(System.Diagnostics.Stopwatch clock, long dueMs) {
             if (clock == null) { throw new System.ArgumentNullException("clock"); }
             _clock = clock;
             _timer = new System.Threading.Timer(Fire, null, dueMs < 0 ? 0 : dueMs, System.Threading.Timeout.Infinite);
         }
+        // CI-FLAKE-HEAVY-SLOT-GATE-PURE-FUNCTION-CASES-1 r2 (test seam): a scripted scheduler in place of the thread-pool timer. No timer is armed;
+        // `arm` is handed the bound's callback and its due time, and whoever holds the callback fires the bound when IT chooses, passing the
+        // probe's age at that fire (a long, ms) as the callback's state: that age is the one a kill records. The two-argument constructor above
+        // (the agent's only production caller) is unchanged.
+        public LeaseProbeWatchdog(System.Diagnostics.Stopwatch clock, long dueMs, System.Action<System.Threading.TimerCallback, long> arm) {
+            if (clock == null) { throw new System.ArgumentNullException("clock"); }
+            if (arm == null) { throw new System.ArgumentNullException("arm"); }
+            _clock = clock;
+            _scripted = true;
+            arm(Fire, dueMs < 0 ? 0 : dueMs);
+        }
         private void Fire(object state) {
             lock (_gate) {
                 _fired = true;
+                if (_scripted && state is long) { _scriptedAgeMs = (long)state; }
                 if (_proc != null) { KillLocked(); }
             }
         }
@@ -2192,7 +2211,7 @@ namespace MlvApp.Agent {
                 // adversary r5-2ca9f68f A1: the probe is done only when its root has exited AND its output pipes are closed; a root that exited
                 // leaving a child holding them is not, and Kill(true) on an exited root still ends that child.
                 if (_disarmed || (_proc.HasExited && _out.IsCompleted && _err.IsCompleted)) { return; }
-                long age = _clock.ElapsedMilliseconds;
+                long age = _scripted && _scriptedAgeMs >= 0 ? _scriptedAgeMs : _clock.ElapsedMilliseconds;
                 _proc.Kill(true);
                 _killedAtMs = age;
             }
@@ -2572,7 +2591,11 @@ function Add-LeaseSlotSnapshot {
         $bound = if ($script:LeaseSnapshotProbeSec -gt 0) { [double]$script:LeaseSnapshotProbeSec } else { 30.0 }
         $dogType = 'MlvApp.Agent.LeaseProbeWatchdog' -as [type]
         $clock = [System.Diagnostics.Stopwatch]::StartNew()
-        if ($null -ne $dogType) { try { $dog = $dogType::new($clock, [long][Math]::Ceiling($bound * 1000.0)) } catch { $dog = $null } }
+        # CI-FLAKE-HEAVY-SLOT-GATE-PURE-FUNCTION-CASES-1 r2: a test's scripted scheduler, when one is set, takes the bound's callback in place
+        # of the real timer; with none set (the agent never sets one) this is the same two-argument constructor as before.
+        $sched = $script:LeaseProbeWatchdogScheduler
+        if ($null -ne $dogType -and $null -ne $sched) { try { $dog = $dogType::new($clock, [long][Math]::Ceiling($bound * 1000.0), [Action[System.Threading.TimerCallback, long]]$sched) } catch { $dog = $null } }
+        elseif ($null -ne $dogType) { try { $dog = $dogType::new($clock, [long][Math]::Ceiling($bound * 1000.0)) } catch { $dog = $null } }
         if ($null -eq $dog) {
             Add-AgentLogLine "quiet-lease: slots-snapshot job=$JobId phase=$Phase slots=unknown(watchdog unavailable)"
             return

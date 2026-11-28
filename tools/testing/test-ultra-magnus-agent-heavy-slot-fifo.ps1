@@ -18,7 +18,11 @@ param(
     # The outer hang guard (UNIT_RUN_TIMEOUT_SEC in test_bachelor_agent_heavy_slot_gate.py) is pinned above this bound's worst case.
     # The range is refused at binding, before any child exists: -1 or 2147484 would otherwise throw in WaitForExit after the launch.
     [ValidateRange(1, 3600)][int]$QuietLeaseBoundSec = 600,
-    [ValidateRange(1, 3600)][int]$StageExemptBoundSec = 120
+    # CI-FLAKE-HEAVY-SLOT-GATE-PURE-FUNCTION-CASES-1 r2 (HUB-TICK 20261127T1902Z ruling: this bound is a hang backstop, read by no assertion, and
+    # may be aligned with the quiet-lease backstop above): 120 s was exceeded on a loaded hosted runner (#921 run 46041205025; ~48 s locally).
+    # 600 s is refused by the outer guard (test_the_outer_guard_outlasts_every_inner_bound: 1410 s > UNIT_RUN_TIMEOUT_SEC 1000, which this
+    # card may not raise); 180 s is the largest round bound it admits (30 + 690 + 270 = 990 s).
+    [ValidateRange(1, 3600)][int]$StageExemptBoundSec = 180
 )
 
 # AGENT-HEAVY-SLOT-WAIT-RELEASE-1 r1c: the Bachelor agent's heavy-slot gate
