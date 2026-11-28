@@ -265,6 +265,13 @@ SHIPPED_LEGS = (*SHIPPED_LEGS, *CHAINATTR_LEGS)
 TEAMPART_LEGS = {f"legs/m16-1243-display-{mode}-s{scale}-teampart.json": f"legs/m16-1243-display-{mode}-s{scale}.json"
                  for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *TEAMPART_LEGS)
+# PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1: the OpenMP team-size sweep (t16 = 16+16, t8 = 8+4, t4 = 4+2) and the LIGHT utilisation-sampler twin (util-light = the 12+6
+# partition with generatorArgs.utilSample true, still paced) of the two s1 -teampart sources (windowed and fullscreen), keyed to the source each one twins. Each
+# differs from it only in legId, card and the named generatorArgs; TeamPartitionLegSpecTests pins their shape. (suffix -> (reconOmpThreads, prepOmpThreads, utilSample))
+OMP_SWEEP_ARMS = {"t16": (16, 16, False), "t8": (8, 4, False), "t4": (4, 2, False), "util-light": (12, 6, True)}
+OMP_SWEEP_LEGS = {f"legs/m16-1243-display-{mode}-s1-teampart-{arm}.json": f"legs/m16-1243-display-{mode}-s1-teampart.json"
+                  for mode in ("fullscreen", "windowed") for arm in OMP_SWEEP_ARMS}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *OMP_SWEEP_LEGS)
 # GUI-SMOKE-FOREGROUND-HANG-NOLA-1: the M16-1457 native full-screen s1 pair taken from #420 (590b0df0, card HFR-NATIVE-60FPS-FULLRES-1) without its conform
 # arm (generatorArgs.playbackConform is not in this base's schema): the Look Assist OFF arm that hung foregrounding (-nola, a classic leg) and its Look Assist
 # ON Cinematic control. Capture-free paced cuda speed legs at scale 1; LegSpecSchemaTests pins the pair.
@@ -9245,6 +9252,13 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124](-ptrace|-identity|-missdump|-teampart)?$", path.name)
                 self.assertNotIn("prepConflatedMove", spec.get("generatorArgs") or {}, path.name)
                 self.assertEqual("reconOmpThreads" in (spec.get("generatorArgs") or {}), spec["legId"].endswith("-teampart"), path.name)
+            elif spec["card"] == "PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1":   # the OpenMP team-size sweep and LIGHT util twins of the s1 -teampart legs, named by arm
+                self.assertIn("legs/" + path.name, OMP_SWEEP_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s1-teampart-(t16|t8|t4|util-light)$", path.name)
+                self.assertEqual(spec["generatorArgs"]["telemetryArm"], "LIGHT", path.name)
+                self.assertNotIn("unpaced", spec["generatorArgs"], path.name)   # paced: no unpaced or presentTrace switch
+                self.assertNotIn("presentTrace", spec["generatorArgs"], path.name)
             elif spec["card"] == "PLAYBACK-VSYNC-DEFAULT-1":   # the swap-interval-1 twins of the display-matrix legs, named by their cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-1243-display-(fullscreen|windowed)-s[124]-vsync1$", path.name)
@@ -9646,6 +9660,9 @@ NO_PACE_TWIN_BY_DESIGN = {
     # CPU-S1-FS-SPIKE-TEAM-PARTITION-1 (adversary A5 on 84d66a4b): the six team-partition arms of the display matrix.
     **{f"m16-1243-display-{mode}-s{scale}-teampart": "team-partition A/B arm: its figures compare it with its display-matrix cell on the same contact-sheet schedule, so a capture-free twin waits for the first PR that cites an absolute figure from it"
        for mode in ("fullscreen", "windowed") for scale in (1, 2, 4)},
+    # PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1: the OpenMP team-size sweep arms (t16 / t8 / t4) and the LIGHT utilisation-sampler twin (util-light) of the two s1 -teampart sources.
+    **{f"m16-1243-display-{mode}-s1-teampart-{arm}": "OpenMP team-size / utilisation-sampler A/B arm of the s1 team-partition source: its figures compare it with that source on the same contact-sheet schedule, so a capture-free twin waits for the first PR that cites an absolute figure from it"
+       for mode in ("fullscreen", "windowed") for arm in ("t16", "t8", "t4", "util-light")},
 }
 
 
@@ -24472,9 +24489,56 @@ class TeamPartitionLegSpecTests(unittest.TestCase):
                 self.assertEqual(dict(twin, legId=cell["legId"]), cell)
                 self.assertEqual(list(twin), list(cell), "the cell's keys in the cell's order")
 
+    def test_each_omp_sweep_twin_differs_from_its_teampart_source_only_in_the_allowed_fields(self) -> None:
+        """PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1: each of the eight twins (t16 / t8 / t4 / util-light of the windowed and fullscreen s1 -teampart sources) is its
+        source except legId (source legId + -<arm>), card, generatorArgs.reconOmpThreads / prepOmpThreads and, for util-light, generatorArgs.utilSample true.
+        Clip, backends, scale, display mode, the Look Assist ON cinematic look block, criteria and timeouts stay equal in value and key order; every twin stays
+        LIGHT and paced."""
+        self.assertEqual(len(OMP_SWEEP_LEGS), 8)
+        for rel, source_rel in OMP_SWEEP_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                source = json.loads((DV / source_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(twin, self.schema)
+                self.assertIn(source_rel, TEAMPART_LEGS)
+                arm = rel[len(source_rel) - len(".json") + 1:-len(".json")]
+                self.assertIn(arm, OMP_SWEEP_ARMS)
+                recon, prep, util = OMP_SWEEP_ARMS[arm]
+                self.assertEqual(twin["legId"], source["legId"] + "-" + arm)
+                self.assertEqual(twin["card"], "PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1")
+                ga = dict(twin["generatorArgs"])
+                self.assertEqual(ga.pop("reconOmpThreads"), recon)
+                self.assertEqual(ga.pop("prepOmpThreads"), prep)
+                if util:
+                    self.assertIs(ga.pop("utilSample"), True)
+                else:
+                    self.assertNotIn("utilSample", ga)
+                source_ga = dict(source["generatorArgs"])
+                source_ga.pop("reconOmpThreads")
+                source_ga.pop("prepOmpThreads")
+                self.assertEqual(ga, source_ga, "every other generatorArgs key is the source's (LIGHT arm, quiescence threshold; no unpaced or presentTrace)")
+                self.assertEqual(ga["telemetryArm"], "LIGHT")
+                rest = dict(twin, legId=source["legId"], card=source["card"], generatorArgs=source["generatorArgs"])
+                self.assertEqual(rest, source)
+                self.assertEqual(list(twin), list(source), "the source's keys in the source's order")
+                self.assertIs(twin["criteria"]["acceptance"]["cuda"][0]["value"], True)   # lookAssistForced eq true: Look Assist ON (D4b)
+                self.assertEqual(twin["look"]["lookFlavor"], "cinematic")
+
+    def test_the_sweep_card_declares_its_venue_roles_like_its_teampart_source(self) -> None:
+        """Adversary A1 on 17a37331: the sweep legs carry card PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1, which venues.json did not name, so Get-DvVenueRole gave every
+        sweep leg defaultRole supplementary on BOTH venues and none could supply acceptance evidence. Their sources (card DUAL-VENUE-DISPLAY-MATRIX-1) are
+        bachelor acceptance; the sweep card declares the same roles, and EVERY card a sweep leg or its source carries is named in the table."""
+        venues = json.loads((DV / "venues.json").read_text(encoding="utf-8"))
+        self.assertEqual(venues["roles"]["PLAYBACK-CPU-UTIL-OMP-SWEEP-SPECS-1"], {"bachelor": "acceptance", "ultra-magnus": "supplementary"})
+        for rel, source_rel in OMP_SWEEP_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                source = json.loads((DV / source_rel).read_text(encoding="utf-8"))
+                self.assertEqual(venues["roles"][twin["card"]], venues["roles"][source["card"]], "a twin plays the role of the source it twins")
+
     def test_no_other_leg_sets_the_keys(self) -> None:
         for path in sorted((DV / "legs").glob("*.json")):
-            if "legs/" + path.name in TEAMPART_LEGS:
+            if "legs/" + path.name in TEAMPART_LEGS or "legs/" + path.name in OMP_SWEEP_LEGS:   # (the sweep twins set them on purpose: test_each_omp_sweep_twin...)
                 continue
             with self.subTest(leg=path.name):
                 ga = json.loads(path.read_text(encoding="utf-8")).get("generatorArgs") or {}
