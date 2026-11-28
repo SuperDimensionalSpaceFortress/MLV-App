@@ -23275,7 +23275,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
                 self.assertEqual((got["b"], got["p"]), (None, None), got)
 
     # R6-BURST-CUTOFF-RESIDUE-1 r12 (Grok CoS G4 on 92e096dd). Every logInteractionEvent emitter of a name the tail reader's fail-closed catch-all
-    # (Get-DvVisualCaptureBeginRecord, DualVenueRunner.psm1 `-match '(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation'`) watches, with the
+    # (Get-DvVisualCaptureBeginRecord, DualVenueRunner.psm1:1488, TAIL_CATCH_ALL below: the event slot of an interaction_trace record at the record start) watches, with the
     # value each placeholder takes in a real run. The record bodies are built from the format strings read out of MainWindow.cpp, so a new field, a renamed
     # event or a new emitter of one of these names fails the control loudly instead of leaving it stale. The free-text fields (invalidate's `reason=`, the
     # summary record's `error="..."`) name events on purpose: a catch-all that reads the whole line voids the binding for them.
@@ -23289,8 +23289,11 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         "gui_smoke.visual_capture": {"measured_session": "3", "requested": "5", "written": "5", "stop_frame": "480", "paused_settled": "1",
                                      "tail_begin_utc": BEGIN_UTC, "tail_end_utc": "2026-11-25T18:00:03.100Z", "error": "", "source_difference": "omitted"},
     }
-    TAIL_CATCH_ALL = r"""'(?i)interaction_trace\b.*\bevent["'']?\s*[=\x1A]\s*["'']?\s*(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)'"""
-    R11_CATCH_ALL = r"'(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation'"
+    TAIL_CATCH_ALL = (r"""[regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace\s*["'']?\s*event["'']?\s*[=\x1A]\s*["'']?\s*"""
+                      r"""(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)'), $script:DvCi)""")
+    R11_CATCH_ALL = r"[string]$line -match '(?i)gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation'"
+    R12_CATCH_ALL = (r"""[string]$line -match '(?i)interaction_trace\b.*\bevent["'']?\s*[=\x1A]\s*["'']?\s*"""
+                     r"""(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)'""")
     TAIL_SUMMARY_EXEMPTION = (r"elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture(\s|$)'), "
                               r"$script:DvCi)) { }")
 
@@ -23367,7 +23370,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         gui_smoke.visual_capture.begin, :11978 gui_smoke.visual_capture.burst_end, :12089 gui_smoke.visual_capture.clip_changed, :12195 the
         gui_smoke.visual_capture summary record (free-text `error=\"%8\"`). A log carrying every one of them, with event names in both free-text fields, binds
         the tail (session 3,the begin record's UTC), counts no tail drop and one post-burst drop, and credits both burst targets. RED when the A2 catch-all
-        (DualVenueRunner.psm1:1487) reads the whole line, which voids the binding for the summary record."""
+        (DualVenueRunner.psm1:1488) reads the whole line, which voids the binding for the summary record."""
         self.assertEqual(sorted(self.tail_emitters()), sorted(self.TAIL_EMITTER_VALUES), "MainWindow.cpp carries an emitter of a watched name the control does not build")
         derived, out = self.credit_from_log(self.every_emitter_log())
         self.assertEqual(derived, {"visualCaptureBeginSession": "3", "visualCaptureBeginUtc": self.BEGIN_UTC, "visualCaptureClipChanged": 0, "visualTailPrepDrops": 0,
@@ -23384,12 +23387,14 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         self.assertIn("clip_changed count=1", out["m"]["conformTailInFlightCreditNote"], out)
 
     def test_r12_g4_mutation_the_catch_all_without_its_trailing_dot_turns_the_control_red(self) -> None:
-        """Mutation rows for the A2 catch-all (DualVenueRunner.psm1:1487). On 92e096dd the catch-all read the whole line (R11_CATCH_ALL), so an `error=\"...\"` that
-        names an event voided every real run's binding; r12 narrows it to the EVENT position of an interaction_trace record (and the app's quoted free text
-        masks its `=`), and keeps the summary record's own exemption (TAIL_SUMMARY_EXEMPTION) ahead of it as defence in depth. The control goes RED when (1) the
-        whole-line catch-all comes back (the exemption removed with it), or (2) the narrowed one loses its trailing `\\.` (the summary record's own event name,
-        `event=gui_smoke.visual_capture `, then matches), the exemption removed. The exemption alone survives a lost dot (3, an equivalent mutant), and the narrowed
-        catch-all alone survives the exemption's removal (4): either guard keeps the binding."""
+        """Mutation rows for the A2 catch-all (DualVenueRunner.psm1:1488). On 92e096dd the catch-all read the whole line (R11_CATCH_ALL), so an `error=\"...\"` that
+        names an event voided every real run's binding; r12 narrowed it to an `event=` token after `interaction_trace` (R12_CATCH_ALL, not anchored), and r13
+        anchors it on the record start and the event slot (TAIL_CATCH_ALL), keeping the summary record's own exemption (TAIL_SUMMARY_EXEMPTION) ahead of it as
+        defence in depth. The control goes RED when (1) the whole-line catch-all comes back (the exemption removed with it), or (2) the anchored one loses its
+        trailing `\\.` (the summary record's own event name, `event=gui_smoke.visual_capture `, then matches), the exemption removed. The exemption alone survives
+        a lost dot (3, an equivalent mutant), and the anchored catch-all alone survives the exemption's removal (4): either guard keeps the binding. r13 (sol r12
+        B1, opus r12 H1): (5) the r12 unanchored form, exemption removed, a paren-free quoted error naming an event, and (6) the record-start anchor dropped alone,
+        sol's metadata path, both void the binding: the anchor is what keeps quoted text out."""
         self.assertEqual(self.tail_catch_all_count(), 1)
         dotless = (self.TAIL_CATCH_ALL, self.TAIL_CATCH_ALL.replace(r"visual_capture\.|", r"visual_capture|"))
         whole_line = (self.TAIL_CATCH_ALL, self.R11_CATCH_ALL)
@@ -23400,7 +23405,12 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
                 ("row 1: the r11 whole-line catch-all, exemption removed, the error names events (the 92e096dd behaviour)", [whole_line, no_exemption], self.every_emitter_log(), True),
                 ("row 2: the trailing dot dropped, exemption removed, an empty error", [dotless, no_exemption], empty_error, True),
                 ("row 3 (equivalent mutant): the trailing dot dropped alone, the exemption in place", [dotless], self.every_emitter_log(), False),
-                ("row 4 (equivalent mutant): the exemption removed alone, the error names events", [no_exemption], self.every_emitter_log(), False)):
+                ("row 4 (equivalent mutant): the exemption removed alone, the error names events", [no_exemption], self.every_emitter_log(), False),
+                ("row 5: the r12 unanchored catch-all, exemption removed, a paren-free quoted error (opus r12 H1)",
+                 [(self.TAIL_CATCH_ALL, self.R12_CATCH_ALL), no_exemption], self.every_emitter_log(error="event=gui_smoke.visual_capture.burst_end missing"), True),
+                ("row 6: the record-start anchor dropped alone, sol r12 B1's metadata path",
+                 [(self.TAIL_CATCH_ALL, self.TAIL_CATCH_ALL.replace("($script:DvRecordStart + '", "('"))],
+                 ['run_metadata={"command_line":["MLVApp.exe","--visual-capture-dir","C:/Temp/interaction_trace event=gui_smoke.visual_capture.example"]}'] + empty_error, True)):
             with self.subTest(case=name):
                 derived, out = self.credit_from_log(log, module=self.mutated_module(edits))
                 if red:
@@ -23516,6 +23526,98 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
                     self.assertIn("serial or painted serial is unreadable", out["m"]["conformTailInFlightCreditNote"], out)
                 else:
                     self.assertNotIn("serial or painted serial is unreadable", out["m"].get("conformTailInFlightCreditNote", ""), out)
+
+    TAIL_PRE = "[2026-11-25T18:00:00.000Z] [INFO] [0xa] "
+    TAIL_LOC = " (C:/build/platform/qt/MainWindow.cpp:11642)"
+
+    def assert_binding_kept(self, lines: list) -> None:
+        """The G4 control's binding (session 3, no tail drop, burst 2) and its credit of 2 survive the log."""
+        derived, out = self.credit_from_log(lines)
+        self.assertEqual((derived["visualCaptureBeginSession"], derived["visualTailPrepDrops"], derived["visualBurstCaptures"]), ("3", 0, 2), derived)
+        self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+
+    def test_r13_b1_event_text_in_a_metadata_path_keeps_the_tail_binding(self) -> None:
+        """r13, sol r12 B1 (on a6729789), its input verbatim: `run_metadata={"command_line":["MLVApp.exe","--visual-capture-dir","C:/Temp/interaction_trace
+        event=gui_smoke.visual_capture.example"]}` before the G4 control log. The quote mask turns that `=` into U+001A, which the r12 catch-all (not anchored
+        to the record start) accepted, so the session, the burst count and the drops all read null and both credits fell to TAIL_VISUAL_NOT_THIS_RUN. The
+        plain-path control (r12 A2) kept them. Both watched families. The catch-all now reads only the event slot at the start of the record."""
+        base = self.every_emitter_log(error="")
+        for name in ("gui_smoke.visual_capture.example", "playback_prep.invalidate_generation", "gui_smoke.visual_capture.burst_end"):
+            with self.subTest(family=name):
+                metadata = 'run_metadata={"command_line":["MLVApp.exe","--visual-capture-dir","C:/Temp/interaction_trace event=' + name + '"]}'
+                self.assert_binding_kept([metadata] + base)
+
+    def test_r13_b1_a_quoted_note_in_an_unrelated_interaction_record_keeps_the_tail_binding(self) -> None:
+        """r13, sol r12 B1 sibling (a quoted note in an unrelated interaction record) and opus r12 H1's class sweep (MainWindow.cpp window_screenshot path,
+        contact_sheet dir, look_assist.daylight_refine unquoted path): an interaction_trace record whose event slot names an UNWATCHED event and whose quoted
+        note, quoted dir or unquoted path value carries `event=<watched name>`, between the begin and burst_end records. Only the event slot counts."""
+        base = self.every_emitter_log(error="")
+        at = next(i for i, line in enumerate(base) if "event=gui_smoke.visual_capture.burst_end" in line)
+        pre = self.TAIL_PRE + "interaction_trace event="
+        for name, body in (("quoted note, burst_end", 'gui_smoke.window_screenshot note="event=gui_smoke.visual_capture.burst_end" width=1'),
+                           ("quoted note, invalidate_generation", 'gui_smoke.window_screenshot note="event=playback_prep.invalidate_generation" width=1'),
+                           ("quoted note naming a whole record", 'gui_smoke.window_screenshot note="interaction_trace event=gui_smoke.visual_capture.begin" width=1'),
+                           ("single-quoted note", "gui_smoke.window_screenshot note='event=gui_smoke.visual_capture.clip_changed' width=1"),
+                           ("quoted dir", 'gui_smoke.contact_sheet dir="C:/runs/event=gui_smoke.visual_capture.1" written=1'),
+                           ("unquoted path value", "look_assist.daylight_refine path=C:/runs/event=gui_smoke.visual_capture.x/run1")):
+            with self.subTest(case=name):
+                self.assert_binding_kept(base[:at] + [pre + body + self.TAIL_LOC] + base[at:])
+
+    def test_r13_b1_mutation_a_paren_free_quoted_error_keeps_the_binding_with_the_summary_exemption_removed(self) -> None:
+        """r13, opus r12 H1 (phase 1 and 2): since r12 fix 2 the summary exemption (TAIL_SUMMARY_EXEMPTION) was the only guard for a paren-free quoted error
+        naming event=<name> (`error="event=gui_smoke.visual_capture.burst_end missing"`: no ` (` before it, so the location cut does not remove it). With the
+        exemption mutated away, the unanchored catch-all voided the binding. The anchored catch-all reads the summary record's own event slot
+        (`gui_smoke.visual_capture`, no trailing dot) and never its error text, so the binding survives without the exemption. Both watched families."""
+        module = self.mutated_module([(self.TAIL_SUMMARY_EXEMPTION, "elseif ($false) { }")])
+        for error in ("event=gui_smoke.visual_capture.burst_end missing", "event=playback_prep.invalidate_generation missing"):
+            with self.subTest(error=error):
+                derived, out = self.credit_from_log(self.every_emitter_log(error=error), module=module)
+                self.assertEqual((derived["visualCaptureBeginSession"], derived["visualTailPrepDrops"], derived["visualBurstCaptures"]), ("3", 0, 2), derived)
+                self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+
+    def test_r13_b1_differential_only_the_event_slot_of_an_interaction_record_voids_the_binding(self) -> None:
+        """r13 (FIX-ROUND-CLASS-SWEEP-1 item 4: a parser defect gets a generated-input check against an exact oracle). Records generated from a fixed seed,
+        each inserted after the begin record of the G4 control log. The oracle is the generator's own label, never the reader's regex: a watched name the
+        generator put in the EVENT SLOT of an interaction_trace record (two spaces, a tab, a quoted token, a quoted name, a space round `=`, an unknown
+        suffix) means `voided` (session null); a watched name it put anywhere else (a double- or single-quoted note, a quoted dir, an unquoted path value of
+        an unwatched event, a run_metadata path, a non-interaction record's quoted text) means `kept` (session 3, burst 2). One pwsh reads every log."""
+        import random
+        rng = random.Random(20261128)
+        base = self.every_emitter_log(error="")
+        at = next(i for i, line in enumerate(base) if "event=gui_smoke.visual_capture.burst_end" in line)
+        watched = ("gui_smoke.visual_capture.begin", "gui_smoke.visual_capture.burst_end", "gui_smoke.visual_capture.clip_changed",
+                   "gui_smoke.visual_capture.example", "playback_prep.invalidate_generation")
+        unwatched = ("gui_smoke.window_screenshot", "gui_smoke.contact_sheet", "look_assist.daylight_refine", "gui_smoke.visual_capture")
+        slots = ("interaction_trace  event={n} k=1", "interaction_trace\tevent={n} k=1", 'interaction_trace "event={n}" k=1', "interaction_trace 'event={n}' k=1",
+                 'interaction_trace event="{n}" k=1', "interaction_trace event='{n}' k=1", "interaction_trace event = {n} k=1", "interaction_trace event ={n} k=1",
+                 'interaction_trace "event"={n} k=1', "interaction_trace event={n}x k=1")
+        texts = ("event={n}", "interaction_trace event={n}", "event = {n}", "C:/runs/event={n}/run1", "interaction_trace  event={n} done")
+        places = ('interaction_trace event={u} note="{t}" w=1', "interaction_trace event={u} note='{t}' w=1", 'interaction_trace event={u} dir="{t}" w=1',
+                  'run_metadata={{"command_line":["MLVApp.exe","--visual-capture-dir","C:/Temp/{t}"]}}', 'playback_smoke.note session=3 text="{t}"')
+        cases = []
+        for n in watched:
+            for slot in slots:
+                cases.append((slot.format(n=n), True))
+            for t in texts:
+                for place in places:
+                    cases.append((place.format(u=rng.choice(unwatched), t=t.format(n=n)), False))
+                cases.append(("interaction_trace event={u} path=C:/runs/event={n}/run1".format(u=rng.choice(unwatched), n=n), False))
+        logs = []
+        for body, _ in cases:
+            prefix = rng.choice((self.TAIL_PRE, "", "[t] "))
+            loc = rng.choice((self.TAIL_LOC, ""))
+            logs.append("\n".join(base[:at] + [prefix + body + loc] + base[at:]) + "\n")
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "logs.json"
+            path.write_text(json.dumps(logs), encoding="utf-8")
+            proc, got = run_pwsh_json("$logs = Get-Content -Raw -LiteralPath $env:DVE_CASES -Encoding utf8 | ConvertFrom-Json\n"
+                                      "$m = Get-Module DualVenueRunner\n"
+                                      "$out = foreach ($l in $logs) { $r = & $m { param($t) Get-DvVisualCaptureBeginRecord -LogText $t } ([string]$l); [ordered]@{ s = $r.session; b = $r.burstCaptures } }\n"
+                                      "ConvertTo-Json -InputObject @($out) -Compress -Depth 3", DVE_CASES=str(path))
+        self.assertIsNotNone(got, proc.stdout + proc.stderr)
+        self.assertEqual(len(got), len(cases))
+        wrong = [(body, voids, row) for (body, voids), row in zip(cases, got) if (row["s"] is None) != voids or (not voids and (row["s"], row["b"]) != ("3", 2))]
+        self.assertEqual(wrong, [], f"{len(wrong)} of {len(cases)} generated records disagree with the oracle")
 
     def tail_catch_all_count(self) -> int:
         return (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8").count(self.TAIL_CATCH_ALL)

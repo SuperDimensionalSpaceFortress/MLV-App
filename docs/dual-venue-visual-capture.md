@@ -263,7 +263,8 @@ unreadable `burst_end` also refuses. An invalidation after `burst_end`, such as 
 so it does not refuse. The burst capture's start is decided inside the capture function, after its HWND, DC and DIB setup and
 immediately before PrintWindow (`captureStartGate`). Typed
 refusals: `TAIL_CREDIT_PREP_DROPPED`, `TAIL_CREDIT_PAINT_WAIT_ESCAPES`, `TAIL_VISUAL_NONCE_ABSENT`, `TAIL_VISUAL_NONCE_MISMATCH`,
-`TAIL_VISUAL_NOT_THIS_RUN`, `TAIL_VISUAL_FILE_AMBIGUOUS`, `TAIL_CREDIT_PAINT_ORDER`, `TAIL_VISUAL_UNREADABLE` (the validator re-throws
+`TAIL_VISUAL_NOT_THIS_RUN`, `TAIL_VISUAL_FILE_AMBIGUOUS`, `TAIL_CREDIT_PAINT_ORDER`, `TAIL_CREDIT_EQUAL_TIME`,
+`TAIL_CREDIT_BURST_NOT_LOGGED`, `TAIL_VISUAL_ROW_UNREADABLE`, `TAIL_VISUAL_UNREADABLE` (the validator re-throws
 it as `DVE_EVIDENCE_VALIDATION_IO`). A credit the criteria were judged with must appear in the receipt's `outcomeDetail`
 (`OUTCOME_DETAIL_TAIL_CREDIT_ABSENT` otherwise). The app's `play_first_unbound` burst (R4-RESIDUE-1) is the capture that can
 qualify: every `play_unbound` capture follows the six forced `play` paints. It can qualify on all three display routes: the GL

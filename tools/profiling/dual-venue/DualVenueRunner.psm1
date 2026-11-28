@@ -1485,7 +1485,10 @@ function Get-DvVisualCaptureBeginRecord {
             }
             elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=playback_prep\.invalidate_generation(\s|$)'), $script:DvCi)) { }   # before the begin record: not tail evidence
             elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace event=gui_smoke\.visual_capture(\s|$)'), $script:DvCi)) { }   # r12 (Grok CoS G4): the app's own summary record (MainWindow.cpp logInteractionEvent "gui_smoke.visual_capture"): not tail evidence, and its free-text error="..." may name any event, so the catch-all below must not read it
-            elseif ([string]$line -match '(?i)interaction_trace\b.*\bevent["'']?\s*[=\x1A]\s*["'']?\s*(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)') {
+            elseif ([regex]::IsMatch([string]$line, ($script:DvRecordStart + 'interaction_trace\s*["'']?\s*event["'']?\s*[=\x1A]\s*["'']?\s*(gui_smoke\.visual_capture\.|playback_prep\.invalidate_generation)'), $script:DvCi)) {
+                # r13 (sol r12 B1 on a6729789; opus r12 H1): anchored on the record start and the event slot (logInteractionEvent writes `interaction_trace
+                # event=<name>` first, MainWindow.cpp), so event-shaped text in a quoted value, a metadata path or an unquoted field of another record never
+                # matches; the U+001A mask is accepted only in the slot itself, where a fully quoted "event=<name>" token puts it
                 # r12 fix 1 (sol pass 16 A1 on dea8d70c): a fully quoted "event=<name>" token has its `=` masked (DvQuotedEqualsMask, U+001A) inside the quotes, so the
                 # event-position form accepts the mask for the `=` and a quote before the `=`
                 # r11 adversary A2 (sol on 6c0a9228): a record naming one of these events in any other form (a quoted event=, two spaces) was skipped
