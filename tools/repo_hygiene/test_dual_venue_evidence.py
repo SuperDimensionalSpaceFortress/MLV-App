@@ -50,6 +50,7 @@ from pathlib import Path
 
 from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, write_synthetic_mlv
 from tools.repo_hygiene.test_leg_play_seconds_within_clip import KNOWN_CLIP_SOURCE
+from tools.repo_hygiene.venue_fixture_modules import offline_tmp_root
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -1694,7 +1695,7 @@ class RunnerHarness:
     that can use a MUTATED COPY of the runner directory (for the mutation tests)."""
 
     def make_harness(self, cleanup_class_gone: bool = True) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dve-run-")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dve-run-", dir=offline_tmp_root())   # (r3: the batch's -SkipCommittedSpecPreflight stand-ins live outside every git work tree)
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         self.share = self.tmp / "share"
@@ -4079,7 +4080,8 @@ class EvidenceBoundReceiptTests(EvidenceFactory, ModuleMutationMixin, unittest.T
         real = self.prod_repo(records=[])                       # the repo the validator is told to use: no record
         env = {"GIT_DIR": str(forged_repo.root / ".git")}
         self.assertNotValid(receipt, real, "is not a blob of this repository", "INVALID", env=env)
-        mutated = self.mutated_module([("[void]$psi.Environment.Remove($name)", "$null = $name")])
+        # (r9: the anchor is the GIT_DIR/GIT_TRACE/GIT_REDIRECT scrub's own line: the GIT_CONFIG* scrub the batch card added after it ends with the same call, so the bare call is no longer unique)
+        mutated = self.mutated_module([("$_ -match '^GIT_REDIRECT_' })) { [void]$psi.Environment.Remove($name) }", "$_ -match '^GIT_REDIRECT_' })) { $null = $name }")])
         status, valid, reasons = self.status(receipt, real, module=mutated, env=env)
         self.assertEqual((status, valid), ("ADVISORY", False), "with the scrub removed GIT_DIR makes the forger's repo the committed one -- so the scrub is guarded")
 
@@ -7050,7 +7052,7 @@ exit 0
         fake = self.tmp / "batch-fake-script.ps1"
         fake.write_text("exit 0\n", encoding="utf-8")
         proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
-                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake), "-SkipCommittedSpecPreflight",
                          "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra=env, timeout=420)
         if mode == "copy":
             self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really swapped the planned spec's bytes")
@@ -7096,7 +7098,7 @@ exit 0
         fake = self.tmp / "batch-fake-script.ps1"
         fake.write_text("exit 0\n", encoding="utf-8")
         proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
-                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake), "-SkipCommittedSpecPreflight",
                          "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra={"DVT_DUP_TWIN": str(source)}, timeout=420)
         self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really changed the path's bytes between its two preflights")
         bound = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
@@ -7128,7 +7130,7 @@ exit 0
         fake = self.tmp / "batch-fake-script.ps1"
         fake.write_text("exit 0\n", encoding="utf-8")
         proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
-                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake), "-SkipCommittedSpecPreflight",
                          "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra={"DVT_DUP_TWIN": str(source)}, timeout=420)
         self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really changed the file's bytes between its two preflights")
         planned_lines = [l for l in proc.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
@@ -7154,7 +7156,7 @@ exit 0
         fake = self.tmp / "batch-fake-script.ps1"
         fake.write_text("exit 0\n", encoding="utf-8")
         proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
-                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake), "-SkipCommittedSpecPreflight",
                          "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline, "-SpecDigestKeyDelay", "1:1500,4:1500"],
                         env_extra={"DVT_UPPER_SPEC": "1"}, timeout=420)
         self.assertNotIn("SPEC_CHANGED_AFTER_PREFLIGHT", proc.stderr, "old: a false refusal naming an empty sha256 on a spec nobody changed\n" + proc.stdout + proc.stderr)
@@ -7167,7 +7169,7 @@ exit 0
         self.assertFalse((self.tmp / "claims").exists() and any((self.tmp / "claims").iterdir()), "no claim is taken")
         # control: the same spelled specs with every lookup answering run, each entry bound to its own judged bytes
         ok = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run-control"),
-                       "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                       "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake), "-SkipCommittedSpecPreflight",
                        "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline], env_extra={"DVT_UPPER_SPEC": "1"}, timeout=420)
         self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
         rows = [l for l in ok.stdout.splitlines() if l.startswith("DVT_PLANNED ")]
@@ -7244,7 +7246,7 @@ exit 0
         fake.write_text("exit 0\n", encoding="utf-8")
         legspec = ",".join("'" + str(s).replace("'", "''") + "'" for s in specs)
         cmd = (f"& '{dv / 'Invoke-VenueLeaseBatch.ps1'}' -Venue bachelor -LegSpec {legspec} -Backend cuda -RunDir '{self.tmp / 'batch-run'}' -SourceCommit {self.sha} "
-               f"-BuildManifestSha256 {self.build_sha} -UmRunScript '{self.um}' -QuietScript '{fake}' -LegScript '{fake}' -ClaimDir '{self.tmp / 'claims'}' "
+               f"-BuildManifestSha256 {self.build_sha} -UmRunScript '{self.um}' -QuietScript '{fake}' -LegScript '{fake}' -SkipCommittedSpecPreflight -ClaimDir '{self.tmp / 'claims'}' "
                f"-AgentShare '{self.share}' -DeadlineUtc {deadline}; exit $LASTEXITCODE")
         return run_pwsh(["-Command", cmd], env_extra=env, timeout=420)
 
@@ -7300,7 +7302,7 @@ exit 0
         fake = self.tmp / "batch-fake-script.ps1"
         fake.write_text("exit 0\n", encoding="utf-8")
         proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
-                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake), "-SkipCommittedSpecPreflight",
                          "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline],
                         env_extra={"DVT_SWAP_TO": str(target), "DVT_SWAP_FROM": str(brace), "DVT_SWAP_MODE": "copy"}, timeout=420)
         self.assertEqual(target.read_bytes(), b"{", "the fixture really cut the planned spec to one brace")
@@ -7487,7 +7489,7 @@ exit 0
         fake = self.tmp / "batch-fake-script.ps1"
         fake.write_text("exit 0\n", encoding="utf-8")
         proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
-                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake), "-SkipCommittedSpecPreflight",
                          "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline],
                         env_extra={"DVT_BUDGET_SWAP_TO": str(target), "DVT_BUDGET_SWAP_FROM": str(source)}, timeout=420)
         self.assertEqual(target.read_bytes(), source.read_bytes(), "the fixture really replaced the planned spec between the shape read and the budget read")
@@ -7516,7 +7518,7 @@ exit 0
         fake = self.tmp / "batch-fake-script.ps1"
         fake.write_text("exit 0\n", encoding="utf-8")
         proc = run_pwsh(["-File", str(dv / "Invoke-VenueLeaseBatch.ps1"), "-Venue", "bachelor", "-LegSet", self.SWAP_LEGSET, "-Backend", "cuda", "-RunDir", str(self.tmp / "batch-run"),
-                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake),
+                         "-SourceCommit", self.sha, "-BuildManifestSha256", self.build_sha, "-UmRunScript", str(self.um), "-QuietScript", str(fake), "-LegScript", str(fake), "-SkipCommittedSpecPreflight",
                          "-ClaimDir", str(self.tmp / "claims"), "-AgentShare", str(self.share), "-DeadlineUtc", deadline],
                         env_extra={"DVT_BUDGET_DELETE": self.SWAP_TARGET}, timeout=420)
         self.assertFalse(target.exists(), "the fixture really deleted the planned spec")

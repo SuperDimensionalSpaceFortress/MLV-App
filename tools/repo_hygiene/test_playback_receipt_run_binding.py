@@ -723,7 +723,7 @@ CONSUMER_FAILING_ACTION: dict[str, tuple[tuple[str, int], ...]] = {
     # counted) in the batch and the run results, and the run exits 7. r3 (sol r2 B2): the leg is a bounded child (killed with its tree at the lease's end), so its
     # exit code is the child's own ($lp.exit from Invoke-VenueBoundedProcess on the leg script), not $LASTEXITCODE.
     "tools/profiling/dual-venue/Invoke-VenueLeaseBatch.ps1": (
-        (r"\$lp\s*=\s*Invoke-VenueBoundedProcess\s+-FilePath\s+\$pwshExe\s+-ArgumentList\s+\$lArgs\b[^\n]*\n[\s\S]*?\$legCode\s*=\s*\$lp\.exit\b"
+        (r"\$lp\s*=\s*Invoke-BatchBoundedChild\s+-FilePath\s+\$pwshExe\s+-ArgumentList\s+\$lArgs\b[^\n]*\n[\s\S]*?\$legCode\s*=\s*\$lp\.exit\b"
          r"[\s\S]*?if\s*\(\$legCode\s+-ne\s+0\)\s*\{\s*"
          r"(?P<act>\$row\s*=\s*\[ordered\]@\{[^\n]*status\s*=\s*'LEG_FAILED';\s*outcome\s*=\s*'INVALID'[^\n]*\}\s*"
          r"\$b\.legs\.Add\(\[pscustomobject\]\$row\);\s*Add-Result\s+\$leg\s+'LEG_FAILED'\s+\$row)", 1),),

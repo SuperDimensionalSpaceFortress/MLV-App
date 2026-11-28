@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.repo_hygiene import test_venue_chain_runner as base
-from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings
+from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, offline_tmp_root
 
 DV = Path(os.environ["VENUE_CLAIM_FIFO_DV_DIR"]) if os.environ.get("VENUE_CLAIM_FIFO_DV_DIR") else base.DV
 RUNNER = DV / "Invoke-VenueChain.ps1"
@@ -974,7 +974,7 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         from tools.repo_hygiene import test_venue_lease_batch as lease
         cls.lease = lease
-        cls.tmp = Path(tempfile.mkdtemp(prefix="venue-lease-fifo-"))
+        cls.tmp = Path(tempfile.mkdtemp(prefix="venue-lease-fifo-", dir=offline_tmp_root()))   # (r3: the stand-in um-run / leg live outside every git work tree, which -SkipCommittedSpecPreflight requires)
         for name, text in (("fake-quiet.ps1", lease.FAKE_QUIET), ("fake-umrun.ps1", lease.FAKE_UMRUN), ("fake-leg.ps1", lease.FAKE_LEG)):
             (cls.tmp / name).write_text(text, encoding="utf-8")
         cls.spec = cls.tmp / "fx-a.json"
@@ -1025,7 +1025,8 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
         args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(runner or LEASE_RUNNER), "-LegSpec", specs or str(self.spec), "-RunDir", str(run_dir), "-SourceCommit", "a" * 40,
                 "-BuildManifestSha256", "b" * 64, "-ClaimDir", str(self.claims), "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"),
                 "-UmRunScript", str(self.tmp / "fake-umrun.ps1"), "-AgentShare", str(share), "-LegBudgetSec", "60", "-LeaseMarginSec", "0", "-ClaimPollSec", str(claim_poll),
-                "-RecheckSec", "1", "-LeaseCooldownSec", cooldown, "-DeadlineUtc", utc_iso(deadline_utc or datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)), *extra]
+                "-RecheckSec", "1", "-LeaseCooldownSec", cooldown, "-DeadlineUtc", utc_iso(deadline_utc or datetime.now(timezone.utc) + timedelta(seconds=deadline_sec)),
+                "-SkipCommittedSpecPreflight", *extra]   # (VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r2: the preflight is on by default; a stand-in leg lives in no repo)
         out_path = self.case / f"stdout-{name}.txt"
         with open(out_path, "w", encoding="utf-8") as out_file:
             p = subprocess.Popen(args, stdout=out_file, stderr=subprocess.STDOUT, text=True, env=e)

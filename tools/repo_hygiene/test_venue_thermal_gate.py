@@ -930,6 +930,7 @@ class ThermalGateRunnerTests(unittest.TestCase):
     setUp = tvlb.VenueLeaseBatchRunnerTests.setUp
     _init_case = tvlb.VenueLeaseBatchRunnerTests._init_case   # the shared setUp builds each case through it (#704)
     batch_cmd = tvlb.VenueLeaseBatchRunnerTests.batch_cmd
+    offline_switch_args = tvlb.VenueLeaseBatchRunnerTests.offline_switch_args   # batch_cmd turns the committed-spec preflight off for a stand-in leg through it (VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1)
     kinds = tvlb.VenueLeaseBatchRunnerTests.kinds
     batches = tvlb.VenueLeaseBatchRunnerTests.batches
     events_raw = tvlb.VenueLeaseBatchRunnerTests.events_raw
@@ -1158,6 +1159,7 @@ class ThermalDeadlineAdmissionTests(unittest.TestCase):
     setUp = tvlb.VenueLeaseBatchRunnerTests.setUp
     _init_case = tvlb.VenueLeaseBatchRunnerTests._init_case   # the shared setUp builds each case through it (#704)
     batch_cmd = tvlb.VenueLeaseBatchRunnerTests.batch_cmd
+    offline_switch_args = tvlb.VenueLeaseBatchRunnerTests.offline_switch_args   # batch_cmd turns the committed-spec preflight off for a stand-in leg through it (VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1)
     kinds = tvlb.VenueLeaseBatchRunnerTests.kinds
     batches = tvlb.VenueLeaseBatchRunnerTests.batches
     events_raw = tvlb.VenueLeaseBatchRunnerTests.events_raw
@@ -1342,6 +1344,7 @@ class ThermalSpreadPlanTests(unittest.TestCase):
     item = tvlb.VenueLeaseBatchLegPlanTests.item
     write_plan = tvlb.VenueLeaseBatchLegPlanTests.write_plan
     plan_cmd = tvlb.VenueLeaseBatchLegPlanTests.plan_cmd
+    offline_switch_args = tvlb.VenueLeaseBatchRunnerTests.offline_switch_args   # plan_cmd turns the committed-spec preflight off for a stand-in leg through it (VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1)
     run_plan = tvlb.VenueLeaseBatchLegPlanTests.run_plan
     leg_calls = tvlb.VenueLeaseBatchLegPlanTests.leg_calls
     kinds = tvlb.VenueLeaseBatchRunnerTests.kinds

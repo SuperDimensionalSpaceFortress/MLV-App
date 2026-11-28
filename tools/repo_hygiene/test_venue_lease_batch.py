@@ -40,7 +40,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules
+from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules, offline_tmp_root
+from tools.repo_hygiene.venue_orphan_fixture import grandchild_pid, kill_tree, pid_is_alive, write_orphan_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -270,6 +271,10 @@ switch ($mode) {
         "QUIET mean=5.0% threshold=$ThresholdPercent% waitedSec=301"; exit 0
     }
     'UNKNOWN' { "VENUE_QUIET_UNKNOWN mean=UNKNOWN threshold=$ThresholdPercent% waitedSec=1 reason=probe-failed"; exit 6 }
+    # r7 (Grok G11 prevention): the probe's other documented exits (Wait-VenueQuiet.ps1: 2 usage, 4 gate unreadable, 5 host mismatch), each a typed stop of the batch
+    'PROBEUSAGE' { "fake probe: usage"; exit 2 }
+    'PROBEGATEUNREADABLE' { "fake probe: gate unreadable"; exit 4 }
+    'PROBEHOSTMISMATCH' { "fake probe: host mismatch"; exit 5 }
     'STEAL' {
         # r5b (Grok G1): another owner's claim replaces the run's mid-batch (another nonce; its owner pid is dead, so the next batch may break it). The probe
         # itself reads QUIET; it waits long enough for a 1 s claim keeper to see the claim NOT_OURS.
@@ -615,6 +620,34 @@ def leg_receipt_root_guard_ps(leg: Path, root: str, offline: bool = False) -> st
     )
 
 
+# A digest no other process shares: the cases that can reach the REAL leg hand it this as -BuildManifestSha256 (a leg's receipt records it as subject.buildManifestSha256), so a receipt that
+# carries it was written by THIS test process (adversary r2 passes 4-5 A2: the shared MANIFEST constant was not distinctive enough).
+THIS_PROCESS_MANIFEST = uuid.uuid4().hex * 2
+
+
+def receipt_state_written_by_this_harness(base: Path) -> dict[str, tuple[int, int]]:
+    """Every file under `base` that carries THIS_PROCESS_MANIFEST, as name -> (size, mtime_ns). A file another process wrote there (whatever manifest it carries) is not counted."""
+    if not base.exists():
+        return {}
+    state: dict[str, tuple[int, int]] = {}
+    for p in base.rglob("*"):
+        try:
+            if p.is_file() and THIS_PROCESS_MANIFEST.encode("ascii") in p.read_bytes():
+                state[str(p.relative_to(base))] = (p.stat().st_size, p.stat().st_mtime_ns)
+        except OSError:
+            continue   # (a receipt another process holds open for write, or removes between the listing and the read, is not this harness's)
+    return state
+
+
+def canonical_receipt_state_for(spec: Path) -> dict[str, tuple[int, int]]:
+    """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r2: the files this harness wrote under the CANONICAL receipt root's directory for `spec`'s card/legId.
+    The canonical root is the one Invoke-VenueLeg resolves for itself when it is given no -ReceiptRoot (the main checkout's .claude-state\\dual-venue\\receipts, found from the git common dir)."""
+    doc = json.loads(spec.read_text(encoding="utf-8"))
+    common = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--path-format=absolute", "--git-common-dir"], capture_output=True, text=True, timeout=60)
+    main_root = Path(common.stdout.strip()).parent if common.returncode == 0 and common.stdout.strip() else ROOT
+    return receipt_state_written_by_this_harness(main_root / ".claude-state" / "dual-venue" / "receipts" / str(doc["card"]) / str(doc["legId"]))
+
+
 def utc_iso(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -688,6 +721,70 @@ def batch_result(stdout: str) -> dict:
     if not lines:
         raise AssertionError("no LEASE_BATCH_RESULT line in:\n" + stdout)
     return json.loads(lines[-1][len("LEASE_BATCH_RESULT="):])
+
+
+# r7 (Grok G11 prevention): a plain text scan of the batch script's typed ends. A STOP pair is a `Set-Stop '<reason>' <code>` call (the code of an `$(if (...) { 7 } else { 3 })` expression is both codes); an END pair
+# is a `$b.endReason = '<reason>'` assignment. The scan asks of every pair whether some batch test names it (_g11_named_pairs), so a NEW branch cannot ship with only its sibling tested.
+# The pair is the unit (a second site that reuses a reason and code is not told apart from the first: the scan cannot see a site, only what it ends the run with).
+def _g11_pairs(runner_text: str) -> tuple[set, set, list]:
+    """(stop pairs, end reasons, odd). PowerShell is case-insensitive and takes either quote, so both are read. `odd` lists every Set-Stop call and every `.endReason =` assignment the two recognisers could not read
+    (a reason held in a variable, a stop with no literal code, another variable than $b): a form the scan cannot read is a failure of the test that asks, never a branch it silently skips (adversary r7 pass 17 A3)."""
+    code = "\n".join(l for l in runner_text.splitlines() if not l.lstrip().startswith("#"))
+    stops, read_stops = set(), 0
+    for m in re.finditer(r"""set-stop\s+(['"])([A-Z][A-Z0-9_]+)\1\s+(?:(\d+)\b|\$\(if .*?\{ (\d+) \} else \{ (\d+) \}\))""", code, flags=re.IGNORECASE):
+        read_stops += 1
+        for c in m.groups()[2:]:
+            if c is not None:
+                stops.add((m.group(2), int(c)))
+    end_re = r"""\$b\.endReason\s*=\s*(['"])([A-Z][A-Z0-9_]+)\1"""
+    stop_re = r"""set-stop\s+(['"])([A-Z][A-Z0-9_]+)\1\s+(?:(\d+)\b|\$\(if .*?\{ (\d+) \} else \{ (\d+) \}\))"""
+    ends = {m.group(2) for m in re.finditer(end_re, code, flags=re.IGNORECASE)}
+    odd = []
+    for call in re.findall(r"(?<!function )\bset-stop\b[^\n]*", code, flags=re.IGNORECASE):
+        if not re.match(stop_re, call, flags=re.IGNORECASE):
+            odd.append(re.split(r";|\s\}", call)[0].strip())
+    # (r8, adversary r8 pass 18 A4: also a scoped variable ($script:b.endReason) and an indexed one ($b['endReason'] =): every spelling of the assignment is either read or reported)
+    # (r9, adversary r9 pass 19 A3: and the quoted member names PowerShell takes the same way, $b."endReason" / $b.'endReason' / $b.('endReason'), and any computed member name on the batch variable, $b.("end" + "Reason"))
+    for assign in re.findall(r"""\$[\w:]+(?:\.endReason|\.\s*['"]endReason['"]|\.\(\s*['"]endReason['"]\s*\)|\[\s*['"]endReason['"]\s*\])\s*=(?!=)[^\n]*|\$(?:\w+:)?b\.\([^\n]*?\)\s*=(?!=)[^\n]*""", code, flags=re.IGNORECASE):
+        if not re.match(end_re, assign, flags=re.IGNORECASE):
+            odd.append(re.split(r";|\s\}", assign)[0].strip())
+    return stops, ends, sorted(set(odd))
+
+
+def _g11_named_pairs(test_text: str, stops: set, ends: set) -> tuple[set, set]:
+    """The stop pairs and end reasons that some test method names: the reason as a string literal, on a line a negative assertion does not own, in a method that reads the run's end (endReason, stopReason or returncode);
+    and for a stop pair, the code too: on a returncode line of that method, or as the `<code>, "<REASON>"` pair of a tuple (the end-state assertions and the table-driven cases use it)."""
+    named_stops, named_ends = set(), set()
+    for method in re.split(r"\n    def test", test_text)[1:]:
+        lines = [l for l in method.splitlines() if not re.search(r"assertNot(?:In|Equal|Regex)|assertFalse|assertIsNone", l)]
+        body = "\n".join(lines)
+        if not re.search(r"endReason|stopReason|returncode", body):
+            continue
+        for reason, c in stops:
+            if re.search(r"""["']""" + re.escape(reason) + r"""["']""", body) and (
+                    any("returncode" in l and re.search(r"(?<![\w.])" + str(c) + r"(?![\w.])", l) for l in lines)
+                    or re.search(r"(?<![\w.])" + str(c) + r"""\s*,\s*["']""" + re.escape(reason) + r"""["']""", body)):
+                named_stops.add((reason, c))
+        for reason in ends:
+            if re.search(r"""["']""" + re.escape(reason) + r"""["']""", body):
+                named_ends.add(reason)
+    return named_stops, named_ends
+
+
+# Pairs no batch test names yet, each with the card that owes the test (a row leaves this list when a test names it: the scan fails on a stale row too). Module level on purpose: the scan reads the test METHODS only.
+_G11_UNNAMED_STOPS: dict = {}
+_G11_UNNAMED_ENDS: dict = {}
+# Typed stops whose reason the scan cannot read as a literal (the reason is the typed refusal an input guard returned, exit 2: Get-HitRefusal / Get-OutputRefusalCode). Each is driven by the refusal tests of those guards,
+# not by name; a test that names every refusal reason these carry is owed (the scan reads them by their exact call text, so a NEW dynamic form fails the scan).
+_G11_DYNAMIC_FORMS: dict = {
+    "Set-Stop $hr[0] 2": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "Set-Stop (Get-HitRefusal $hit)[0] 2": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "Set-Stop $rf.reason $rf.code": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "$B.endReason = $hr[0]": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "$b.endReason = $hr[0]": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "$b.endReason = $rf.reason": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "$b.endReason = $leaseClass": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",   # LEASE_EXPIRED | LEASE_DEMOTED | LEASE_LOST | LEASE_IDLE_ENDED, read from the agent's own end line
+}
 
 
 # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r10: numeric-contract scanners for the dual-venue PowerShell. Both are tested on their own spellings below, so a pin cannot go blind
@@ -807,7 +904,7 @@ def ps_float_validaterange_params(text: str) -> list[tuple[int, str, bool]]:
 class VenueLeaseBatchRunnerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.tmp = Path(tempfile.mkdtemp(prefix="venue-lease-batch-"))
+        cls.tmp = Path(tempfile.mkdtemp(prefix="venue-lease-batch-", dir=offline_tmp_root()))   # (r3: the stand-in um-run / leg live outside every git work tree, which -SkipCommittedSpecPreflight requires)
         for name, text in (("fake-quiet.ps1", FAKE_QUIET), ("fake-umrun.ps1", FAKE_UMRUN), ("fake-leg.ps1", FAKE_LEG)):
             (cls.tmp / name).write_text(text, encoding="utf-8")
         cls.specs = []
@@ -853,12 +950,19 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         defaults = {"-LegBudgetSec": "60", "-LeaseMarginSec": "0", "-ClaimPollSec": "1", "-RecheckSec": "1",
                     "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
         for k in omit:
-            defaults.pop(k)
+            defaults.pop(k, None)   # (r2: an OMIT_DEFAULTS name that is not a valued default, as -SkipCommittedSpecPreflight, is read by offline_switch_args)
         args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(self.runner), "-LegSpec", ",".join(str(s) for s in (specs or self.specs[:2])),
                 "-RunDir", str(self.run_dir), "-SourceCommit", SHA, "-BuildManifestSha256", MANIFEST, "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
-                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *extra]
+                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *self.offline_switch_args(extra, omit), *extra]
         return args, e
+
+    def offline_switch_args(self, extra: tuple, omit: list) -> list[str]:
+        """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r2: the committed-spec preflight is on in every mode and a stand-in leg lives in no repo, so every offline case turns it off with the
+        explicit switch -- unless the case passes the switch itself, names a repo for the preflight (-CommittedSpecRepoRoot), or asks for the default (OMIT_DEFAULTS=-SkipCommittedSpecPreflight)."""
+        if "-SkipCommittedSpecPreflight" in omit or "-SkipCommittedSpecPreflight" in extra or "-CommittedSpecRepoRoot" in extra:
+            return []
+        return ["-SkipCommittedSpecPreflight"]
 
     def kinds(self) -> list[str]:
         """The event order: OPEN / CLOSE (um-run), QUIET:<mode>, LEG:<leaf>:<leaseBatch>."""
@@ -2292,7 +2396,21 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         self.assertEqual([x.split(":")[0] for x in k], ["OPEN", "QUIET", "CLOSE"], k)
         [b] = self.batches()
         self.assertEqual(b["endReason"], "PROBE_VENUE_QUIET_UNKNOWN")
+        self.assertEqual(batch_result(r.stdout)["stopReason"], "VENUE_QUIET_UNKNOWN")   # r7 (G11 prevention): the stop's typed reason and its exit code 6 are named together
         self.assertFalse(self.claim_path.exists())
+
+    def test_r7_g11_each_documented_probe_exit_is_a_typed_stop_with_its_own_code_and_the_lease_is_still_closed(self) -> None:
+        for mode, code, stop, end in (("PROBEUSAGE", 2, "USAGE", "PROBE_USAGE"), ("PROBEGATEUNREADABLE", 4, "GATE_UNREADABLE", "PROBE_GATE_UNREADABLE"), ("PROBEHOSTMISMATCH", 5, "HOST_MISMATCH", "PROBE_HOST_MISMATCH")):
+            with self.subTest(probe_exit=code):
+                self._init_case(Path(tempfile.mkdtemp(prefix="case-", dir=self.tmp)))   # a fresh share, claim dir and event log per probe exit
+                r = self.run_batch(self.specs[:2], FAKE_QUIET_MODES=mode)
+                out = r.stdout + r.stderr
+                self.assertEqual(r.returncode, code, out)
+                self.assertEqual(batch_result(r.stdout)["stopReason"], stop, out)
+                self.assertEqual([x.split(":")[0] for x in self.kinds()], ["OPEN", "QUIET", "CLOSE"], self.kinds())
+                [b] = self.batches()
+                self.assertEqual((b["endReason"], b["legsAttempted"]), (end, 0), out)
+                self.assertFalse(self.claim_path.exists())
 
     def test_a_leg_budget_no_fresh_lease_can_hold_stops_instead_of_opening_lease_after_lease(self) -> None:
         r = self.run_batch([self.specs[0]], FAKE_LEASE_REMAIN="30")
@@ -3565,6 +3683,19 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         super().setUpClass()
         (cls.tmp / "fake-leg-args.ps1").write_text(FAKE_LEG_ARGS, encoding="utf-8")
         cls.commit_a, cls.commit_b = "1" * 40, "2" * 40
+        # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r2: this class lets the REAL Invoke-VenueLeg.ps1 run in a few cases (and would on a regression); its default receipt root is the CANONICAL one
+        cls.canonical_receipts_before = canonical_receipt_state_for(DV / "legs" / "m16-1243-chainattr-l-fullscreen-s1.json")
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            after = canonical_receipt_state_for(DV / "legs" / "m16-1243-chainattr-l-fullscreen-s1.json")
+            if after != cls.canonical_receipts_before:
+                added = sorted(set(after) - set(cls.canonical_receipts_before))
+                changed = sorted(k for k in after if k in cls.canonical_receipts_before and after[k] != cls.canonical_receipts_before[k])
+                raise AssertionError(f"the CANONICAL receipt root was written by this class (the real leg ran with its default -ReceiptRoot): added={added} changed={changed}")
+        finally:
+            super().tearDownClass()
 
     def setUp(self) -> None:
         super().setUp()
@@ -3611,14 +3742,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         e = dict(os.environ)
         e.update({"FAKE_EVENTS": str(self.events), "FAKE_SHARE": str(self.share), "FAKE_CLAIM_PATH": str(self.claim_path), "FAKE_LEG_ROOT": str(self.case),
                   "FAKE_LEG_ARGS": str(self.leg_args)})
+        omit = [x for x in env.pop("OMIT_DEFAULTS", "").split(",") if x]
         e.update(env)
         defaults = {"-LegBudgetSec": "60", "-LeaseMarginSec": "0", "-ClaimPollSec": "1", "-RecheckSec": "1",
                     "-DeadlineUtc": utc_iso(datetime.now(timezone.utc) + timedelta(seconds=240)), "-LeaseCooldownSec": "0"}
+        for k in omit:
+            defaults.pop(k, None)
         # plan_runner: a case that runs a patched mirror of the runner (_mirror_with_bad_sidecar) names it here; unset, it is the runner under test
         args = [PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(getattr(self, "plan_runner", RUNNER)), "-LegPlan", str(plan),
                 "-RunDir", str(self.run_dir), "-ClaimDir", str(self.claims),
                 "-QuietScript", str(self.tmp / "fake-quiet.ps1"), "-LegScript", str(self.tmp / "fake-leg-args.ps1"), "-UmRunScript", str(self.tmp / "fake-umrun.ps1"),
-                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *extra]
+                "-AgentShare", str(self.share), *[x for k, v in defaults.items() if k not in extra for x in (k, v)], *self.offline_switch_args(extra, omit), *extra]
         return args, e
 
     def run_plan(self, plan: Path, *extra: str, **env: str) -> subprocess.CompletedProcess:
@@ -3765,6 +3899,20 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         [bt] = self.batches()
         self.assertEqual([l["arm"] for l in bt["legs"]], ["A", "B", "A", "B"])
         self.assertEqual(batch_result(r.stdout)["legPlan"]["order"], "Interleave", "the receipt names the canonical order, not the spelling typed")
+
+    def test_r7_a6_a_thermal_spread_order_in_any_letter_case_is_the_canonical_order_and_reads_heat_from(self) -> None:
+        # adversary r6 pass 15 A6 (pre-existing, carried OPEN by r6): the sibling spelling of test_r3_a1. $PlanOrder is canonicalised once at the top (Invoke-VenueLeaseBatch.ps1, "-PlanOrder binds case-insensitively"), so
+        # 'thermalspread' is the ThermalSpread order (the receipt names it) and -HeatFrom is accepted with it, while -HeatFrom with another order is still the usage refusal.
+        for spelling in ("thermalspread", "THERMALSPREAD"):
+            with self.subTest(spelling=spelling):
+                r = self.run_plan(self.ab_block_plan(), "-PlanOrder", spelling)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertEqual(batch_result(r.stdout)["legPlan"]["order"], "ThermalSpread", "the receipt names the canonical order, not the spelling typed")
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "interleave", "-HeatFrom", str(self.case))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("-HeatFrom is read only by -PlanOrder ThermalSpread", r.stderr)
+        r = self.run_plan(self.ab_block_plan(), "-PlanOrder", "thermalspread", "-HeatFrom", str(self.case))
+        self.assertNotIn("-HeatFrom is read only by -PlanOrder ThermalSpread", r.stderr, "a lower-case thermalspread is the ThermalSpread order, so -HeatFrom is read")
 
     def test_r3_a2_arms_that_differ_only_in_case_are_separate_arms(self) -> None:
         # sol r3 A2: the arm label is validated case-sensitively (A and a are both legal) but the interleave keyed its queues case-insensitively, merging them.
@@ -5172,7 +5320,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
     _R7_WRITERS = {
         "batch.log (L)": ('                L "LEG $($leg.name) RUN batch=',
                           "[IO.File]::Delete((Join-Path $RunDir 'batch.log')); New-Item -ItemType HardLink -Path (Join-Path $RunDir 'batch.log') -Value '{b}' | Out-Null"),
-        "leg output": ("                try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {\n",
+        "leg output": ("                try { $lp = Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList $lArgs -Clock $legClock -EndSec $legBoundSec -StartBeforeUtc $deadline } catch {\n",
                        "New-Item -ItemType HardLink -Path $out -Value '{b}' | Out-Null"),
         "probe output": ("    $qArgs = @('-NoProfile', '-NonInteractive', '-File', $QuietScript,", "New-Item -ItemType HardLink -Path $out -Value '{b}' | Out-Null"),
         "leg-plan.json": ('        L "CLAIM_TAKEN batch=$batchNo',
@@ -5677,8 +5825,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # process creation and the leg that never started was recorded LEG_FAILED. A launch that throws a Win32Exception started nothing: the leg stays NOT_RUN.
         # The 40000-character -SheetCopyDir cannot be fed to the runner itself (its own command line is past the limit), so the launch is made to fail the same way:
         # Process.Start on a file that does not exist throws the same Win32Exception, before any child exists.
-        anchor = "Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs"
-        runner = self._patched_runner(anchor, "Invoke-VenueBoundedProcess -FilePath (Join-Path $RunDir 'no-such-pwsh.exe') -ArgumentList $lArgs")
+        anchor = "Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList $lArgs"
+        runner = self._patched_runner(anchor, "Invoke-BatchBoundedChild -FilePath (Join-Path $RunDir 'no-such-pwsh.exe') -ArgumentList $lArgs")
         args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]))
         args[args.index("-File") + 1] = str(runner)
         r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
@@ -5803,6 +5951,1129 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 self.assertIn("BATCH_USAGE LEG_SPEC_INVALID", r.stderr)
                 self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
                 self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: the leg refuses a spec that is not COMMITTED (LEG_SPEC_NOT_COMMITTED, Invoke-VenueLeg.ps1 via Find-DvCommittedLegSpec) only
+    # after the lease is open: on 2026-11-27T19:11:55Z an untracked swap0 spec spent about 2 min of Bachelor lease and a quiet probe before that refusal. The batch preflight now
+    # asks the SAME function before any claim, open or lease. -CommittedSpecRepoRoot is the offline seam that turns the preflight on against a repo's HEAD while the stubs stand in
+    # for the leg (the check is on by default only when the leg script is the real Invoke-VenueLeg.ps1, as the leg's own check is on outside -OfflineTestMode).
+    _COMMITTED_SPEC = DV / "legs" / "m16-1243-chainattr-l-fullscreen-s1.json"
+
+    def _untracked_copy_of_a_committed_spec(self) -> Path:
+        doc = json.loads(self._COMMITTED_SPEC.read_text(encoding="utf-8"))
+        doc["playSeconds"] = 26   # one field changed: the bytes are no committed blob's bytes
+        p = self.case / "untracked-swap0.json"
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        return p
+
+    def _hermetic_receipt_root(self) -> tuple[str, str]:
+        """r2: this case's own receipt root (under a .claude-state directory of its temp dir, as the batch's guard requires), never the canonical one a real leg defaults to."""
+        return ("-ReceiptRoot", str(self.case / ".claude-state" / "dual-venue" / "receipts"))
+
+    def _reset_committed_case(self) -> None:
+        for p in (self.events, self.leg_args, self.claim_path):
+            p.unlink(missing_ok=True)
+        shutil.rmtree(self.run_dir, ignore_errors=True)
+
+    def _assert_nothing_claimed_or_leased(self, mode: str, r: subprocess.CompletedProcess) -> None:
+        out = f"{mode}: " + r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertEqual(self.kinds(), [], f"{mode}: nothing is submitted: no open, no probe, no leg. " + out)
+        self.assertEqual(self.leg_calls(), [], f"{mode}: no leg ran. " + out)
+        self.assertFalse(self.claim_path.exists(), f"{mode}: a claim was written for a spec the leg refuses. " + out)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), f"{mode}: a lease was opened. " + out)
+
+    def test_legspec_committed_an_uncommitted_spec_is_refused_before_any_claim_in_every_mode(self) -> None:
+        untracked = self._untracked_copy_of_a_committed_spec()
+        seam = ("-CommittedSpecRepoRoot", str(ROOT), *self._hermetic_receipt_root())
+        self._reset_committed_case()
+        r = self.run_batch([untracked], *seam)
+        self._assert_nothing_claimed_or_leased("-LegSpec", r)
+        self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+        # the plan form: the whole plan is refused at the item (item 2: item 1 is a committed spec and is fine), naming the index
+        committed_item = self.item(self._COMMITTED_SPEC, "A", self.commit_a)
+        self._reset_committed_case()
+        r = self.run_plan(self.write_plan([committed_item, self.item(untracked, "B", self.commit_a)]), *seam)
+        self._assert_nothing_claimed_or_leased("-LegPlan", r)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_NOT_COMMITTED item=2 ", r.stderr)
+        # -LegSet: a set under legsets/ naming an untracked copy beside the committed legs (both removed in the finally)
+        name = f"zz-legspec-committed-{uuid.uuid4().hex[:8]}"
+        legset_path = DV / "legsets" / f"{name}.json"
+        spec_in_legs = DV / "legs" / f"{name}.json"
+        doc = json.loads(untracked.read_text(encoding="utf-8"))
+        spec_in_legs.write_text(json.dumps(dict(doc, legId=name)), encoding="utf-8")
+        legset_path.write_text(json.dumps({"schema": "mlv-app/dual-venue-legset/v1", "legSet": name, "card": doc["card"], "clipId": doc["clipId"],
+                                           "description": "legspec-committed test stand-in, removed by the test", "legs": [f"legs/{name}.json"]}), encoding="utf-8")
+        try:
+            self._reset_committed_case()
+            args, e = self.batch_cmd([untracked], *seam)
+            args[args.index("-LegSpec"):args.index("-LegSpec") + 2] = ["-LegSet", name]
+            r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+            self._assert_nothing_claimed_or_leased("-LegSet", r)
+            self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+        finally:
+            legset_path.unlink(missing_ok=True)
+            spec_in_legs.unlink(missing_ok=True)
+
+    def test_legspec_committed_the_real_leg_script_turns_the_preflight_on_without_the_seam(self) -> None:
+        # production: the batch runs the real Invoke-VenueLeg.ps1, whose own check refuses an uncommitted spec, so the preflight is on with no seam at all
+        self._reset_committed_case()
+        # (r2 hermetic: a regression here lets the real leg run, and it writes its refusal receipt under -ReceiptRoot; this case's own temp dir keeps that out of the canonical root)
+        args, e = self.batch_cmd([self._untracked_copy_of_a_committed_spec()], *self._hermetic_receipt_root(), OMIT_DEFAULTS="-SkipCommittedSpecPreflight")
+        args[args.index("-LegScript") + 1] = str(LEG)
+        args[args.index("-BuildManifestSha256") + 1] = THIS_PROCESS_MANIFEST   # (a receipt this case's real leg writes anywhere is then recognisably ours: the class teardown check)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=600, env=e)
+        self._assert_nothing_claimed_or_leased("real leg script", r)
+        self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+
+    def test_legspec_committed_a_committed_spec_still_passes_the_preflight(self) -> None:
+        seam = ("-CommittedSpecRepoRoot", str(ROOT), *self._hermetic_receipt_root())
+        self._reset_committed_case()
+        r = self.run_batch([self._COMMITTED_SPEC], *seam)
+        self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr, r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self._reset_committed_case()
+        r = self.run_plan(self.write_plan([self.item(self._COMMITTED_SPEC, "A", self.commit_a, "cpu")]), *seam)
+        self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr, r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_legspec_committed_the_seams_are_refused_with_the_real_um_run(self) -> None:
+        stand_in = self.case / "stand-in-committed.ps1"
+        stand_in.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\nWrite-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head= root=x'\nexit 0\n", encoding="utf-8")
+        for flag, value in (("-CommittedSpecRepoRoot", str(ROOT)), ("-CommittedSpecScript", str(stand_in))):
+            with self.subTest(seam=flag):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], flag, value, *self._hermetic_receipt_root())
+                args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+                r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(f"{flag} is an offline test seam", r.stderr)
+                self.assertEqual(self.kinds(), [])
+
+    # r2/r3 (adversary A1, pass 2 A1/A2): production is the real um-run.ps1, and the preflight is on there whatever the leg script's own bytes are (a copy with other line endings is still the leg that
+    # runs; the classification used to compare raw bytes, and to read the file unbounded before -DeadlineUtc), and the repo is the one THAT leg resolves for itself (its own ..\..\..)
+    def test_legspec_committed_the_real_um_run_turns_the_preflight_on_for_any_leg_script_in_that_legs_own_repo(self) -> None:
+        leg_copy_root = self.case / "legcopy"
+        leg_copy_dir = leg_copy_root / "tools" / "profiling" / "dual-venue"
+        leg_copy_dir.mkdir(parents=True)
+        original = LEG.read_bytes()
+        lf = original.replace(b"\r\n", b"\n")
+        converted = lf.replace(b"\n", b"\r\n") if lf == original else lf   # the other line ending: never byte-identical to the shipped leg
+        self.assertNotEqual(converted, original)
+        (leg_copy_dir / "Invoke-VenueLeg.ps1").write_bytes(converted)
+        self._reset_committed_case()
+        # the spec IS committed in this repo, but the copy's own repo (its ..\..\.. : a plain directory, no HEAD) holds nothing: the leg that runs would refuse it, so the batch does first.
+        # (the real um-run.ps1 is never reached: the refusal is before any claim; the short deadline bounds the run if a regression let it through)
+        # (OMIT_DEFAULTS: the real um-run.ps1 refuses the stub's -LeaseCooldownSec 0 as LEASE_CAP_RELAXED, which would end the run before the preflight is reached)
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=60)), *self._hermetic_receipt_root(), OMIT_DEFAULTS="-LeaseCooldownSec," + self._SKIP)
+        args[args.index("-LegScript") + 1] = str(leg_copy_dir / "Invoke-VenueLeg.ps1")
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=e)
+        self._assert_nothing_claimed_or_leased("real um-run, converted copy of the leg", r)
+        self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+        self.assertIn("legcopy", r.stderr)   # the message names the repo the check ran in: the copy's own tree, not this checkout
+
+    # r2 (adversary A2, A4): an inherited GIT_DIR / GIT_TRACE must neither choose the commit nor make git write: every git call is the module's hardened one, in a child
+    def test_legspec_committed_an_inherited_git_environment_changes_neither_the_commit_nor_writes_a_file(self) -> None:
+        trace = self.case / "git-trace.log"
+        self._reset_committed_case()
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT), *self._hermetic_receipt_root(), GIT_DIR=str(self.case / "no-such-override.git"), GIT_TRACE=str(trace), GIT_TRACE2_EVENT=str(trace))
+        self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr, r.stdout + r.stderr)
+        self.assertNotIn("COMMITTED_SPEC_PREFLIGHT", r.stdout + r.stderr, r.stdout + r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse(trace.exists(), "git wrote the trace file its environment named")
+
+    # r2 (adversary A3): the lookup is bounded by the room left before -DeadlineUtc, and a child that gives no answer is a typed refusal, never "no refusal"
+    def test_legspec_committed_a_lookup_that_overruns_the_deadline_is_killed_and_refused_before_any_claim(self) -> None:
+        slow = self.case / "slow-committed.ps1"
+        slow.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\nStart-Sleep -Seconds 120\nWrite-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head= root=x'\nexit 0\n", encoding="utf-8")
+        silent = self.case / "silent-committed.ps1"
+        silent.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\nexit 0\n", encoding="utf-8")
+        for name, script, code, limit_s in (("slow", slow, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT", 40), ("silent", silent, "COMMITTED_SPEC_PREFLIGHT_FAILED", 40)):
+            with self.subTest(child=name):
+                self._reset_committed_case()
+                deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=30))
+                t0 = time.monotonic()
+                r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT), "-CommittedSpecScript", str(script), "-DeadlineUtc", deadline, *self._hermetic_receipt_root())
+                elapsed = time.monotonic() - t0
+                self._assert_nothing_claimed_or_leased(name, r)
+                self.assertIn(f"BATCH_USAGE {code}", r.stderr)
+                self.assertLess(elapsed, limit_s, f"{name}: the run outlived the child's bound ({elapsed:.1f} s): " + r.stderr[-1500:])
+
+    # ---- r2 (adversary r1 pass 3: A1, A2) ----
+    # A1: "production" was decided by inference (the real um-run.ps1 by path or bytes, or the real leg script's path), and an inference a line-ending change defeats leaves the gate OFF in a complete
+    # second checkout. The preflight is now ON in every mode, and off only by the explicit offline switch -SkipCommittedSpecPreflight (refused with the real um-run.ps1).
+    # A2: the repo root is resolved by the bounded child from the LEG SCRIPT PATH it is handed (and so is the offline seam's value), never by the parent before -DeadlineUtc exists.
+    _SKIP = "-SkipCommittedSpecPreflight"
+
+    def test_legspec_committed_r2_the_preflight_is_on_by_default_for_a_stand_in_leg_and_um_run_in_every_mode(self) -> None:
+        untracked = self._untracked_copy_of_a_committed_spec()
+        hermetic = self._hermetic_receipt_root()
+        self._reset_committed_case()
+        r = self.run_batch([untracked], *hermetic, OMIT_DEFAULTS=self._SKIP)
+        self._assert_nothing_claimed_or_leased("-LegSpec, no switch, no seam", r)
+        self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+        self._reset_committed_case()
+        r = self.run_plan(self.write_plan([self.item(untracked, "A", self.commit_a)]), *hermetic, OMIT_DEFAULTS=self._SKIP)
+        self._assert_nothing_claimed_or_leased("-LegPlan, no switch, no seam", r)
+        self.assertIn("LEG_PLAN_REFUSED reason=LEG_SPEC_NOT_COMMITTED item=1 ", r.stderr)
+
+    def test_legspec_committed_r2_a_second_checkout_whose_leg_and_um_run_differ_by_line_endings_is_still_preflighted_in_its_own_repo(self) -> None:
+        # the second checkout: its real leg script differs from this checkout's only by line endings, and so would its um-run.ps1. Both then classify as "not the real one" by path AND by bytes,
+        # exactly like the harness's stand-in um-run below, so no classification may decide whether the gate is on.
+        leg_copy_dir = self.case / "checkout2" / "tools" / "profiling" / "dual-venue"
+        leg_copy_dir.mkdir(parents=True)
+        original = LEG.read_bytes()
+        lf = original.replace(b"\r\n", b"\n")
+        converted = lf.replace(b"\n", b"\r\n") if lf == original else lf
+        self.assertNotEqual(converted, original)
+        (leg_copy_dir / "Invoke-VenueLeg.ps1").write_bytes(converted)
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        args[args.index("-LegScript") + 1] = str(leg_copy_dir / "Invoke-VenueLeg.ps1")
+        args[args.index("-BuildManifestSha256") + 1] = THIS_PROCESS_MANIFEST
+        r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=e)
+        self._assert_nothing_claimed_or_leased("second checkout, line-ending copy of the leg, stand-in um-run", r)
+        self.assertIn("BATCH_USAGE LEG_SPEC_NOT_COMMITTED", r.stderr)
+        self.assertIn("checkout2", r.stderr)   # the repo it asked is the second checkout's own tree
+
+    def test_legspec_committed_r2_the_explicit_offline_switch_turns_the_preflight_off(self) -> None:
+        untracked = self._untracked_copy_of_a_committed_spec()
+        self._reset_committed_case()
+        r = self.run_batch([untracked], self._SKIP, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr)
+        self.assertTrue(self.leg_calls() or self.kinds(), "the legs ran")
+        self._reset_committed_case()
+        r = self.run_plan(self.write_plan([self.item(untracked, "A", self.commit_a)]), self._SKIP, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("LEG_SPEC_NOT_COMMITTED", r.stdout + r.stderr)
+
+    def test_legspec_committed_r2_the_offline_switch_is_refused_with_the_real_um_run_and_with_the_seam_that_turns_the_preflight_on(self) -> None:
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], self._SKIP, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        args[args.index("-UmRunScript") + 1] = str(RUNNER.parent.parent / "um-run.ps1")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"{self._SKIP} is an offline test seam", r.stderr)
+        self.assertEqual(self.kinds(), [])
+        self._reset_committed_case()
+        r = self.run_batch([self._COMMITTED_SPEC], self._SKIP, "-CommittedSpecRepoRoot", str(ROOT), *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(f"{self._SKIP} contradicts -CommittedSpecRepoRoot", r.stderr)
+        self.assertEqual(self.kinds(), [])
+
+    def test_legspec_committed_r2_the_child_is_handed_the_leg_script_path_and_the_seam_unresolved(self) -> None:
+        # A2: the parent does NO file-system work on the root before the bounded child: it hands over the leg script's path (the child resolves ..\..\..) and the seam value as spelled
+        child = self.case / "recording-committed.ps1"
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         "Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'child-args.log') -Value ('LegScript={0}|RepoRoot={1}|Sha={2}' -f $LegScript, $RepoRoot, $LegSpecSha256)\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        log = self.case / "child-args.log"
+        hermetic = self._hermetic_receipt_root()
+        self._reset_committed_case()
+        log.unlink(missing_ok=True)
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), *hermetic, OMIT_DEFAULTS=self._SKIP)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        rows = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+        self.assertTrue(rows, "the preflight child ran (the gate is on with no seam and no switch): " + r.stdout[-1500:] + r.stderr[-1500:])
+        first = dict(kv.split("=", 1) for kv in rows[0].split("|"))
+        self.assertEqual(first["LegScript"].lower(), str(self.tmp / "fake-leg.ps1").lower(), rows[0])
+        self.assertEqual(first["RepoRoot"], "", "no seam: the child resolves the root itself: " + rows[0])
+        self.assertRegex(first["Sha"], r"^[0-9a-f]{64}$")
+        spelled = str(ROOT) + "\\tools\\.."   # a spelling Resolve-Path would normalise: the child must get it as written
+        self._reset_committed_case()
+        log.unlink(missing_ok=True)
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", spelled, "-CommittedSpecScript", str(child), *hermetic)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        first = dict(kv.split("=", 1) for kv in log.read_text(encoding="utf-8").splitlines()[0].split("|"))
+        self.assertEqual(first["RepoRoot"], spelled, "the seam value reaches the child as spelled, unresolved by the parent")
+        self.assertEqual(first["LegScript"].lower(), str(self.tmp / "fake-leg.ps1").lower())
+
+    # adversary r2 pass 4 A1: the "real um-run.ps1" classification must not be defeated by line endings either, or the offline seams (the new skip switch among them) are accepted from a second
+    # checkout's production um-run. (Hermetic: the spec does not exist, so the run ends at its usage checks and never reaches a um-run.)
+    def test_legspec_committed_r2_a_um_run_that_differs_from_the_real_one_only_by_line_endings_is_still_the_real_one(self) -> None:
+        real_bytes = (RUNNER.parent.parent / "um-run.ps1").read_bytes()
+        lf = real_bytes.replace(b"\r\n", b"\n")
+        converted = lf.replace(b"\n", b"\r\n") if lf == real_bytes else lf
+        self.assertNotEqual(converted, real_bytes)
+        copy_dir = self.case / "checkout2" / "tools" / "profiling"
+        copy_dir.mkdir(parents=True)
+        (copy_dir / "um-run.ps1").write_bytes(converted)
+        for flag, needle in ((["-SkipCommittedSpecPreflight"], "-SkipCommittedSpecPreflight is an offline test seam"),
+                             (["-LeaseBudgetWindowSec", "3600"], "LEASE_CAP_RELAXED"),
+                             (["-CommittedSpecRepoRoot", str(ROOT)], "-CommittedSpecRepoRoot is an offline test seam")):
+            with self.subTest(flag=flag[0]):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self.case / "no-such-spec.json"], *flag, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+                args[args.index("-UmRunScript") + 1] = str(copy_dir / "um-run.ps1")
+                r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(needle, r.stderr)
+                self.assertEqual(self.kinds(), [])
+
+    # adversary r2 pass 5 A1: a RELATIVE -UmRunScript is the file Test-Path accepts under PowerShell's location; reading it for the content test through .NET (its own current directory, which
+    # Set-Location does not move) threw before any preflight. Both the path test and the content test judge the path PowerShell resolved.
+    def test_legspec_committed_r2_a_relative_um_run_path_is_judged_from_powershells_location_not_the_process_directory(self) -> None:
+        child = self.case / "recording-relative.ps1"
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         "Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'child-args-relative.log') -Value ('LegScript={0}' -f $LegScript)\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        log = self.case / "child-args-relative.log"
+        self._reset_committed_case()
+        log.unlink(missing_ok=True)
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        args[args.index("-UmRunScript") + 1] = ".\\fake-umrun.ps1"   # (the leg stays absolute: a relative leg is launched in a child process that does not share this location, which this card does not touch)
+        runner_at = args.index("-File") + 1
+        command = f"Set-Location -LiteralPath '{psq(self.tmp)}'; & '{psq(args[runner_at])}' " + " ".join(a if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", a) else f"'{psq(a)}'" for a in args[runner_at + 1:]) + "; exit $LASTEXITCODE"   # (parameter names bare, values quoted)
+        r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=300, env=e, cwd=str(ROOT))
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+        self.assertNotIn("Could not find file", r.stdout + r.stderr)
+        self.assertNotIn("Invoke-VenueLeaseBatch.ps1:", r.stderr, r.stderr[-1500:])   # (no PowerShell error from the script itself)
+        self.assertTrue(self.kinds(), "the batch ran its lease and legs through the relative um-run: " + r.stdout[-2500:] + r.stderr[-1500:])
+        # the preflight child ran (the gate is on) and was handed the leg script PowerShell resolved
+        self.assertEqual(log.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1].lower(), str(self.tmp / "fake-leg.ps1").lower())
+
+    # ---- r3 (adversary r2 pass 6 A1, the 4th run of one class: raw bytes -> line-ending-normalised hash -> BOM -> ...) ----
+    # ANY byte test of "is this the real um-run" is defeated by one more byte-level change, so -SkipCommittedSpecPreflight is no longer decided by bytes: it is accepted only when the stand-in is a
+    # stand-in by LOCATION, both -UmRunScript and -LegScript resolving to a directory outside every git work tree (git rev-parse --is-inside-work-tree), and refused when git cannot say.
+    _SEAM_NEEDLE = "-SkipCommittedSpecPreflight is an offline test seam"
+
+    def _git_work_tree(self, name: str) -> Path:
+        d = self.case / name
+        d.mkdir(parents=True)
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        subprocess.run(["git", "-C", str(d), "init", "-q"], check=True, capture_output=True, timeout=120, env=clean)
+        return d
+
+    def _assert_switch_refused_by_location(self, label: str, args: list, e: dict, needle: str = "is inside a git work tree") -> None:   # (the reason, not the refusal's own generic wording)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, f"{label}: {r.stdout}{r.stderr}")
+        self.assertIn(self._SEAM_NEEDLE, r.stderr, label)
+        self.assertIn(needle, r.stderr, label)
+        self.assertEqual(self.kinds(), [], label)   # nothing claimed, leased, opened or run
+
+    def test_legspec_committed_r3_the_switch_is_refused_for_a_bom_copy_of_the_real_um_run_in_a_second_checkout(self) -> None:
+        # adversary r2 pass 6 A1: a complete second checkout whose um-run.ps1 is EF BB BF + the unchanged production bytes (a hash of any normalisation differs by the BOM), with its own leg script
+        wt = self._git_work_tree("checkout-bom")
+        prof = wt / "tools" / "profiling"
+        (prof / "dual-venue").mkdir(parents=True)
+        (prof / "um-run.ps1").write_bytes(b"\xef\xbb\xbf" + (RUNNER.parent.parent / "um-run.ps1").read_bytes())
+        (prof / "dual-venue" / "Invoke-VenueLeg.ps1").write_bytes(LEG.read_bytes())
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())   # (the harness adds the switch)
+        self.assertIn(self._SKIP, args)
+        args[args.index("-UmRunScript") + 1] = str(prof / "um-run.ps1")
+        args[args.index("-LegScript") + 1] = str(prof / "dual-venue" / "Invoke-VenueLeg.ps1")
+        self._assert_switch_refused_by_location("BOM um-run + leg in a second checkout", args, e)
+
+    def test_legspec_committed_r3_the_switch_is_refused_when_either_stand_in_sits_in_a_git_work_tree(self) -> None:
+        for which in ("um-run", "leg"):
+            with self.subTest(in_work_tree=which):
+                wt = self._git_work_tree(f"wt-{which}")
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+                name, flag = ("fake-umrun.ps1", "-UmRunScript") if which == "um-run" else ("fake-leg.ps1", "-LegScript")
+                (wt / name).write_bytes((self.tmp / name).read_bytes())
+                args[args.index(flag) + 1] = str(wt / name)   # the other stand-in stays in the temp directory
+                self._assert_switch_refused_by_location(f"{which} in a work tree", args, e)
+
+    def test_legspec_committed_r3_a_relative_stand_in_is_judged_where_powershell_resolves_it(self) -> None:
+        wt = self._git_work_tree("wt-relative")
+        (wt / "fake-umrun.ps1").write_bytes((self.tmp / "fake-umrun.ps1").read_bytes())
+        for location, expect_refused in ((wt, True), (self.tmp, False)):
+            with self.subTest(location="work tree" if expect_refused else "temp dir"):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+                args[args.index("-UmRunScript") + 1] = ".\\fake-umrun.ps1"
+                runner_at = args.index("-File") + 1
+                command = f"Set-Location -LiteralPath '{psq(location)}'; & '{psq(args[runner_at])}' " + " ".join(a if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", a) else f"'{psq(a)}'" for a in args[runner_at + 1:]) + "; exit $LASTEXITCODE"
+                r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=300, env=e, cwd=str(ROOT))
+                if expect_refused:
+                    self.assertEqual(r.returncode, 2, r.stdout[-1500:] + r.stderr[-1500:])
+                    self.assertIn(self._SEAM_NEEDLE, r.stderr)
+                    self.assertIn("is inside a git work tree", r.stderr)
+                    self.assertEqual(self.kinds(), [])
+                else:   # the control: the process directory is this git work tree (ROOT) but PowerShell's location is the temp directory, so the switch is accepted and the run completes
+                    self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+                    self.assertNotIn(self._SEAM_NEEDLE, r.stderr)
+                    self.assertTrue(self.kinds(), "the batch ran")
+
+    def test_legspec_committed_r3_the_switch_is_accepted_for_stand_ins_in_a_temp_directory_outside_every_work_tree(self) -> None:
+        # the control: every offline caller is this shape
+        untracked = self._untracked_copy_of_a_committed_spec()
+        self._reset_committed_case()
+        r = self.run_batch([untracked], self._SKIP, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn(self._SEAM_NEEDLE, r.stderr)
+        self.assertTrue(self.kinds(), "the batch ran")
+
+    def test_legspec_committed_r3_a_link_into_a_git_work_tree_does_not_hide_the_location(self) -> None:
+        # a junction in the temp directory whose target is a work tree: the stand-in's spelled path is outside every work tree, the directory it lives in is not
+        wt = self._git_work_tree("wt-target")
+        (wt / "fake-umrun.ps1").write_bytes((self.tmp / "fake-umrun.ps1").read_bytes())
+        link = self.case / "junction-to-wt"
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(wt)], capture_output=True, text=True, timeout=60)
+        if made.returncode != 0:
+            self.skipTest("cannot create a directory junction here: " + made.stdout + made.stderr)
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+        args[args.index("-UmRunScript") + 1] = str(link / "fake-umrun.ps1")
+        self._assert_switch_refused_by_location("stand-in reached through a junction into a work tree", args, e)
+
+    def _bom_second_checkout(self, name: str) -> tuple[Path, Path]:
+        wt = self._git_work_tree(name)
+        prof = wt / "tools" / "profiling"
+        (prof / "dual-venue").mkdir(parents=True)
+        (prof / "um-run.ps1").write_bytes(b"\xef\xbb\xbf" + (RUNNER.parent.parent / "um-run.ps1").read_bytes())
+        (prof / "dual-venue" / "Invoke-VenueLeg.ps1").write_bytes(LEG.read_bytes())
+        return wt, prof
+
+    # adversary r3 pass 7 A1: git's own discovery is steerable (GIT_CEILING_DIRECTORIES makes it answer "not a git repository" for a directory inside a checkout), so "outside" is not taken from git alone
+    def test_legspec_committed_r3_an_inherited_git_ceiling_does_not_hide_a_work_tree(self) -> None:
+        wt, prof = self._bom_second_checkout("checkout-ceiling")
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+        e = dict(e)
+        e["GIT_CEILING_DIRECTORIES"] = str(wt)
+        e["GIT_DISCOVERY_ACROSS_FILESYSTEM"] = "0"
+        args[args.index("-UmRunScript") + 1] = str(prof / "um-run.ps1")
+        args[args.index("-LegScript") + 1] = str(prof / "dual-venue" / "Invoke-VenueLeg.ps1")
+        self._assert_switch_refused_by_location("GIT_CEILING_DIRECTORIES names the checkout", args, e)
+
+    # adversary r3 pass 7 A2: the other seams this card added (-CommittedSpecScript, -CommittedSpecRepoRoot) and every older seam were refused only for a um-run classified REAL by bytes or path, and the
+    # same BOM defeats it with no switch at all. "Real" now also means: either script is in a git work tree, or git cannot say it is not.
+    def test_legspec_committed_r3_every_offline_seam_is_refused_for_a_bom_um_run_in_a_second_checkout_with_no_switch(self) -> None:
+        _wt, prof = self._bom_second_checkout("checkout-seams")
+        stand_in = self.case / "stand-in-committed.ps1"
+        stand_in.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\nWrite-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        budget = self.case / "fake-budget.ps1"
+        budget.write_text("[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        for flag, needle in ((["-CommittedSpecScript", str(stand_in)], "-CommittedSpecScript is an offline test seam"),
+                             (["-CommittedSpecRepoRoot", str(ROOT)], "-CommittedSpecRepoRoot is an offline test seam"),
+                             (["-LeaseBudgetWindowSec", "3600"], "LEASE_CAP_RELAXED"),
+                             (["-ExportBudgetScript", str(budget)], "-ExportBudgetScript is an offline test seam")):
+            with self.subTest(seam=flag[0]):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self.case / "no-such-spec.json"], *flag, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+                args[args.index("-UmRunScript") + 1] = str(prof / "um-run.ps1")
+                args[args.index("-LegScript") + 1] = str(prof / "dual-venue" / "Invoke-VenueLeg.ps1")
+                r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(needle, r.stderr)
+                self.assertEqual(self.kinds(), [])
+
+    # adversary r3 pass 7 A3: a host with no temp directory outside every work tree fails loudly at setup, not as a refusal of every stand-in
+    def test_legspec_committed_r3_a_host_with_no_temp_directory_outside_a_work_tree_fails_loudly(self) -> None:
+        ws = self.case / "ws"
+        for sub in (".git", "tmp", "AppData/Local/Temp", "Windows/Temp", "home/AppData/Local/Temp"):
+            (ws / sub).mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(tempfile, "gettempdir", return_value=str(ws / "tmp")), \
+                mock.patch.dict(os.environ, {"LOCALAPPDATA": str(ws / "AppData" / "Local"), "SystemRoot": str(ws / "Windows")}), \
+                mock.patch.object(Path, "home", return_value=ws / "home"):
+            with self.assertRaises(RuntimeError):
+                offline_tmp_root()
+
+    def _run_from_ps_location(self, args: list, e: dict, location: Path, native_cwd: Path) -> subprocess.CompletedProcess:
+        """Run the runner from PowerShell location `location` while the PROCESS directory (what a child process inherits) is `native_cwd`."""
+        runner_at = args.index("-File") + 1
+        command = f"Set-Location -LiteralPath '{psq(location)}'; & '{psq(args[runner_at])}' " + " ".join(a if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", a) else f"'{psq(a)}'" for a in args[runner_at + 1:]) + "; exit $LASTEXITCODE"
+        return subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=300, env=e, cwd=str(native_cwd))
+
+    # adversary r3 pass 8 A1: the preflight bound the leg PowerShell resolved (relative to the PowerShell location), but the leg was dispatched as the spelled relative path in a child process that
+    # inherits the PROCESS directory: another leg ran, after the claim and the lease. The same file now is checked and run (and so is the quiet probe).
+    def test_legspec_committed_r3_a_relative_leg_script_runs_the_file_the_preflight_checked(self) -> None:
+        other = self.case / "process-dir"
+        other.mkdir()
+        marker = self.case / "ran-in-process-dir.txt"
+        for name in ("fake-leg.ps1", "fake-quiet.ps1"):
+            (other / name).write_text("Set-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'ran-in-process-dir.txt') -Value '" + name + "'\nexit 0\n", encoding="utf-8")
+        self._reset_committed_case()
+        marker.unlink(missing_ok=True)
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+        args[args.index("-LegScript") + 1] = ".\\fake-leg.ps1"
+        args[args.index("-QuietScript") + 1] = ".\\fake-quiet.ps1"
+        r = self._run_from_ps_location(args, e, self.tmp, other)
+        self.assertFalse(marker.exists(), "a script of the PROCESS directory ran, not the one PowerShell resolved: " + (marker.read_text(encoding="utf-8") if marker.exists() else ""))
+        self.assertTrue(any(k.startswith("LEG:") for k in self.kinds()), "the leg PowerShell resolved ran: " + r.stdout[-1500:] + r.stderr[-1500:])
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+
+    # adversary r3 pass 8 A2: a relative -CommittedSpecRepoRoot was handed on as spelled, and the child resolves it in the PROCESS directory, not where PowerShell resolved it
+    def test_legspec_committed_r3_a_relative_seam_root_reaches_the_child_as_the_path_powershell_resolves(self) -> None:
+        child = self.case / "recording-root.ps1"
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         "Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'child-root.log') -Value ('RepoRoot=' + $RepoRoot)\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        log = self.case / "child-root.log"
+        self._reset_committed_case()
+        log.unlink(missing_ok=True)
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", ".", "-CommittedSpecScript", str(child), *self._hermetic_receipt_root())
+        r = self._run_from_ps_location(args, e, self.tmp, ROOT)
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+        self.assertTrue(log.exists(), "the preflight child ran")
+        # (r4, hosted CI: TEMP may be spelled with an 8.3 short name -- C:\Users\RUNNER~1 -- which .NET's GetFullPath keeps and PowerShell's location may give long: the same directory either way, so compare what each names)
+        spelled = log.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1].rstrip("\\")
+        self.assertEqual(os.path.normcase(os.path.realpath(spelled)), os.path.normcase(os.path.realpath(self.tmp)))
+
+    def test_legspec_committed_r3_a_git_that_cannot_answer_refuses_the_switch(self) -> None:
+        # fail CLOSED: with no git on PATH the location is unknown, which is not "outside"
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+        e = dict(e)
+        e["PATH"] = str(Path(PWSH).parent) + os.pathsep + str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32")
+        self._assert_switch_refused_by_location("no git on PATH", args, e, needle="git could not show that")
+
+    # ---- r4 (adversary r3 pass 9 A1, A2; Grok CoS 7232347897 G2, G4) ----
+    # A2: git's "not a git repository" was read as a substring of its stderr, from a git that still honoured the caller's GIT_CONFIG_* variables, so a forged config key printed that text with exit 128 and
+    # a link into a checkout was taken for "outside"; a link's TARGET was only asked of git, never walked for a .git entry the way the stand-in's own path is.
+    _FORGED_CONFIG_ENV = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "not a git repository", "GIT_CONFIG_VALUE_0": "true"}
+
+    def _junction(self, link: Path, target: Path) -> None:
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], capture_output=True, text=True, timeout=60)
+        if made.returncode != 0:
+            self.skipTest("cannot create a directory junction here: " + made.stdout + made.stderr)
+
+    def test_legspec_committed_r4_a2_a_junction_into_a_checkout_is_refused_whatever_git_is_made_to_say(self) -> None:
+        for label, forged in (("clean environment", {}), ("forged GIT_CONFIG_COUNT/KEY_0/VALUE_0", self._FORGED_CONFIG_ENV)):
+            for target_kind in ("checkout root", "a directory inside the checkout"):
+                with self.subTest(env=label, target=target_kind):
+                    wt = self._git_work_tree(f"wt-r4-{abs(hash((label, target_kind)))}")
+                    target = wt if target_kind == "checkout root" else wt / "inner"
+                    target.mkdir(exist_ok=True)
+                    (target / "fake-umrun.ps1").write_bytes((self.tmp / "fake-umrun.ps1").read_bytes())
+                    link = self.case / f"junction-r4-{abs(hash((label, target_kind)))}"
+                    self._junction(link, target)
+                    self._reset_committed_case()
+                    args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+                    e = {**e, **forged}
+                    args[args.index("-UmRunScript") + 1] = str(link / "fake-umrun.ps1")
+                    # the .git walk on the link's target is what names it (git's own answer is the second opinion, and a forged one)
+                    self._assert_switch_refused_by_location("stand-in reached through a junction into a checkout", args, e, needle="holds a .git entry")
+
+    def test_legspec_committed_r4_a2_invoke_dvgit_gives_git_none_of_the_callers_git_config_variables(self) -> None:
+        broken = self.case / "broken.gitconfig"
+        broken.write_text("[unterminated\n", encoding="utf-8")
+        cases = {"count-key-value": self._FORGED_CONFIG_ENV, "parameters": {"GIT_CONFIG_PARAMETERS": "'not a git repository'='true'"},
+                 "global": {"GIT_CONFIG_GLOBAL": str(broken)}, "system": {"GIT_CONFIG_SYSTEM": str(broken)}, "nosystem": {"GIT_CONFIG_NOSYSTEM": "1"}}
+        script = (f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking\n"
+                  f"$g = & (Get-Module DualVenueRunner) {{ Invoke-DvGit -RepoRoot '{psq(ROOT)}' -GitArgs @('rev-parse', '--is-inside-work-tree') }}\n"
+                  "'{0}|{1}' -f $g.exitCode, [Text.Encoding]::UTF8.GetString([byte[]]$g.bytes).Trim()")
+        for label, extra in cases.items():
+            with self.subTest(variable=label):
+                e = {**{k: v for k, v in os.environ.items() if not k.startswith("GIT_")}, **extra}
+                r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=180, env=e)
+                self.assertEqual(r.stdout.strip(), "0|true", r.stdout + r.stderr)
+
+    def test_legspec_committed_r4_a2_only_a_line_that_starts_with_the_fatal_text_is_git_saying_it_is_outside(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("(?m)^fatal: not a git repository", text)
+        self.assertNotRegex(text, r"(?i)-c?match\s+'not a git repository'")
+
+    # A1: the preflight and the leg that runs must name ONE repo for one leg script: a directory whose name holds a wildcard character (repo[1]) was literal in the preflight and a pattern in the leg (repo1)
+    def test_legspec_committed_r4_a1_the_preflight_and_the_leg_resolve_the_same_repo_for_a_bracketed_directory(self) -> None:
+        plain, bracketed = self.case / "repo1", self.case / "repo[1]"
+        for repo in (plain, bracketed):
+            (repo / "tools" / "profiling" / "dual-venue").mkdir(parents=True)
+        leg_dir = bracketed / "tools" / "profiling" / "dual-venue"
+        pre = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-File", str(DV / "Test-LegSpecCommitted.ps1"), "-LegSpecSha256", "0" * 64,
+                              "-LegScript", str(leg_dir / "Invoke-VenueLeg.ps1")], capture_output=True, text=True, timeout=180)
+        found = re.search(r"root=(.*)$", pre.stdout.strip(), re.M)
+        self.assertIsNotNone(found, pre.stdout + pre.stderr)
+        # the leg's own line, evaluated as the leg evaluates it (-RepoRoot not given, $here = the leg script's directory)
+        line = next(x for x in LEG.read_text(encoding="utf-8").splitlines() if x.startswith("if ([string]::IsNullOrWhiteSpace($RepoRoot)) { $RepoRoot = "))
+        leg = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+                              f"Import-Module '{psq(DV / 'DualVenueRunner.psm1')}' -Force -DisableNameChecking; $here = '{psq(leg_dir)}'; $RepoRoot = ''\n{line}\n$RepoRoot"],
+                             capture_output=True, text=True, timeout=180)
+        self.assertEqual(leg.returncode, 0, leg.stdout + leg.stderr)
+        self.assertEqual(found.group(1).strip().lower(), str(bracketed).lower(), pre.stdout)
+        self.assertEqual(leg.stdout.strip().lower(), found.group(1).strip().lower(), "the leg ran in another repo than the one the preflight read")
+
+    # G4: a seam path is judged as the PowerShell the batch runs in resolves it, and some spellings resolve elsewhere in the bounded child: a drive-relative C:rel (that drive's own current directory), ~
+    # (the PowerShell home, a literal directory name to .NET), a PSDrive (Env:\x, Temp:\x) or a provider-qualified path. Each is refused with its own typed reason, before anything is claimed.
+    def test_legspec_committed_r4_g4_a_seam_path_in_a_spelling_that_resolves_elsewhere_is_refused_with_a_typed_reason(self) -> None:
+        spellings = {"drive-relative": ("C:rel\\x", "SEAM_PATH_DRIVE_RELATIVE"), "drive-only": ("C:", "SEAM_PATH_DRIVE_RELATIVE"), "tilde": ("~\\x", "SEAM_PATH_TILDE"), "tilde-alone": ("~", "SEAM_PATH_TILDE"),
+                     "tilde-forward": ("~/x", "SEAM_PATH_TILDE"), "env-psdrive": ("Env:\\x", "SEAM_PATH_PSDRIVE"), "registry-psdrive": ("HKLM:\\Software", "SEAM_PATH_PSDRIVE"),
+                     "named-psdrive": ("Temp:\\x", "SEAM_PATH_PSDRIVE"), "provider-qualified": ("Microsoft.PowerShell.Core\\FileSystem::" + str(ROOT), "SEAM_PATH_PSDRIVE")}
+        for flag in ("-CommittedSpecRepoRoot", "-CommittedSpecScript"):
+            for label, (spelled, code) in spellings.items():
+                with self.subTest(seam=flag, spelling=label):
+                    self._reset_committed_case()
+                    args, e = self.batch_cmd([self._COMMITTED_SPEC], flag, spelled, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+                    r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+                    self._assert_nothing_claimed_or_leased(f"{flag} {spelled}", r)
+                    self.assertIn(f"BATCH_USAGE {code}", r.stderr)
+                    self.assertIn(flag, r.stderr)
+
+    def test_legspec_committed_r4_g4_a_single_letter_psdrive_that_dotnet_does_not_know_is_refused(self) -> None:
+        letter = next(c for c in "QPXYWVU" if not Path(f"{c}:\\").exists())
+        for flag in ("-CommittedSpecRepoRoot", "-CommittedSpecScript"):
+            with self.subTest(seam=flag):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], flag, f"{letter}:\\x", *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+                runner_at = args.index("-File") + 1
+                command = (f"New-PSDrive -Name {letter} -PSProvider FileSystem -Root '{psq(self.tmp)}' | Out-Null; & '{psq(args[runner_at])}' "
+                           + " ".join(a if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", a) else f"'{psq(a)}'" for a in args[runner_at + 1:]) + "; exit $LASTEXITCODE")
+                r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=300, env=e, cwd=str(ROOT))
+                self._assert_nothing_claimed_or_leased(f"{flag} {letter}:\\x", r)
+                self.assertIn("BATCH_USAGE SEAM_PATH_PSDRIVE", r.stderr)
+
+    def test_legspec_committed_r4_g4_plain_absolute_and_relative_seam_paths_are_still_accepted(self) -> None:
+        self._reset_committed_case()
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(ROOT), *self._hermetic_receipt_root())
+        self.assertNotIn("BATCH_USAGE SEAM_PATH_", r.stderr)
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+
+    # ---- r4 fix (adversary r4 pass 10: A1, A2, advisory A3) ----
+    # A1: the location walk's visited set and the directory de-duplication folded case, so on a case-sensitive directory (C:\cs\A and C:\cs\a are two trees) the second stand-in's .git check was skipped
+    # and git was asked about one of the two. Ordinal everywhere a directory is compared there. (A case-sensitive directory needs `fsutil file setCaseSensitiveInfo`, which wants an elevated token, so the
+    # contract is pinned on the source text: a walk that compares directories by ordinal name and a de-duplication that keeps both spellings.)
+    def test_legspec_committed_r4b_a1_the_location_walk_never_folds_the_case_of_a_directory(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("function Get-OfflineSeamLocationRefusal")
+        walk = text[start:text.index("$umRunIsReal = ($umRunFull", start)]
+        self.assertRegex(walk, r"HashSet\[string\]\]::new\(\[StringComparer\]::Ordinal\)")
+        self.assertNotRegex(walk, r"OrdinalIgnoreCase")
+        # (r4 fix 2: Sort-Object -Unique, with or without -CaseSensitive, compares by CULTURE and ignores a zero-width character: the directories are de-duplicated by an ORDINAL set)
+        self.assertNotRegex(walk, r"Sort-Object")
+        self.assertRegex(walk, r"SortedSet\[string\]\]::new\(\$dirs, \[StringComparer\]::Ordinal\)")
+
+    # A2: the walk is file-system work (a .git probe on every ancestor, a link target) that runs BEFORE -DeadlineUtc is read, so a stalled share held the batch. It runs on a bounded worker, capped at 30 s and at
+    # the room left before -DeadlineUtc; a probe that does not answer is "not shown to be outside" (fail closed), as a git that does not answer is. -LocationProbeDelaySec stalls the worker for the test.
+    def test_legspec_committed_r4b_a2_a_location_probe_that_stalls_is_cut_off_at_the_deadline_and_refuses_the_switch(self) -> None:
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], "-LocationProbeDelaySec", "90", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=14)), *self._hermetic_receipt_root())
+        t0 = time.monotonic()
+        r = subprocess.run(args, capture_output=True, text=True, timeout=150, env=e)
+        elapsed = time.monotonic() - t0
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(self._SEAM_NEEDLE, r.stderr)
+        self.assertIn("could not be established", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing claimed, leased, opened or run")
+        self.assertLess(elapsed, 40, f"the run outlived the deadline's room by far ({elapsed:.1f} s): the stalled probe held the batch")
+
+    def test_legspec_committed_r4b_a2_a_probe_that_answers_in_time_still_accepts_a_stand_in_outside_every_work_tree(self) -> None:
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._untracked_copy_of_a_committed_spec()], "-LocationProbeDelaySec", "1", *self._hermetic_receipt_root())
+        r = subprocess.run(args, capture_output=True, text=True, timeout=300, env=e)
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+        self.assertNotIn(self._SEAM_NEEDLE, r.stderr)
+
+    # A3 (advisory): a rooted path with no drive (\repo, /repo) passed IsPathRooted and was handed to the child as spelled, which resolves it on the PROCESS directory's drive, not PowerShell's
+    def test_legspec_committed_r4b_a3_a_drive_less_rooted_seam_root_reaches_the_child_fully_qualified(self) -> None:
+        child = self.case / "recording-root-a3.ps1"
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         "Add-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT 'child-root-a3.log') -Value ('RepoRoot=' + $RepoRoot)\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        log = self.case / "child-root-a3.log"
+        for spelled in ("\\repo", "/repo"):
+            with self.subTest(spelled=spelled):
+                self._reset_committed_case()
+                log.unlink(missing_ok=True)
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", spelled, "-CommittedSpecScript", str(child), *self._hermetic_receipt_root())
+                r = self._run_from_ps_location(args, e, self.tmp, ROOT)
+                self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+                self.assertTrue(log.exists(), "the preflight child ran")
+                got = log.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1]
+                self.assertRegex(got, r"^[A-Za-z]:\\", f"the child was handed {got!r}, which is resolved on the process directory's drive")
+                self.assertEqual(got.lower(), (Path(str(self.tmp)).drive + "\\repo").lower())
+
+    # ---- r4 fix 2 (adversary r4 pass 11: A1, A2, advisory A3) ----
+    # A2: Sort-Object -Unique -CaseSensitive still compares by CULTURE, which ignores a zero-width character, so C:\offline\A and C:\offline\A<U+200B> (two directories) collapsed to one and git was never asked about the second.
+    def test_legspec_committed_r4c_a2_two_directories_that_differ_by_a_zero_width_character_are_both_asked_of_git(self) -> None:
+        plain = self.case / "ZWA"
+        odd = self.case / "ZWA\u200b"
+        plain.mkdir()
+        odd.mkdir()
+        (plain / "fake-umrun.ps1").write_bytes((self.tmp / "fake-umrun.ps1").read_bytes())
+        (odd / "fake-leg.ps1").write_bytes((self.tmp / "fake-leg.ps1").read_bytes())
+        # a directory that looks like a bare repository whose config git cannot read: git answers with a failure that is NOT "not a git repository"
+        (odd / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+        (odd / "objects").mkdir()
+        (odd / "refs").mkdir()
+        (odd / "config").write_text("[unterminated\n", encoding="utf-8")
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+        args[args.index("-UmRunScript") + 1] = str(plain / "fake-umrun.ps1")
+        args[args.index("-LegScript") + 1] = str(odd / "fake-leg.ps1")
+        self._assert_switch_refused_by_location("two directories one zero-width character apart", args, e, needle="git could not show that")
+
+    # A1: with no room before -DeadlineUtc nothing can start (every later gate refuses on the deadline), so the probe is not started either -- it used to be started with a one-second floor, after the deadline
+    def test_legspec_committed_r4c_a1_a_probe_is_not_started_when_no_room_is_left_before_the_deadline(self) -> None:
+        for label, deadline in (("a second ago", utc_iso(datetime.now(timezone.utc) - timedelta(seconds=1))), ("year 1", "0001-01-01T00:00:00Z")):
+            with self.subTest(deadline=label):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], "-LocationProbeDelaySec", "600", "-DeadlineUtc", deadline, *self._hermetic_receipt_root())
+                t0 = time.monotonic()
+                r = subprocess.run(args, capture_output=True, text=True, timeout=150, env=e)
+                self.assertLess(time.monotonic() - t0, 60, r.stderr[-800:])
+                self.assertNotIn("could not be established", r.stderr, "a probe was started (and given up on) with no room left")
+                self.assertEqual(self.kinds(), [], "nothing claimed, leased, opened or run")
+                self.assertNotEqual(r.returncode, 0, r.stdout[-800:] + r.stderr[-800:])
+
+    def test_legspec_committed_r4c_a1_the_probe_wait_ends_at_the_sampled_end_of_the_room(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        probe = text[text.index("$locationCapSec = "):text.index("$locationRefusal = $(if")]
+        for needle in ("-Clock", "-EndSec", "-EndIsBoundEnd"):
+            self.assertIn(needle, probe, f"the bounded read is not handed the caller's clock and end ({needle})")
+
+    # A3 (advisory): a PSDrive that shadows a real drive's letter (D: mapped to another directory) passed the "is this a drive of the host" test; the child would read the physical D:
+    def test_legspec_committed_r4c_a3_a_psdrive_shadowing_a_real_drive_letter_is_refused(self) -> None:
+        letter = next((c for c in "QPXYWVU" if not Path(f"{c}:\\").exists()), None)
+        if letter is None:
+            self.skipTest("no free drive letter for subst")
+        made = subprocess.run(["subst", f"{letter}:", str(self.tmp)], capture_output=True, text=True, timeout=60)
+        if made.returncode != 0:
+            self.skipTest("cannot create a substituted drive here: " + made.stdout + made.stderr)
+        try:
+            for flag in ("-CommittedSpecRepoRoot", "-CommittedSpecScript"):
+                with self.subTest(seam=flag):
+                    self._reset_committed_case()
+                    args, e = self.batch_cmd([self._COMMITTED_SPEC], flag, f"{letter}:\\x", *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+                    runner_at = args.index("-File") + 1
+                    command = (f"& {{ New-PSDrive -Name {letter} -PSProvider FileSystem -Root '{psq(self.case)}' -Scope Local | Out-Null; & '{psq(args[runner_at])}' "
+                               + " ".join(a if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", a) else f"'{psq(a)}'" for a in args[runner_at + 1:]) + " }; exit $LASTEXITCODE")
+                    r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=300, env=e, cwd=str(ROOT))
+                    self._assert_nothing_claimed_or_leased(f"{flag} {letter}:\\x", r)
+                    self.assertIn("BATCH_USAGE SEAM_PATH_PSDRIVE", r.stderr)
+        finally:
+            subprocess.run(["subst", f"{letter}:", "/d"], capture_output=True, text=True, timeout=60)
+
+    # ---- r5 (adversary r4 pass 12 A1 = Grok G5; G6 fail-closed) ----
+    # G5 (major, introduced): the committed-spec child was handed -TimeoutSec from a room sampled BEFORE the launch, and its FOUND answer was accepted with no look at -DeadlineUtc, so a parent descheduled between
+    # the sample and the launch started a child after the deadline and gave it a fresh wait. Every bounded child of the batch now goes through ONE helper that is handed the sampled stopwatch and end, starts nothing
+    # with no room left on it, and every preflight answer is refused (typed) when -DeadlineUtc has passed by the time it is judged.
+    def _g5_found_child(self, name: str) -> tuple[Path, Path]:
+        child = self.case / name
+        pid = self.case / (name + ".pid")
+        pid.unlink(missing_ok=True)
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         f"Set-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT '{pid.name}') -Value $PID\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        return child, pid
+
+    def _assert_g5_refused(self, label: str, r: subprocess.CompletedProcess, code: str) -> None:
+        out = f"{label}: " + r.stdout[-1500:] + r.stderr[-1500:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn(f"BATCH_USAGE {code}", r.stderr, out)
+        self.assertEqual(self.kinds(), [], out)
+        self.assertFalse(self.claim_path.exists(), out)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), out)
+
+    def test_legspec_committed_r5_g5_a_child_that_would_start_past_the_deadline_is_not_started(self) -> None:
+        child, pid = self._g5_found_child("g5-launch.ps1")
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=16))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildLaunchDelaySec", "20", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("launch past the deadline", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        self.assertFalse(pid.exists(), "the committed-spec child was started after -DeadlineUtc")
+
+    def test_legspec_committed_r5_g5_a_found_answer_seen_after_the_deadline_is_refused(self) -> None:
+        child, pid = self._g5_found_child("g5-return.ps1")
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=24))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildReturnDelaySec", "28", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("FOUND after the deadline", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        self.assertIn("after -DeadlineUtc", r.stderr)
+
+    def test_legspec_committed_r8_a2_a_found_answer_seen_after_the_sampled_end_is_a_timeout_with_the_run_deadline_still_ahead(self) -> None:
+        """r8 (adversary r8 pass 18 A2): the helper judged an answer late only against -NotAfterUtc (the run deadline), so a child answer in hand after the SAMPLED END (here the 120 s cap) with the deadline still ten minutes
+        ahead was accepted: FOUND passed the preflight. An answer seen after the end it was sampled for is a timeout, whatever the deadline says."""
+        child, pid = self._g5_found_child("r8-a2-return.ps1")
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=10))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildReturnDelaySec", "122", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("FOUND after the sampled end, deadline ahead", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        self.assertIn("did not answer", r.stderr)
+        self.assertNotIn("after -DeadlineUtc", r.stderr)
+
+    # r9 (Grok G13 = adversary r9 pass 19 A2): the helper turned an answer seen after the sampled end into a timeout and killed nothing, passing the module's killConfirmed=$true through, so a descendant of the answered
+    # root outlived a timeout reported as a confirmed kill. The child here starts a hidden descendant (through ShellExecute, so it inherits no handle and holds none of the test's pipes) and then answers FOUND.
+    def _g13_child_with_descendant(self, name: str) -> tuple[Path, Path]:
+        child = self.case / name
+        desc = self.case / (name + ".desc.pid")
+        desc.unlink(missing_ok=True)
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         "$d = Join-Path $env:FAKE_LEG_ROOT 'DESCPID'\n"
+                         "Remove-Item -LiteralPath $d -ErrorAction SilentlyContinue\n"
+                         "$psi = [Diagnostics.ProcessStartInfo]::new('pwsh'); $psi.UseShellExecute = $true; $psi.WindowStyle = 'Hidden'\n"
+                         "$psi.Arguments = '-NoProfile -Command \"Set-Content -LiteralPath ''' + $d + ''' -Value $PID; Start-Sleep 600\"'\n"
+                         "[void][Diagnostics.Process]::Start($psi)\n"
+                         "$sw = [Diagnostics.Stopwatch]::StartNew()\n"
+                         "while (-not (Test-Path -LiteralPath $d) -and $sw.Elapsed.TotalSeconds -lt 30) { Start-Sleep -Milliseconds 100 }\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n".replace("DESCPID", desc.name), encoding="utf-8")
+        return child, desc
+
+    @staticmethod
+    def _pid_is_alive(pid: int) -> bool:
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"], capture_output=True, text=True).stdout
+        return f'"{pid}"' in out
+
+    def _descendant_pid(self, desc: Path) -> int:
+        self.assertTrue(desc.exists(), "the descendant never started: the test proves nothing")
+        pid = int(desc.read_text(encoding="utf-8-sig").strip())
+        self.addCleanup(lambda: subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True))
+        return pid
+
+    def test_legspec_committed_r9_a2_g13_an_answer_seen_after_the_sampled_end_kills_the_tree_of_the_answered_root(self) -> None:
+        child, desc = self._g13_child_with_descendant("r9-g13-kill.ps1")
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=10))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildReturnDelaySec", "122", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("FOUND after the sampled end, descendant alive", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        pid = self._descendant_pid(desc)
+        # r10 (Grok G14): the root had already exited when the helper made this kill, so it is root-only: the descendant of the root is still swept (below), but the kill is never reported confirmed from the root alone
+        self.assertIn("kill UNCONFIRMED", r.stderr)
+        self.assertNotIn("kill confirmed", r.stderr)
+        for _ in range(50):
+            if not self._pid_is_alive(pid):
+                break
+            time.sleep(0.2)
+        self.assertFalse(self._pid_is_alive(pid), "the kill of the answered root's tree left a direct descendant of the root running (pid %d)" % pid)
+        text = RUNNER.read_text(encoding="utf-8")
+        helper = text[text.index("function Invoke-BatchBoundedChild"):text.index("function Get-UnconfirmedKillText")]
+        self.assertNotIn("killConfirmed = $r.killConfirmed;", helper, "the helper copies the module's confirmation into a timeout it made itself")
+        self.assertIn(".Kill($true)", helper, "the branch that turns an answer into a timeout kills the tree itself")
+
+    def test_legspec_committed_r9_a2_g13_an_answer_after_the_sampled_end_whose_kill_cannot_be_made_is_reported_unconfirmed(self) -> None:
+        child, desc = self._g13_child_with_descendant("r9-g13-unconfirmed.ps1")
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=26))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildReturnDelaySec", "30", "-BoundedChildKillFails", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("FOUND after the sampled end, the kill fails", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        pid = self._descendant_pid(desc)
+        self.assertIn("kill UNCONFIRMED", r.stderr)
+        self.assertNotIn("kill confirmed", r.stderr)
+        self.assertTrue(self._pid_is_alive(pid), "the seam made the kill fail, so the descendant must still be there (the test proves the report, not a kill)")
+
+    def test_legspec_committed_r10_g14_a_late_answer_whose_root_and_intermediate_parent_exited_is_root_only_and_never_a_confirmed_kill(self) -> None:
+        """r10 (Grok G14 = adversary r9 pass 20/21 A1): the helper's late-answer branch killed an already-exited root and read killConfirmed from the root's HasExited, so an orphaned grandchild ran on under "kill confirmed".
+        The same fixture the module test builds (root exited, intermediate exited, grandchild orphaned and alive) must read kill UNCONFIRMED here, and the helper records the root's state BEFORE the kill (killScope root-only)."""
+        d = self.case / "r10-g14-orphan"
+        pid_file = d / "grandchild.pid"
+        root = write_orphan_fixture(d, pid_file, answer="DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x")
+        self.addCleanup(lambda: pid_file.exists() and kill_tree(grandchild_pid(pid_file)))
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=10))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(root), "-BoundedChildReturnDelaySec", "122", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("FOUND after the sampled end, orphaned grandchild alive", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        self.assertTrue(pid_file.exists(), "the fixture's grandchild never started: the test proves nothing")
+        self.assertTrue(pid_is_alive(grandchild_pid(pid_file)), "the fixture's orphaned grandchild is gone, so the case under test was not built")
+        self.assertIn("kill UNCONFIRMED", r.stderr, "a kill made after the root had exited was reported confirmed from the root alone while a grandchild ran on")
+        self.assertNotIn("kill confirmed", r.stderr)
+        text = RUNNER.read_text(encoding="utf-8")
+        helper = text[text.index("function Invoke-BatchBoundedChild"):text.index("function Get-UnconfirmedKillText")]
+        code = "\n".join(l for l in helper.splitlines() if not l.lstrip().startswith("#"))
+        self.assertLess(code.index("$rootExitedBeforeKill = [bool]($r.process -and $r.process.HasExited)"), code.index("$r.process.Kill($true)"), "the root's state is read before the helper's kill")
+        self.assertIn("-not $rootExitedBeforeKill) { [void]$r.process.WaitForExit(", code, "a root that had exited before the kill is never confirmed from its own HasExited")
+        self.assertIn("'root-only'", code)
+        unconfirmed = text[text.index("function Get-UnconfirmedKillText"):text.index("function Get-KilledAtStartText")]
+        self.assertIn("root-only", unconfirmed, "the unconfirmed-kill wording says the root alone was checked")
+
+    def test_legspec_committed_r5_g5_the_export_budget_siblings_are_bounded_by_the_same_sampled_end(self) -> None:
+        pid = self.case / "g5-budget.pid"
+        pid.unlink(missing_ok=True)
+        fake = self.case / "g5-budget.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n"
+                        f"Set-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT '{pid.name}') -Value $PID\n[pscustomobject]@{{ jobTimeoutSec = 1 }}\n", encoding="utf-8")
+        spec = self.case / "g5-export.json"
+        spec.write_text((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"), encoding="utf-8")
+        self._reset_committed_case()
+        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-BoundedChildLaunchDelaySec", "20", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=16)))
+        self._assert_g5_refused("export budget child past the deadline", r, "EXPORT_BUDGET_PREFLIGHT_TIMEOUT")
+        self.assertFalse(pid.exists(), "the export budget child was started after -DeadlineUtc")
+        self._reset_committed_case()
+        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-BoundedChildReturnDelaySec", "28", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=24)))
+        self._assert_g5_refused("export budget answer after the deadline", r, "EXPORT_BUDGET_PREFLIGHT_TIMEOUT")
+        self.assertIn("after -DeadlineUtc", r.stderr)
+
+    def test_legspec_committed_r5_g5_no_bounded_child_in_the_batch_is_started_outside_the_one_helper(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("function Invoke-BatchBoundedChild")
+        end = text.index("\nfunction ", start + 10)
+        rest = text[:start] + text[end:]
+        code = "\n".join(l for l in rest.splitlines() if not l.lstrip().startswith("#"))
+        bare = re.findall(r"Invoke-VenueBoundedProcess\b[^\n]*", code)
+        self.assertEqual(bare, [], "a bounded child is started without the one helper that re-samples its end: " + "; ".join(bare)[:600])
+        helper = text[start:end]
+        for needle in ("$EndSec - $Clock.Elapsed.TotalSeconds", "-TimeoutSec $boundSec", "Invoke-VenueBoundedProcess"):
+            self.assertIn(needle, helper)
+        self.assertGreaterEqual(len(re.findall(r"Invoke-BatchBoundedChild -FilePath", code)), 4, "the three preflight children and the leg all go through the helper")
+        self.assertEqual(len(re.findall(r"\$(?:bp|fp)\.late\b", code)), 3, "each of the three preflight answers is refused when it is late")
+
+    # r5 fix (adversary r5 pass 13 A1, A2). A1: the helper's -AtLeastOneSec turned an expired sampled end back into a 1 s bound, and a caller that did not pass it inherited it from PSDefaultParameterValues: no caller can ask for
+    # a child past the end it sampled. A2: the leg launch was handed no deadline, so a parent delayed after the launch guard started a leg after -DeadlineUtc; every caller now hands the run deadline as -StartBeforeUtc.
+    def test_legspec_committed_r5_a1_the_helper_never_restores_a_bound_the_sampled_end_has_used_up(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("function Invoke-BatchBoundedChild")
+        helper = text[start:text.index("\nfunction ", start + 10)]
+        self.assertNotIn("AtLeastOneSec", text)
+        self.assertNotRegex(helper, r"\$boundSec\s*=\s*1\b")
+        for call in re.findall(r"Invoke-BatchBoundedChild -FilePath[^\n]*", "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))):
+            self.assertIn("-StartBeforeUtc $deadline", call, "every bounded child is handed the run deadline it may not be started after: " + call[:200])
+
+    def test_legspec_committed_r5_a2_a_leg_is_not_started_when_the_run_deadline_passed_after_the_launch_guard(self) -> None:
+        self._reset_committed_case()
+        r = self.run_batch([self.specs[0]], "-BoundedChildLaunchDelaySec", "50", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=45)))
+        out = r.stdout[-1500:] + r.stderr[-1500:]
+        self.assertEqual([k for k in self.kinds() if k.startswith("LEG:")], [], "a leg was started after -DeadlineUtc: " + out)
+        self.assertEqual(r.returncode, 3, out)
+        self.assertIn("DEADLINE", r.stdout, out)
+
+    # r6 (Grok G8, defect): the ROOM branch at the leg launch (under 1 s of the lease left when the helper samples it) set endReason LEASE_REMAINING_SHORT but not $launchShort, so on a FRESH lease (legsAttempted 0,
+    # no probe retry, no thermal wait) the batch-end retype read it as "a leg budget no lease can hold" and stopped LEG_BUDGET_EXCEEDS_LEASE with exit 2. The launch delay (the descheduled parent) uses the lease up
+    # between the launch guard and the helper's sample: the batch ends room-short, the leg goes to the next batch (a fresh lease), and nothing is retyped.
+    def test_legspec_committed_r6_g8_a_room_return_at_the_leg_launch_on_a_fresh_lease_is_a_short_end_not_a_leg_budget_stop(self) -> None:
+        self._reset_committed_case()
+        r = self.run_batch([self.specs[0]], "-BoundedChildLaunchDelaySec", "66", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=420)), FAKE_LEASE_REMAIN="66,2700")
+        out = r.stdout[-2500:] + r.stderr[-2500:]
+        self.assertNotIn("LEG_BUDGET_EXCEEDS_LEASE", r.stdout + r.stderr + (self.run_dir / "batch.log").read_text(encoding="utf-8"), out)
+        self.assertEqual(r.returncode, 0, out)
+        b1, b2 = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsAttempted"], b1["probeRetries"], b1["thermalWaits"], b2["endReason"], b2["legsCounted"]), ("LEASE_REMAINING_SHORT", 0, 0, 0, "ALL_LEGS_DONE", 1), out)
+        self.assertIn("s of the lease were left after the launch guard", b1["endDetail"])
+
+    # r6 (Grok G10): a child that came to life after -StartBeforeUtc (the parent descheduled just before Process.Start) WAS started and is killed at once. It was reported notStarted with reason DEADLINE, and killConfirmed
+    # could be $false, so the leg went back in the queue and logged "no leg launched" with a child possibly still running. It is KILLED_AT_START now (the pid and killConfirmed travel with it).
+    def _g10_leg_run(self, *extra: str) -> tuple[subprocess.CompletedProcess, str]:
+        self._reset_committed_case()
+        r = self.run_batch([self.specs[0]], "-BoundedChildStartDelaySec", "50", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=45)), *extra)
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8") if (self.run_dir / "batch.log").exists() else ""
+        return r, log
+
+    def test_legspec_committed_r6_g10_a_leg_killed_at_start_with_an_unconfirmed_kill_is_a_launched_leg_that_stops_the_run(self) -> None:
+        r, log = self._g10_leg_run("-BoundedChildKillFails")
+        out = r.stdout[-2500:] + r.stderr[-2500:] + log[-2500:]
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"]), (3, "LEG_KILL_UNCONFIRMED"), out)
+        [leg] = res["legs"]
+        self.assertEqual((leg["status"], leg["class"], leg["killConfirmed"]), ("LEG_FAILED", "KILL_UNCONFIRMED", False), out)
+        self.assertGreater(int(leg["childPid"]), 0, out)
+        [b] = self.batches()
+        self.assertEqual(b["legsAttempted"], 1, "the leg was started: it is never un-counted\n" + out)
+        self.assertEqual(b["endReason"], "LEG_KILL_UNCONFIRMED", out)
+        line = [l for l in log.splitlines() if "KILLED_AT_START" in l or "kill UNCONFIRMED" in l]
+        self.assertTrue(line and all("no leg launched" not in l for l in line), out)
+        self.assertEqual([x for x in res["legs"] if x["status"] == "NOT_RUN"], [], "the leg is not put back in the queue\n" + out)
+
+    def test_legspec_committed_r6_g10_a_leg_killed_at_start_with_a_confirmed_kill_stops_on_the_deadline_and_says_the_child_was_started(self) -> None:
+        r, log = self._g10_leg_run()
+        out = r.stdout[-2500:] + r.stderr[-2500:] + log[-2500:]
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"]), (3, "DEADLINE"), out)
+        # r6 fix (adversary r6 pass 15 A3): a child that was started and killed is a launched leg even when the kill is confirmed: a LEG_FAILED row (class KILLED_AT_START), counted as attempted, never NOT_RUN
+        [leg] = res["legs"]
+        self.assertEqual((leg["status"], leg["class"], leg["killConfirmed"], leg["lateKind"]), ("LEG_FAILED", "KILLED_AT_START", True, "DEADLINE"), out)
+        [b] = self.batches()
+        self.assertEqual((b["legsAttempted"], b["endReason"]), (1, "DEADLINE"), out)
+        self.assertEqual((res["notRun"], res["failed"]), (0, 1), out)
+        dl = [l for l in log.splitlines() if " DEADLINE batch=" in l and "phase=launch" in l]
+        self.assertEqual(len(dl), 1, out)
+        self.assertIn("was started", dl[0])
+        self.assertIn("killed", dl[0])
+        self.assertIn("kill confirmed", dl[0])
+        self.assertNotIn("no leg launched", dl[0])
+
+    # r7 (Grok G11): the ROOM-late KILLED_AT_START branches at the leg launch (lateKind ROOM: the LEASE's sampled end, not the run deadline, was spent between the helper's check and Process.Start). The start-delay seam
+    # holds the parent just before Process.Start for as long as the 66 s lease lasts (the run deadline is 10 min away, so lateKind is ROOM and never DEADLINE): the child is started, then killed at once.
+    def _g11_room_late_run(self, specs: list[Path], *extra: str) -> tuple[subprocess.CompletedProcess, str]:
+        self._reset_committed_case()
+        r = self.run_batch(specs, "-BoundedChildStartDelaySec", "66", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=600)), *extra, FAKE_LEASE_REMAIN="66,2700")
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8") if (self.run_dir / "batch.log").exists() else ""
+        return r, log
+
+    def test_legspec_committed_r7_g11_a_leg_killed_at_start_for_the_leases_room_with_an_unconfirmed_kill_stops_the_run_with_exit_7(self) -> None:
+        r, log = self._g11_room_late_run([self.specs[0]], "-BoundedChildKillFails")
+        out = r.stdout[-2500:] + r.stderr[-2500:] + log[-2500:]
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"]), (7, "LEG_KILL_UNCONFIRMED"), out)
+        [leg] = res["legs"]
+        self.assertEqual((leg["status"], leg["class"], leg["killConfirmed"], leg["lateKind"]), ("LEG_FAILED", "KILL_UNCONFIRMED", False, "ROOM"), out)
+        self.assertGreater(int(leg["childPid"]), 0, out)
+        [b] = self.batches()
+        self.assertEqual((b["legsAttempted"], b["endReason"]), (1, "LEG_KILL_UNCONFIRMED"), "the leg was started: it is never un-counted\n" + out)
+        self.assertIn("with the lease's sampled end already used up", b["endDetail"], out)
+        self.assertIn("kill UNCONFIRMED", b["endDetail"], out)
+        self.assertEqual((res["notRun"], res["failed"]), (0, 1), "the killed leg is not put back in the queue\n" + out)
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, "no second lease is opened while a child may still be running\n" + out)
+        self.assertTrue([l for l in log.splitlines() if "KILL_UNCONFIRMED" in l and "reason=KILLED_AT_START" in l and "no leg launched" not in l], out)
+
+    def test_legspec_committed_r7_g11_a_leg_killed_at_start_for_the_leases_room_with_a_confirmed_kill_ends_the_batch_short_and_the_next_batch_runs_the_rest(self) -> None:
+        r, log = self._g11_room_late_run(self.specs[:2])
+        out = r.stdout[-3000:] + r.stderr[-2500:] + log[-2500:]
+        res = batch_result(r.stdout)
+        self.assertEqual(r.returncode, 7, out)
+        self.assertIsNone(res["stopReason"], "no stop: the run goes on\n" + out)
+        b1, b2 = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsAttempted"]), ("LEASE_REMAINING_SHORT", 1), "the leg was started: it is never un-counted\n" + out)
+        [row] = b1["legs"]
+        self.assertEqual((row["status"], row["class"], row["killConfirmed"], row["lateKind"]), ("LEG_FAILED", "KILLED_AT_START", True, "ROOM"), out)
+        self.assertGreater(int(row["childPid"]), 0, out)
+        self.assertIn("with the lease's sampled end already used up", b1["endDetail"], out)
+        self.assertIn("kill confirmed", b1["endDetail"], out)
+        self.assertEqual((b2["endReason"], b2["legsCounted"], b2["legsAttempted"]), ("ALL_LEGS_DONE", 1, 1), "the next batch runs the remaining leg\n" + out)
+        self.assertEqual([x["status"] for x in res["legs"]], ["LEG_FAILED", "RAN"], out)
+        self.assertEqual((res["notRun"], res["failed"], res["counted"]), (0, 1, 1), out)
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 2, out)
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("LEG:fx-b:")]), 1, "the remaining leg ran once, in the second lease\n" + out)
+        self.assertTrue([l for l in log.splitlines() if "LEG_FAILED" in l and "class=KILLED_AT_START" in l and "kill confirmed" in l], out)
+
+    # r7 (Grok G11 prevention): every typed end of the batch script is named by at least one batch test, or is on the module-level allowlist with the card that owes its test.
+    def test_legspec_committed_r7_g11_every_stop_and_end_pair_of_the_batch_script_is_named_by_a_batch_test_or_is_on_the_allowlist(self) -> None:
+        stops, ends, odd = _g11_pairs(RUNNER.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(set(odd) - set(_G11_DYNAMIC_FORMS)), [], "the scan cannot read a typed end of the batch script: teach _g11_pairs the form, write the end in a form it reads, or add its exact call text to _G11_DYNAMIC_FORMS with the card that owes its test")
+        self.assertEqual(sorted(set(_G11_DYNAMIC_FORMS) - set(odd)), [], "a dynamic form on the allowlist is no longer in the script: remove its row")
+        named_stops, named_ends = _g11_named_pairs(Path(__file__).read_text(encoding="utf-8"), stops, ends)
+        self.assertGreaterEqual((len(stops), len(ends)), (15, 19), "the scan went blind: " + repr((sorted(stops), sorted(ends))))
+        new_stops = sorted(stops - named_stops - set(_G11_UNNAMED_STOPS))
+        new_ends = sorted(ends - named_ends - set(_G11_UNNAMED_ENDS))
+        self.assertEqual((new_stops, new_ends), ([], []), "a branch of Invoke-VenueLeaseBatch.ps1 has no batch test naming it: write one (a test that asserts the run's end reason or stop reason and, for a stop, its exit code), "
+                         "or add it to _G11_UNNAMED_* with the card that owes the test")
+        self.assertEqual((sorted((stops & named_stops) & set(_G11_UNNAMED_STOPS)), sorted((ends & named_ends) & set(_G11_UNNAMED_ENDS))), ([], []), "an allowlisted pair is named by a test now: remove its row")
+        self.assertEqual((sorted(set(_G11_UNNAMED_STOPS) - stops), sorted(set(_G11_UNNAMED_ENDS) - ends)), ([], []), "an allowlisted pair is no longer in the script: remove its row")
+        for card in (*_G11_UNNAMED_STOPS.values(), *_G11_UNNAMED_ENDS.values(), *_G11_DYNAMIC_FORMS.values()):
+            self.assertRegex(card, r"^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+-\d+$", "each allowlist row names a successor card id")
+
+    def test_legspec_committed_r7_g11_the_pair_scan_sees_a_new_branch_and_a_test_that_only_names_its_sibling(self) -> None:
+        script = ("function Set-Stop([string]$Reason, [int]$Code) { $script:stopReason = $Reason }\n"
+                  "$b.endReason = 'SIBLING_END'; Set-Stop 'SIBLING_STOP' 3\n"
+                  "$B.EndReason  =  \"NEW_END\"\n"
+                  "set-stop \"SIBLING_STOP\" 9\n"
+                  "Set-Stop 'DYNAMIC_STOP' $(if ($x -ceq 'ROOM') { 7 } else { 3 })\n"
+                  "# Set-Stop 'COMMENTED_STOP' 5\n")
+        stops, ends, odd = _g11_pairs(script)
+        self.assertEqual((stops, ends, odd), ({("SIBLING_STOP", 3), ("SIBLING_STOP", 9), ("DYNAMIC_STOP", 7), ("DYNAMIC_STOP", 3)}, {"SIBLING_END", "NEW_END"}, []),
+                         "a double-quoted reason and a lower-case Set-Stop are read like the usual spelling")
+        _s, _e, odd = _g11_pairs(script + "Set-Stop $reason 4\n$b.endReason = $why\n$batch.endReason = 'OTHER_VARIABLE'\n$script:b.endReason = 'SCOPED'\n$b['endReason'] = 'INDEXED'\n")
+        self.assertEqual(odd, ["$b.endReason = $why", "$b['endReason'] = 'INDEXED'", "$batch.endReason = 'OTHER_VARIABLE'", "$script:b.endReason = 'SCOPED'", "Set-Stop $reason 4"], "a form the recognisers cannot read is reported, never skipped: " + repr(odd))
+        tests = ("\n    def test_sibling(self):\n"
+                 "        self.assertEqual((r.returncode, res[\"stopReason\"]), (3, \"SIBLING_STOP\"))\n"
+                 "        self.assertEqual(b[\"endReason\"], \"SIBLING_END\")\n"
+                 "        self.assertNotIn(\"NEW_END\", b[\"endReason\"])\n"
+                 "\n    def test_dynamic(self):\n"
+                 "        self.assertEqual(r.returncode, 7)\n"
+                 "        self.assertEqual(res[\"stopReason\"], \"DYNAMIC_STOP\")\n"
+                 "\n    def test_no_end_read(self):\n"
+                 "        self.assertEqual(x, \"NEW_END\")\n")
+        named_stops, named_ends = _g11_named_pairs(tests, stops, ends)
+        self.assertEqual(named_stops, {("SIBLING_STOP", 3), ("DYNAMIC_STOP", 7)}, "the (SIBLING_STOP, 9) branch and the (DYNAMIC_STOP, 3) branch are named by no test")
+        self.assertEqual(named_ends, {"SIBLING_END"}, "a negative assertion, or a method that reads no end, does not name a branch")
+
+    def test_legspec_committed_r9_a3_a_quoted_or_parenthesised_member_name_of_the_end_is_read_or_reported(self) -> None:
+        """r9 (adversary r9 pass 19 A3): PowerShell takes `$b."endReason" = ...`, `$b.'endReason' = ...` and `$b.('endReason') = ...` as the same assignment as `$b.endReason = ...`; the end recogniser read only the plain
+        spelling and the odd-form recogniser only `.endReason` and `['endReason']`, so the three above were in neither list and a typed end written that way was silently skipped by the coverage gate."""
+        script = ("$b.endReason = 'PLAIN_END'\n$b.\"endReason\" = 'QUOTED_END'\n$b.'endReason' = 'SINGLE_END'\n$b.('endReason') = 'PAREN_END'\n$b.(\"end\" + \"Reason\") = 'BUILT_END'\n$script:b.(\"endReason\") = 'SCOPED_END'\n"
+                  "if ($b.endReason -eq 'X') { }\n$other.('endReason') = 'NOT_THE_BATCH'\n")
+        _stops, ends, odd = _g11_pairs(script)
+        self.assertEqual(ends, {"PLAIN_END"})
+        self.assertEqual(odd, sorted(["$b.\"endReason\" = 'QUOTED_END'", "$b.'endReason' = 'SINGLE_END'", "$b.('endReason') = 'PAREN_END'", "$b.(\"end\" + \"Reason\") = 'BUILT_END'",
+                                      "$script:b.(\"endReason\") = 'SCOPED_END'", "$other.('endReason') = 'NOT_THE_BATCH'"]), "every spelling of the assignment is read or reported: " + repr(odd))
+
+    def test_legspec_committed_r6_g10_a_preflight_child_killed_at_start_is_a_started_and_killed_refusal_never_a_not_started_one(self) -> None:
+        child, _pid = self._g5_found_child("g10-committed.ps1")
+        spec = self.case / "g10-export.json"
+        spec.write_text((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"), encoding="utf-8")
+        fake = self.case / "g10-budget.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        for fails in (False, True):
+            tail = "kill UNCONFIRMED" if fails else "kill confirmed"
+            for label, args, code in (("committed-spec", ([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), *self._hermetic_receipt_root()), "COMMITTED_SPEC_PREFLIGHT_TIMEOUT"),
+                                      ("export budget", ([spec], "-ExportBudgetScript", str(fake)), "EXPORT_BUDGET_PREFLIGHT_TIMEOUT")):
+                with self.subTest(preflight=label, killFails=fails):
+                    self._reset_committed_case()
+                    extra = ("-BoundedChildStartDelaySec", "20", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=16)), *(["-BoundedChildKillFails"] if fails else []))
+                    r = self.run_batch(*args[:1], *args[1:], *extra, OMIT_DEFAULTS=self._SKIP if label == "committed-spec" else "")
+                    self._assert_g5_refused(label, r, code)
+                    self.assertIn("was started", r.stderr)
+                    self.assertIn("killed", r.stderr)
+                    self.assertIn(tail, r.stderr)
+                    self.assertNotIn("was not started", r.stderr)
+
+    def test_legspec_committed_r6_g10_sweep_a_leg_killed_at_the_lease_end_with_an_unconfirmed_kill_stops_the_run(self) -> None:
+        # FIELD_SWEEP: the leg's killConfirmed was never read, so a tree kill that could not be confirmed ended the batch LEASE_EXPIRED and the next batch opened a lease with the child possibly still running
+        self.addCleanup(self._kill_fake_leg_pids)
+        self._reset_committed_case()
+        r = self.run_batch(self.specs[:2], "-BoundedChildKillFails", FAKE_LEASE_REMAIN="63,2700", FAKE_LEG_MODES="hang")
+        out = r.stdout[-2500:] + r.stderr[-2500:]
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"]), (7, "LEG_KILL_UNCONFIRMED"), out)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["legs"][0]["status"], b["legs"][0]["killConfirmed"]), ("LEASE_EXPIRED", 1, "LEASE_EXPIRED", False), out)
+        self.assertIn("kill UNCONFIRMED", b["endDetail"])
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, "no second lease is opened while a child may still be running\n" + out)
+        self.assertEqual([x["status"] for x in res["legs"]], ["LEASE_EXPIRED", "NOT_RUN"], out)
+
+    def test_legspec_committed_r6_g10_every_not_started_caller_reads_killed_at_start_and_the_module_returns_it(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+        self.assertEqual(len(re.findall(r"if \(-not \$(?:bp|fp|lp)\.started\)", code)), 4, "the leg and the three preflights are the callers that read started")
+        self.assertEqual(len(re.findall(r"if \(-not \$(bp|fp)\.started -and \$\1\.reason -ceq 'KILLED_AT_START'\) \{ return '[A-Z_]+', ", code)), 3, "each preflight types KILLED_AT_START before its not-started wording")
+        leg = code[code.index("if (-not $lp.started) {"):]
+        leg = leg[:leg.index("                    break\n                }")]
+        self.assertLess(leg.index("if ($lp.reason -ceq 'KILLED_AT_START') {"), leg.index("$b.legsAttempted--"), "a child that was started is decided before the leg is un-counted")
+        started = leg[:leg.index("$inFlightLeg = $null; $b.legsAttempted--")]
+        self.assertNotIn("legsAttempted--", started)
+        self.assertNotIn("$pending.Add", started)
+        self.assertNotIn("no leg launched", started)
+        self.assertIn("Add-Result $leg 'LEG_FAILED' $row", started, "a started-and-killed leg has a result row, confirmed or not (never NOT_RUN)")
+        self.assertEqual(len(re.findall(r"if \(\$(?:bp|fp)\.late\) \{ return '[A-Z_]+', [^\n]*\$\(Get-UnconfirmedKillText \$(?:bp|fp)\)", code)), 3, "r6 fix A5: a late answer whose child was also killed unconfirmed says so, at all three preflights")
+        chain = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = chain[chain.index("function Invoke-VenueBoundedProcess"):chain.index("function Get-VenueDriverScriptMissing")]
+        self.assertNotRegex(body, r"\$EndSec - \$Clock\.Elapsed\.TotalSeconds\) -(?:lt|le) ", "r6 fix A4: every end comparison is written so that a NaN end is no room")
+        self.assertIn("-not ($waitMs -gt 0)", body)
+        self.assertIn("'KILLED_AT_START'", body)
+        self.assertNotRegex(body, r"\$lateStart\) \{ 'DEADLINE' \}")
+        self.assertIn("childPid = $p.Id", body)
+
+    # G6 (improvement): a probe that is not started for lack of room (under 1 s) used to leave the stand-in accepted on the comment "every later gate refuses on the deadline". It fails closed: production-shaped, every seam refused.
+    def test_legspec_committed_r5_g6_no_room_for_the_location_probe_refuses_every_stand_in_seam(self) -> None:
+        child, pid = self._g5_found_child("g6-child.ps1")
+        for label, extra, omit, needle in (("the skip switch", (), "", self._SEAM_NEEDLE),
+                                           ("the committed-spec seam script", ("-CommittedSpecScript", str(child)), self._SKIP, "-CommittedSpecScript is an offline test seam")):
+            with self.subTest(seam=label):
+                self._reset_committed_case()
+                soon = (datetime.now(timezone.utc) + timedelta(seconds=2.5)).isoformat().replace("+00:00", "Z")
+                r = self.run_batch([self._COMMITTED_SPEC], *extra, "-DeadlineUtc", soon, *self._hermetic_receipt_root(), OMIT_DEFAULTS=omit)
+                out = r.stdout[-1200:] + r.stderr[-1200:]
+                self.assertNotEqual(r.returncode, 0, out)
+                self.assertIn(needle, r.stderr, out)
+                self.assertEqual(self.kinds(), [], "nothing claimed, leased, opened or run")
+                self.assertFalse(self.claim_path.exists(), out)
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), out)
+                self.assertFalse(pid.exists(), out)
+
+    def test_legspec_committed_r5_g6_the_probe_gate_no_longer_rests_on_a_comment_about_later_gates(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertNotIn("every later gate refuses on the deadline", text)
+        gate = text[text.index("$locationCapSec = 30.0"):text.index("if ($umRunIsReal -and $LeaseBudgetWindowSec")]
+        self.assertRegex(gate, r"else \{[^}]*\$umRunIsReal = \$true")
+
+    # adversary r2 pass 4 A2: the canonical-receipt teardown check counts only what this harness wrote, so another process's receipt in the same directory is not a false failure
+    def test_legspec_committed_r2_the_receipt_state_check_ignores_files_another_process_wrote(self) -> None:
+        base = self.case / "receipts-under-watch"
+        (base / "bachelor").mkdir(parents=True)
+        (base / "bachelor" / "parallel.json").write_text("{}\n", encoding="utf-8")
+        (base / "bachelor" / "parallel-shared-digest.json").write_text(json.dumps({"subject": {"buildManifestSha256": MANIFEST}}), encoding="utf-8")   # the digest every harness process shares
+        self.assertEqual(receipt_state_written_by_this_harness(base), {})
+        (base / "bachelor" / "ours.json").write_text(json.dumps({"subject": {"buildManifestSha256": THIS_PROCESS_MANIFEST}}), encoding="utf-8")
+        self.assertEqual(list(receipt_state_written_by_this_harness(base)), [str(Path("bachelor") / "ours.json")])
+        self.assertEqual(receipt_state_written_by_this_harness(self.case / "no-such-dir"), {})
+        # pass 6 A2: a receipt another process holds open for write (Write-DvReceipt's FileShare.None) or removes between the listing and the read is not ours and must not fail the check
+        (base / "bachelor" / "locked.json").write_text("{}\n", encoding="utf-8")
+        original = Path.read_bytes
+
+        def read_bytes_with_a_held_file(path: Path) -> bytes:
+            if path.name == "locked.json":
+                raise PermissionError("held by its writer")
+            return original(path)
+
+        with mock.patch.object(Path, "read_bytes", read_bytes_with_a_held_file):
+            self.assertEqual(list(receipt_state_written_by_this_harness(base)), [str(Path("bachelor") / "ours.json")])
+
+    def test_legspec_committed_r2_a_seam_root_that_does_not_resolve_is_the_childs_typed_refusal_not_a_synchronous_usage_stop(self) -> None:
+        self._reset_committed_case()
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecRepoRoot", str(self.case / "no-such-repo"), *self._hermetic_receipt_root())
+        self._assert_nothing_claimed_or_leased("seam root that does not exist", r)
+        self.assertIn("BATCH_USAGE COMMITTED_SPEC_PREFLIGHT_FAILED", r.stderr)
+        self.assertNotIn("is not a directory", r.stderr)
 
     def test_r8_export_a_window_the_agent_job_cap_refuses_is_refused_before_the_claim_in_every_mode(self) -> None:
         # EXPORT-VENUE-LEG-1 r8 (adversary r7 A3): maxFrames=20000 on the shipped 3.4 GB ProRes leg is a job the agent refuses (submitted timeout past 86400 s), but only the
@@ -6329,9 +7600,19 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                         "Set-Content -LiteralPath $env:FAKE_BUDGET_PID_FILE -Value $PID\n[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
         spec = self.case / "export-noroom.json"
         spec.write_text((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"), encoding="utf-8")
+        # r5 (Grok G6, forced companion): with no room for the location probe a stand-in is no longer accepted (the run is production-shaped and every offline seam, -ExportBudgetScript among them, is refused), so this
+        # case runs as a REAL run is shaped: the real um-run.ps1, no seam. It still proves the typed no-room refusal before any claim or lease; "no child was started" for a stand-in budget script is proved by
+        # test_legspec_committed_r5_g5_the_export_budget_siblings_are_bounded_by_the_same_sampled_end (a pid file) and, for the helper itself, by the source test beside it.
+        real_um_run = str(RUNNER.parent.parent / "um-run.ps1")
+
+        def real_shaped(args: list[str]) -> list[str]:
+            args[args.index("-UmRunScript") + 1] = real_um_run
+            return args
+
         for p in (self.events, self.claim_path, pid_file):
             p.unlink(missing_ok=True)
-        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=1)), FAKE_BUDGET_PID_FILE=str(pid_file))
+        args, e = self.batch_cmd([spec], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=1)), OMIT_DEFAULTS="-LeaseCooldownSec," + self._SKIP)
+        r = subprocess.run(real_shaped(args), capture_output=True, text=True, timeout=300, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         # r19 (adversary pass 22 A1): with no room left no spec read starts either, so the refusal can now come at the first read (SPEC_READ_TIMEOUT), before the budget's own
         noroom = r"BATCH_USAGE (EXPORT_BUDGET_PREFLIGHT_TIMEOUT|SPEC_READ_TIMEOUT) "
@@ -6343,7 +7624,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # lost the typed refusal and the plan form reported a generic LEG_PLAN_INVALID. The room is compared as a double first.
         for p in (self.events, self.claim_path, pid_file):
             p.unlink(missing_ok=True)
-        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", "0001-01-01T00:00:00Z", FAKE_BUDGET_PID_FILE=str(pid_file))
+        args, e = self.batch_cmd([spec], "-DeadlineUtc", "0001-01-01T00:00:00Z", OMIT_DEFAULTS="-LeaseCooldownSec," + self._SKIP)
+        r = subprocess.run(real_shaped(args), capture_output=True, text=True, timeout=300, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         # adversary pass 22 A1: a deadline long gone starts NO read (a 1 s floor read the spec anyway and refused only at the budget): the first read is the typed refusal
         self.assertIn("BATCH_USAGE SPEC_READ_TIMEOUT ", r.stderr)
@@ -6351,7 +7633,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         for p in (self.events, self.leg_args, self.claim_path):
             p.unlink(missing_ok=True)
         shutil.rmtree(self.run_dir, ignore_errors=True)
-        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-DeadlineUtc", "0001-01-01T00:00:00Z", FAKE_BUDGET_PID_FILE=str(pid_file))
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), "-DeadlineUtc", "0001-01-01T00:00:00Z", OMIT_DEFAULTS="-LeaseCooldownSec," + self._SKIP)
+        r = subprocess.run(real_shaped(args), capture_output=True, text=True, timeout=300, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         # (r19: the plan file's own bounded read refuses first with no room: LEG_PLAN_UNREADABLE, still typed and never LEG_PLAN_INVALID)
         self.assertRegex(r.stderr, r"LEG_PLAN_REFUSED reason=(EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 |SPEC_READ_TIMEOUT item=1 |LEG_PLAN_UNREADABLE )")
@@ -9631,7 +10914,7 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # adversary r5 pass 2 A2: the marker was set before the "LEG .. RUN" log line, so a throw while that line was appended recorded a leg whose child never started as
         # LEG_FAILED. It is set on the line before the child is launched, after everything that can throw without having started it.
         text = RUNNER.read_text(encoding="utf-8")
-        run_line, launch = text.index('L "LEG $($leg.name) RUN batch='), text.index("$lp = Invoke-VenueBoundedProcess -FilePath $pwshExe")
+        run_line, launch = text.index('L "LEG $($leg.name) RUN batch='), text.index("$lp = Invoke-BatchBoundedChild -FilePath $pwshExe")
         marks = [i for i in range(len(text)) if text.startswith("$inFlightLeg = $leg", i)]
         self.assertEqual(len(marks), 1, marks)
         self.assertTrue(run_line < marks[0] < launch, (run_line, marks, launch))
@@ -9767,6 +11050,7 @@ class VenueLeaseBatchReceiptRootTests(unittest.TestCase):
     _init_case = VenueLeaseBatchRunnerTests._init_case
     run_batch = VenueLeaseBatchRunnerTests.run_batch
     batch_cmd = VenueLeaseBatchRunnerTests.batch_cmd
+    offline_switch_args = VenueLeaseBatchRunnerTests.offline_switch_args   # r2: batch_cmd adds -SkipCommittedSpecPreflight through it
     kinds = VenueLeaseBatchRunnerTests.kinds
     batches = VenueLeaseBatchRunnerTests.batches
 

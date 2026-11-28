@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, cross_tree_modules, sibling_modules
+from tools.repo_hygiene.venue_orphan_fixture import grandchild_pid, kill_tree, pid_is_alive, write_orphan_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -1595,6 +1596,191 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         ok = pwsh_text(f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output hi; exit 3') -TimeoutSec 60; \"$($r.timedOut) $($r.exit) $($r.stdout.Trim())\"")
         self.assertEqual(ok, "False 3 hi")
 
+    def test_r5_bounded_process_wait_is_what_is_left_of_the_callers_sampled_end_and_nothing_starts_past_it(self) -> None:
+        """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r5 (adversary r5 pass 14 A2): the wait after Process.Start was a fresh relative -TimeoutSec, so a caller descheduled around the launch got a whole new wait
+        past the end it had sampled. -Clock/-EndSec make the wait what is left of that end; -StartBeforeUtc and an end with under 1 s left start nothing. A caller that passes none is unchanged (the tests around this one)."""
+        marker = Path(tempfile.mkdtemp(prefix="bounded-r5-")) / "started.txt"
+        lead = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        waited = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 60 -Clock $c -EndSec 4 -CleanupWaitMs 1000; "
+                           "\"$($r.timedOut) $($r.notStarted) $([int]$c.Elapsed.TotalSeconds)\"").split()
+        self.assertEqual(waited[:2], ["True", "False"], waited)
+        self.assertLessEqual(int(waited[2]), 15, f"the wait outlived the sampled end by far (a fresh 60 s bound): {waited}")
+        past = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command',\"Set-Content -LiteralPath '{marker}' -Value 1\") -TimeoutSec 60 -StartBeforeUtc ([DateTime]::UtcNow.AddSeconds(-1)); "
+                         "\"$($r.notStarted) $($r.reason) $($r.timedOut)\"")
+        self.assertEqual(past, "True DEADLINE False")
+        spent = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command',\"Set-Content -LiteralPath '{marker}' -Value 1\") -TimeoutSec 60 -Clock $c -EndSec 0.5; "
+                          "\"$($r.notStarted) $($r.reason) $($r.timedOut)\"")
+        self.assertEqual(spent, "True ROOM False")
+        self.assertFalse(marker.exists(), "a child was started although the deadline or the sampled end had passed")
+        shutil.rmtree(marker.parent, ignore_errors=True)
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        self.assertIn("($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0", body, "the wait is derived from the caller's clock AFTER the launch")
+        self.assertIn("$lateStart", body, "a child that came to life after the deadline is killed and reported notStarted")
+
+    def test_r6_bounded_process_a_child_started_after_the_deadline_is_killed_at_start_with_its_pid_and_a_failed_kill_is_unconfirmed(self) -> None:
+        """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r6 (Grok G10): a child that came to life after -StartBeforeUtc was started (Process.Start ran) and killed. It used to read notStarted with reason DEADLINE,
+        the same as a child that was never started, and its killConfirmed could be $false. It is reason KILLED_AT_START now, with childPid; a pre-start return carries no pid."""
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; "   # r7 (adversary r7 A1): the offline seams are honoured only in a process that says it is a test
+        run = (lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 60 -StartBeforeUtc ([DateTime]::UtcNow.AddSeconds(1)) -TestStartDelayMs 2000 -CleanupWaitMs 3000 "
+               "EXTRA; \"$($r.notStarted) $($r.reason) $($r.killConfirmed) $($r.timedOut) $($r.childPid -gt 0)\"; if ($r.childPid) { Stop-Process -Id $r.childPid -Force -ErrorAction SilentlyContinue }; exit 0")
+        self.assertEqual(pwsh_text(run.replace("EXTRA", "")).split(), ["True", "KILLED_AT_START", "True", "True", "True"])
+        self.assertEqual(pwsh_text(run.replace("EXTRA", "-TestKillThrows")).split(), ["True", "KILLED_AT_START", "False", "True", "True"], "a kill that threw is never confirmed, and the caller is told the child was started")
+        never = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','exit 0') -TimeoutSec 60 -StartBeforeUtc ([DateTime]::UtcNow.AddSeconds(-1)); \"$($r.notStarted) $($r.reason) [$($r.childPid)]\"")
+        self.assertEqual(never, "True DEADLINE []")
+
+    def test_r6_fix_a_child_started_with_the_sampled_end_used_up_is_killed_at_start_and_an_answer_after_that_end_is_never_accepted(self) -> None:
+        """r6 fix (adversary r6 pass 15 A1, A2). A1: the sampled-end check ran before Process.Start, so a parent descheduled between them started a child with no room left and reported it an ordinary start.
+        A2: a child that exited on its own while the parent was descheduled past the sampled end read as timedOut=$false, exit 0 (WaitForExit(0) is true for an exited child) and the answer was accepted.
+        Both are now a child that is KILLED_AT_START (lateKind ROOM) and a timedOut answer; a run deadline that passed is lateKind DEADLINE; a plain timeout carries no lateKind."""
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "   # (r7: the seams are honoured only in a process that says it is a test)
+        tail = "; \"$($r.notStarted) $($r.reason) [$($r.lateKind)] $($r.timedOut) $($r.exit) $($r.killConfirmed) $($r.childPid -gt 0)\"; if ($r.childPid) { Stop-Process -Id $r.childPid -Force -ErrorAction SilentlyContinue }; exit 0"
+        room = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 2 -Clock $c -EndSec 2 -StartBeforeUtc ([DateTime]::UtcNow.AddHours(1)) -TestStartDelayMs 3000 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(room, "True KILLED_AT_START [ROOM] True  True True", "a child started after the sampled end was used up is KILLED_AT_START with lateKind ROOM")
+        late = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 60 -StartBeforeUtc ([DateTime]::UtcNow.AddSeconds(1)) -TestStartDelayMs 2000 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(late, "True KILLED_AT_START [DEADLINE] True  True True")
+        # A2: the child exits at once; the parent is held (after Process.Start) until the sampled end is past: a finished child's answer is still late
+        answer = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 3 -TestAfterStartDelayMs 6000 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(answer, "False  [] True  False True", "an answer in hand only after the sampled end is a timeout (no exit), and a child that had exited on its own before the kill is never a confirmed kill (r10 G14: root-only)")
+        plain = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 600 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(plain, "False  [] False 0 True True", "an answer inside the sampled end is accepted")
+        # r6 fix A4 (the first pass 15 on a8b9c3ed): a NaN end passed `-lt 1`, the child started, and [int]NaN threw at the wait with no cleanup: a NaN end is no room, and nothing is started
+        marker = Path(tempfile.mkdtemp(prefix="bounded-nan-")) / "started.txt"
+        nan = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command',\"Set-Content -LiteralPath '{marker}' -Value 1\") -TimeoutSec 5 -Clock $c -EndSec ([double]::NaN) -CleanupWaitMs 1000; "
+                        "\"$($r.notStarted) $($r.reason) [$($r.childPid)]\"")
+        self.assertEqual(nan, "True ROOM []")
+        self.assertFalse(marker.exists(), "a child was started on a NaN end")
+        shutil.rmtree(marker.parent, ignore_errors=True)
+
+    def test_r7_a1_a_default_parameter_value_cannot_bind_an_offline_seam_into_a_production_child(self) -> None:
+        """r7 (adversary r7 pass 17 A1): the seams are parameters, and $PSDefaultParameterValues (a profile, a wrapper) binds a parameter the caller never typed, indistinguishably from one it typed. A caller that
+        passes none of them (Invoke-VenueChain.ps1 passes none; the batch passed three of the four) inherited a ten-minute hold or a failing kill in a PRODUCTION child. The seams are inert unless the process says
+        it is an offline test (MLV_VENUE_BOUNDED_TEST_SEAMS=1); the same entries still work when it does."""
+        defaults = ("$PSDefaultParameterValues['Invoke-VenueBoundedProcess:TestStartDelayMs'] = 4000; $PSDefaultParameterValues['Invoke-VenueBoundedProcess:TestAfterStartDelayMs'] = 4000; "
+                    "$PSDefaultParameterValues['Invoke-VenueBoundedProcess:TestBeforeWaitDelayMs'] = 4000; $PSDefaultParameterValues['Invoke-VenueBoundedProcess:TestBeforeDrainDelayMs'] = 4000; $PSDefaultParameterValues['Invoke-VenueBoundedProcess:TestKillThrows'] = $true; ")
+        fast = f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 8 -CleanupWaitMs 3000; \"$($r.notStarted) $($r.timedOut) [$($r.exit)] $($r.killConfirmed)\""
+        hang = f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs 3000; \"$($r.timedOut) $($r.killConfirmed)\"; if ($r.childPid) {{ Stop-Process -Id $r.childPid -Force -ErrorAction SilentlyContinue }}; exit 0"
+        clean =f"Remove-Item Env:MLV_VENUE_BOUNDED_TEST_SEAMS -ErrorAction SilentlyContinue; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); " + defaults
+        self.assertEqual(pwsh_text(clean + fast), "False False [0] True", "an injected delay held a production child past the sampled end")
+        self.assertEqual(pwsh_text(clean + hang), "True True", "an injected failing kill read as an unconfirmed kill in a production child")
+        seams_on = "$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; " + clean[clean.index("Import-Module"):]
+        self.assertEqual(pwsh_text(seams_on + fast), "False True [] False", "with the offline switch the very same entries do hold the child past its end (the seams still work)")
+        self.assertEqual(pwsh_text(seams_on + hang), "True False", "with the offline switch the failing kill is honoured")
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        self.assertIn("if ($env:MLV_VENUE_BOUNDED_TEST_SEAMS -cne '1') { $TestStartDelayMs = 0; $TestKillThrows = [switch]::new($false); $TestAfterStartDelayMs = 0; $TestBeforeWaitDelayMs = 0; $TestBeforeDrainDelayMs = 0 }", body)
+        batch = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertIn("$env:MLV_VENUE_BOUNDED_TEST_SEAMS = $(if ($BoundedChildStartDelaySec -gt 0 -or $BoundedChildKillFails) { '1' } else { $null })", batch, "the batch sets the switch only for its own offline seams, and clears one it inherited")
+
+    def test_r7_a2_an_answer_the_parent_observes_after_the_sampled_end_is_a_timeout_even_when_the_child_had_already_exited(self) -> None:
+        """r7 (adversary r7 pass 17 A2): the r6 fix covered a parent descheduled BEFORE the wait is computed. One descheduled AFTER it (the wait is still positive) and before WaitForExit began got true from
+        WaitForExit for a child that had already exited, so timedOut=$false and exit 0 survived past the sampled end. The end is asked again once the wait returns."""
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        tail = "; \"$($r.notStarted) $($r.timedOut) [$($r.exit)] $($r.killConfirmed) [$($r.stdout.Trim())]\"; exit 0"
+        late = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 4 -TestBeforeWaitDelayMs 6000 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(late, "False True [] False [answer]", "a child that exited before the parent got to wait, observed after the sampled end, is a timeout with no exit code and no confirmed kill (r10 G14: root-only)")
+        inside = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 600 -TestBeforeWaitDelayMs 1000 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(inside, "False False [0] True [answer]", "an answer inside the sampled end is accepted")
+        none = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(none, "False False [0] True [answer]", "a caller with no clock is unchanged")
+
+    def test_r8_a1_a_wait_begun_after_a_pause_is_sized_from_what_is_left_of_the_end_at_that_moment(self) -> None:
+        """r8 (adversary r8 pass 18 A1): the wait was sized ONCE, then the parent paused (the offline seam stands in for a descheduled parent) and WaitForExit began with that stale size, so a child still running at the
+        sampled end was not killed until the stale wait ran out (EndSec 4, a 6 s pause, a 3.75 s wait: killed at about 10 s). The wait with a clock is taken in short slices, each sized from the end AT THAT MOMENT."""
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        tail = "; \"$($r.timedOut) [$($r.exit)] $($r.killConfirmed) $([int][Math]::Floor($c.Elapsed.TotalSeconds))\"; exit 0"
+        paused = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 60 -Clock $c -EndSec 4 -TestBeforeWaitDelayMs 6000 -CleanupWaitMs 3000" + tail).split()
+        self.assertEqual(paused[:3], ["True", "[]", "True"], paused)
+        self.assertLess(int(paused[3]), 9, "a child still running at the sampled end was held on past it by a wait sized before the pause: " + " ".join(paused))
+        plain = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 60 -Clock $c -EndSec 3 -CleanupWaitMs 3000" + tail).split()
+        self.assertEqual(plain[:3], ["True", "[]", "True"], plain)
+        self.assertLess(int(plain[3]), 7, "a plain run is still killed at the sampled end: " + " ".join(plain))
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        self.assertIn("[Math]::Min(250.0, $leftMs)", body, "the wait with a clock is taken in slices sized from the clock")
+
+    def test_r8_a2_an_answer_still_being_drained_when_the_sampled_end_passes_is_a_timeout_and_its_tree_is_killed(self) -> None:
+        """r8 (adversary r8 pass 18 A2, module sibling): the child exited on its own inside its end but a descendant held its stdout, and draining the streams (up to -CleanupWaitMs) ran past the end: the answer was accepted
+        (timedOut false, exit 0) after the sampled end. The drain is bounded by the end too, and an answer in hand only after it is a timeout whose tree is killed."""
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        tail = "; \"$($r.notStarted) $($r.timedOut) [$($r.exit)] $($r.killConfirmed) $([int][Math]::Floor($c.Elapsed.TotalSeconds))\"; exit 0"
+        held = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Process -FilePath pwsh -ArgumentList ''-NoProfile'',''-Command'',''Start-Sleep 10'' -NoNewWindow; Write-Output hi') -TimeoutSec 60 -Clock $c -EndSec 3 -CleanupWaitMs 15000" + tail).split()
+        self.assertEqual(held[:4], ["False", "True", "[]", "False"], held)   # (r10 G14: the root had exited, a descendant held the stdout: root-only, never confirmed)
+        self.assertLess(int(held[4]), 7, "the stream drain ran on past the sampled end: " + " ".join(held))
+
+    def test_r8_a3_a_timeout_after_the_root_exited_still_kills_its_descendants_and_never_confirms_a_kill_it_did_not_make(self) -> None:
+        """r8 (adversary r8 pass 18 A3): a root that exited on its own before the sampled end passed was never killed (the kill was skipped for an exited root) and killConfirmed read HasExited, so a descendant that outlived it
+        ran on while the kill was reported confirmed. The tree is always killed on a timeout (Kill($true) of an exited root takes its surviving descendants, measured), and the confirmation needs that kill to have run."""
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        run = (lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Process -FilePath pwsh -ArgumentList ''-NoProfile'',''-Command'',''Start-Sleep 60'' -NoNewWindow; exit 0') "
+               "-TimeoutSec 60 -Clock $c -EndSec 3 -TestAfterStartDelayMs 6000 -CleanupWaitMs 1000; "
+               "$kids = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$($r.childPid)\" | Where-Object { $_.Name -like 'pwsh*' }); "
+               "\"$($r.timedOut) $($r.killConfirmed) kids=$($kids.Count)\"; $kids | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; exit 0")
+        self.assertEqual(pwsh_text(run), "True False kids=0", "a descendant of a root that had already exited survived a timeout, or the kill of an exited root was reported confirmed (r10 G14: root-only is never confirmed)")
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        self.assertNotIn("elseif (-not $p.HasExited) { try { $p.Kill($true) }", body, "the tree kill is no longer skipped for a root that already exited")
+
+    def test_r9_a1_a_stream_drain_begun_after_a_pause_is_sized_from_what_is_left_of_the_end_at_that_moment_and_its_tree_is_killed(self) -> None:
+        """r9 (adversary r9 pass 19 A1): the drain of a child that answered inside its end was sized ONCE (what was left of the end and of -CleanupWaitMs when it was sampled), then the parent paused (the offline
+        seam -TestBeforeDrainDelayMs stands in for a descheduled parent) and Task.Wait began with that stale size: a descendant that held the stdout kept the run alive until the stale wait ran out (EndSec 8, the root
+        out at about 2 s, a 10 s pause, a 6 s stale wait: back at about 18 s). The drain is taken in short slices, each sized from the clock at that moment, and what it leaves is a timeout whose tree is killed."""
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        run = (lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Process -FilePath pwsh -ArgumentList ''-NoProfile'',''-Command'',''Start-Sleep 60'' -NoNewWindow; Write-Output hi') "
+               "-TimeoutSec 60 -Clock $c -EndSec 8 -TestBeforeDrainDelayMs 10000 -CleanupWaitMs 15000; $sec = [int][Math]::Floor($c.Elapsed.TotalSeconds); "
+               "$kids = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$($r.childPid)\" | Where-Object { $_.Name -like 'pwsh*' }); "
+               "\"$($r.timedOut) [$($r.exit)] $($r.killConfirmed) $sec kids=$($kids.Count)\"; $kids | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; exit 0")
+        got = pwsh_text(run).split()
+        self.assertEqual([got[0], got[1], got[2], got[4]], ["True", "[]", "False", "kids=0"], got)   # (r10 G14: the root had exited before the kill: root-only, never confirmed)
+        self.assertLess(int(got[3]), 16, "the stream drain was held on past the sampled end by a wait sized before the pause: " + " ".join(got))
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        self.assertNotIn("[void]$outTask.Wait((& $drainMs))", body, "the drain is no longer one wait sized before it begins")
+        self.assertIn("$TestBeforeDrainDelayMs = 0 }", body, "the new seam is inert outside an offline test (the r7 A1 guard resets it too)")
+
+    def test_r9_sweep_every_timeout_site_of_the_bounded_process_kills_the_tree_of_a_descendant(self) -> None:
+        """r9 (Grok G13 prevention): a rule that says "a timeout always kills the tree" is checked at EVERY place a timeout is set, one test each. The module has one kill (`if ($timedOut) { ... Kill($true) }`) that every
+        site reaches: the wait that expires on a running root, an answer observed after the sampled end (the root had exited, a descendant had not), and the drain (r9 A1 above; the late start is r8 A3). Each leaves no descendant."""
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        kids = ("$kids = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$($r.childPid)\" | Where-Object { $_.Name -like 'pwsh*' }); "
+                "\"$($r.timedOut) [$($r.exit)] $($r.killConfirmed) kids=$($kids.Count)\"; $kids | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; exit 0")
+        spawn = "Start-Process -FilePath pwsh -ArgumentList ''-NoProfile'',''-Command'',''Start-Sleep 60'' -NoNewWindow; "
+        expired = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','{spawn}Start-Sleep 60') -TimeoutSec 4 -Clock $c -EndSec 600 -CleanupWaitMs 3000; " + kids)
+        self.assertEqual(expired, "True [] True kids=0", "the wait that expired on a running root left a descendant")
+        after_end = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','{spawn}exit 0') -TimeoutSec 60 -Clock $c -EndSec 4 -TestBeforeWaitDelayMs 6000 -CleanupWaitMs 3000; " + kids)
+        self.assertEqual(after_end, "True [] False kids=0", "an answer observed after the sampled end left a descendant of the exited root, or its kill was reported confirmed (r10 G14: root-only)")
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+        self.assertEqual(len(re.findall(r"if \(\$timedOut\) \{ if \(\$TestKillThrows\)", code)), 1, "there is exactly one kill, behind every site")
+        kill_at = code.index("if ($timedOut) { if ($TestKillThrows)")
+        for m in re.finditer(r"\$timedOut = \$true", code):
+            self.assertLess(m.start(), kill_at, "a site sets $timedOut after the one kill: it would time out without killing")
+
+    def test_r10_g14_a_kill_after_the_root_and_its_intermediate_parent_exited_is_root_only_and_never_confirmed(self) -> None:
+        """r10 (Grok G14 = adversary r9 pass 20/21 A1): a timeout whose ROOT had already exited was reported killConfirmed from the root's HasExited, so a grandchild whose parent exited first (the chain Kill($true) walks
+        is gone) ran on under a confirmed kill. Whether the root was gone is read BEFORE the kill: that kill is killScope 'root-only' and never confirmed; a kill of a running root is 'tree'; no timeout is 'none'.
+        The fixture (tools/repo_hygiene/venue_orphan_fixture.py) is the one the batch test uses too: root exited, intermediate exited, grandchild orphaned and alive."""
+        d = Path(tempfile.mkdtemp(prefix="orphan-chain-"))
+        pid_file = d / "grandchild.pid"
+        root = write_orphan_fixture(d, pid_file)
+        self.addCleanup(shutil.rmtree, d, True)
+        self.addCleanup(lambda: pid_file.exists() and kill_tree(grandchild_pid(pid_file)))
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        tail = "; \"$($r.timedOut) [$($r.exit)] $($r.killConfirmed) $($r.killScope)\"; exit 0"
+        orphan = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-File','{root}') -TimeoutSec 60 -Clock $c -EndSec 3 -TestAfterStartDelayMs 20000 -CleanupWaitMs 3000" + tail)
+        self.assertTrue(pid_file.exists(), "the fixture's grandchild never started: the test proves nothing")
+        self.assertTrue(pid_is_alive(grandchild_pid(pid_file)), "the fixture's grandchild is gone, so the case under test (an orphan alive after the kill) was not built")
+        self.assertEqual(orphan, "True [] False root-only", "a kill after the root and its intermediate parent exited was confirmed from the root alone, with an orphaned grandchild alive")
+        running = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(running, "True [] True tree", "a kill of a root that was still running is a checked tree kill")
+        plain = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','exit 0') -TimeoutSec 60" + tail)
+        self.assertEqual(plain, "False [0] True none", "no timeout is no kill")
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+        self.assertLess(code.index("$rootExitedBeforeKill = ($timedOut -and [bool]$p.HasExited)"), code.index("$p.Kill($true)"), "the root's state is read before the kill, never after it")
+
     def test_r11_bounded_process_cleanup_waits_share_one_budget_and_a_failed_tree_kill_is_never_confirmed(self) -> None:
         """EXPORT-VENUE-LEG-1 r11 (adversary r11 A5, A6). A6: after the bound, the kill wait and both stream waits shared 3 x 15 s past a caller's deadline; a grandchild that outlives its parent
         and holds the inherited stdout (Start-Process -NoNewWindow, 40 s) now costs the ONE -CleanupWaitMs budget, not 15 s per wait. A5: a tree kill that threw is never `killConfirmed`
@@ -1612,7 +1798,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
         self.assertIn("try { $p.Kill($true) } catch { $killErrored = $true }", body, "a tree kill that threw is recorded, not swallowed")
-        self.assertIn("killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })", body)
+        self.assertIn("killConfirmed = $(if ($timedOut) { (-not $killErrored) -and (-not $rootExitedBeforeKill) -and [bool]$p.HasExited } else { $true })", body)
 
     def test_staged_manifest_states(self) -> None:
         q = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Get-VenueStagedBuildManifest -AgentShare '{{}}' -SourceCommit '{SHA}' -TimeoutSec 20; \"$($r.state) $($r.sha256)\""
