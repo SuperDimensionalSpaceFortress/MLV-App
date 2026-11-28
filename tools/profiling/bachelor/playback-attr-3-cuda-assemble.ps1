@@ -257,7 +257,12 @@ $StepLog['qmake'] = 0
 # alias key, or a script-block default that empties the table while it binds) could supply one past any check made here (adversary
 # 9b7006d5-A1 and 84f4e8af-A1 sibling). No caller in the repo passed one.
 . (Join-Path $PSScriptRoot '..\..\coordination\build-guard.ps1') -Library
-$guardOptions = @{}
+# VENUE-STAGE-HEAVY-SLOT-RESERVE-FOR-VENUE-CHAINS-1: this assemble is a short exclusive job that waited 23-83 min behind 30 min shared pytest
+# batches, so it asks heavy-slot for --class exclusive-short (C:\ProgramData\HeavySlot\bin\README.md:103-109): admitted at the next job
+# boundary ahead of shared tickets younger than 60 min, never preempting. The eta is 12 min = ceil(8.39) + 3, from the 40 newest mlv:hub:build
+# holds in the heavy-slot ledger (median 1.19 min, max 8.39 min; .scratch/hold-measure.md); heavy-slot promotes only an eta of 15 min or less
+# and demotes the key mlv:venue-stage for good after a unit that runs past 15 min, so do not raise it past 15.
+$guardOptions = @{ HeavySlotClass = 'exclusive-short'; HeavySlotEtaMinutes = 12 }
 Invoke-BuildGuard -Label "attr3-assemble:$($names.shortSha)" -RequestedJobs $MakeJobs -Options $guardOptions -Action {
     param($Jobs)
     $script:MakeJobs = $Jobs

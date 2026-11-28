@@ -145,6 +145,26 @@ class AssemblerRequiresHeavySlotDeadlineTests(unittest.TestCase):
             self.assertIn(later, text, later)
             self.assertLess(check, text.index(later), f"the refusal must come before: {later}")
 
+    def test_the_assembler_asks_heavy_slot_for_exclusive_short_with_a_promotable_eta_and_no_other_caller_does(self) -> None:
+        # VENUE-STAGE-HEAVY-SLOT-RESERVE-FOR-VENUE-CHAINS-1: the stage assemble waited 23-83 min behind 30 min shared pytest batches while holding
+        # the slot 5 s - 6.6 min. heavy-slot promotes `--class exclusive-short` only with an eta of 15 min or less (C:\ProgramData\HeavySlot\bin\README.md:103-109),
+        # so the assembler's options must carry both. The eta is 12 min = ceil(8.39) + 3 from the 40 newest mlv:hub:build holds (median 1.19, max 8.39).
+        text = ASSEMBLER.read_text(encoding="utf-8")
+        found = re.findall(r"^\$guardOptions\s*=\s*@\{(.*)\}\s*$", text, re.M)
+        self.assertEqual(len(found), 1, "exactly one $guardOptions table in the assembler")
+        self.assertRegex(found[0], r"HeavySlotClass\s*=\s*'exclusive-short'")
+        eta = re.search(r"HeavySlotEtaMinutes\s*=\s*(\d+(?:\.\d+)?)\b", found[0])
+        self.assertIsNotNone(eta, "an exclusive-short ticket needs its own eta (the guard's 20 min default is not promotable)")
+        self.assertTrue(0 < float(eta.group(1)) <= 15, f"eta {eta.group(1)} is outside heavy-slot's promotion limit of 15 min")
+        self.assertIn("Invoke-BuildGuard -Label \"attr3-assemble:", text)
+        self.assertIn("-Options $guardOptions", text)
+        # Touch no other assembler or caller: nothing else in tools/ names the option (build-guard.ps1 defines it).
+        allowed = {ASSEMBLER.resolve(), (ROOT / "tools" / "coordination" / "build-guard.ps1").resolve()}
+        others = sorted(
+            str(p.relative_to(ROOT)) for pattern in ("*.ps1", "*.psm1") for p in (ROOT / "tools").rglob(pattern)
+            if p.resolve() not in allowed and "HeavySlotClass" in p.read_text(encoding="utf-8", errors="replace"))
+        self.assertEqual(others, [], "only the venue stage assembler asks for exclusive-short")
+
     # The r1 test here (test_the_tracked_chain_and_nightly_still_hand_the_assembler_a_deadline) matched two regexes against the callers' TEXT. It is
     # replaced, not kept beside: the callers are now read from the PowerShell syntax tree (test_stage_chain_deadline_boundaries.
     # TrackedAssemblerCallerAstTests, with widening mutations) and the chain's hand-over is observed at run time (StageChainPropagationTests).
