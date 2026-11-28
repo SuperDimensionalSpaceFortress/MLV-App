@@ -364,3 +364,62 @@ TEST(Debayered16HonourScaleWiring, SaveRestoreCoversEveryRecordTheResetClears)
     ASSERT_TRUE(macro.contains(QStringLiteral(", g_llrawproc_last_pre_dualiso_fix_ms)")));
     ASSERT_TRUE(macro.contains(QStringLiteral(", g_llrawproc_last_pre_dualiso_fix_completed)")));
 }
+
+// CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: getMlvLastDebayeredFrameMilliseconds() and the debayer-stage getters are the
+// render thread's LAST recording entry. drawFrame's OutputDebayered16 branch reaches one (renderDebayered16FromSlot) only
+// when its GPU branch (GPU AMaZE, GPU bilinear, or the bilinear's own CPU fallback) did not render the frame, so a frame
+// that branch rendered reported the previous CPU frame's debayered_frame_ms (a warm-up's, say). drawFrame clears the
+// debayer-stage records before that branch, times the bilinear's CPU fallback itself, and reads the debayered-frame
+// record only through debayered16DrawDebayeredFrameMs (pipeline-tested), for both debayered_frame_ms and the exclusive split.
+TEST(Debayered16HonourScaleWiring, DrawFrameReportsADebayeredFrameOnlyFromThisDrawsOwnDebayer)
+{
+    const QString source = readRepoFile(QStringLiteral("platform/qt/RenderFrameThread.cpp"));
+    ASSERT_EQ(1, source.count(QStringLiteral("getMlvLastDebayeredFrameMilliseconds()")));
+    const int drawAt = source.indexOf(QStringLiteral("void RenderFrameThread::drawFrame( int slotIndex,"));
+    ASSERT_TRUE(drawAt >= 0);
+    const QString body = source.mid(drawAt);
+    const int flagDeclAt = body.indexOf(QStringLiteral("bool debayered16CpuEntryRan = true;"));
+    const int fallbackDeclAt = body.indexOf(QStringLiteral("double debayered16GpuBranchCpuDebayerMs = 0.0;"));
+    const int branchAt = body.indexOf(QStringLiteral(
+        "else if ( outputMode == OutputDebayered16 && !slot.rawImage16.empty() )\n"
+        "    {\n"));
+    const int resetAt = body.indexOf(QStringLiteral("resetMlvLastDebayerStageMilliseconds();"), branchAt);
+    const int gpuAt = body.indexOf(QStringLiteral("if ( useGpuAmazeDebayer && m_pMlvObject )"), branchAt);
+    const int bilinearStartAt = body.indexOf(QStringLiteral("const double gpuBilinearFrameStart = mlv_stage_timing_now();"), gpuAt);
+    const int bilinearReadAt = body.indexOf(QStringLiteral("m_gpuBilinearDebayerRawFrame.data() );"), gpuAt);
+    const int cpuFallbackAt = body.indexOf(QStringLiteral("debayerBasic( slot.rawImage16.data(),"), gpuAt);
+    const int cpuFallbackMsAt = body.indexOf(QStringLiteral(
+        "debayered16GpuBranchCpuDebayerMs = ( mlv_stage_timing_now() - gpuBilinearFrameStart ) * 1000.0;"), gpuAt);
+    const int flagAt = body.indexOf(QStringLiteral("debayered16CpuEntryRan = !renderedDebayeredFrame;"), gpuAt);
+    const int cpuBranchAt = body.indexOf(QStringLiteral("if ( !renderedDebayeredFrame )"), gpuAt);
+    const int dispatchAt = body.indexOf(QStringLiteral("renderDebayered16FromSlot("), gpuAt);
+    ASSERT_TRUE(flagDeclAt >= 0);
+    ASSERT_TRUE(fallbackDeclAt > flagDeclAt);
+    ASSERT_TRUE(branchAt > fallbackDeclAt);
+    ASSERT_TRUE(resetAt > branchAt);
+    ASSERT_TRUE(gpuAt > resetAt);
+    ASSERT_TRUE(bilinearStartAt > gpuAt);
+    ASSERT_TRUE(bilinearReadAt > bilinearStartAt);
+    ASSERT_TRUE(cpuFallbackAt > bilinearReadAt);
+    ASSERT_TRUE(cpuFallbackMsAt > cpuFallbackAt);
+    ASSERT_TRUE(flagAt > cpuFallbackMsAt);
+    ASSERT_TRUE(cpuBranchAt > flagAt);
+    ASSERT_TRUE(dispatchAt > cpuBranchAt);
+    ASSERT_EQ(1, body.count(QStringLiteral("debayered16CpuEntryRan = ")));
+    ASSERT_EQ(1, body.count(QStringLiteral("debayered16GpuBranchCpuDebayerMs = (")));
+    const int readAt = body.indexOf(QStringLiteral(
+        "const double debayeredFrameMs =\n"
+        "        debayered16DrawDebayeredFrameMs( debayered16CpuEntryRan,\n"
+        "                                         getMlvLastDebayeredFrameMilliseconds(),\n"
+        "                                         debayered16GpuBranchCpuDebayerMs );"));
+    const int exclusiveAt = body.indexOf(QStringLiteral(
+        "const double debayerExclusiveMs = qMax( 0.0,\n"
+        "                                            debayeredFrameMs\n"
+        "                                                - renderThreadRawUint16Ms"));
+    const int insertAt = body.indexOf(QStringLiteral(
+        "slot.stageTimingTelemetry.insert( QStringLiteral(\"debayered_frame_ms\"),\n"
+        "                                      debayeredFrameMs );"));
+    ASSERT_TRUE(readAt > dispatchAt);
+    ASSERT_TRUE(exclusiveAt > readAt);
+    ASSERT_TRUE(insertAt > exclusiveAt);
+}

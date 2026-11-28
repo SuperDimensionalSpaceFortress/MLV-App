@@ -57,6 +57,7 @@
 
 extern "C" {
 #include "../../src/debayer/debayer.h"
+#include "../../src/debug/StageTiming.h"
 int debayerBasicU16ReinitDispatchForTesting(void);
 }
 
@@ -1583,6 +1584,57 @@ TEST(Debayered16ReconReuse, HonourScaleDebayered16EntriesRecordTheirOwnDebayered
         }, &r));
         expectOwnRecords("inline getMlvRawFrameDebayered", r);
     }
+}
+
+// CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: the render's OutputDebayered16 CPU branch (renderDebayered16FromSlot, the call
+// RenderFrameThread::drawFrame makes) after a heavy debayer on the same thread reports a debayered-frame total no greater
+// than the wall time of its own call, and 0 when it ran no debayer (the second call is served by the current-frame copy).
+TEST(Debayered16ReconReuse, Debayered16CpuBranchAfterAHeavyDebayerReportsNoMoreThanItsOwnWork)
+{
+    EnvGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    const size_t n = fullPixels(fixture);
+    std::vector<uint16_t> slot(n * 3u, 0u);
+    std::vector<float> scratch;
+    ASSERT_TRUE(poisonFrameAndProcessingRecords(fixture));
+    const double poisonMs = getMlvLastDebayeredFrameMilliseconds();
+    resetMlvCachedFrame(fixture.video());
+    const double renderStart = mlv_stage_timing_now();
+    const Debayered16ReconRefusal outcome =
+        renderDebayered16FromSlot(fixture.video(), 2, Debayered16ReconReuseInputs(), slot.data(), n, scratch, nullptr);
+    const double renderMs = (mlv_stage_timing_now() - renderStart) * 1000.0;
+    const double ownMs = getMlvLastDebayeredFrameMilliseconds();
+    const double servedStart = mlv_stage_timing_now();
+    renderDebayered16FromSlot(fixture.video(), 2, Debayered16ReconReuseInputs(), slot.data(), n, scratch, nullptr);
+    const double servedRenderMs = (mlv_stage_timing_now() - servedStart) * 1000.0;
+    const double servedMs = getMlvLastDebayeredFrameMilliseconds();
+    std::printf("[debayered16-stale-residue] poison=%.4f outcome=%s render=%.4f own=%.4f served_render=%.4f served=%.4f\n",
+                poisonMs, debayered16ReconRefusalName(outcome), renderMs, ownMs, servedRenderMs, servedMs);
+    ASSERT_TRUE(poisonMs > 0.0);
+    ASSERT_TRUE(outcome == Debayered16ReconRefusal::NotReconned);
+    ASSERT_TRUE(ownMs <= renderMs);
+    ASSERT_TRUE(servedMs == 0.0);
+}
+
+// CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: getMlvRawFrameDebayered refusing a frame it cannot render (an index past the
+// clip) runs no debayer, so it must not leave the thread's previous debayered-frame and processing records behind.
+TEST(Debayered16ReconReuse, InlineDebayerRefusingAFrameLeavesNoStaleDebayeredFrameRecord)
+{
+    EnvGuard guard;
+    MlvPipelineFixture fixture;
+    ASSERT_TRUE(openLargeHq(fixture));
+    std::vector<uint16_t> rgb16(fullPixels(fixture) * 3u, 0u);
+    ASSERT_TRUE(poisonFrameAndProcessingRecords(fixture));
+    const double poisonMs = getMlvLastDebayeredFrameMilliseconds();
+    getMlvRawFrameDebayered(fixture.video(), getMlvFrames(fixture.video()), rgb16.data());
+    const double frameMs = getMlvLastDebayeredFrameMilliseconds();
+    const double processingMs = getMlvLastProcessingMilliseconds();
+    std::printf("[debayered16-stale-residue] refused index: poison=%.4f -> frame=%.4f processing=%.4f\n",
+                poisonMs, frameMs, processingMs);
+    ASSERT_TRUE(poisonMs > 0.0);
+    ASSERT_TRUE(frameMs == 0.0);
+    ASSERT_TRUE(processingMs == 0.0);
 }
 
 // The prep's reduced-source config: only a SourceAlreadyReduced decision at x2/x4 whose
