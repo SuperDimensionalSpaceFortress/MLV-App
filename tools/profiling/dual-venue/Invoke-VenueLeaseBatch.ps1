@@ -309,7 +309,54 @@ $realUmRun = [IO.Path]::GetFullPath((Join-Path $here '..\um-run.ps1'))
 function Get-NormalisedFileSha256([string]$Path) { Get-DvLegSpecSha256 ([IO.File]::ReadAllBytes($Path)) }
 # (pass 5 A1: the path is the one PowerShell resolved, the one Test-Path above accepted: a RELATIVE -UmRunScript is relative to PowerShell's location, which Set-Location moves and .NET's current directory does not)
 $umRunFull = (Resolve-Path -LiteralPath $UmRunScript).ProviderPath
+# r3 (adversary r2 pass 6 A1, the 4th run of one class: raw bytes -> line-ending-normalised hash -> BOM -> ...; r3 pass 7 A2: the same BOM defeated every other seam): ANY byte test of "is this the real
+# um-run" is defeated by one more byte-level change, so the bytes are no longer the last word. A run is production-shaped ("real") unless BOTH stand-ins are stand-ins by LOCATION: each resolves (the path
+# PowerShell resolved, every link on the way followed) to a directory outside every git work tree, found by a .git entry on the way up AND by git itself (rev-parse --is-inside-work-tree, through the module's
+# hardened Invoke-DvGit, with the discovery variables that steer git scrubbed: pass 7 A1). A production-shaped checkout is a work tree whatever its bytes are; a git that cannot answer is "not shown to be outside"
+# (fail CLOSED), never "outside". Returns '' when every file is outside, else the reason.
+function Get-OfflineSeamLocationRefusal([string[]]$Files) {
+    $dirs = [Collections.Generic.List[string]]::new()
+    try {
+        foreach ($f in $Files) {
+            $cur = [IO.Path]::GetFullPath($f)
+            $dirs.Add([IO.Path]::GetDirectoryName($cur))
+            while ($cur) {
+                if (Test-Path -LiteralPath (Join-Path $cur '.git')) { return "'$cur' holds a .git entry, so '$f' is inside a git work tree" }
+                $item = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+                if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    $final = $item.ResolveLinkTarget($true)   # the link's last target: a junction or symlink into a work tree is a place in that work tree
+                    if ($null -ne $final) { $dirs.Add($(if ($final -is [IO.DirectoryInfo]) { $final.FullName } else { $final.DirectoryName })) }
+                }
+                $cur = [IO.Path]::GetDirectoryName($cur)   # $null at a root: the loop ends
+            }
+        }
+    } catch { return "its location could not be resolved ($($_.Exception.Message -replace '\s+', ' '))" }
+    $module = Get-Module DualVenueRunner
+    # git's own discovery is steerable by the environment: a ceiling makes it answer "not a git repository" inside a checkout, and without the cross-filesystem switch it stops at a mount point; its English text is read below
+    $saved = @{}
+    foreach ($name in 'GIT_CEILING_DIRECTORIES', 'GIT_DISCOVERY_ACROSS_FILESYSTEM', 'LC_ALL') { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
+    [Environment]::SetEnvironmentVariable('GIT_CEILING_DIRECTORIES', $null)
+    [Environment]::SetEnvironmentVariable('GIT_DISCOVERY_ACROSS_FILESYSTEM', '1')
+    [Environment]::SetEnvironmentVariable('LC_ALL', 'C')
+    try {
+        foreach ($dir in ($dirs | Sort-Object -Unique)) {
+            # a git that does not start or return is exit -1 with a typed stderr
+            $g = & $module { param($d) Invoke-DvGit -RepoRoot $d -GitArgs @('rev-parse', '--is-inside-work-tree') } $dir
+            $said = [Text.Encoding]::UTF8.GetString([byte[]]$g.bytes).Trim()
+            if ($g.exitCode -eq 0 -and $said -ceq 'true') { return "'$dir' is inside a git work tree" }
+            if (-not ($g.exitCode -eq 128 -and [string]$g.stderr -match 'not a git repository')) {
+                return "git could not show that '$dir' is outside every git work tree (exit $($g.exitCode): $(([string]$g.stderr -replace '\s+', ' ').Trim()))"
+            }
+        }
+    } finally { foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) } }
+    ''
+}
 $umRunIsReal = ($umRunFull -ieq $realUmRun) -or ((Test-Path -LiteralPath $realUmRun -PathType Leaf) -and (Get-NormalisedFileSha256 $umRunFull) -ceq (Get-NormalisedFileSha256 $realUmRun))
+$locationRefusal = ''
+if (-not $umRunIsReal) {
+    $locationRefusal = Get-OfflineSeamLocationRefusal @($umRunFull, (Resolve-Path -LiteralPath $LegScript).ProviderPath)
+    if ($locationRefusal) { $umRunIsReal = $true }   # not shown to be a stand-in by location: production-shaped, whatever its bytes are (every seam below, the skip switch among them, is refused)
+}
 if ($umRunIsReal -and $LeaseBudgetWindowSec -lt 10800) {
     Stop-Usage "LEASE_CAP_RELAXED -LeaseBudgetWindowSec $LeaseBudgetWindowSec is looser than Bachelor's 10800 s window"
 }
@@ -358,46 +405,8 @@ $stagedBuildProbe = $(if ($StagedBuildProbeScript) { [scriptblock]::Create([IO.F
 $artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::ReadAllText($ArtifactProbeScript)) } else { $null })
 if ($umRunIsReal -and $GuardReadDelay) { Stop-Usage '-GuardReadDelay is an offline test seam: with the real um-run.ps1 the guard reads are never delayed' }
 # r2 (adversary A1): the only way to turn the committed-spec preflight off is refused with the real um-run.ps1 (last, so every older seam keeps its own message)
-if ($umRunIsReal -and $SkipCommittedSpecPreflight) { Stop-Usage '-SkipCommittedSpecPreflight is an offline test seam: with the real um-run.ps1 the committed-spec preflight is always on' }
-# r3 (adversary r2 pass 6 A1, the 4th run of one class: raw bytes -> line-ending-normalised hash -> BOM -> ...): ANY byte test of "is this the real um-run" is defeated by one more byte-level change, so the
-# switch is NOT decided by bytes. It is accepted only when BOTH stand-ins are stand-ins by LOCATION: each resolves (the path PowerShell resolved, every link on the way followed) to a directory outside every
-# git work tree. A production-shaped checkout is a work tree whatever its bytes are, so it can never take the switch; a git that cannot answer is a refusal (fail CLOSED), never "outside".
-function Get-OfflineSeamLocationRefusal([string[]]$Files) {
-    $dirs = [Collections.Generic.List[string]]::new()
-    try {
-        foreach ($f in $Files) {
-            $cur = [IO.Path]::GetFullPath($f)
-            $dirs.Add([IO.Path]::GetDirectoryName($cur))
-            while ($cur) {
-                $item = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
-                if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-                    $final = $item.ResolveLinkTarget($true)   # the link's last target: a junction or symlink into a work tree is a place in that work tree
-                    if ($null -ne $final) { $dirs.Add($(if ($final -is [IO.DirectoryInfo]) { $final.FullName } else { $final.DirectoryName })) }
-                }
-                $cur = [IO.Path]::GetDirectoryName($cur)   # $null at a root: the loop ends
-            }
-        }
-    } catch { return "its location could not be resolved ($($_.Exception.Message -replace '\s+', ' '))" }
-    $module = Get-Module DualVenueRunner
-    $savedLang = $env:LC_ALL
-    $env:LC_ALL = 'C'   # (git's "not a git repository" is read below: its English text)
-    try {
-        foreach ($dir in ($dirs | Sort-Object -Unique)) {
-            # the module's hardened git: bounded, no inherited GIT_DIR override, a git that does not start or return is exit -1 with a typed stderr
-            $g = & $module { param($d) Invoke-DvGit -RepoRoot $d -GitArgs @('rev-parse', '--is-inside-work-tree') } $dir
-            $said = [Text.Encoding]::UTF8.GetString([byte[]]$g.bytes).Trim()
-            if ($g.exitCode -eq 0 -and $said -ceq 'true') { return "'$dir' is inside a git work tree" }
-            if (-not ($g.exitCode -eq 128 -and [string]$g.stderr -match 'not a git repository')) {
-                return "git could not show that '$dir' is outside every git work tree (exit $($g.exitCode): $(([string]$g.stderr -replace '\s+', ' ').Trim()))"
-            }
-        }
-    } finally { $env:LC_ALL = $savedLang }
-    ''
-}
-if ($SkipCommittedSpecPreflight) {
-    $locationRefusal = Get-OfflineSeamLocationRefusal @($umRunFull, (Resolve-Path -LiteralPath $LegScript).ProviderPath)
-    if ($locationRefusal) { Stop-Usage "-SkipCommittedSpecPreflight is an offline test seam: it is accepted only for a stand-in -UmRunScript and -LegScript outside every git work tree (a git work tree is a checkout, and a checkout's committed-spec preflight is always on): $locationRefusal" }
-}
+if ($umRunIsReal -and $SkipCommittedSpecPreflight) { Stop-Usage ('-SkipCommittedSpecPreflight is an offline test seam: with the real um-run.ps1 the committed-spec preflight is always on' + $(if ($locationRefusal) { "; a stand-in is accepted only when -UmRunScript and -LegScript are outside every git work tree (a checkout's committed-spec preflight is always on): $locationRefusal" } else { '' })) }
+# (r3: $umRunIsReal above also covers a stand-in that is not shown to be outside every git work tree; Get-OfflineSeamLocationRefusal's reason is $locationRefusal)
 $script:guardDelaySeam = $null; $script:lastGuardSeam = $null
 if ($GuardReadDelay) {
     # r4 adversary A3: [0-9], not \d, which also matches non-ASCII decimal digits that [int] then throws on. r5: rundir delays every read of -RunDir itself, in that guard and after it

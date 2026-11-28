@@ -90,4 +90,5 @@ def offline_tmp_root() -> str | None:
     for candidate in (Path(os.environ.get("LOCALAPPDATA", "")) / "Temp", Path.home() / "AppData" / "Local" / "Temp", Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp"):
         if candidate.is_dir() and os.access(candidate, os.W_OK) and not _inside_git_work_tree(candidate.resolve()):
             return str(candidate)
-    return None
+    # (r3 pass 7 A3: never fall back to the rejected default, which would surface as every stand-in being refused by the batch's location gate)
+    raise RuntimeError(f"no temp directory outside every git work tree: the default {default} is inside one and so is every alternative; point TEMP at a directory outside any checkout")

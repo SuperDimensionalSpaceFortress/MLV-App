@@ -6223,6 +6223,59 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         args[args.index("-UmRunScript") + 1] = str(link / "fake-umrun.ps1")
         self._assert_switch_refused_by_location("stand-in reached through a junction into a work tree", args, e)
 
+    def _bom_second_checkout(self, name: str) -> tuple[Path, Path]:
+        wt = self._git_work_tree(name)
+        prof = wt / "tools" / "profiling"
+        (prof / "dual-venue").mkdir(parents=True)
+        (prof / "um-run.ps1").write_bytes(b"\xef\xbb\xbf" + (RUNNER.parent.parent / "um-run.ps1").read_bytes())
+        (prof / "dual-venue" / "Invoke-VenueLeg.ps1").write_bytes(LEG.read_bytes())
+        return wt, prof
+
+    # adversary r3 pass 7 A1: git's own discovery is steerable (GIT_CEILING_DIRECTORIES makes it answer "not a git repository" for a directory inside a checkout), so "outside" is not taken from git alone
+    def test_legspec_committed_r3_an_inherited_git_ceiling_does_not_hide_a_work_tree(self) -> None:
+        wt, prof = self._bom_second_checkout("checkout-ceiling")
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+        e = dict(e)
+        e["GIT_CEILING_DIRECTORIES"] = str(wt)
+        e["GIT_DISCOVERY_ACROSS_FILESYSTEM"] = "0"
+        args[args.index("-UmRunScript") + 1] = str(prof / "um-run.ps1")
+        args[args.index("-LegScript") + 1] = str(prof / "dual-venue" / "Invoke-VenueLeg.ps1")
+        self._assert_switch_refused_by_location("GIT_CEILING_DIRECTORIES names the checkout", args, e)
+
+    # adversary r3 pass 7 A2: the other seams this card added (-CommittedSpecScript, -CommittedSpecRepoRoot) and every older seam were refused only for a um-run classified REAL by bytes or path, and the
+    # same BOM defeats it with no switch at all. "Real" now also means: either script is in a git work tree, or git cannot say it is not.
+    def test_legspec_committed_r3_every_offline_seam_is_refused_for_a_bom_um_run_in_a_second_checkout_with_no_switch(self) -> None:
+        _wt, prof = self._bom_second_checkout("checkout-seams")
+        stand_in = self.case / "stand-in-committed.ps1"
+        stand_in.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\nWrite-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        budget = self.case / "fake-budget.ps1"
+        budget.write_text("[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        for flag, needle in ((["-CommittedSpecScript", str(stand_in)], "-CommittedSpecScript is an offline test seam"),
+                             (["-CommittedSpecRepoRoot", str(ROOT)], "-CommittedSpecRepoRoot is an offline test seam"),
+                             (["-LeaseBudgetWindowSec", "3600"], "LEASE_CAP_RELAXED"),
+                             (["-ExportBudgetScript", str(budget)], "-ExportBudgetScript is an offline test seam")):
+            with self.subTest(seam=flag[0]):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self.case / "no-such-spec.json"], *flag, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+                args[args.index("-UmRunScript") + 1] = str(prof / "um-run.ps1")
+                args[args.index("-LegScript") + 1] = str(prof / "dual-venue" / "Invoke-VenueLeg.ps1")
+                r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertIn(needle, r.stderr)
+                self.assertEqual(self.kinds(), [])
+
+    # adversary r3 pass 7 A3: a host with no temp directory outside every work tree fails loudly at setup, not as a refusal of every stand-in
+    def test_legspec_committed_r3_a_host_with_no_temp_directory_outside_a_work_tree_fails_loudly(self) -> None:
+        ws = self.case / "ws"
+        for sub in (".git", "tmp", "AppData/Local/Temp", "Windows/Temp", "home/AppData/Local/Temp"):
+            (ws / sub).mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(tempfile, "gettempdir", return_value=str(ws / "tmp")), \
+                mock.patch.dict(os.environ, {"LOCALAPPDATA": str(ws / "AppData" / "Local"), "SystemRoot": str(ws / "Windows")}), \
+                mock.patch.object(Path, "home", return_value=ws / "home"):
+            with self.assertRaises(RuntimeError):
+                offline_tmp_root()
+
     def test_legspec_committed_r3_a_git_that_cannot_answer_refuses_the_switch(self) -> None:
         # fail CLOSED: with no git on PATH the location is unknown, which is not "outside"
         self._reset_committed_case()
