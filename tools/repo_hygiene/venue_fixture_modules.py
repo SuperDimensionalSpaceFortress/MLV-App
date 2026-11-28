@@ -11,8 +11,10 @@ VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (hosted Tests run 43580040634): a module
 """
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import tempfile
 from pathlib import Path
 
 _SIBLING_IMPORT = re.compile(r"^\s*Import-Module\s+\(Join-Path\s+\$(?:PSScriptRoot|here)\s+'([^']+\.psm1)'\)", re.MULTILINE)
@@ -70,3 +72,22 @@ def copy_with_siblings(source: Path, dest_dir: Path, text: str | None = None) ->
     else:
         copy.write_text(text, encoding="utf-8")
     return copy
+
+
+def _inside_git_work_tree(path: Path) -> bool:
+    return any((p / ".git").exists() for p in [path, *path.parents])
+
+
+def offline_tmp_root() -> str | None:
+    """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r3: the `dir=` for the temp directory that holds an offline stand-in um-run / leg script.
+
+    Invoke-VenueLeaseBatch.ps1 accepts -SkipCommittedSpecPreflight only for stand-ins outside every git work tree. A lane that points TEMP into its own worktree
+    (.claude-state\\ls\\..., git-ignored but inside the work tree) would have every stand-in refused, so then the user-profile temp directory is used. None = the default
+    temp directory is already outside every work tree (hosted CI)."""
+    default = Path(tempfile.gettempdir()).resolve()
+    if not _inside_git_work_tree(default):
+        return None
+    for candidate in (Path(os.environ.get("LOCALAPPDATA", "")) / "Temp", Path.home() / "AppData" / "Local" / "Temp", Path(os.environ.get("SystemRoot", r"C:\Windows")) / "Temp"):
+        if candidate.is_dir() and os.access(candidate, os.W_OK) and not _inside_git_work_tree(candidate.resolve()):
+            return str(candidate)
+    return None

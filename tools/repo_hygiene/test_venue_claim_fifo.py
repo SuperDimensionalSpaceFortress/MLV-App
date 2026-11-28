@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.repo_hygiene import test_venue_chain_runner as base
-from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings
+from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, offline_tmp_root
 
 DV = Path(os.environ["VENUE_CLAIM_FIFO_DV_DIR"]) if os.environ.get("VENUE_CLAIM_FIFO_DV_DIR") else base.DV
 RUNNER = DV / "Invoke-VenueChain.ps1"
@@ -974,7 +974,7 @@ class VenueLeaseBatchFifoTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         from tools.repo_hygiene import test_venue_lease_batch as lease
         cls.lease = lease
-        cls.tmp = Path(tempfile.mkdtemp(prefix="venue-lease-fifo-"))
+        cls.tmp = Path(tempfile.mkdtemp(prefix="venue-lease-fifo-", dir=offline_tmp_root()))   # (r3: the stand-in um-run / leg live outside every git work tree, which -SkipCommittedSpecPreflight requires)
         for name, text in (("fake-quiet.ps1", lease.FAKE_QUIET), ("fake-umrun.ps1", lease.FAKE_UMRUN), ("fake-leg.ps1", lease.FAKE_LEG)):
             (cls.tmp / name).write_text(text, encoding="utf-8")
         cls.spec = cls.tmp / "fx-a.json"

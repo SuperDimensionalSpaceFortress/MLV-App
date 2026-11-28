@@ -40,7 +40,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules
+from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules, offline_tmp_root
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -835,7 +835,7 @@ def ps_float_validaterange_params(text: str) -> list[tuple[int, str, bool]]:
 class VenueLeaseBatchRunnerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        cls.tmp = Path(tempfile.mkdtemp(prefix="venue-lease-batch-"))
+        cls.tmp = Path(tempfile.mkdtemp(prefix="venue-lease-batch-", dir=offline_tmp_root()))   # (r3: the stand-in um-run / leg live outside every git work tree, which -SkipCommittedSpecPreflight requires)
         for name, text in (("fake-quiet.ps1", FAKE_QUIET), ("fake-umrun.ps1", FAKE_UMRUN), ("fake-leg.ps1", FAKE_LEG)):
             (cls.tmp / name).write_text(text, encoding="utf-8")
         cls.specs = []
@@ -6135,6 +6135,101 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertTrue(self.kinds(), "the batch ran its lease and legs through the relative um-run: " + r.stdout[-2500:] + r.stderr[-1500:])
         # the preflight child ran (the gate is on) and was handed the leg script PowerShell resolved
         self.assertEqual(log.read_text(encoding="utf-8").splitlines()[0].split("=", 1)[1].lower(), str(self.tmp / "fake-leg.ps1").lower())
+
+    # ---- r3 (adversary r2 pass 6 A1, the 4th run of one class: raw bytes -> line-ending-normalised hash -> BOM -> ...) ----
+    # ANY byte test of "is this the real um-run" is defeated by one more byte-level change, so -SkipCommittedSpecPreflight is no longer decided by bytes: it is accepted only when the stand-in is a
+    # stand-in by LOCATION, both -UmRunScript and -LegScript resolving to a directory outside every git work tree (git rev-parse --is-inside-work-tree), and refused when git cannot say.
+    _SEAM_NEEDLE = "-SkipCommittedSpecPreflight is an offline test seam"
+
+    def _git_work_tree(self, name: str) -> Path:
+        d = self.case / name
+        d.mkdir(parents=True)
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        subprocess.run(["git", "-C", str(d), "init", "-q"], check=True, capture_output=True, timeout=120, env=clean)
+        return d
+
+    def _assert_switch_refused_by_location(self, label: str, args: list, e: dict, needle: str = "is inside a git work tree") -> None:   # (the reason, not the refusal's own generic wording)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        self.assertEqual(r.returncode, 2, f"{label}: {r.stdout}{r.stderr}")
+        self.assertIn(self._SEAM_NEEDLE, r.stderr, label)
+        self.assertIn(needle, r.stderr, label)
+        self.assertEqual(self.kinds(), [], label)   # nothing claimed, leased, opened or run
+
+    def test_legspec_committed_r3_the_switch_is_refused_for_a_bom_copy_of_the_real_um_run_in_a_second_checkout(self) -> None:
+        # adversary r2 pass 6 A1: a complete second checkout whose um-run.ps1 is EF BB BF + the unchanged production bytes (a hash of any normalisation differs by the BOM), with its own leg script
+        wt = self._git_work_tree("checkout-bom")
+        prof = wt / "tools" / "profiling"
+        (prof / "dual-venue").mkdir(parents=True)
+        (prof / "um-run.ps1").write_bytes(b"\xef\xbb\xbf" + (RUNNER.parent.parent / "um-run.ps1").read_bytes())
+        (prof / "dual-venue" / "Invoke-VenueLeg.ps1").write_bytes(LEG.read_bytes())
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())   # (the harness adds the switch)
+        self.assertIn(self._SKIP, args)
+        args[args.index("-UmRunScript") + 1] = str(prof / "um-run.ps1")
+        args[args.index("-LegScript") + 1] = str(prof / "dual-venue" / "Invoke-VenueLeg.ps1")
+        self._assert_switch_refused_by_location("BOM um-run + leg in a second checkout", args, e)
+
+    def test_legspec_committed_r3_the_switch_is_refused_when_either_stand_in_sits_in_a_git_work_tree(self) -> None:
+        for which in ("um-run", "leg"):
+            with self.subTest(in_work_tree=which):
+                wt = self._git_work_tree(f"wt-{which}")
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+                name, flag = ("fake-umrun.ps1", "-UmRunScript") if which == "um-run" else ("fake-leg.ps1", "-LegScript")
+                (wt / name).write_bytes((self.tmp / name).read_bytes())
+                args[args.index(flag) + 1] = str(wt / name)   # the other stand-in stays in the temp directory
+                self._assert_switch_refused_by_location(f"{which} in a work tree", args, e)
+
+    def test_legspec_committed_r3_a_relative_stand_in_is_judged_where_powershell_resolves_it(self) -> None:
+        wt = self._git_work_tree("wt-relative")
+        (wt / "fake-umrun.ps1").write_bytes((self.tmp / "fake-umrun.ps1").read_bytes())
+        for location, expect_refused in ((wt, True), (self.tmp, False)):
+            with self.subTest(location="work tree" if expect_refused else "temp dir"):
+                self._reset_committed_case()
+                args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+                args[args.index("-UmRunScript") + 1] = ".\\fake-umrun.ps1"
+                runner_at = args.index("-File") + 1
+                command = f"Set-Location -LiteralPath '{psq(location)}'; & '{psq(args[runner_at])}' " + " ".join(a if re.fullmatch(r"-[A-Za-z][A-Za-z0-9]*", a) else f"'{psq(a)}'" for a in args[runner_at + 1:]) + "; exit $LASTEXITCODE"
+                r = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], capture_output=True, text=True, timeout=300, env=e, cwd=str(ROOT))
+                if expect_refused:
+                    self.assertEqual(r.returncode, 2, r.stdout[-1500:] + r.stderr[-1500:])
+                    self.assertIn(self._SEAM_NEEDLE, r.stderr)
+                    self.assertIn("is inside a git work tree", r.stderr)
+                    self.assertEqual(self.kinds(), [])
+                else:   # the control: the process directory is this git work tree (ROOT) but PowerShell's location is the temp directory, so the switch is accepted and the run completes
+                    self.assertEqual(r.returncode, 0, r.stdout[-1500:] + r.stderr[-1500:])
+                    self.assertNotIn(self._SEAM_NEEDLE, r.stderr)
+                    self.assertTrue(self.kinds(), "the batch ran")
+
+    def test_legspec_committed_r3_the_switch_is_accepted_for_stand_ins_in_a_temp_directory_outside_every_work_tree(self) -> None:
+        # the control: every offline caller is this shape
+        untracked = self._untracked_copy_of_a_committed_spec()
+        self._reset_committed_case()
+        r = self.run_batch([untracked], self._SKIP, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn(self._SEAM_NEEDLE, r.stderr)
+        self.assertTrue(self.kinds(), "the batch ran")
+
+    def test_legspec_committed_r3_a_link_into_a_git_work_tree_does_not_hide_the_location(self) -> None:
+        # a junction in the temp directory whose target is a work tree: the stand-in's spelled path is outside every work tree, the directory it lives in is not
+        wt = self._git_work_tree("wt-target")
+        (wt / "fake-umrun.ps1").write_bytes((self.tmp / "fake-umrun.ps1").read_bytes())
+        link = self.case / "junction-to-wt"
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(wt)], capture_output=True, text=True, timeout=60)
+        if made.returncode != 0:
+            self.skipTest("cannot create a directory junction here: " + made.stdout + made.stderr)
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+        args[args.index("-UmRunScript") + 1] = str(link / "fake-umrun.ps1")
+        self._assert_switch_refused_by_location("stand-in reached through a junction into a work tree", args, e)
+
+    def test_legspec_committed_r3_a_git_that_cannot_answer_refuses_the_switch(self) -> None:
+        # fail CLOSED: with no git on PATH the location is unknown, which is not "outside"
+        self._reset_committed_case()
+        args, e = self.batch_cmd([self._COMMITTED_SPEC], *self._hermetic_receipt_root())
+        e = dict(e)
+        e["PATH"] = str(Path(PWSH).parent) + os.pathsep + str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32")
+        self._assert_switch_refused_by_location("no git on PATH", args, e, needle="git could not show that")
 
     # adversary r2 pass 4 A2: the canonical-receipt teardown check counts only what this harness wrote, so another process's receipt in the same directory is not a false failure
     def test_legspec_committed_r2_the_receipt_state_check_ignores_files_another_process_wrote(self) -> None:

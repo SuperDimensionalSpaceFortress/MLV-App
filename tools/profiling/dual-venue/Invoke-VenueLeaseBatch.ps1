@@ -108,7 +108,8 @@
 #         VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1: a spec that is not COMMITTED under tools/profiling/dual-venue/legs/ at HEAD of this checkout (the leg's own
 #         Find-DvCommittedLegSpec, LEG_SPEC_NOT_COMMITTED) is refused here too (reason=LEG_SPEC_NOT_COMMITTED item=<n>, or BATCH_USAGE LEG_SPEC_NOT_COMMITTED for -LegSpec / -LegSet),
 #         ALWAYS (r2: on in every mode, decided by no classification of the scripts); the leg would refuse it only after the lease is open. Only the explicit offline switch
-#         -SkipCommittedSpecPreflight turns it off (refused with the real um-run.ps1); -CommittedSpecRepoRoot names the repo for a stand-in leg (the other offline seam).
+#         -SkipCommittedSpecPreflight turns it off (r3: refused unless BOTH -UmRunScript and -LegScript are outside every git work tree, by location and never by bytes; refused when
+#         git cannot say; and with the real um-run.ps1); -CommittedSpecRepoRoot names the repo for a stand-in leg (the other offline seam).
 #         The same content checks run again once the claim is held (inside -ClaimTtlSec less -ClaimRenewSec) and once the lease is open (inside the lease's room less
 #         -LeaseMarginSec and the leg budget, so a slow re-hash ends SHARE_UNREACHABLE before the lease is spent, never LEG_BUDGET_EXCEEDS_LEASE after it; a lease whose
 #         room cannot start the re-read is refused reason=LEG_BUDGET_EXCEEDS_LEASE at once, before any probe). r4: each check is ONE deadline over all of its reads (existence,
@@ -358,6 +359,45 @@ $artifactProbe = $(if ($ArtifactProbeScript) { [scriptblock]::Create([IO.File]::
 if ($umRunIsReal -and $GuardReadDelay) { Stop-Usage '-GuardReadDelay is an offline test seam: with the real um-run.ps1 the guard reads are never delayed' }
 # r2 (adversary A1): the only way to turn the committed-spec preflight off is refused with the real um-run.ps1 (last, so every older seam keeps its own message)
 if ($umRunIsReal -and $SkipCommittedSpecPreflight) { Stop-Usage '-SkipCommittedSpecPreflight is an offline test seam: with the real um-run.ps1 the committed-spec preflight is always on' }
+# r3 (adversary r2 pass 6 A1, the 4th run of one class: raw bytes -> line-ending-normalised hash -> BOM -> ...): ANY byte test of "is this the real um-run" is defeated by one more byte-level change, so the
+# switch is NOT decided by bytes. It is accepted only when BOTH stand-ins are stand-ins by LOCATION: each resolves (the path PowerShell resolved, every link on the way followed) to a directory outside every
+# git work tree. A production-shaped checkout is a work tree whatever its bytes are, so it can never take the switch; a git that cannot answer is a refusal (fail CLOSED), never "outside".
+function Get-OfflineSeamLocationRefusal([string[]]$Files) {
+    $dirs = [Collections.Generic.List[string]]::new()
+    try {
+        foreach ($f in $Files) {
+            $cur = [IO.Path]::GetFullPath($f)
+            $dirs.Add([IO.Path]::GetDirectoryName($cur))
+            while ($cur) {
+                $item = Get-Item -LiteralPath $cur -Force -ErrorAction SilentlyContinue
+                if ($null -ne $item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    $final = $item.ResolveLinkTarget($true)   # the link's last target: a junction or symlink into a work tree is a place in that work tree
+                    if ($null -ne $final) { $dirs.Add($(if ($final -is [IO.DirectoryInfo]) { $final.FullName } else { $final.DirectoryName })) }
+                }
+                $cur = [IO.Path]::GetDirectoryName($cur)   # $null at a root: the loop ends
+            }
+        }
+    } catch { return "its location could not be resolved ($($_.Exception.Message -replace '\s+', ' '))" }
+    $module = Get-Module DualVenueRunner
+    $savedLang = $env:LC_ALL
+    $env:LC_ALL = 'C'   # (git's "not a git repository" is read below: its English text)
+    try {
+        foreach ($dir in ($dirs | Sort-Object -Unique)) {
+            # the module's hardened git: bounded, no inherited GIT_DIR override, a git that does not start or return is exit -1 with a typed stderr
+            $g = & $module { param($d) Invoke-DvGit -RepoRoot $d -GitArgs @('rev-parse', '--is-inside-work-tree') } $dir
+            $said = [Text.Encoding]::UTF8.GetString([byte[]]$g.bytes).Trim()
+            if ($g.exitCode -eq 0 -and $said -ceq 'true') { return "'$dir' is inside a git work tree" }
+            if (-not ($g.exitCode -eq 128 -and [string]$g.stderr -match 'not a git repository')) {
+                return "git could not show that '$dir' is outside every git work tree (exit $($g.exitCode): $(([string]$g.stderr -replace '\s+', ' ').Trim()))"
+            }
+        }
+    } finally { $env:LC_ALL = $savedLang }
+    ''
+}
+if ($SkipCommittedSpecPreflight) {
+    $locationRefusal = Get-OfflineSeamLocationRefusal @($umRunFull, (Resolve-Path -LiteralPath $LegScript).ProviderPath)
+    if ($locationRefusal) { Stop-Usage "-SkipCommittedSpecPreflight is an offline test seam: it is accepted only for a stand-in -UmRunScript and -LegScript outside every git work tree (a git work tree is a checkout, and a checkout's committed-spec preflight is always on): $locationRefusal" }
+}
 $script:guardDelaySeam = $null; $script:lastGuardSeam = $null
 if ($GuardReadDelay) {
     # r4 adversary A3: [0-9], not \d, which also matches non-ASCII decimal digits that [int] then throws on. r5: rundir delays every read of -RunDir itself, in that guard and after it

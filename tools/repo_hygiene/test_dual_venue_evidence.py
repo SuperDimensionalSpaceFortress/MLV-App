@@ -50,6 +50,7 @@ from pathlib import Path
 
 from tools.repo_hygiene.synthetic_mlv import FRAMES_30S_AT_23976, write_synthetic_mlv
 from tools.repo_hygiene.test_leg_play_seconds_within_clip import KNOWN_CLIP_SOURCE
+from tools.repo_hygiene.venue_fixture_modules import offline_tmp_root
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -1677,7 +1678,7 @@ class RunnerHarness:
     that can use a MUTATED COPY of the runner directory (for the mutation tests)."""
 
     def make_harness(self, cleanup_class_gone: bool = True) -> None:
-        self._tmp = tempfile.TemporaryDirectory(prefix="dve-run-")
+        self._tmp = tempfile.TemporaryDirectory(prefix="dve-run-", dir=offline_tmp_root())   # (r3: the batch's -SkipCommittedSpecPreflight stand-ins live outside every git work tree)
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         self.share = self.tmp / "share"
