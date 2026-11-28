@@ -10,6 +10,7 @@
 #include "../../platform/qt/PlaybackStartupSplit.h"
 
 #include <cmath>
+#include <functional>
 #include <string>
 
 using playback_warm_output_reuse::Key;
@@ -57,6 +58,7 @@ Key warmKey()
     k.reducedHnyquist = false;
     k.setClipCountAfterWarm = 3;
     k.setLutsCountAfterWarm = 5;
+    k.setPatternCountAfterWarm = 11;
     k.captureId = 7;
     k.state = preparedState();
     return k;
@@ -69,14 +71,16 @@ Key presentKey()
     k.valid = false;
     k.setClipCountAfterWarm = 0;
     k.setLutsCountAfterWarm = 0;
+    k.setPatternCountAfterWarm = 0;
     k.captureId = 0;
     return k;
 }
 
-// enabled, adopted, not suppressed, not a validation probe, no set_clip / set_luts since the warm
+// enabled, adopted, not suppressed, not a validation probe, no set_clip / set_luts / set_iso_pattern since the warm
 Reason gate(const Key &warm, const Key &present)
 {
-    return preGate(true, true, warm, present, false, false, warm.setClipCountAfterWarm, warm.setLutsCountAfterWarm);
+    return preGate(true, true, warm, present, false, false, warm.setClipCountAfterWarm, warm.setLutsCountAfterWarm,
+                   warm.setPatternCountAfterWarm);
 }
 
 std::string name(Reason reason) { return std::string(reasonName(reason)); }
@@ -162,20 +166,23 @@ TEST(PlaybackWarmOutputReusePolicy, EachSkipReasonRefusesBeforeAnyCompare)
     const Key p = presentKey();
     const uint64_t c = w.setClipCountAfterWarm;
     const uint64_t l = w.setLutsCountAfterWarm;
-    ASSERT_EQ(std::string("disabled"), name(preGate(false, true, w, p, false, false, c, l)));
-    ASSERT_EQ(std::string("not_adopted"), name(preGate(true, false, w, p, false, false, c, l)));
+    const uint64_t t = w.setPatternCountAfterWarm;
+    ASSERT_EQ(std::string("disabled"), name(preGate(false, true, w, p, false, false, c, l, t)));
+    ASSERT_EQ(std::string("not_adopted"), name(preGate(true, false, w, p, false, false, c, l, t)));
     Key invalid = w;
     invalid.valid = false;
-    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, invalid, p, false, false, c, l)));
+    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, invalid, p, false, false, c, l, t)));
     Key noCapture = w;
     noCapture.captureId = 0;
-    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, noCapture, p, false, false, c, l)));
-    ASSERT_EQ(std::string("validation_probe"), name(preGate(true, true, w, p, false, true, c, l)));
-    ASSERT_EQ(std::string("cuda_suppressed"), name(preGate(true, true, w, p, true, false, c, l)));
-    ASSERT_EQ(std::string("recon_configured_since_warm"), name(preGate(true, true, w, p, false, false, c + 1, l)));
-    ASSERT_EQ(std::string("recon_configured_since_warm"), name(preGate(true, true, w, p, false, false, c, l + 1)));
+    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, noCapture, p, false, false, c, l, t)));
+    ASSERT_EQ(std::string("validation_probe"), name(preGate(true, true, w, p, false, true, c, l, t)));
+    ASSERT_EQ(std::string("cuda_suppressed"), name(preGate(true, true, w, p, true, false, c, l, t)));
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(preGate(true, true, w, p, false, false, c + 1, l, t)));
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(preGate(true, true, w, p, false, false, c, l + 1, t)));
+    // adversary r17 A1: a pattern-only configure (set_iso_pattern) advances neither of the two counts above
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(preGate(true, true, w, p, false, false, c, l, t + 1)));
     // a default (never set) key, as the window holds before any warm
-    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, Key(), p, false, false, 0, 0)));
+    ASSERT_EQ(std::string("no_warm_key"), name(preGate(true, true, Key(), p, false, false, 0, 0, 0)));
     for (const Reason r : {Reason::Disabled, Reason::NotAdopted, Reason::NoWarmKey, Reason::ValidationProbe,
                            Reason::CudaSuppressed, Reason::FrameMismatch, Reason::SizeMismatch, Reason::BlackMismatch,
                            Reason::WbMismatch, Reason::HnyquistMismatch, Reason::ReconConfiguredSinceWarm})
@@ -188,8 +195,228 @@ TEST(PlaybackWarmOutputReusePolicy, TheKillSwitchAndAdoptionOutrankEveryOtherFie
     p.frame += 1;
     p.wb[0] += 1.0;
     // disabled first, then not adopted, whatever else differs
-    ASSERT_EQ(std::string("disabled"), name(preGate(false, false, Key(), p, true, true, 9, 9)));
-    ASSERT_EQ(std::string("not_adopted"), name(preGate(true, false, warmKey(), p, true, true, 9, 9)));
+    ASSERT_EQ(std::string("disabled"), name(preGate(false, false, Key(), p, true, true, 9, 9, 9)));
+    ASSERT_EQ(std::string("not_adopted"), name(preGate(true, false, warmKey(), p, true, true, 9, 9, 9)));
+}
+
+// adversary r17 A1: the pattern-only configure (llrpGpuPlaybackReconSetIsoPatternCount) is a recon configure like the clip
+// and LUT ones. Warm frame 0 with pattern 1100, finish frame 1 with 0011 and identical geometry, levels and LUTs: only the
+// pattern count moved, and the warm output must not be compared (let alone reused) as if nothing had changed.
+TEST(PlaybackWarmOutputReusePolicy, APatternOnlyConfigureSinceTheWarmRefusesTheCompare)
+{
+    const Key w = warmKey();
+    const Key p = presentKey();
+    ASSERT_EQ(std::string("none"), name(gate(w, p)));
+    ASSERT_EQ(std::string("recon_configured_since_warm"),
+              name(preGate(true, true, w, p, false, false, w.setClipCountAfterWarm, w.setLutsCountAfterWarm,
+                           w.setPatternCountAfterWarm + 1)));
+    // each of the three counts alone refuses; none of them moving does not
+    ASSERT_EQ(std::string("recon_configured_since_warm"),
+              name(preGate(true, true, w, p, false, false, w.setClipCountAfterWarm + 1, w.setLutsCountAfterWarm,
+                           w.setPatternCountAfterWarm)));
+    ASSERT_EQ(std::string("recon_configured_since_warm"),
+              name(preGate(true, true, w, p, false, false, w.setClipCountAfterWarm, w.setLutsCountAfterWarm + 1,
+                           w.setPatternCountAfterWarm)));
+}
+
+// sol r17 #2: the present's decision (decide(), GpuDisplayWindow's gate and compare) with the interleaving injected, no
+// threads. The process-wide counts live in `live`; readLiveCounts() is the present reading them; the compare callback is
+// the window in which a lookahead frame's configure can land (llrawproc.c runs on the recon worker while the GUI thread
+// presents).
+namespace {
+
+struct InjectedPresent
+{
+    playback_warm_output_reuse::LiveCounts live;
+    int reads = 0;
+    int compares = 0;
+    bool equal = true;                                   // what the exact compare reports
+    std::function<void()> duringCompare;                 // a configure landing after the gate's read
+    // adversary r18 A1: the three counters are read one after another (GpuDisplayWindow's readLiveConfigureCounts);
+    // midRead(read, field) runs after field 0 (clip), 1 (luts) or 2 (pattern) of read number `read` was copied
+    std::function<void(int, int)> midRead;
+
+    playback_warm_output_reuse::LiveCounts readSequentially()
+    {
+        ++reads;
+        playback_warm_output_reuse::LiveCounts now;
+        now.setClip = live.setClip;
+        if (midRead) midRead(reads, 0);
+        now.setLuts = live.setLuts;
+        if (midRead) midRead(reads, 1);
+        now.setPattern = live.setPattern;
+        if (midRead) midRead(reads, 2);
+        now.generation = live.generation;   // r22 adversary A1: loaded last, as GpuDisplayWindow does
+        return now;
+    }
+
+    Reason run(const Key &warm, const Key &present, bool *compareAttempted)
+    {
+        return playback_warm_output_reuse::decide(
+            true, true, warm, present, false, false,
+            [this]() { return readSequentially(); },
+            [this](bool *sameInput, QString *why) {
+                ++compares;
+                if (duringCompare) duringCompare();
+                *sameInput = equal;
+                why->clear();
+                return true;
+            },
+            compareAttempted);
+    }
+};
+
+InjectedPresent atWarmCounts(const Key &w)
+{
+    InjectedPresent p;
+    p.live.setClip = w.setClipCountAfterWarm;
+    p.live.setLuts = w.setLutsCountAfterWarm;
+    p.live.setPattern = w.setPatternCountAfterWarm;
+    p.live.generation = w.configureGenerationAfterWarm;
+    return p;
+}
+
+} // namespace
+
+// r22 adversary A1, the row as written: warm and gate counts (3,5,11), adopted valid keys, an equal completed compare;
+// the worker publishes and stores set_luts 5 -> 6 after the luts load of read 3 (the second post-compare read) and
+// before its pattern load. Every native configure also publishes the generation before its call (llrawproc.c) and the
+// present loads the generation last, so the hit is refused.
+TEST(PlaybackWarmOutputReusePolicy, ALutsConfigureInsideTheFinalReadIsNeverAHitBecauseTheGenerationIsReadLast)
+{
+    Key w = warmKey();
+    w.configureGenerationAfterWarm = 19;
+    InjectedPresent present = atWarmCounts(w);
+    present.midRead = [&present](int read, int field)
+    {
+        if (read != 3 || field != 1) return;
+        ++present.live.setLuts;      // published before the native call ...
+        ++present.live.generation;   // ... with the generation
+    };
+    bool attempted = false;
+    const Reason r = present.run(w, presentKey(), &attempted);
+    ASSERT_EQ(3, present.reads);
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(r));
+    ASSERT_FALSE(reuse(r));
+    // and a generation that moved before the gate skips the compare, like any per-kind count
+    InjectedPresent early = atWarmCounts(w);
+    early.live.generation = 20;
+    bool earlyAttempted = true;
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(early.run(w, presentKey(), &earlyAttempted)));
+    ASSERT_FALSE(earlyAttempted);
+    ASSERT_EQ(0, early.compares);
+}
+
+// sol r17 #2, the row as written: reuse on, the present samples pattern count 11, then lookahead configures 1100 -> 0011
+// (live count 12) before the present's compare; equal prepared state, equal Bayer16 input. Expected
+// recon_configured_since_warm, never a hit.
+TEST(PlaybackWarmOutputReusePolicy, APatternConfigureAfterTheGateReadAndBeforeTheCompareIsNeverAHit)
+{
+    const Key w = warmKey();
+    ASSERT_EQ((uint64_t)11, w.setPatternCountAfterWarm);
+    InjectedPresent present = atWarmCounts(w);
+    present.duringCompare = [&present]() { present.live.setPattern = 12; };
+    bool attempted = false;
+    const Reason r = present.run(w, presentKey(), &attempted);
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(r));
+    ASSERT_FALSE(reuse(r));
+    ASSERT_TRUE(attempted);
+    ASSERT_EQ(1, present.compares);
+    ASSERT_EQ(std::string("miss"), std::string(playback_warm_output_reuse::outcomeName(r, attempted)));
+}
+
+// the class, not the instance: a late set_clip or set_luts is refused the same way
+TEST(PlaybackWarmOutputReusePolicy, AClipOrLutsConfigureAfterTheGateReadIsNeverAHitEither)
+{
+    const Key w = warmKey();
+    for (int which = 0; which < 3; ++which)
+    {
+        InjectedPresent present = atWarmCounts(w);
+        present.duringCompare = [&present, which]() {
+            if (which == 0) ++present.live.setClip;
+            else if (which == 1) ++present.live.setLuts;
+            else ++present.live.setPattern;
+        };
+        bool attempted = false;
+        const Reason r = present.run(w, presentKey(), &attempted);
+        ASSERT_EQ(std::string("recon_configured_since_warm"), name(r));
+        ASSERT_FALSE(reuse(r));
+    }
+}
+
+// nothing configures: still a hit, and the counts were read once before the compare and twice after it
+TEST(PlaybackWarmOutputReusePolicy, WithNoConfigureTheDecisionIsAHitAndReadsTheCountsAfterTheCompare)
+{
+    const Key w = warmKey();
+    InjectedPresent present = atWarmCounts(w);
+    bool attempted = false;
+    const Reason r = present.run(w, presentKey(), &attempted);
+    ASSERT_EQ(std::string("hit"), name(r));
+    ASSERT_TRUE(reuse(r));
+    ASSERT_TRUE(attempted);
+    ASSERT_EQ(3, present.reads);
+    ASSERT_EQ(1, present.compares);
+}
+
+// adversary r18 A1, the row as written: warm (3,5,11), equal compare; during the first read after the compare, after
+// its LUT read of 5 and before its pattern read, lookahead frame 1244 runs set_luts (5 -> 6). That read is the torn
+// tuple (3,5,11). Expected recon_configured_since_warm, never a hit.
+TEST(PlaybackWarmOutputReusePolicy, AConfigureBetweenTwoCounterReadsAfterTheCompareIsNeverAHit)
+{
+    const Key w = warmKey();
+    InjectedPresent present = atWarmCounts(w);
+    present.midRead = [&present](int read, int field) {
+        if (read == 2 && field == 1) present.live.setLuts = 6;
+    };
+    bool attempted = false;
+    const Reason r = present.run(w, presentKey(), &attempted);
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(r));
+    ASSERT_FALSE(reuse(r));
+    ASSERT_TRUE(attempted);
+}
+
+// the class: every tear position after the compare (a counter advanced after this read copied it), for each counter
+// already copied in that read
+TEST(PlaybackWarmOutputReusePolicy, EveryTornReadAfterTheCompareIsRefused)
+{
+    const Key w = warmKey();
+    for (int field = 0; field < 3; ++field)
+    {
+        for (int counter = 0; counter <= field; ++counter)
+        {
+            InjectedPresent present = atWarmCounts(w);
+            present.midRead = [&present, field, counter](int read, int at) {
+                if (read != 2 || at != field) return;
+                if (counter == 0) ++present.live.setClip;
+                else if (counter == 1) ++present.live.setLuts;
+                else ++present.live.setPattern;
+            };
+            bool attempted = false;
+            const Reason r = present.run(w, presentKey(), &attempted);
+            ASSERT_EQ(std::string("recon_configured_since_warm"), name(r));
+            ASSERT_FALSE(reuse(r));
+        }
+    }
+}
+
+// a refusal before the compare does not compare and reads once; a content mismatch stays content_mismatch (the dump's
+// trigger) even when a configure also landed
+TEST(PlaybackWarmOutputReusePolicy, TheRecheckOnlyEverTurnsAHitIntoARefusal)
+{
+    const Key w = warmKey();
+    InjectedPresent early = atWarmCounts(w);
+    early.live.setPattern = 12;
+    bool attempted = true;
+    ASSERT_EQ(std::string("recon_configured_since_warm"), name(early.run(w, presentKey(), &attempted)));
+    ASSERT_FALSE(attempted);
+    ASSERT_EQ(0, early.compares);
+    ASSERT_EQ(1, early.reads);
+
+    InjectedPresent differs = atWarmCounts(w);
+    differs.equal = false;
+    differs.duringCompare = [&differs]() { differs.live.setPattern = 12; };
+    ASSERT_EQ(std::string("content_mismatch"), name(differs.run(w, presentKey(), &attempted)));
+    ASSERT_TRUE(attempted);
 }
 
 // ---- after the compare ----
@@ -343,7 +570,7 @@ TEST(PlaybackWarmOutputReusePolicy, AMissingPreparedStateOnEitherSideIsAStateMis
     ASSERT_EQ(std::string("frame_mismatch"), name(gate(warmKey(), frame)));
     ASSERT_EQ(std::string("recon_configured_since_warm"),
               name(preGate(true, true, warmKey(), present, false, false, warmKey().setClipCountAfterWarm + 1,
-                           warmKey().setLutsCountAfterWarm)));
+                           warmKey().setLutsCountAfterWarm, warmKey().setPatternCountAfterWarm)));
 }
 
 TEST(PlaybackWarmOutputReusePolicy, ThePreparedStateIsReadFromTheReconStateByName)

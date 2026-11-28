@@ -125,6 +125,11 @@ typedef struct
      * bridged the two and left async H2D permanently disarmed. See
      * .claude-state/project-memory/async-h2d-frameid-crosses-a-subsystem-boundary-20260905.md. */
     uint64_t frame_id;
+    /* DUALISO-CONFIGURE-CACHE-1 (sol r6 B3): a stamp that changes whenever the CONTENTS behind raw2ev, ev2raw,
+     * mix_curve or fullres_curve are rewritten. The backend skips a LUT upload only when pointers, levels and this
+     * stamp all match; a writer that rewrites a table in place MUST give the state a new stamp. 0 = the builder
+     * keeps no stamp (its tables are immutable while referenced), so only the pointers distinguish them. */
+    uint64_t lut_generation;
 } llrpGpuPlaybackReconState_t;
 
 typedef struct
@@ -358,6 +363,22 @@ int llrpGpuPlaybackReconReducedIsoNotchAvailable(void);
 /* Cumulative igpu_recon_set_clip / set_luts calls made by the C seam. */
 uint64_t llrpGpuPlaybackReconSetClipCount(void);
 uint64_t llrpGpuPlaybackReconSetLutsCount(void);
+/* DUALISO-CONFIGURE-CACHE-1: cumulative igpu_recon_set_iso_pattern calls (the pattern-only configure that
+ * replaces a set_clip + set_luts when only the ISO pattern moved). Additive; the two counts above keep
+ * their meaning. */
+uint64_t llrpGpuPlaybackReconSetIsoPatternCount(void);
+/* DUALISO-CONFIGURE-CACHE-1 r22 (sol r21 #1): each of the three counts above is incremented BEFORE its native
+ * call (a reader that does not see the new count read before the backend changed). This returns 1 and the three
+ * counts as the calling thread's last recon run read them under the backend mutex, after its configure and before
+ * its run, or 0 when no run on this thread recorded them since the last call; either way it clears them. NULL
+ * outputs are allowed (a call with all NULLs only clears). The warm-output reuse key (PlaybackReconWarmRun.h)
+ * uses it so that its counts describe the backend state its own recon ran with. */
+int llrpGpuPlaybackReconTakeLastRunConfigureCounts(uint64_t * set_clip, uint64_t * set_luts, uint64_t * set_pattern,
+                                                   uint64_t * configure_generation);
+/* r22 adversary A1: one count that every native configure (set_iso_pattern, set_clip, set_luts) increments before
+ * its call. A reader that loads it LAST, and still sees the value it expects, read before any configure stored
+ * anything after that value; three per-kind loads alone cannot give that (a configure can land between them). */
+uint64_t llrpGpuPlaybackReconConfigureGeneration(void);
 /* One line per set_clip / set_luts event (frame, wall ms, dims), emitted after
  * the backend mutex is released. NULL uninstalls. */
 typedef void (*llrpGpuReconEventLogger_t)(const char * line);

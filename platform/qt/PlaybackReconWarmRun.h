@@ -33,6 +33,10 @@
 namespace playback_recon_warm_run
 {
 
+/*! r22 (sol r21 #1): the reuse key's configure count when the warm's run recorded none. No live count ever reaches
+ *  it, so the present's gate reads recon_configured_since_warm and runs AMaZE. */
+constexpr uint64_t kNoKeyCount = UINT64_MAX;
+
 struct Outcome
 {
     bool ran = false;            // the prepare-only recon ran and retained an output
@@ -50,6 +54,16 @@ struct Outcome
     // after this run (the warm key: a later configuration call means the warm's output may be stale)
     uint64_t setClipCountAfter = 0;
     uint64_t setLutsCountAfter = 0;
+    uint64_t setPatternCountAfter = 0;   // adversary r17 A1: set_iso_pattern (the pattern-only configure) moves neither count above
+    // r22 (sol r21 #1): what the warm-output reuse KEY counts. The three counts as THIS thread's recon run read them
+    // under the backend mutex, after its configure and before its run (llrpGpuPlaybackReconTakeLastRunConfigureCounts).
+    // Every count is published before its native configure, so a configure these do not count began after the backend
+    // state this warm's recon ran with. The *CountAfter fields above are read after the run, outside the lock, where
+    // another thread's configure may already be counted but not yet stored: they stay telemetry only.
+    uint64_t keySetClipCount = kNoKeyCount;
+    uint64_t keySetLutsCount = kNoKeyCount;
+    uint64_t keySetPatternCount = kNoKeyCount;
+    uint64_t keyConfigureGeneration = kNoKeyCount;   // r22 adversary A1: the one count all three kinds publish to
     int backendRc = 0;
     llrpGpuPlaybackRetainedDeviceBayer16_t retained;   // valid when ran; the caller releases retained.token
     // PLAYBACK-STARTUP-WAIT-S1-WARM-RECON-DETERMINISM-1: the llrawproc runs this warm made (F-a: 2 when the first one
@@ -162,6 +176,8 @@ inline Outcome run( mlvObject_t *video,
         }
         const uint64_t setClipRunStart = llrpGpuPlaybackReconSetClipCount();
         const uint64_t setLutsRunStart = llrpGpuPlaybackReconSetLutsCount();
+        // r22: drop any counts an earlier run on this thread left, so the ones taken below are this run's
+        (void)llrpGpuPlaybackReconTakeLastRunConfigureCounts( nullptr, nullptr, nullptr, nullptr );
         const double runStart = mlv_stage_timing_now();
         {
             const ThreadOptIn optIn;
@@ -180,6 +196,16 @@ inline Outcome run( mlvObject_t *video,
         ++out.warmRuns;
         out.setClipCountAfter = llrpGpuPlaybackReconSetClipCount();
         out.setLutsCountAfter = llrpGpuPlaybackReconSetLutsCount();
+        out.setPatternCountAfter = llrpGpuPlaybackReconSetIsoPatternCount();
+        {
+            uint64_t keyClip = 0, keyLuts = 0, keyPattern = 0, keyGeneration = 0;
+            const bool keyed =
+                llrpGpuPlaybackReconTakeLastRunConfigureCounts( &keyClip, &keyLuts, &keyPattern, &keyGeneration ) != 0;
+            out.keySetClipCount = keyed ? keyClip : kNoKeyCount;
+            out.keySetLutsCount = keyed ? keyLuts : kNoKeyCount;
+            out.keySetPatternCount = keyed ? keyPattern : kNoKeyCount;
+            out.keyConfigureGeneration = keyed ? keyGeneration : kNoKeyCount;
+        }
         out.setClipCalls = out.setClipCountAfter - setClipBefore;
         out.setLutsCalls = out.setLutsCountAfter - setLutsBefore;
         // this thread's run_backend just measured them (0 when the run needed neither)

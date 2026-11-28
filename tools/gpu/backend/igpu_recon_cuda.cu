@@ -2503,4 +2503,21 @@ int igpu_recon_set_reduced_iso_notch(igpu_recon_backend* b, int enable)
     return 0;
 }
 
+/* DUALISO-CONFIGURE-CACHE-1: the pattern-only configure. The dual-ISO prepare
+ * re-derives the ISO pattern per frame (M16-1456/1457: it moves between frames
+ * while dims and levels stay), and set_clip for a pattern change cost ~1.5 ms of
+ * synchronous constant copies that igpu_recon_run_internal repeats anyway: it
+ * pushes d_is_bright from b->is_bright on EVERY run. So the pattern needs only
+ * to reach b->is_bright. No CUDA call, nothing to free or reallocate. */
+IGPU_API
+int igpu_recon_set_iso_pattern(igpu_recon_backend* b, const int* is_bright)
+{
+    if (!b || !is_bright || !b->have_clip) return -1;
+    for (int i = 0; i < 4; i++) {
+        if (is_bright[i] != 0 && is_bright[i] != 1) return -1;
+    }
+    for (int i = 0; i < 4; i++) b->is_bright[i] = is_bright[i];
+    return 0;
+}
+
 } /* extern "C" */

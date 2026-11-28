@@ -51,7 +51,7 @@ enum class Reason
     BlackMismatch,
     WbMismatch,                 // any of the three doubles not exactly equal
     HnyquistMismatch,
-    ReconConfiguredSinceWarm,   // a set_clip or set_luts ran after the warm
+    ReconConfiguredSinceWarm,   // a set_clip, set_luts or set_iso_pattern ran after the warm (read before and after the compare)
     StateMismatch,              // WARM-RECON-DETERMINISM-1 F-key: the recon's per-run constants differ (or one is unknown)
     // final outcomes after the compare
     Hit,
@@ -160,9 +160,19 @@ struct Key
     bool reducedHnyquist = false;
     uint64_t setClipCountAfterWarm = 0;
     uint64_t setLutsCountAfterWarm = 0;
+    uint64_t setPatternCountAfterWarm = 0;   // adversary r17 A1: set_iso_pattern is a configure that moves neither count above
+    uint64_t configureGenerationAfterWarm = 0;   // r22 adversary A1: llrpGpuPlaybackReconConfigureGeneration, all three kinds
     uint64_t captureId = 0;
     PreparedState state;   // F-key: the recon's per-run constants this AMaZE input was made with
 };
+
+/*! Whether any configure (set_clip, set_luts, set_iso_pattern) ran since the warm: one predicate for the gate and for
+ *  decide()'s recheck after the compare. */
+inline bool configuredSinceWarm( const Key &warmKey, uint64_t setClipNow, uint64_t setLutsNow, uint64_t setPatternNow )
+{
+    return setClipNow != warmKey.setClipCountAfterWarm || setLutsNow != warmKey.setLutsCountAfterWarm
+        || setPatternNow != warmKey.setPatternCountAfterWarm;
+}
 
 /*! Everything but the content: Reason::None means compare the input bytes against warmKey.captureId. Exact double
  *  equality on WB on purpose (a 1-ulp difference is a different AMaZE output). */
@@ -173,7 +183,8 @@ inline Reason preGate( bool enabled,
                        bool cudaSuppressed,
                        bool validationProbe,
                        uint64_t setClipNow,
-                       uint64_t setLutsNow )
+                       uint64_t setLutsNow,
+                       uint64_t setPatternNow )
 {
     if( !enabled ) return Reason::Disabled;
     if( !adopted ) return Reason::NotAdopted;
@@ -188,8 +199,7 @@ inline Reason preGate( bool enabled,
         if( !( warmKey.wb[i] == presentKey.wb[i] ) ) return Reason::WbMismatch;
     }
     if( warmKey.reducedHnyquist != presentKey.reducedHnyquist ) return Reason::HnyquistMismatch;
-    if( setClipNow != warmKey.setClipCountAfterWarm || setLutsNow != warmKey.setLutsCountAfterWarm )
-        return Reason::ReconConfiguredSinceWarm;
+    if( configuredSinceWarm( warmKey, setClipNow, setLutsNow, setPatternNow ) ) return Reason::ReconConfiguredSinceWarm;
     // F-key: decided here, before any compare; an unknown state on either side is never proven equal
     if( !warmKey.state.valid || !presentKey.state.valid || !preparedStateDiff( warmKey.state, presentKey.state ).isEmpty() )
         return Reason::StateMismatch;
@@ -205,6 +215,79 @@ inline Reason afterCompare( bool compareCompleted, bool equal, const QString &wh
     if( why == QLatin1String( "capture_missing" ) ) return Reason::CaptureMissing;
     if( why == QLatin1String( "cuda_suppressed" ) ) return Reason::CudaSuppressed;
     return Reason::CompareFailed;
+}
+
+/*! The three process-wide configure counts (llrpGpuPlaybackReconSetClipCount / SetLutsCount / SetIsoPatternCount), read
+ *  together, and r22 (adversary A1) the configure generation, read LAST (llrpGpuPlaybackReconConfigureGeneration:
+ *  every native configure increments it before its call, so a read whose final load still sees the warm's generation
+ *  was taken before any configure stored anything since the warm). */
+struct LiveCounts
+{
+    uint64_t setClip = 0;
+    uint64_t setLuts = 0;
+    uint64_t setPattern = 0;
+    uint64_t generation = 0;
+};
+
+/*! The per-kind counts and the generation against the warm key: whether any configure ran since the warm. */
+inline bool configuredSinceWarm( const Key &warmKey, const LiveCounts &now )
+{
+    return configuredSinceWarm( warmKey, now.setClip, now.setLuts, now.setPattern )
+        || now.generation != warmKey.configureGenerationAfterWarm;
+}
+
+/*! The present's whole decision (GpuDisplayWindow::setPresentedGpuPlaybackReconAmazePostWbTexture): preGate() on the live
+ *  counts, then, only when it passed, the exact input compare. readLiveCounts() returns a LiveCounts;
+ *  compareInput( bool *equal, QString *why ) runs the compare and returns whether it completed.
+ *  *compareAttempted says whether compareInput ran.
+ *  sol r17 #2: the counts preGate() read are a sample. The recon worker configures while the GUI thread presents, so a
+ *  lookahead frame's set_iso_pattern (or set_clip / set_luts) can land after that read and before or during the compare.
+ *  A hit is therefore authorized only by the counts read again AFTER the compare, twice (adversary r18 A1: a torn
+ *  single read): if any moved since the warm, the outcome is ReconConfiguredSinceWarm. The first read stays (it skips the compare when a configure is already visible).
+ *  Only a hit is rechecked; every other outcome already runs AMaZE, and a content miss keeps its name (the dump's
+ *  trigger). */
+template <typename ReadLiveCounts, typename CompareInput>
+inline Reason decide( bool enabled,
+                      bool adopted,
+                      const Key &warmKey,
+                      const Key &presentKey,
+                      bool cudaSuppressed,
+                      bool validationProbe,
+                      ReadLiveCounts readLiveCounts,
+                      CompareInput compareInput,
+                      bool *compareAttempted )
+{
+    if( compareAttempted ) *compareAttempted = false;
+    const LiveCounts sampled = readLiveCounts();
+    const Reason gate = preGate( enabled, adopted, warmKey, presentKey, cudaSuppressed, validationProbe, sampled.setClip,
+                                 sampled.setLuts, sampled.setPattern );
+    if( gate != Reason::None ) return gate;
+    // r22 adversary A1: the generation too (preGate keeps its per-kind signature)
+    if( configuredSinceWarm( warmKey, sampled ) ) return Reason::ReconConfiguredSinceWarm;
+    if( compareAttempted ) *compareAttempted = true;
+    bool equal = false;
+    QString why;
+    const bool completed = compareInput( &equal, &why );
+    const Reason compared = afterCompare( completed, equal, why );
+    if( compared != Reason::Hit ) return compared;
+    // adversary r18 A1: one read of three counters is not one instant (a set_luts can land between its LUT and pattern
+    // reads). The counters only ever increase (llrawproc.c InterlockedIncrement64, never reset; full-barrier reads), so
+    // two whole reads that both equal the warm key prove every counter held the warm value at one instant between them.
+    // r22 (sol r21 #1): that instant says nothing about the backend unless each count is published BEFORE its native
+    // configure (llrawproc.c, the configure block of llrawproc_gpu_recon_run_backend): then a count still at the warm
+    // value means its configure's native call had not started, and the warm key's counts are read under the backend
+    // mutex by the warm's own run (llrpGpuPlaybackReconTakeLastRunConfigureCounts), so nothing it does not count was
+    // stored before its recon ran. Pinned by tests/pipeline/test_dualiso_gpu_configure_cache.cpp (AReuseDecisionInside*)
+    // r22 adversary A1: the per-kind instant is at the END of the first whole read, and a configure can still be
+    // published and stored before the second read's last per-kind load. The generation, loaded last in every read and
+    // incremented before every native configure, closes that: a hit means no configure stored anything before
+    // decide()'s final load (AReuseDecisionWhoseFinalReadIsTornByAConfigureIsNeverAHit).
+    for( int pass = 0; pass < 2; ++pass )
+    {
+        const LiveCounts after = readLiveCounts();
+        if( configuredSinceWarm( warmKey, after ) ) return Reason::ReconConfiguredSinceWarm;
+    }
+    return Reason::Hit;
 }
 
 /*! Reuse only on a hit: every other reason runs AMaZE unchanged. */

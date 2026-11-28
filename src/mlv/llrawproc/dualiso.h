@@ -95,6 +95,11 @@ typedef struct
     int ev_lut_float_valid;
     int ev_lut_black;
     int ev_lut_white;
+    /* DUALISO-CONFIGURE-CACHE-1 (sol r6 B3): a stamp from dualiso_next_lut_stamp(), taken whenever the table behind
+     * it is about to be rewritten, so the GPU backend can tell a rewrite at the same address from no change. */
+    uint64_t ev_lut_generation;
+    uint64_t mix_curve_generation[DUALISO_MIX_CURVE_CACHE_SLOTS];
+    uint64_t fullres_curve_float_as_double_generation;
     size_t mix_curve_capacity[DUALISO_MIX_CURVE_CACHE_SLOTS];
     size_t mix_curve_float_capacity[DUALISO_MIX_CURVE_CACHE_SLOTS];
     int mix_curve_valid[DUALISO_MIX_CURVE_CACHE_SLOTS];
@@ -346,6 +351,9 @@ typedef struct
     const double * fullres_curve;
     const float * randn05;
     int apply_dither;
+    /* DUALISO-CONFIGURE-CACHE-1 (sol r6 B3): changes whenever the contents behind raw2ev, ev2raw, mix_curve,
+     * fullres_curve or randn05 are rewritten; never 0 when produced by diso_prepare_gpu_recon_state. */
+    uint64_t lut_generation;
 } dualiso_gpu_recon_state_t;
 
 #ifdef __cplusplus
