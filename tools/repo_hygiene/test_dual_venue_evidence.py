@@ -22415,6 +22415,12 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         """r11 (adversary A1 on 6c0a9228): the same capture row at another index (and its own file name): the burst rows are numbered 0 .. burst_captures-1."""
         return {**row, "index": index, "file": f"{row['kind'].replace('_', '-')}-{index}.png"}
 
+    @staticmethod
+    def omit(row: dict, *fields: str) -> dict:
+        """EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r2: the capture row with the named fields ABSENT (the key is not in the JSON at all). `play(0, f=None)` writes
+        `"f": null`, a PRESENT field of no JSON type, which the reader now refuses as TAIL_VISUAL_ROW_UNREADABLE; an old test that means 'the app omitted it' uses this."""
+        return {k: v for k, v in row.items() if k not in fields}
+
     @classmethod
     def app_json(cls, *frames: dict, boundary: bool = True, **top) -> dict:
         rows = list(frames or (cls.play(0), cls.play(1), cls.play(2)))
@@ -22559,16 +22565,19 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
             "no frames": ({}, self.app_json(frames=[]), "no play capture"),
             "Play not active": ({}, self.app_json(play(0, play_active=False)), "no play capture"),
             "capture not saved": ({}, self.app_json(play(0, saved=False)), "no play capture"),
-            "saved is the string false": ({}, self.app_json(play(0, saved="false")), "no play capture"),
-            "play_active is the string true": ({}, self.app_json(play(0, play_active="true")), "no play capture"),
+            # EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r2: a PRESENT field of the wrong JSON type is refused earlier, by the reader (TAIL_VISUAL_ROW_UNREADABLE), and
+            # still never credited; the old reason ('no play capture') is for a row the reader accepted and the credit then did not count
+            "saved is the string false": ({}, self.app_json(play(0, saved="false")), "TAIL_VISUAL_ROW_UNREADABLE: the play_unbound capture 0 carries saved="),
+            "play_active is the string true": ({}, self.app_json(play(0, play_active="true")), "TAIL_VISUAL_ROW_UNREADABLE: the play_unbound capture 0 carries play_active="),
             "a paused capture": ({}, self.app_json(play(0, kind="paused")), "no play capture"),
             "a kind with a zero-width suffix": ({}, self.app_json(play(0, kind="play​")), "no play capture"),
             # r2 (sol r1 finding 5): a capture showing 478 exactly now credits 478 (test_r2_...); 477 is the last painted frame, before every in-flight target
             "display frame before every in-flight target": ({}, self.app_json(play(0, display_frame=477)), "no play capture"),
             # r12 (adversary A3 on e8011af8): a bound paint-recording row whose frame or time the reader could not read is refused by name, no longer dropped
-            "display frame a string": ({}, self.app_json(play(0, display_frame="479")), "display frame or tail time is unreadable"),
-            "tail time a string": ({}, self.app_json(play(0, tail_elapsed_ms="Infinity")), "display frame or tail time is unreadable"),
-            "no tail time": ({}, self.app_json(play(0, tail_elapsed_ms=None)), "display frame or tail time is unreadable"),
+            # r2: a wrong-typed PRESENT field is the reader's refusal now; an ABSENT tail_elapsed_ms (no key; `=None` would write a JSON null, a present field of no type) keeps the credit's name
+            "display frame a string": ({}, self.app_json(play(0, display_frame="479")), "TAIL_VISUAL_ROW_UNREADABLE: the play_unbound capture 0 carries display_frame="),
+            "tail time a string": ({}, self.app_json(play(0, tail_elapsed_ms="Infinity")), "TAIL_VISUAL_ROW_UNREADABLE: the play_unbound capture 0 carries tail_elapsed_ms="),
+            "no tail time": ({}, self.app_json(self.omit(play(0), "tail_elapsed_ms")), "display frame or tail time is unreadable"),
             "a negative tail time": ({}, self.app_json(play(0, tail_elapsed_ms=-1)), "display frame or tail time is unreadable"),
             "a prepared result replaced before": ({"prepReplacedBefore": 1}, "default", "was replaced"),
             "a prepared result replaced after": ({"prepReplacedAfter": 1}, "default", "was replaced"),
@@ -22877,16 +22886,20 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         the observer supplied the paint it credited. Only an unforced capture taken before any forced repaint counts."""
         forced = self.play(0, kind="play", label_bound_basis="pixmap_item_by_construction", forced_paints_before=0)
         after = [self.play(i, forced_paints_before=1, tail_elapsed_ms=1625 + 250 * i) for i in range(2)]
-        cases = {"the forced play capture with unforced captures after it": self.app_json(forced, *after),
-                 "the forced play capture alone": self.app_json(forced),
-                 "unforced captures after one forced paint": self.app_json(*after),
-                 "forced_paints_before absent": self.app_json(self.play(0, forced_paints_before=None)),
-                 "forced_paints_before a string": self.app_json(self.play(0, forced_paints_before="0"))}
-        for name, app in cases.items():
+        # EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r2: 'absent' is now an omitted key (`=None` writes a JSON null, a PRESENT field of no type); a string "0" is a
+        # PRESENT wrong-typed field, refused earlier by the reader (TAIL_VISUAL_ROW_UNREADABLE) and still never credited
+        before = "before any forced repaint"
+        cases = {"the forced play capture with unforced captures after it": (self.app_json(forced, *after), before),
+                 "the forced play capture alone": (self.app_json(forced), before),
+                 "unforced captures after one forced paint": (self.app_json(*after), before),
+                 "forced_paints_before absent": (self.app_json(self.omit(self.play(0), "forced_paints_before")), before),
+                 "forced_paints_before a string": (self.app_json(self.play(0, forced_paints_before="0")),
+                                                   "TAIL_VISUAL_ROW_UNREADABLE: the play_unbound capture 0 carries forced_paints_before=")}
+        for name, (app, why) in cases.items():
             with self.subTest(case=name):
                 out = self.metrics(self.HELD, app=app, criteria=self.BOTH)
                 self.assert_no_credit(out, 1)
-                self.assertIn("before any forced repaint", out["m"]["conformTailInFlightCreditNote"], out)
+                self.assertIn(why, out["m"]["conformTailInFlightCreditNote"], out)
         with self.subTest(case="an unforced capture before any forced repaint still credits"):
             out = self.metrics(self.HELD, app=self.app_json(self.play(0)), criteria=self.BOTH)
             self.assertEqual(out["m"]["conformTailInFlightCreditedFrames"], 1, out)
@@ -22902,7 +22915,9 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
                  "the log's begin record is another session's": ({"visualCaptureBeginSession": "2"}, self.app_json(self.play(0)), "TAIL_VISUAL_NOT_THIS_RUN"),
                  "the clip changed during the tail": ({"visualCaptureClipChanged": 1}, self.app_json(self.play(0)), "TAIL_VISUAL_NOT_THIS_RUN"),
                  "the clip-changed count is unreadable": ({"visualCaptureClipChanged": None}, self.app_json(self.play(0)), "TAIL_VISUAL_NOT_THIS_RUN"),
-                 "the capture carries no source_id": ({}, self.app_json(self.play(0, source_id=None)), "no play capture"),
+                 # r2 (EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1): the app OMITS source_id once the clip changed, so the case is the key absent (`=None` writes a JSON
+                 # null, a PRESENT field of no type, which the reader refuses as TAIL_VISUAL_ROW_UNREADABLE: EveryFrameTailWrongTypeFieldRefusalTests)
+                 "the capture carries no source_id": ({}, self.app_json(self.omit(self.play(0), "source_id")), "no play capture"),
                  "the source_id is not the app's 16-hex form": ({}, self.app_json(self.play(0, source_id="1DF")), "no play capture"),
                  # r4 fix 2 (A6 on b6c53917): `$` matched before a final newline; the anchor is \z
                  "the source_id carries a trailing newline": ({}, self.app_json(self.play(0, source_id="00000000000001df\n")), "no play capture"),
@@ -23006,8 +23021,9 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         shared = "play-unbound-1.png"
         for name, rows in (("two rows name one file", (self.play(0, display_frame=478, serial=483, painted_serial=483, file=shared), self.play(1, file=shared))),
                            ("a row names another row's file", (self.play(0, display_frame=478, file=shared),)),
-                           ("the forced kind, the adversary's literal names", (self.play(0, kind="play", display_frame=478, file="play-1.png", source_id=None),
-                                                                              self.play(1, kind="play", file="play-1.png", source_id=None)))):
+                           # r2: the adversary's rows OMIT source_id (the key is absent); `source_id=None` would write a JSON null, refused earlier as a wrong-typed field
+                           ("the forced kind, the adversary's literal names", (self.omit(self.play(0, kind="play", display_frame=478, file="play-1.png"), "source_id"),
+                                                                              self.omit(self.play(1, kind="play", file="play-1.png"), "source_id")))):
             with self.subTest(case=name):
                 out = self.metrics(app=self.app_json(*rows), criteria=self.BOTH)
                 self.assert_no_credit(out, 2)
@@ -23730,14 +23746,17 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         def burst(i: int, ms, frame, serial: int, **over) -> dict:
             return self.play(i, kind="play_first_unbound", tail_elapsed_ms=ms, display_frame=frame, serial=serial, painted_serial=serial, **over)
 
-        for name, middle, why in (("readable control", burst(1, 38, 478, 485, saved=False), "TAIL_CREDIT_PAINT_ORDER"),
-                                  ("display_frame as a string", burst(1, 38, "478", 485, saved=False), "unreadable"),
-                                  ("tail_elapsed_ms as a string", burst(1, "38", 478, 485, saved=False), "unreadable"),
-                                  ("display_frame absent", {k: v for k, v in burst(1, 38, 478, 485, saved=False).items() if k != "display_frame"}, "unreadable")):
+        # EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1: a PRESENT display_frame or tail_elapsed_ms of the wrong type (a string) is now refused earlier, by the reader
+        # (TAIL_VISUAL_ROW_UNREADABLE, whatever the row's other fields); an ABSENT one still reaches this credit refusal
+        for name, middle, code, why in (("readable control", burst(1, 38, 478, 485, saved=False), "TAIL_CREDIT_PAINT_ORDER", "TAIL_CREDIT_PAINT_ORDER"),
+                                        ("display_frame as a string", burst(1, 38, "478", 485, saved=False), "TAIL_VISUAL_ROW_UNREADABLE", "carries display_frame="),
+                                        ("tail_elapsed_ms as a string", burst(1, "38", 478, 485, saved=False), "TAIL_VISUAL_ROW_UNREADABLE", "carries tail_elapsed_ms="),
+                                        ("display_frame absent", {k: v for k, v in burst(1, 38, 478, 485, saved=False).items() if k != "display_frame"},
+                                         "TAIL_CREDIT_PAINT_ORDER", "unreadable")):
             with self.subTest(case=name):
                 out = self.metrics({"visualBurstCaptures": 3}, app=self.app_json(burst(0, 8, 478, 484), middle, burst(2, 68, 479, 486), forced), criteria=self.BOTH)
                 self.assertNotIn("conformTailInFlightCreditedFrames", out["m"], out)
-                self.assertIn("TAIL_CREDIT_PAINT_ORDER", out["m"]["conformTailInFlightCreditNote"], out)
+                self.assertIn(code, out["m"]["conformTailInFlightCreditNote"], out)
                 self.assertIn(why, out["m"]["conformTailInFlightCreditNote"], out)
 
     def test_r12_fix1_a1_a_fully_quoted_event_token_still_voids_the_binding(self) -> None:
@@ -23768,17 +23787,23 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
         def burst(i: int, ms: int, frame: int, serial, painted=None, **over) -> dict:
             return self.play(i, kind="play_first_unbound", tail_elapsed_ms=ms, display_frame=frame, serial=serial, painted_serial=serial if painted is None else painted, **over)
 
-        for name, middle, refused in (("a string serial", burst(1, 38, 478, "485", 485, saved=False), True),
-                                      ("serial 0", burst(1, 38, 478, 0, saved=False), True),
-                                      ("serial != painted_serial", burst(1, 38, 478, 485, 484, saved=False), True),
-                                      ("label_bound false (not asserted)", burst(1, 38, 478, "485", 485, saved=False, label_bound=False), False)):
+        unreadable = "serial or painted serial is unreadable"
+        # EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r2: a string serial is a PRESENT field of the wrong JSON type, refused earlier by the reader (still never
+        # credited); the control keeps its intent (a row that does not assert label_bound is skipped) with an INTEGER serial, so it is not refused by anything
+        for name, middle, refused in (("a string serial", burst(1, 38, 478, "485", 485, saved=False), "TAIL_VISUAL_ROW_UNREADABLE: the play_first_unbound capture 1 carries serial="),
+                                      ("serial 0", burst(1, 38, 478, 0, saved=False), unreadable),
+                                      ("serial != painted_serial", burst(1, 38, 478, 485, 484, saved=False), unreadable),
+                                      ("a string serial on a row that does not assert label_bound", burst(1, 38, 478, "485", 485, saved=False, label_bound=False),
+                                       "TAIL_VISUAL_ROW_UNREADABLE: the play_first_unbound capture 1 carries serial="),
+                                      ("label_bound false (not asserted)", burst(1, 38, 478, 485, 485, saved=False, label_bound=False), None)):
             with self.subTest(case=name):
                 out = self.metrics({"visualBurstCaptures": 3}, app=self.app_json(burst(0, 8, 478, 484), middle, burst(2, 68, 479, 486), forced), criteria=self.BOTH)
                 if refused:
                     self.assertNotIn("conformTailInFlightCreditedFrames", out["m"], out)
-                    self.assertIn("serial or painted serial is unreadable", out["m"]["conformTailInFlightCreditNote"], out)
+                    self.assertIn(refused, out["m"]["conformTailInFlightCreditNote"], out)
                 else:
-                    self.assertNotIn("serial or painted serial is unreadable", out["m"].get("conformTailInFlightCreditNote", ""), out)
+                    self.assertNotIn(unreadable, out["m"].get("conformTailInFlightCreditNote", ""), out)
+                    self.assertNotIn("TAIL_VISUAL_ROW_UNREADABLE", out["m"].get("conformTailInFlightCreditNote", ""), out)
 
     TAIL_PRE = "[2026-11-25T18:00:00.000Z] [INFO] [0xa] "
     TAIL_LOC = " (C:/build/platform/qt/MainWindow.cpp:11642)"
@@ -23967,6 +23992,10 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
                     self.assert_no_credit(out, 1)
                     note = out["m"]["conformTailInFlightCreditNote"]
                     self.assertIn("label_bound_basis", note, out)
+                    if name == "a JSON number":
+                        # EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1: a present non-string basis is a wrong-typed field, refused by the reader before the credit's basis check
+                        self.assertTrue(note.startswith("TAIL_VISUAL_ROW_UNREADABLE"), out)
+                        continue
                     for paint_basis in self.PAINT_BASES:
                         self.assertIn(paint_basis, note, out)
 
@@ -23979,6 +24008,342 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
                     out = self.metrics(self.HELD, app=self.app_json(self.play(0, kind=kind, **extra, label_bound_basis=basis)), criteria=self.BOTH)
                     self.assertEqual((out["m"].get("conformTailInFlightCreditedFrames"), out["m"]["conformTailUnpaintedFrames"]), (1, 0), out)
                     self.assertTrue(out["v"]["pass"], out)
+
+    def test_wrongtype_every_arm_of_the_tail_record_chain_is_anchored_on_the_record_start_and_the_event_slot(self) -> None:
+        """EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1 (Grok CoS #913 G8). Source half of the guard below: every regex Get-DvVisualCaptureBeginRecord applies to a
+        record line (the begin / clip_changed / burst_end arms, the three invalidate_generation arms, the summary-record exemption and the catch-all) is built from
+        $script:DvRecordStart plus `interaction_trace` and the event slot, so a later `event=` token in the same line can match no arm."""
+        mod = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        start = mod.index("function Get-DvVisualCaptureBeginRecord {")
+        body = mod[start:mod.index("\nfunction ", start + 10)]
+        arms = re.findall(r"\[regex\]::IsMatch\(\[string\]\$line, \((.*?)\), \$script:DvCi\)", body)
+        self.assertEqual(len(arms), 8, arms)   # begin, clip_changed, burst_end, three invalidate_generation, the summary record, the catch-all
+        for arm in arms:
+            self.assertTrue(arm.startswith("$script:DvRecordStart + 'interaction_trace"), arm)
+            self.assertRegex(arm, r"interaction_trace(?: event=|\\W\*event\\W\*)", arm)
+
+    def test_wrongtype_a_later_event_token_in_a_record_whose_first_event_is_another_never_matches_a_tail_arm(self) -> None:
+        """EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1 (Grok CoS #913 G8), its input: a record whose FIRST event is another name and which carries
+        `event=playback_prep.invalidate_generation` (or a gui_smoke.visual_capture.* name) LATER in the same line, between the begin and burst_end records of an
+        ordinary log. No arm of the chain reads it (each is anchored on the record start and the event slot), so the binding and every count equal the control's.
+        GREEN on 79971b23 (every arm was already anchored; r13 did it): this is the guard. Mutation: the r12 whole-line form (R12_CATCH_ALL) reads the later token,
+        sets malformedTail and voids the binding, so the guard is RED against it."""
+        pre = "[2026-11-25T18:00:00.000Z] [INFO] [0xa] interaction_trace event=ui.note detail=x "
+        loc = " (C:/build/platform/qt/MainWindow.cpp:1437)"
+        base = self.every_emitter_log(error="")
+        at = next(i for i, line in enumerate(base) if "event=gui_smoke.visual_capture.begin" in line) + 1
+        control = self.derive_tail_binding(base)
+        later_tokens = {"invalidate_generation": "event=playback_prep.invalidate_generation reason=resize dropped_pending=1",
+                        "begin": "event=gui_smoke.visual_capture.begin measured_session=9 tail_ms=3000 play_frames=6 tail_begin_utc=2026-11-25T19:00:00.000Z",
+                        "burst_end": "event=gui_smoke.visual_capture.burst_end measured_session=3 burst_captures=9 generation_changes=0 stale_drops=0 generation_drops=0 replaced_before=0 replaced_after=0",
+                        "clip_changed": "event=gui_smoke.visual_capture.clip_changed refused_play_captures=1 capture_generation=7"}
+        for name, token in later_tokens.items():
+            with self.subTest(later=name):
+                derived = self.derive_tail_binding(base[:at] + [pre + token + loc] + base[at:])
+                self.assertEqual(derived, control, derived)
+        with self.subTest(case="mutation: the r12 whole-line catch-all reads the later token"):
+            mutated = self.mutated_module([(self.TAIL_CATCH_ALL, self.R12_CATCH_ALL), (self.TAIL_SUMMARY_EXEMPTION, "elseif ($false) { }")])
+            line = pre + later_tokens["invalidate_generation"] + loc
+            derived = self.derive_tail_binding(base[:at] + [line] + base[at:], mutated)
+            self.assertIsNone(derived["visualCaptureBeginSession"], derived)
+            self.assertIsNone(derived["visualTailPrepDrops"], derived)
+
+
+@requires_windows_pwsh
+class EveryFrameTailWrongTypeFieldRefusalTests(ModuleMutationMixin, unittest.TestCase):
+    """EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1 (Grok CoS #913 G7, hub ACK 7230207984): the GUARD class for the card. Get-DvTailVisualEvidence read each field of a
+    play capture row through Get-DvProp and normalised a field that was PRESENT with the WRONG TYPE (play_active "true", forced_paints_before "0", label_bound_basis 7,
+    ...) to false or $null, so the row either vanished from the credit's order and repeat checks (a hidden paint: 478, 478 (play_active "true"), 479 credited both
+    targets) or stayed counted beside a row the credit then credited. A row of a play kind (play, play_unbound, play_first_unbound) with ANY ordering or binding field
+    present and of the wrong type now refuses the whole tail, typed (TAIL_VISUAL_ROW_UNREADABLE, naming the field and the type found). One test per field below, each
+    built from the same valid rows with that one field wrong-typed. An ABSENT field is not a wrong type (the app omits source_id when the clip changed), and a row of
+    another kind (stop_unbound, paused) is not read for these fields.
+
+    The fixtures and the metrics harness are the in-flight class's (borrowed, not subclassed: a subclass would re-run its pwsh tests)."""
+
+    _Base = EveryFrameTailInFlightVsNeverPaintedTests
+    BEGIN_UTC = _Base.BEGIN_UTC
+    RUN_A = _Base.RUN_A
+    PB = _Base.PB
+    LEG = _Base.LEG
+    BOTH = _Base.BOTH
+    play = staticmethod(_Base.play)
+    png_bytes = staticmethod(_Base.png_bytes)
+    app_json = _Base.__dict__["app_json"]
+    metrics = _Base.metrics
+    assert_no_credit = _Base.assert_no_credit
+
+    @classmethod
+    def burst(cls, i: int, ms, frame, serial: int, **over) -> dict:
+        return cls.play(i, kind="play_first_unbound", tail_elapsed_ms=ms, display_frame=frame, serial=serial, painted_serial=serial, **over)
+
+    def rows(self, shape: str, field: str | None = None, wrong=None, absent: bool = False) -> tuple:
+        """(rows, burst count). `hidden`: 478 (0), a second paint of 478 at 38 ms (1, the row under test, unsaved), 479 (2): a valid row 1 is refused as a repeat
+        (TAIL_CREDIT_PAINT_ORDER), a row 1 the reader dropped is invisible to that check and 478 and 479 credit. `tail`: 478 (0), 479 (1, the row under test)."""
+        forced = self.play(0, kind="play", tail_elapsed_ms=125, display_frame=479, serial=487, painted_serial=487)
+        if shape in ("hidden", "unbound"):
+            # `unbound`: row 1 records no paint (label_bound and painted_serial_valid false), which the credit ignores: a wrong-typed serial, painted_serial,
+            # display_frame or tail_elapsed_ms on it was counted (credited 478 and 479 beside it) because the bound-row refusals (TAIL_CREDIT_PAINT_ORDER) never saw it
+            first = self.burst(0, 8, 478, 484)
+            under = self.burst(1, 38, 478, 485, saved=False, **({"label_bound": False, "painted_serial_valid": False} if shape == "unbound" else {}))
+            last = self.burst(2, 68, 479, 486)
+            body = (first, under, last)
+        else:
+            first, under = self.burst(0, 8, 478, 484), self.burst(1, 68, 479, 486)
+            body = (first, under)
+        if field is not None:
+            if absent:
+                under.pop(field)
+            else:
+                under[field] = wrong
+        return body + (forced,), len(body)
+
+    def out_for(self, shape: str, field: str | None = None, wrong=None, absent: bool = False) -> dict:
+        rows, count = self.rows(shape, field, wrong, absent)
+        return self.metrics({"visualBurstCaptures": count}, app=self.app_json(*rows), criteria=self.BOTH)
+
+    def assert_field_refused(self, shape: str, field: str, values: list, *also: str) -> None:
+        for the_shape in (shape,) + also:
+            for wrong in values:
+                with self.subTest(shape=the_shape, field=field, wrong=wrong):
+                    out = self.out_for(the_shape, field, wrong)
+                    self.assert_no_credit(out, 2)
+                    note = out["m"]["conformTailInFlightCreditNote"]
+                    self.assertTrue(note.startswith("TAIL_VISUAL_ROW_UNREADABLE"), out)
+                    self.assertIn(f"carries {field}=", note, out)
+
+    def test_controls_the_valid_rows_behave_as_before(self) -> None:
+        hidden = self.out_for("hidden")
+        self.assert_no_credit(hidden, 2)
+        self.assertIn("TAIL_CREDIT_PAINT_ORDER", hidden["m"]["conformTailInFlightCreditNote"], hidden)
+        for shape in ("tail", "unbound"):
+            with self.subTest(shape=shape):
+                out = self.out_for(shape)
+                self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+                self.assertTrue(out["v"]["pass"], out)
+
+    def test_play_active_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("hidden", "play_active", ["true", 1, None])
+
+    def test_label_bound_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("hidden", "label_bound", ["true", 1, None])
+
+    def test_painted_serial_valid_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("hidden", "painted_serial_valid", ["true", 1, None])
+
+    def test_forced_paints_before_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("hidden", "forced_paints_before", ["0", 0.5, True, None])
+
+    def test_label_bound_basis_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("hidden", "label_bound_basis", [7, True, ["gl_window_paint"], None])
+
+    def test_serial_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("hidden", "serial", ["485", 485.5, True, None], "unbound")
+
+    def test_painted_serial_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("hidden", "painted_serial", ["485", 485.5, True, None], "unbound")
+
+    def test_display_frame_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("hidden", "display_frame", ["478", 478.5, True, None], "unbound")
+
+    def test_tail_elapsed_ms_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("hidden", "tail_elapsed_ms", ["38", True, None], "unbound")
+
+    def test_saved_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("tail", "saved", ["true", 1, None])
+
+    def test_source_id_of_the_wrong_type_refuses_the_row(self) -> None:
+        self.assert_field_refused("tail", "source_id", [123, True, None])
+
+    # ---- r2 adversary pass on e4958b93 (A1, A2, A4; A3 is the class decorator above): each RED on e4958b93 ----
+    def test_r2_a1_a_kind_that_only_culture_compares_equal_to_play_is_not_a_play_row(self) -> None:
+        """A1, its input: a row {"kind": "play\\u0000", "index": 0, "tail_elapsed_ms": 2000, "saved": "no"} appended to the tail rows (credited 2 on the base). `-ceq` is a
+        culture compare that ignores the NUL, so the row entered the new field guard and refused the whole tail; the kind filter below it is ordinal and ignores the
+        row. A kind is matched ordinally here too (siblings: every kind compare in Get-DvTailVisualEvidence is [string]::Equals(..., Ordinal))."""
+        rows, count = self.rows("tail")
+        for kind in ("play\u0000", "play_unbound\u0000", "play_first_unbound\u0000", "play​", "PLAY"):
+            with self.subTest(kind=kind):
+                other = {"kind": kind, "index": 0, "tail_elapsed_ms": 2000, "saved": "no", "play_active": "no", "forced_paints_before": "x", "serial": "x"}
+                out = self.metrics({"visualBurstCaptures": count}, app=self.app_json(*rows, other), criteria=self.BOTH)
+                self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+                self.assertNotIn("TAIL_VISUAL_ROW_UNREADABLE", out["m"].get("conformTailInFlightCreditNote", ""), out)
+
+    def test_r2_a2_a_json_string_that_powershell_reads_as_a_date_is_a_string(self) -> None:
+        """A2, its input: the `unbound` shape's middle row (records no paint) carries source_id (and, in a second run, label_bound_basis) "2026-11-28T00:00:00Z".
+        ConvertFrom-Json turns that JSON string into a DateTime, so the guard called it not-a-string and refused the whole tail; the base ignores that row and credits
+        the two valid targets. A JSON string is a string whatever PowerShell makes of it; a number, a boolean and null stay wrong types (the tests above)."""
+        for field in ("source_id", "label_bound_basis"):
+            for text in ("2026-11-28T00:00:00Z", "2026-11-28", "2026-11-28T00:00:00+01:00"):
+                with self.subTest(field=field, text=text):
+                    out = self.out_for("unbound", field, text)
+                    self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+                    self.assertNotIn("TAIL_VISUAL_ROW_UNREADABLE", out["m"].get("conformTailInFlightCreditNote", ""), out)
+
+    def test_r2_a4_a_field_object_that_shadows_gettype_is_still_refused_by_name(self) -> None:
+        """A4 (advisory, introduced), its input: saved={"GetType": "x"}. `$value.GetType()` resolved to the JSON member, the helper threw, the reader's catch returned
+        $null and the named refusal was lost (the tail was still not credited). The helper never calls a method on a value it is judging."""
+        for field, shape in (("saved", "tail"), ("play_active", "hidden"), ("serial", "unbound"), ("source_id", "tail")):
+            for wrong in ({"GetType": "x"}, {"ToString": 1}, [1, 2]):
+                with self.subTest(field=field, wrong=wrong):
+                    out = self.out_for(shape, field, wrong)
+                    self.assert_no_credit(out, 2)
+                    note = out["m"]["conformTailInFlightCreditNote"]
+                    self.assertTrue(note.startswith("TAIL_VISUAL_ROW_UNREADABLE"), out)
+                    self.assertIn(f"carries {field}=", note, out)
+
+    # ---- r4 (Grok CoS #929 G3, sol adversary pass 3 A1 on 34eea0f5): the reason names the JSON type the value HAS, and shows a number as written ----
+    # (field, the wrong value, the whole text the reason must carry). The refusal itself is the r1 refusal in every row; only its words are under test, and the TYPE WORD
+    # (`(a JSON <type>)`) is asserted, not only the `carries <field>=` prefix.
+    R4_TYPE_WORD_ARMS = {
+        "string": ("play_active", "true", "play_active=true (a JSON string), not a JSON bool"),
+        "datetime": ("serial", "2026-11-28T00:00:00Z", "(a JSON string), not a JSON integer"),
+        "number": ("play_active", 1, "play_active=1 (a JSON number), not a JSON bool"),
+        # r5 (Grok CoS #929 G5): a JSON integer outside Int64 is a BigInteger the reader does not take; the reason names that cause, never `(a JSON number), not a JSON integer`
+        "bigint": ("serial", 123456789012345678901234567890, "serial=123456789012345678901234567890 (a JSON integer outside Int64), not a JSON integer"),
+        "bigint-negative": ("serial", -123456789012345678901234567890, "serial=-123456789012345678901234567890 (a JSON integer outside Int64), not a JSON integer"),
+        "bigint-just-past-int64": ("serial", 9223372036854775808, "serial=9223372036854775808 (a JSON integer outside Int64), not a JSON integer"),
+        "bigint-tail-elapsed-ms": ("tail_elapsed_ms", 123456789012345678901234567890, "tail_elapsed_ms=123456789012345678901234567890 (a JSON integer outside Int64), not a JSON number"),
+        "double-integral": ("serial", 479.0, "serial=479.0 (a JSON number), not a JSON integer"),
+        "double-fraction": ("serial", 485.5, "serial=485.5 (a JSON number), not a JSON integer"),
+        "bool": ("serial", True, "serial=true (a JSON boolean), not a JSON integer"),
+        "null": ("serial", None, "serial=null (a JSON null), not a JSON integer"),
+        "array": ("serial", [1, 2], "serial=<array> (a JSON array), not a JSON integer"),
+        "object": ("serial", {"a": 1}, "serial=<object> (a JSON object), not a JSON integer"),
+    }
+
+    def test_r4_g3_the_reason_names_the_json_type_of_each_kind_of_wrong_value(self) -> None:
+        """G3, its inputs: play_active="2026-11-28T00:00:00Z" was reported `(a JSON object)` (ConvertFrom-Json made it a DateTime; in JSON it is a string),
+        serial=123456789012345678901234567890 was reported `(a JSON object)` (a BigInteger; in JSON a number), and serial=479.0 was shown `479 (a JSON number), not a JSON
+        integer` (the shown value looked like a valid integer). One row per arm of the classifier."""
+        for arm, (field, wrong, expected) in self.R4_TYPE_WORD_ARMS.items():
+            with self.subTest(arm=arm):
+                out = self.out_for("hidden", field, wrong)
+                self.assert_no_credit(out, 2)
+                note = out["m"]["conformTailInFlightCreditNote"]
+                self.assertTrue(note.startswith("TAIL_VISUAL_ROW_UNREADABLE"), out)
+                self.assertIn(f"carries {field}=", note, out)
+                self.assertIn(expected, note, out)
+        with self.subTest(arm="a date-shaped string is never an object"):
+            out = self.out_for("hidden", "play_active", "2026-11-28T00:00:00Z")
+            self.assertNotIn("(a JSON object)", out["m"]["conformTailInFlightCreditNote"], out)
+            self.assertIn("(a JSON string), not a JSON bool", out["m"]["conformTailInFlightCreditNote"], out)
+
+    def test_r4_g3_a_double_is_shown_in_round_trip_form_checked_against_an_exact_oracle(self) -> None:
+        """The oracle is Python's own float and fractions.Fraction: the text the reason shows for a double field must parse back to the very double the file held, be
+        exactly that number (Fraction) for an integral double below 2**53, and, for a value with no fractional part, must not read as a plain integer (a JSON
+        integer is what the field wants, so `479` would look valid)."""
+        from fractions import Fraction
+        values = [479.0, 0.0, -0.0, -3.0, 1.0, 1234567.0, 2.0 ** 53, 1e15, 1e16, 1e20, 485.5, 0.1, 1e-7, 123456789.125, -479.0, 1e300]
+        for value in values:
+            with self.subTest(value=repr(value)):
+                out = self.out_for("hidden", "serial", value)
+                self.assert_no_credit(out, 2)
+                note = out["m"]["conformTailInFlightCreditNote"]
+                m = re.search(r"carries serial=(\S+) \(a JSON number\), not a JSON integer", note)
+                self.assertIsNotNone(m, out)
+                shown = m.group(1)
+                self.assertEqual(float(shown), value, (shown, out))   # round-trip: the shown text parses back to the very double the file held
+                if abs(value) < 2.0 ** 53 and value == int(value):
+                    self.assertEqual(Fraction(shown), Fraction(value), (shown, out))   # an integral double below 2**53 is exact, so the text is exactly that number
+                if value == int(value):
+                    self.assertIsNone(re.fullmatch(r"-?\d+", shown), f"{shown!r} reads as a plain integer")
+
+    def test_r4_g3_sibling_the_index_refusal_names_the_type_and_shows_a_double_as_written(self) -> None:
+        """The same reader's other refusal of a value by a PowerShell type: a play row whose index is no non-negative JSON integer (`index=$([string]$index)` showed
+        1.0 as `1` and a string "1" as `1`, with no type word). Each row is refused as before; the reason now carries the type word and the value as written."""
+        cases = {"double-integral": (1.0, "index=1.0 (a JSON number)"), "string": ("1", "index=1 (a JSON string)"), "negative": (-1, "index=-1 (a JSON number)"),
+                 "bool": (True, "index=true (a JSON boolean)"), "null": (None, "index=null (a JSON null)"), "object": ({"a": 1}, "index=<object> (a JSON object)"),
+                 # r5 (Grok CoS #929 G5): the index is a JSON integer, only one Int64 cannot hold
+                 "bigint": (123456789012345678901234567890, "index=123456789012345678901234567890 (a JSON integer outside Int64)")}
+        for name, (wrong, expected) in cases.items():
+            with self.subTest(index=name):
+                out = self.out_for("tail", "index", wrong)
+                self.assert_no_credit(out, 2)
+                note = out["m"]["conformTailInFlightCreditNote"]
+                self.assertTrue(note.startswith("TAIL_VISUAL_ROW_UNREADABLE"), out)
+                self.assertIn(f"carries {expected}, not a non-negative JSON integer", note, out)
+
+    # ---- r5 (Grok CoS #929 G5): no reason names a value's type with the very word the field wanted ----
+    R5_VALUE_PROBE = (
+        f"Import-Module '{DV / 'DualVenueRunner.psm1'}' -Force\n"
+        "$m = Get-Module DualVenueRunner\n"
+        "$fields = & $m { @($script:TailRowFieldTypes.Keys) }\n"
+        # values as ConvertFrom-Json reads them (a date-shaped string is a DateTime, an integer past Int64 a BigInteger) ...
+        "$json = @{ 'null' = 'null'; 'string' = '\"text\"'; 'date' = '\"2026-11-28T00:00:00Z\"'; 'true' = 'true'; 'false' = 'false'; 'int' = '1'; 'negative' = '-1'; 'double' = '485.5'\n"
+        "  'double-integral' = '479.0'; 'big' = '123456789012345678901234567890'; 'big-negative' = '-123456789012345678901234567890'; 'past-int64' = '9223372036854775808'\n"
+        "  'below-int64' = '-9223372036854775809'; 'array' = '[1,2]'; 'object' = '{\"a\":1}' }\n"
+        "$values = [ordered]@{}\n"
+        "foreach ($k in $json.Keys) { $values[$k] = ('{\"v\":' + $json[$k] + '}' | ConvertFrom-Json).v }\n"
+        # ... and the .NET types ConvertFrom-Json does not produce today but the classifier names
+        "$values['decimal'] = [decimal]5.5; $values['decimal-integral'] = [decimal]5; $values['single'] = [single]1.5; $values['int16'] = [int16]1; $values['uint16'] = [uint16]1\n"
+        "$values['uint32'] = [uint32]1; $values['uint64'] = [uint64]1; $values['uint64-max'] = [uint64]::MaxValue; $values['byte'] = [byte]1; $values['sbyte'] = [sbyte]-1\n"
+        "$values['bigint-in-range'] = [System.Numerics.BigInteger]5; $values['datetime'] = [datetime]::UtcNow; $values['datetimeoffset'] = [datetimeoffset]::UtcNow\n"
+        "foreach ($f in $fields) { foreach ($k in $values.Keys) {\n"
+        "  $row = [pscustomobject]@{}; $row | Add-Member -NotePropertyName $f -NotePropertyValue $values[$k]\n"
+        "  $reason = & $m { param($r) Get-DvTailRowTypeProblem -Row $r } $row\n"
+        "  [pscustomobject]@{ field = $f; value = $k; reason = $reason } | ConvertTo-Json -Compress } }\n"
+    )
+
+    def test_r5_g5_no_reason_names_the_type_of_a_refused_value_with_the_word_the_field_wanted(self) -> None:
+        """G5, the property: every value of every arm of the type-word classifier (Get-DvJsonTypeWord), put into every field of the row through the real acceptance check
+        (Get-DvTailRowTypeProblem), either is accepted or is refused with a reason whose `(a JSON X)` is not the field's own `not a JSON X` (a BigInteger tail_elapsed_ms read
+        `(a JSON number), not a JSON number`). Every word the classifier can return must show up in some reason, so a new arm cannot go unprobed."""
+        proc = run_pwsh(["-Command", self.R5_VALUE_PROBE])
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        records = [json.loads(line) for line in proc.stdout.splitlines() if line.startswith("{")]
+        self.assertEqual(len(records), 11 * 28, len(records))
+        shape = re.compile(r"\(a JSON (?P<word>[^)]+)\), not a JSON (?P<wanted>\S+)$")
+        seen: set[str] = set()
+        refused = 0
+        for rec in records:
+            reason = rec["reason"]
+            if reason is None:
+                continue
+            refused += 1
+            with self.subTest(field=rec["field"], value=rec["value"]):
+                m = shape.search(reason)
+                self.assertIsNotNone(m, reason)
+                word, wanted = m.group("word"), m.group("wanted")
+                seen.add(word.split(" ")[0])
+                self.assertNotEqual(word, {"bool": "boolean"}.get(wanted, wanted), f"{rec['field']}={rec['value']}: {reason}")
+        self.assertGreater(refused, 11 * 10, refused)
+        source = (DV / "DualVenueRunner.psm1").read_text(encoding="utf-8")
+        body = source.split("function Get-DvJsonTypeWord {", 1)[1].split("\nfunction ", 1)[0]
+        words = set(re.findall(r"return '(\w+)'", body))
+        self.assertEqual(words, {"null", "string", "boolean", "number", "array", "object"}, "a new arm of the classifier needs a probe value above")
+        self.assertEqual(words - seen, set(), f"a classifier word no probe value reached a reason with: {sorted(words - seen)}")
+        # the wording for each way a number of the wanted JSON type can still be refused
+        by_key = {(r["field"], r["value"]): r["reason"] for r in records}
+        for key, expected in {
+            ("tail_elapsed_ms", "big"): "(a JSON integer outside Int64), not a JSON number",
+            ("tail_elapsed_ms", "past-int64"): "(a JSON integer outside Int64), not a JSON number",
+            ("serial", "below-int64"): "(a JSON integer outside Int64), not a JSON integer",
+            ("serial", "uint64-max"): "(a JSON integer outside Int64), not a JSON integer",
+            ("serial", "int16"): "(a JSON integer not held as an int or a long), not a JSON integer",
+            ("tail_elapsed_ms", "bigint-in-range"): "(a JSON integer not held as an int or a long), not a JSON number",
+            ("tail_elapsed_ms", "decimal"): "(a JSON number not held as a double), not a JSON number",
+            ("tail_elapsed_ms", "single"): "(a JSON number not held as a double), not a JSON number",
+            ("serial", "decimal"): "(a JSON number), not a JSON integer",
+            ("serial", "double"): "(a JSON number), not a JSON integer",
+            ("play_active", "big"): "(a JSON number), not a JSON bool",
+            ("source_id", "big"): "(a JSON number), not a JSON string",
+        }.items():
+            with self.subTest(wording=key):
+                self.assertTrue(by_key[key].endswith(expected), by_key[key])
+        for key in (("tail_elapsed_ms", "double"), ("tail_elapsed_ms", "int"), ("serial", "int"), ("source_id", "date"), ("play_active", "true")):
+            self.assertIsNone(by_key[key], key)
+
+    def test_an_absent_field_is_not_a_wrong_type_and_another_kind_of_row_is_not_read(self) -> None:
+        for field in ("saved", "play_active", "label_bound", "painted_serial_valid", "forced_paints_before", "label_bound_basis", "serial", "painted_serial",
+                      "display_frame", "tail_elapsed_ms", "source_id"):
+            with self.subTest(absent=field):
+                note = self.out_for("tail", field, absent=True)["m"].get("conformTailInFlightCreditNote", "")
+                self.assertNotIn("TAIL_VISUAL_ROW_UNREADABLE", note)
+        stop = {"kind": "stop_unbound", "index": 0, "file": "stop-unbound.png", "tail_elapsed_ms": 2900, "saved": "no", "play_active": "no", "forced_paints_before": "x",
+                "label_bound": "no", "label_bound_basis": 7, "source_id": 7, "serial": "x"}
+        rows, count = self.rows("tail")
+        out = self.metrics({"visualBurstCaptures": count}, app=self.app_json(*rows[:-1], stop, rows[-1]), criteria=self.BOTH)
+        self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
 
 
 class DriftLegSpecTests(unittest.TestCase):
