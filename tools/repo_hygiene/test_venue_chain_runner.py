@@ -1620,7 +1620,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
     def test_r6_bounded_process_a_child_started_after_the_deadline_is_killed_at_start_with_its_pid_and_a_failed_kill_is_unconfirmed(self) -> None:
         """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r6 (Grok G10): a child that came to life after -StartBeforeUtc was started (Process.Start ran) and killed. It used to read notStarted with reason DEADLINE,
         the same as a child that was never started, and its killConfirmed could be $false. It is reason KILLED_AT_START now, with childPid; a pre-start return carries no pid."""
-        lead = f"Import-Module '{MODULE}' -Force -DisableNameChecking; "
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; "   # r7 (adversary r7 A1): the offline seams are honoured only in a process that says it is a test
         run = (lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 60 -StartBeforeUtc ([DateTime]::UtcNow.AddSeconds(1)) -TestStartDelayMs 2000 -CleanupWaitMs 3000 "
                "EXTRA; \"$($r.notStarted) $($r.reason) $($r.killConfirmed) $($r.timedOut) $($r.childPid -gt 0)\"; if ($r.childPid) { Stop-Process -Id $r.childPid -Force -ErrorAction SilentlyContinue }; exit 0")
         self.assertEqual(pwsh_text(run.replace("EXTRA", "")).split(), ["True", "KILLED_AT_START", "True", "True", "True"])
@@ -1632,7 +1632,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         """r6 fix (adversary r6 pass 15 A1, A2). A1: the sampled-end check ran before Process.Start, so a parent descheduled between them started a child with no room left and reported it an ordinary start.
         A2: a child that exited on its own while the parent was descheduled past the sampled end read as timedOut=$false, exit 0 (WaitForExit(0) is true for an exited child) and the answer was accepted.
         Both are now a child that is KILLED_AT_START (lateKind ROOM) and a timedOut answer; a run deadline that passed is lateKind DEADLINE; a plain timeout carries no lateKind."""
-        lead = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "   # (r7: the seams are honoured only in a process that says it is a test)
         tail = "; \"$($r.notStarted) $($r.reason) [$($r.lateKind)] $($r.timedOut) $($r.exit) $($r.killConfirmed) $($r.childPid -gt 0)\"; if ($r.childPid) { Stop-Process -Id $r.childPid -Force -ErrorAction SilentlyContinue }; exit 0"
         room = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 2 -Clock $c -EndSec 2 -StartBeforeUtc ([DateTime]::UtcNow.AddHours(1)) -TestStartDelayMs 3000 -CleanupWaitMs 3000" + tail)
         self.assertEqual(room, "True KILLED_AT_START [ROOM] True  True True", "a child started after the sampled end was used up is KILLED_AT_START with lateKind ROOM")
@@ -1650,6 +1650,38 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertEqual(nan, "True ROOM []")
         self.assertFalse(marker.exists(), "a child was started on a NaN end")
         shutil.rmtree(marker.parent, ignore_errors=True)
+
+    def test_r7_a1_a_default_parameter_value_cannot_bind_an_offline_seam_into_a_production_child(self) -> None:
+        """r7 (adversary r7 pass 17 A1): the seams are parameters, and $PSDefaultParameterValues (a profile, a wrapper) binds a parameter the caller never typed, indistinguishably from one it typed. A caller that
+        passes none of them (Invoke-VenueChain.ps1 passes none; the batch passed three of the four) inherited a ten-minute hold or a failing kill in a PRODUCTION child. The seams are inert unless the process says
+        it is an offline test (MLV_VENUE_BOUNDED_TEST_SEAMS=1); the same entries still work when it does."""
+        defaults = ("$PSDefaultParameterValues['Invoke-VenueBoundedProcess:TestStartDelayMs'] = 4000; $PSDefaultParameterValues['Invoke-VenueBoundedProcess:TestAfterStartDelayMs'] = 4000; "
+                    "$PSDefaultParameterValues['Invoke-VenueBoundedProcess:TestBeforeWaitDelayMs'] = 4000; $PSDefaultParameterValues['Invoke-VenueBoundedProcess:TestKillThrows'] = $true; ")
+        fast = f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 8 -CleanupWaitMs 3000; \"$($r.notStarted) $($r.timedOut) [$($r.exit)] $($r.killConfirmed)\""
+        hang = f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs 3000; \"$($r.timedOut) $($r.killConfirmed)\"; if ($r.childPid) {{ Stop-Process -Id $r.childPid -Force -ErrorAction SilentlyContinue }}; exit 0"
+        clean =f"Remove-Item Env:MLV_VENUE_BOUNDED_TEST_SEAMS -ErrorAction SilentlyContinue; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); " + defaults
+        self.assertEqual(pwsh_text(clean + fast), "False False [0] True", "an injected delay held a production child past the sampled end")
+        self.assertEqual(pwsh_text(clean + hang), "True True", "an injected failing kill read as an unconfirmed kill in a production child")
+        seams_on = "$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; " + clean[clean.index("Import-Module"):]
+        self.assertEqual(pwsh_text(seams_on + fast), "False True [] False", "with the offline switch the very same entries do hold the child past its end (the seams still work)")
+        self.assertEqual(pwsh_text(seams_on + hang), "True False", "with the offline switch the failing kill is honoured")
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        self.assertIn("if ($env:MLV_VENUE_BOUNDED_TEST_SEAMS -cne '1') { $TestStartDelayMs = 0; $TestKillThrows = [switch]::new($false); $TestAfterStartDelayMs = 0; $TestBeforeWaitDelayMs = 0 }", body)
+        batch = (DV / "Invoke-VenueLeaseBatch.ps1").read_text(encoding="utf-8")
+        self.assertIn("$env:MLV_VENUE_BOUNDED_TEST_SEAMS = $(if ($BoundedChildStartDelaySec -gt 0 -or $BoundedChildKillFails) { '1' } else { $null })", batch, "the batch sets the switch only for its own offline seams, and clears one it inherited")
+
+    def test_r7_a2_an_answer_the_parent_observes_after_the_sampled_end_is_a_timeout_even_when_the_child_had_already_exited(self) -> None:
+        """r7 (adversary r7 pass 17 A2): the r6 fix covered a parent descheduled BEFORE the wait is computed. One descheduled AFTER it (the wait is still positive) and before WaitForExit began got true from
+        WaitForExit for a child that had already exited, so timedOut=$false and exit 0 survived past the sampled end. The end is asked again once the wait returns."""
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        tail = "; \"$($r.notStarted) $($r.timedOut) [$($r.exit)] $($r.killConfirmed) [$($r.stdout.Trim())]\"; exit 0"
+        late = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 4 -TestBeforeWaitDelayMs 6000 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(late, "False True [] True [answer]", "a child that exited before the parent got to wait, observed after the sampled end, is a timeout with no exit code")
+        inside = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 600 -TestBeforeWaitDelayMs 1000 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(inside, "False False [0] True [answer]", "an answer inside the sampled end is accepted")
+        none = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(none, "False False [0] True [answer]", "a caller with no clock is unchanged")
 
     def test_r11_bounded_process_cleanup_waits_share_one_budget_and_a_failed_tree_kill_is_never_confirmed(self) -> None:
         """EXPORT-VENUE-LEG-1 r11 (adversary r11 A5, A6). A6: after the bound, the kill wait and both stream waits shared 3 x 15 s past a caller's deadline; a grandchild that outlives its parent

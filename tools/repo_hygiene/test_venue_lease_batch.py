@@ -725,15 +725,27 @@ def batch_result(stdout: str) -> dict:
 # r7 (Grok G11 prevention): a plain text scan of the batch script's typed ends. A STOP pair is a `Set-Stop '<reason>' <code>` call (the code of an `$(if (...) { 7 } else { 3 })` expression is both codes); an END pair
 # is a `$b.endReason = '<reason>'` assignment. The scan asks of every pair whether some batch test names it (_g11_named_pairs), so a NEW branch cannot ship with only its sibling tested.
 # The pair is the unit (a second site that reuses a reason and code is not told apart from the first: the scan cannot see a site, only what it ends the run with).
-def _g11_pairs(runner_text: str) -> tuple[set, set]:
+def _g11_pairs(runner_text: str) -> tuple[set, set, list]:
+    """(stop pairs, end reasons, odd). PowerShell is case-insensitive and takes either quote, so both are read. `odd` lists every Set-Stop call and every `.endReason =` assignment the two recognisers could not read
+    (a reason held in a variable, a stop with no literal code, another variable than $b): a form the scan cannot read is a failure of the test that asks, never a branch it silently skips (adversary r7 pass 17 A3)."""
     code = "\n".join(l for l in runner_text.splitlines() if not l.lstrip().startswith("#"))
-    stops = set()
-    for m in re.finditer(r"Set-Stop '([A-Z][A-Z0-9_]+)' (?:(\d+)\b|\$\(if .*?\{ (\d+) \} else \{ (\d+) \}\))", code):
-        for c in m.groups()[1:]:
+    stops, read_stops = set(), 0
+    for m in re.finditer(r"""set-stop\s+(['"])([A-Z][A-Z0-9_]+)\1\s+(?:(\d+)\b|\$\(if .*?\{ (\d+) \} else \{ (\d+) \}\))""", code, flags=re.IGNORECASE):
+        read_stops += 1
+        for c in m.groups()[2:]:
             if c is not None:
-                stops.add((m.group(1), int(c)))
-    ends = {m.group(1) for m in re.finditer(r"\$b\.endReason = '([A-Z][A-Z0-9_]+)'", code, flags=re.IGNORECASE)}
-    return stops, ends
+                stops.add((m.group(2), int(c)))
+    end_re = r"""\$b\.endReason\s*=\s*(['"])([A-Z][A-Z0-9_]+)\1"""
+    stop_re = r"""set-stop\s+(['"])([A-Z][A-Z0-9_]+)\1\s+(?:(\d+)\b|\$\(if .*?\{ (\d+) \} else \{ (\d+) \}\))"""
+    ends = {m.group(2) for m in re.finditer(end_re, code, flags=re.IGNORECASE)}
+    odd = []
+    for call in re.findall(r"(?<!function )\bset-stop\b[^\n]*", code, flags=re.IGNORECASE):
+        if not re.match(stop_re, call, flags=re.IGNORECASE):
+            odd.append(re.split(r";|\s\}", call)[0].strip())
+    for assign in re.findall(r"\$\w+\.endReason\s*=(?!=)[^\n]*", code, flags=re.IGNORECASE):
+        if not re.match(end_re, assign, flags=re.IGNORECASE):
+            odd.append(re.split(r";|\s\}", assign)[0].strip())
+    return stops, ends, sorted(set(odd))
 
 
 def _g11_named_pairs(test_text: str, stops: set, ends: set) -> tuple[set, set]:
@@ -759,6 +771,17 @@ def _g11_named_pairs(test_text: str, stops: set, ends: set) -> tuple[set, set]:
 # Pairs no batch test names yet, each with the card that owes the test (a row leaves this list when a test names it: the scan fails on a stale row too). Module level on purpose: the scan reads the test METHODS only.
 _G11_UNNAMED_STOPS: dict = {}
 _G11_UNNAMED_ENDS: dict = {}
+# Typed stops whose reason the scan cannot read as a literal (the reason is the typed refusal an input guard returned, exit 2: Get-HitRefusal / Get-OutputRefusalCode). Each is driven by the refusal tests of those guards,
+# not by name; a test that names every refusal reason these carry is owed (the scan reads them by their exact call text, so a NEW dynamic form fails the scan).
+_G11_DYNAMIC_FORMS: dict = {
+    "Set-Stop $hr[0] 2": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "Set-Stop (Get-HitRefusal $hit)[0] 2": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "Set-Stop $rf.reason $rf.code": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "$B.endReason = $hr[0]": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "$b.endReason = $hr[0]": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "$b.endReason = $rf.reason": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",
+    "$b.endReason = $leaseClass": "VENUE-LEASE-BATCH-TYPED-END-COVERAGE-1",   # LEASE_EXPIRED | LEASE_DEMOTED | LEASE_LOST | LEASE_IDLE_ENDED, read from the agent's own end line
+}
 
 
 # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1 r10: numeric-contract scanners for the dual-venue PowerShell. Both are tested on their own spellings below, so a pin cannot go blind
@@ -6798,7 +6821,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
 
     # r7 (Grok G11 prevention): every typed end of the batch script is named by at least one batch test, or is on the module-level allowlist with the card that owes its test.
     def test_legspec_committed_r7_g11_every_stop_and_end_pair_of_the_batch_script_is_named_by_a_batch_test_or_is_on_the_allowlist(self) -> None:
-        stops, ends = _g11_pairs(RUNNER.read_text(encoding="utf-8"))
+        stops, ends, odd = _g11_pairs(RUNNER.read_text(encoding="utf-8"))
+        self.assertEqual(sorted(set(odd) - set(_G11_DYNAMIC_FORMS)), [], "the scan cannot read a typed end of the batch script: teach _g11_pairs the form, write the end in a form it reads, or add its exact call text to _G11_DYNAMIC_FORMS with the card that owes its test")
+        self.assertEqual(sorted(set(_G11_DYNAMIC_FORMS) - set(odd)), [], "a dynamic form on the allowlist is no longer in the script: remove its row")
         named_stops, named_ends = _g11_named_pairs(Path(__file__).read_text(encoding="utf-8"), stops, ends)
         self.assertGreaterEqual((len(stops), len(ends)), (15, 19), "the scan went blind: " + repr((sorted(stops), sorted(ends))))
         new_stops = sorted(stops - named_stops - set(_G11_UNNAMED_STOPS))
@@ -6807,17 +6832,21 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                          "or add it to _G11_UNNAMED_* with the card that owes the test")
         self.assertEqual((sorted((stops & named_stops) & set(_G11_UNNAMED_STOPS)), sorted((ends & named_ends) & set(_G11_UNNAMED_ENDS))), ([], []), "an allowlisted pair is named by a test now: remove its row")
         self.assertEqual((sorted(set(_G11_UNNAMED_STOPS) - stops), sorted(set(_G11_UNNAMED_ENDS) - ends)), ([], []), "an allowlisted pair is no longer in the script: remove its row")
-        for card in (*_G11_UNNAMED_STOPS.values(), *_G11_UNNAMED_ENDS.values()):
+        for card in (*_G11_UNNAMED_STOPS.values(), *_G11_UNNAMED_ENDS.values(), *_G11_DYNAMIC_FORMS.values()):
             self.assertRegex(card, r"^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+-\d+$", "each allowlist row names a successor card id")
 
     def test_legspec_committed_r7_g11_the_pair_scan_sees_a_new_branch_and_a_test_that_only_names_its_sibling(self) -> None:
-        script = ("$b.endReason = 'SIBLING_END'; Set-Stop 'SIBLING_STOP' 3\n"
-                  "$b.endReason = 'NEW_END'\n"
-                  "Set-Stop 'SIBLING_STOP' 9\n"
+        script = ("function Set-Stop([string]$Reason, [int]$Code) { $script:stopReason = $Reason }\n"
+                  "$b.endReason = 'SIBLING_END'; Set-Stop 'SIBLING_STOP' 3\n"
+                  "$B.EndReason  =  \"NEW_END\"\n"
+                  "set-stop \"SIBLING_STOP\" 9\n"
                   "Set-Stop 'DYNAMIC_STOP' $(if ($x -ceq 'ROOM') { 7 } else { 3 })\n"
                   "# Set-Stop 'COMMENTED_STOP' 5\n")
-        stops, ends = _g11_pairs(script)
-        self.assertEqual((stops, ends), ({("SIBLING_STOP", 3), ("SIBLING_STOP", 9), ("DYNAMIC_STOP", 7), ("DYNAMIC_STOP", 3)}, {"SIBLING_END", "NEW_END"}))
+        stops, ends, odd = _g11_pairs(script)
+        self.assertEqual((stops, ends, odd), ({("SIBLING_STOP", 3), ("SIBLING_STOP", 9), ("DYNAMIC_STOP", 7), ("DYNAMIC_STOP", 3)}, {"SIBLING_END", "NEW_END"}, []),
+                         "a double-quoted reason and a lower-case Set-Stop are read like the usual spelling")
+        _s, _e, odd = _g11_pairs(script + "Set-Stop $reason 4\n$b.endReason = $why\n$batch.endReason = 'OTHER_VARIABLE'\n")
+        self.assertEqual(odd, ["$b.endReason = $why", "$batch.endReason = 'OTHER_VARIABLE'", "Set-Stop $reason 4"], "a form the recognisers cannot read is reported, never skipped: " + repr(odd))
         tests = ("\n    def test_sibling(self):\n"
                  "        self.assertEqual((r.returncode, res[\"stopReason\"]), (3, \"SIBLING_STOP\"))\n"
                  "        self.assertEqual(b[\"endReason\"], \"SIBLING_END\")\n"

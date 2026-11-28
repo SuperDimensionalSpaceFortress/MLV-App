@@ -2517,7 +2517,11 @@ function Invoke-VenueBoundedProcess {
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
           [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000,
           [Diagnostics.Stopwatch]$Clock = $null, [double]$EndSec = 0, [Nullable[DateTime]]$StartBeforeUtc = $null,
-          [ValidateRange(0, 600000)][int]$TestStartDelayMs = 0, [switch]$TestKillThrows, [ValidateRange(0, 600000)][int]$TestAfterStartDelayMs = 0)
+          [ValidateRange(0, 600000)][int]$TestStartDelayMs = 0, [switch]$TestKillThrows, [ValidateRange(0, 600000)][int]$TestAfterStartDelayMs = 0, [ValidateRange(0, 600000)][int]$TestBeforeWaitDelayMs = 0)
+    # r7 (adversary r7 pass 17 A1): the four offline seams above are inert unless the process says it is an offline test (MLV_VENUE_BOUNDED_TEST_SEAMS=1, set by the batch script only when one of its own seam switches is
+    # asked for, and by the module tests). A value a caller never typed, one that $PSDefaultParameterValues (a profile, a wrapper) binds to the parameter, is indistinguishable from one it typed (both read as bound), so the
+    # production guard cannot sit on the parameter: no caller of this function, in this repo or outside it, can inherit a delay or a failing kill into a production child.
+    if ($env:MLV_VENUE_BOUNDED_TEST_SEAMS -cne '1') { $TestStartDelayMs = 0; $TestKillThrows = [switch]::new($false); $TestAfterStartDelayMs = 0; $TestBeforeWaitDelayMs = 0 }
     # r6 fix (adversary r6 pass 15 A1, A2): right after Process.Start the child is also late when the caller's SAMPLED END is already used up (lateKind ROOM, as a passed -StartBeforeUtc is lateKind DEADLINE): it is killed at
     # once and reported KILLED_AT_START, so nothing runs on with no room. And a child that exited on its own is no answer when the wait began with no room left (WaitForExit(0) is true for an exited child): it is timedOut,
     # exit $null, never accepted. -TestAfterStartDelayMs (held right after Process.Start's late check) stands in for a parent descheduled between the launch and the wait.
@@ -2544,7 +2548,11 @@ function Invoke-VenueBoundedProcess {
     $waitMs = [double]$TimeoutSec * 1000.0
     if ($null -ne $Clock) { $waitMs = [Math]::Min($waitMs, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
     $pastEnd = ($null -ne $Clock -and -not ($waitMs -gt 0))
+    if ($TestBeforeWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($TestBeforeWaitDelayMs) }   # (offline seam: a parent descheduled after the wait was computed and before it begins; $waitMs stays what it was)
     $timedOut = $(if ($lateStart -or $pastEnd) { $true } else { -not $p.WaitForExit([int][Math]::Max(0.0, [Math]::Min([double][int]::MaxValue, $waitMs))) })
+    # r7 (adversary r7 pass 17 A2): WaitForExit is true for a child that had already exited, whenever the parent got to ask: an answer observed only after the sampled end is a timeout, never an answer (exit $null, as the
+    # no-room-at-the-wait case above). The child needs no kill (it is gone), so killConfirmed reads from HasExited as for any timeout.
+    if (-not $timedOut -and $null -ne $Clock -and -not (($EndSec - $Clock.Elapsed.TotalSeconds) -gt 0)) { $timedOut = $true }
     $killErrored = $false
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
     if ($timedOut) { if ($TestKillThrows) { $killErrored = $true } elseif (-not $p.HasExited) { try { $p.Kill($true) } catch { $killErrored = $true } }; [void]$p.WaitForExit($CleanupWaitMs) }   # (-TestKillThrows: the kill is not made and reads as failed; a child that already exited needs none)
