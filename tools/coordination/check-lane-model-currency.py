@@ -135,7 +135,8 @@ CONSECUTIVE_STALE_RUNS = 2
 DEFAULT_SINCE_HOURS = 72.0
 LIVE_GRACE_SEC = 300.0
 MAX_FUTURE_START_SKEW_SEC = 300     # a running receipt may be dated at most this far past now (clock skew)
-MAX_LIVE_TIMEOUT_SEC = 172800.0     # 48 h; the longest timeoutSec seen on a real lane is 12600 s
+TRIAL_PRODUCER_ENGINES = ("antigravity", "kimicode")   # THIRD-PARTY-PRODUCER-LANES-1: neon/kimi receipts carry no comparable model id
+MAX_LIVE_TIMEOUT_SEC = 172800.0    # 48 h; the longest timeoutSec seen on a real lane is 12600 s
 # THE ONE startedUtc SHAPE (r6, hub ruling 20261105T1245Z): what Invoke-Lane.ps1 writes (ToString('o') of a UTC
 # DateTime: 'Z' and 7 digits) plus the ordinary ISO 8601 neighbours (1-9 fraction digits, an HH:MM offset). ASCII
 # digits only, hour 00-23 (3.14's fromisoformat reads 24 as the next day, 3.13's refuses it), offset hour 00-23 and
@@ -306,6 +307,7 @@ def load_receipts(runs_dir):
             # the exact timeout a live candidate needs, decided once here on the RAW token (r3)
             "timeoutExact": exact_timeout(timeout),
             "card": data.get("card"), "effort": data.get("effort"),
+            "engine": data.get("engine") if isinstance(data.get("engine"), str) else None,
             "resolvedModel": resolved if isinstance(resolved, str) else None,
             "parsed": parse_model_id(resolved),
         })
@@ -359,6 +361,10 @@ def is_live_running(receipt, now):
 
 def evaluate(receipts, since_hours=DEFAULT_SINCE_HOURS, now=None, overrides=None):
     now = now or datetime.datetime.now(datetime.timezone.utc)
+    # THIRD-PARTY-PRODUCER-LANES-1: a trial producer's receipt names no comparable model id, so it is dropped BEFORE any
+    # family maximum, liveness or per-lane judgement reads it (a producer's resolvedModel can never become the newest id of
+    # a claude/codex family).
+    receipts = [r for r in receipts if r.get("engine") not in TRIAL_PRODUCER_ENGINES]
     # The family's newest id is judged over every receipt that is not `running`, however old; the window only decides
     # what is reported. A `running` receipt is never evidence, live or expired (r5, B1), so it cannot raise the newest id.
     live_ids = {id(r) for r in receipts if is_live_running(r, now)}
