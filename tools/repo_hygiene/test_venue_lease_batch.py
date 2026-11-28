@@ -6627,6 +6627,106 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertEqual(r.returncode, 3, out)
         self.assertIn("DEADLINE", r.stdout, out)
 
+    # r6 (Grok G8, defect): the ROOM branch at the leg launch (under 1 s of the lease left when the helper samples it) set endReason LEASE_REMAINING_SHORT but not $launchShort, so on a FRESH lease (legsAttempted 0,
+    # no probe retry, no thermal wait) the batch-end retype read it as "a leg budget no lease can hold" and stopped LEG_BUDGET_EXCEEDS_LEASE with exit 2. The launch delay (the descheduled parent) uses the lease up
+    # between the launch guard and the helper's sample: the batch ends room-short, the leg goes to the next batch (a fresh lease), and nothing is retyped.
+    def test_legspec_committed_r6_g8_a_room_return_at_the_leg_launch_on_a_fresh_lease_is_a_short_end_not_a_leg_budget_stop(self) -> None:
+        self._reset_committed_case()
+        r = self.run_batch([self.specs[0]], "-BoundedChildLaunchDelaySec", "66", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=420)), FAKE_LEASE_REMAIN="66,2700")
+        out = r.stdout[-2500:] + r.stderr[-2500:]
+        self.assertNotIn("LEG_BUDGET_EXCEEDS_LEASE", r.stdout + r.stderr + (self.run_dir / "batch.log").read_text(encoding="utf-8"), out)
+        self.assertEqual(r.returncode, 0, out)
+        b1, b2 = self.batches()
+        self.assertEqual((b1["endReason"], b1["legsAttempted"], b1["probeRetries"], b1["thermalWaits"], b2["endReason"], b2["legsCounted"]), ("LEASE_REMAINING_SHORT", 0, 0, 0, "ALL_LEGS_DONE", 1), out)
+        self.assertIn("s of the lease were left after the launch guard", b1["endDetail"])
+
+    # r6 (Grok G10): a child that came to life after -StartBeforeUtc (the parent descheduled just before Process.Start) WAS started and is killed at once. It was reported notStarted with reason DEADLINE, and killConfirmed
+    # could be $false, so the leg went back in the queue and logged "no leg launched" with a child possibly still running. It is KILLED_AT_START now (the pid and killConfirmed travel with it).
+    def _g10_leg_run(self, *extra: str) -> tuple[subprocess.CompletedProcess, str]:
+        self._reset_committed_case()
+        r = self.run_batch([self.specs[0]], "-BoundedChildStartDelaySec", "50", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=45)), *extra)
+        log = (self.run_dir / "batch.log").read_text(encoding="utf-8") if (self.run_dir / "batch.log").exists() else ""
+        return r, log
+
+    def test_legspec_committed_r6_g10_a_leg_killed_at_start_with_an_unconfirmed_kill_is_a_launched_leg_that_stops_the_run(self) -> None:
+        r, log = self._g10_leg_run("-BoundedChildKillFails")
+        out = r.stdout[-2500:] + r.stderr[-2500:] + log[-2500:]
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"]), (3, "LEG_KILL_UNCONFIRMED"), out)
+        [leg] = res["legs"]
+        self.assertEqual((leg["status"], leg["class"], leg["killConfirmed"]), ("LEG_FAILED", "KILL_UNCONFIRMED", False), out)
+        self.assertGreater(int(leg["childPid"]), 0, out)
+        [b] = self.batches()
+        self.assertEqual(b["legsAttempted"], 1, "the leg was started: it is never un-counted\n" + out)
+        self.assertEqual(b["endReason"], "LEG_KILL_UNCONFIRMED", out)
+        line = [l for l in log.splitlines() if "KILLED_AT_START" in l or "kill UNCONFIRMED" in l]
+        self.assertTrue(line and all("no leg launched" not in l for l in line), out)
+        self.assertEqual([x for x in res["legs"] if x["status"] == "NOT_RUN"], [], "the leg is not put back in the queue\n" + out)
+
+    def test_legspec_committed_r6_g10_a_leg_killed_at_start_with_a_confirmed_kill_stops_on_the_deadline_and_says_the_child_was_started(self) -> None:
+        r, log = self._g10_leg_run()
+        out = r.stdout[-2500:] + r.stderr[-2500:] + log[-2500:]
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"]), (3, "DEADLINE"), out)
+        dl = [l for l in log.splitlines() if " DEADLINE batch=" in l and "phase=launch" in l]
+        self.assertEqual(len(dl), 1, out)
+        self.assertIn("was started", dl[0])
+        self.assertIn("killed", dl[0])
+        self.assertIn("kill confirmed", dl[0])
+        self.assertNotIn("no leg launched", dl[0])
+
+    def test_legspec_committed_r6_g10_a_preflight_child_killed_at_start_is_a_started_and_killed_refusal_never_a_not_started_one(self) -> None:
+        child, _pid = self._g5_found_child("g10-committed.ps1")
+        spec = self.case / "g10-export.json"
+        spec.write_text((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"), encoding="utf-8")
+        fake = self.case / "g10-budget.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        for fails in (False, True):
+            tail = "kill UNCONFIRMED" if fails else "kill confirmed"
+            for label, args, code in (("committed-spec", ([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), *self._hermetic_receipt_root()), "COMMITTED_SPEC_PREFLIGHT_TIMEOUT"),
+                                      ("export budget", ([spec], "-ExportBudgetScript", str(fake)), "EXPORT_BUDGET_PREFLIGHT_TIMEOUT")):
+                with self.subTest(preflight=label, killFails=fails):
+                    self._reset_committed_case()
+                    extra = ("-BoundedChildStartDelaySec", "20", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=16)), *(["-BoundedChildKillFails"] if fails else []))
+                    r = self.run_batch(*args[:1], *args[1:], *extra, OMIT_DEFAULTS=self._SKIP if label == "committed-spec" else "")
+                    self._assert_g5_refused(label, r, code)
+                    self.assertIn("was started", r.stderr)
+                    self.assertIn("killed", r.stderr)
+                    self.assertIn(tail, r.stderr)
+                    self.assertNotIn("was not started", r.stderr)
+
+    def test_legspec_committed_r6_g10_sweep_a_leg_killed_at_the_lease_end_with_an_unconfirmed_kill_stops_the_run(self) -> None:
+        # FIELD_SWEEP: the leg's killConfirmed was never read, so a tree kill that could not be confirmed ended the batch LEASE_EXPIRED and the next batch opened a lease with the child possibly still running
+        self.addCleanup(self._kill_fake_leg_pids)
+        self._reset_committed_case()
+        r = self.run_batch(self.specs[:2], "-BoundedChildKillFails", FAKE_LEASE_REMAIN="63,2700", FAKE_LEG_MODES="hang")
+        out = r.stdout[-2500:] + r.stderr[-2500:]
+        res = batch_result(r.stdout)
+        self.assertEqual((r.returncode, res["stopReason"]), (7, "LEG_KILL_UNCONFIRMED"), out)
+        [b] = self.batches()
+        self.assertEqual((b["endReason"], b["legsAttempted"], b["legs"][0]["status"], b["legs"][0]["killConfirmed"]), ("LEASE_EXPIRED", 1, "LEASE_EXPIRED", False), out)
+        self.assertIn("kill UNCONFIRMED", b["endDetail"])
+        self.assertEqual(len([k for k in self.kinds() if k.startswith("OPEN:")]), 1, "no second lease is opened while a child may still be running\n" + out)
+        self.assertEqual([x["status"] for x in res["legs"]], ["LEASE_EXPIRED", "NOT_RUN"], out)
+
+    def test_legspec_committed_r6_g10_every_not_started_caller_reads_killed_at_start_and_the_module_returns_it(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        code = "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))
+        self.assertEqual(len(re.findall(r"if \(-not \$(?:bp|fp|lp)\.started\)", code)), 4, "the leg and the three preflights are the callers that read started")
+        self.assertEqual(len(re.findall(r"if \(-not \$(bp|fp)\.started -and \$\1\.reason -ceq 'KILLED_AT_START'\) \{ return '[A-Z_]+', ", code)), 3, "each preflight types KILLED_AT_START before its not-started wording")
+        leg = code[code.index("if (-not $lp.started) {"):]
+        leg = leg[:leg.index("                    break\n                }")]
+        self.assertLess(leg.index("$lp.reason -ceq 'KILLED_AT_START' -and -not $lp.killConfirmed"), leg.index("$b.legsAttempted--"), "an unconfirmed kill is decided before the leg is un-counted")
+        unconfirmed = leg[:leg.index("$inFlightLeg = $null; $b.legsAttempted--")]
+        self.assertNotIn("legsAttempted--", unconfirmed)
+        self.assertNotIn("$pending.Add", unconfirmed)
+        self.assertNotIn("no leg launched", unconfirmed)
+        chain = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = chain[chain.index("function Invoke-VenueBoundedProcess"):chain.index("function Get-VenueDriverScriptMissing")]
+        self.assertIn("'KILLED_AT_START'", body)
+        self.assertNotRegex(body, r"\$lateStart\) \{ 'DEADLINE' \}")
+        self.assertIn("childPid = $p.Id", body)
+
     # G6 (improvement): a probe that is not started for lack of room (under 1 s) used to leave the stand-in accepted on the comment "every later gate refuses on the deadline". It fails closed: production-shaped, every seam refused.
     def test_legspec_committed_r5_g6_no_room_for_the_location_probe_refuses_every_stand_in_seam(self) -> None:
         child, pid = self._g5_found_child("g6-child.ps1")

@@ -1617,6 +1617,17 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertIn("($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0", body, "the wait is derived from the caller's clock AFTER the launch")
         self.assertIn("$lateStart", body, "a child that came to life after the deadline is killed and reported notStarted")
 
+    def test_r6_bounded_process_a_child_started_after_the_deadline_is_killed_at_start_with_its_pid_and_a_failed_kill_is_unconfirmed(self) -> None:
+        """VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r6 (Grok G10): a child that came to life after -StartBeforeUtc was started (Process.Start ran) and killed. It used to read notStarted with reason DEADLINE,
+        the same as a child that was never started, and its killConfirmed could be $false. It is reason KILLED_AT_START now, with childPid; a pre-start return carries no pid."""
+        lead = f"Import-Module '{MODULE}' -Force -DisableNameChecking; "
+        run = (lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 60 -StartBeforeUtc ([DateTime]::UtcNow.AddSeconds(1)) -TestStartDelayMs 2000 -CleanupWaitMs 3000 "
+               "EXTRA; \"$($r.notStarted) $($r.reason) $($r.killConfirmed) $($r.timedOut) $($r.childPid -gt 0)\"; if ($r.childPid) { Stop-Process -Id $r.childPid -Force -ErrorAction SilentlyContinue }; exit 0")
+        self.assertEqual(pwsh_text(run.replace("EXTRA", "")).split(), ["True", "KILLED_AT_START", "True", "True", "True"])
+        self.assertEqual(pwsh_text(run.replace("EXTRA", "-TestKillThrows")).split(), ["True", "KILLED_AT_START", "False", "True", "True"], "a kill that threw is never confirmed, and the caller is told the child was started")
+        never = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','exit 0') -TimeoutSec 60 -StartBeforeUtc ([DateTime]::UtcNow.AddSeconds(-1)); \"$($r.notStarted) $($r.reason) [$($r.childPid)]\"")
+        self.assertEqual(never, "True DEADLINE []")
+
     def test_r11_bounded_process_cleanup_waits_share_one_budget_and_a_failed_tree_kill_is_never_confirmed(self) -> None:
         """EXPORT-VENUE-LEG-1 r11 (adversary r11 A5, A6). A6: after the bound, the kill wait and both stream waits shared 3 x 15 s past a caller's deadline; a grandchild that outlives its parent
         and holds the inherited stdout (Start-Process -NoNewWindow, 40 s) now costs the ONE -CleanupWaitMs budget, not 15 s per wait. A5: a tree kill that threw is never `killConfirmed`

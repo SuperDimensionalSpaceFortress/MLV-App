@@ -154,7 +154,7 @@
 #
 # Exit codes (a leg's OUTCOME is never the exit code: read LEASE_BATCH_RESULT and the receipts): 0 every leg ran; 2 usage (or a leg budget no lease can hold,
 # or a refused -LegPlan: LEG_PLAN_REFUSED);
-# 3 DEADLINE before every leg ran (a cooldown, budget or exit-75 wait that reached it included); 4 GATE_UNREADABLE and 5 HOST_MISMATCH from Wait-VenueQuiet; 6 a probe ended VENUE_QUIET_UNKNOWN; 7 a leg process exited
+# 3 DEADLINE before every leg ran (a cooldown, budget or exit-75 wait that reached it included; r6: also a leg whose child was started after it and killed with the kill UNCONFIRMED, stopReason LEG_KILL_UNCONFIRMED, and a leg still running at the lease's end whose tree kill was unconfirmed keeps 7 with that stopReason); 4 GATE_UNREADABLE and 5 HOST_MISMATCH from Wait-VenueQuiet; 6 a probe ended VENUE_QUIET_UNKNOWN; 7 a leg process exited
 # non-zero (LEG_FAILED), was killed at the lease's end (LEASE_EXPIRED) or stayed THERMAL_HOT_SKIPPED past its re-queues (item 10; the run goes on); 9 a batch lease could not be opened (the open job was RETRACTED,
 # UNRESOLVED or not admitted, or never submitted because its sidecar could not be written: LIVENESS_UNAVAILABLE, or its job file could not be written here:
 # OPEN_JOB_WRITE_FAILED, or refused at its dispatch because the agent could admit it after the claim's last good expiry while the keeper is not renewing the claim:
@@ -282,7 +282,11 @@ param(
     # r5 (adversary r4 pass 12 A1): the two seams that stand in for a parent that is descheduled (a suspended VM, a paused debugger) around a bounded child. -BoundedChildLaunchDelaySec holds the parent for that many seconds AFTER
     # the room was sampled and BEFORE the child is started; -BoundedChildReturnDelaySec holds it AFTER the child returned and BEFORE its answer is judged. Offline only: refused with the real um-run.ps1.
     [ValidateRange(0, 600)][int]$BoundedChildLaunchDelaySec = 0,
-    [ValidateRange(0, 600)][int]$BoundedChildReturnDelaySec = 0
+    [ValidateRange(0, 600)][int]$BoundedChildReturnDelaySec = 0,
+    # r6 (Grok G10): -BoundedChildStartDelaySec holds the parent INSIDE Invoke-VenueBoundedProcess, after its checks and just before Process.Start (a parent descheduled in that gap, so a child that comes to life after
+    # -DeadlineUtc is killed at once: KILLED_AT_START); -BoundedChildKillFails makes that kill (any timeout kill) throw, so killConfirmed reads $false. Offline only: refused with the real um-run.ps1.
+    [ValidateRange(0, 600)][int]$BoundedChildStartDelaySec = 0,
+    [switch]$BoundedChildKillFails
 )
 $ErrorActionPreference = 'Stop'
 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A3 sibling): a caller's $PSNativeCommandUseErrorActionPreference = $true is inherited by `& script`; with Stop it would turn the
@@ -420,6 +424,7 @@ if ($umRunIsReal -and $ExportBudgetScript) { Stop-Usage '-ExportBudgetScript is 
 if ($umRunIsReal -and $ExportBudgetSpecReadFault) { Stop-Usage '-ExportBudgetSpecReadFault is an offline test seam: with the real um-run.ps1 the export budget preflight reads the spec as it is' }
 if ($umRunIsReal -and $ExportBudgetSpecReadDelaySec -gt 0) { Stop-Usage '-ExportBudgetSpecReadDelaySec is an offline test seam: with the real um-run.ps1 the export budget preflight reads the spec as it is' }
 if ($umRunIsReal -and ($BoundedChildLaunchDelaySec -gt 0 -or $BoundedChildReturnDelaySec -gt 0)) { Stop-Usage '-BoundedChildLaunchDelaySec and -BoundedChildReturnDelaySec are offline test seams: with the real um-run.ps1 no bounded child is ever held before its launch or after its return' }
+if ($umRunIsReal -and ($BoundedChildStartDelaySec -gt 0 -or $BoundedChildKillFails)) { Stop-Usage '-BoundedChildStartDelaySec and -BoundedChildKillFails are offline test seams: with the real um-run.ps1 no bounded child is ever held just before Process.Start and no kill is made to fail' }
 if ($umRunIsReal -and $CommittedSpecRepoRoot) { Stop-Usage '-CommittedSpecRepoRoot is an offline test seam: with the real um-run.ps1 the committed-spec preflight reads this checkout''s own HEAD' }
 if ($SkipCommittedSpecPreflight -and $CommittedSpecRepoRoot) { Stop-Usage '-SkipCommittedSpecPreflight contradicts -CommittedSpecRepoRoot: that seam asks for the committed-spec preflight' }
 # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r4 (Grok CoS G4): the two path seams (-CommittedSpecRepoRoot, -CommittedSpecScript) are made absolute below with .NET (lexically, no file-system work before -DeadlineUtc) and
@@ -474,13 +479,14 @@ function Invoke-BatchBoundedChild {
     $leftSec = $EndSec - $Clock.Elapsed.TotalSeconds
     $boundSec = $(if ([double]::IsNaN($leftSec)) { 0 } else { [int][Math]::Min($CapSec, [Math]::Floor([Math]::Max(0.0, $leftSec))) })
     $notStarted = $(if ([DateTime]::UtcNow -ge $StartBeforeUtc) { 'DEADLINE' } elseif ($boundSec -lt 1) { 'ROOM' } else { '' })
-    if ($notStarted) { return [pscustomobject]@{ started = $false; reason = $notStarted; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = '' } }
+    if ($notStarted) { return [pscustomobject]@{ started = $false; reason = $notStarted; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; childPid = $null } }
     # (r5 pass 14 A2: the module is handed the stopwatch, the end and the deadline too, so the wait it makes AFTER Process.Start is what is left of the sampled end, not a fresh relative bound, and a child that came to
     # life only after the deadline is killed at once and comes back notStarted)
-    $r = Invoke-VenueBoundedProcess -FilePath $FilePath -ArgumentList $ArgumentList -TimeoutSec $boundSec -CleanupWaitMs $CleanupWaitMs -Clock $Clock -EndSec $EndSec -StartBeforeUtc $StartBeforeUtc
-    if ($r.notStarted) { return [pscustomobject]@{ started = $false; reason = [string]$r.reason; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = [bool]$r.killConfirmed; stdout = ''; stderr = '' } }
+    $r = Invoke-VenueBoundedProcess -FilePath $FilePath -ArgumentList $ArgumentList -TimeoutSec $boundSec -CleanupWaitMs $CleanupWaitMs -Clock $Clock -EndSec $EndSec -StartBeforeUtc $StartBeforeUtc -TestStartDelayMs ($BoundedChildStartDelaySec * 1000) -TestKillThrows:$BoundedChildKillFails
+    # r6 (Grok G10): reason KILLED_AT_START is a child that WAS started (childPid) and killed at once, so started stays $false (no answer) but killConfirmed and childPid say what became of it; every caller reads them
+    if ($r.notStarted) { return [pscustomobject]@{ started = $false; reason = [string]$r.reason; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = [bool]$r.killConfirmed; stdout = ''; stderr = ''; childPid = $r.childPid } }
     if ($BoundedChildReturnDelaySec -gt 0) { [Threading.Thread]::Sleep($BoundedChildReturnDelaySec * 1000) }
-    [pscustomobject]@{ started = $true; reason = ''; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $r.exit; timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; stdout = $r.stdout; stderr = $r.stderr }
+    [pscustomobject]@{ started = $true; reason = ''; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $r.exit; timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; stdout = $r.stdout; stderr = $r.stderr; childPid = $r.childPid }
 }
 # r19 (sol r18 B1): the sha256 of the leg spec bytes the export-budget preflight judged, by spec path (Get-ExportBudgetRefusal records it). Every later read of that spec before a
 # lease or a leg is compared with it (Get-InputContentRefusal, and the leg itself through -ExpectSpecSha256), so a lease is never spent on bytes the budget did not judge.
@@ -1812,6 +1818,8 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $bp = Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -Clock $boundClock -EndSec $boundFloor -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -StartBeforeUtc $deadline -NotAfterUtc $deadline
+    # r6 (Grok G10): a child started after -DeadlineUtc and killed at once WAS started: the refusal says so, and says whether the kill is confirmed (never "was not started")
+    if (-not $bp.started -and $bp.reason -ceq 'KILLED_AT_START') { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was started (pid $($bp.childPid)) after -DeadlineUtc and killed at once ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' })); no claim or lease is taken on it" }
     if (-not $bp.started) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, the room sampled for it ended before its launch ($($bp.reason): $([Math]::Round([Math]::Max(0.0, $bp.leftSec), 1)) s were left of it); no claim or lease is taken on it" }
     $boundSec = $bp.boundSec
     if ($bp.late) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted; no claim or lease is taken on it" }
@@ -1828,6 +1836,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
     $fp = Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -Clock $boundClock -EndSec $boundFloor -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -StartBeforeUtc $deadline -NotAfterUtc $deadline
+    if (-not $fp.started -and $fp.reason -ceq 'KILLED_AT_START') { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was started (pid $($fp.childPid)) after -DeadlineUtc and killed at once ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' })); no claim or lease is taken on it" }
     if (-not $fp.started) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, the room sampled for it ended before its launch ($($fp.reason): $([Math]::Round([Math]::Max(0.0, $fp.leftSec), 1)) s were left of it); no claim or lease is taken on it" }
     $boundSec = $fp.boundSec
     if ($fp.late) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip-independent export budget floor's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted; no claim or lease is taken on it" }
@@ -1877,6 +1886,7 @@ function Get-LegSpecCommittedRefusal([string]$Path) {
         $childArgs = @('-NoProfile', '-File', $script:CommittedSpecScript, '-LegScript', $script:CommittedSpecLegScript, '-LegSpecSha256', $normSha)
         if ($script:CommittedSpecRepoRoot) { $childArgs += @('-RepoRoot', $script:CommittedSpecRepoRoot) }
         $bp = Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList $childArgs -Clock $boundClock -EndSec $boundFloor -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -StartBeforeUtc $deadline -NotAfterUtc $deadline
+        if (-not $bp.started -and $bp.reason -ceq 'KILLED_AT_START') { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight was started (pid $($bp.childPid)) after -DeadlineUtc and killed at once ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' })); no claim or lease is taken on it" }
         if (-not $bp.started) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight was not started, the room sampled for it ended before its launch ($($bp.reason): $([Math]::Round([Math]::Max(0.0, $bp.leftSec), 1)) s were left of it); no claim or lease is taken on it" }
         $boundSec = $bp.boundSec
         if ($bp.late) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted; no claim or lease is taken on it" }
@@ -3293,11 +3303,28 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 }
                 # r5 (adversary r5 pass 13 A2): the helper starts nothing at or after the run deadline, or with no whole second of the lease left, whatever delayed this parent since the launch guard above: the leg did not start
                 if (-not $lp.started) {
+                    # r6 (Grok G10): KILLED_AT_START is a child that WAS started (pid) and killed at once, not "no leg launched". An UNCONFIRMED kill may have left it running: it is a launched leg (counted, never put
+                    # back, never NOT_RUN) that stops the run, as a leg still running at the lease's end does (LEG_FAILED, class KILL_UNCONFIRMED; exit 7). A confirmed kill keeps today's DEADLINE stop and says so.
+                    if ($lp.reason -ceq 'KILLED_AT_START' -and -not $lp.killConfirmed) {
+                        $inFlightLeg = $null
+                        $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; class = 'KILL_UNCONFIRMED'; counted = $false; killConfirmed = $false; childPid = $lp.childPid; jobId = $null; legSec = 0; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }
+                        $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEG_FAILED' $row; $pending.RemoveAt(0)
+                        Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
+                        $b.endReason = 'LEG_KILL_UNCONFIRMED'; $b.endDetail = "leg $($leg.name) was started (pid $($lp.childPid)) after the run deadline (deadline=$($deadline.ToString('o'))) and killed at once, but the kill is UNCONFIRMED: the child may still be running; the run stops, the leg is not re-run"
+                        Set-Stop 'LEG_KILL_UNCONFIRMED' 3   # exit 3, the run deadline's code: the deadline has passed, so the receipt guard would replace a 7 (a 0 or 7 yields to its SHARE_UNREACHABLE stop) and hide this stop; 3 is kept
+                        LogBest "LEG $($leg.name) KILL_UNCONFIRMED batch=$batchNo pid=$($lp.childPid) reason=KILLED_AT_START (started after the run deadline, killed at once, kill UNCONFIRMED: the child may still be running; counted=False, the run stops)"
+                        break
+                    }
                     $inFlightLeg = $null; $b.legsAttempted--
-                    if ($lp.reason -ceq 'DEADLINE') {
+                    if ($lp.reason -ceq 'KILLED_AT_START') {
+                        $b.endReason = 'DEADLINE'; $b.endDetail = "at the launch of leg $($leg.name): the run deadline passed (deadline=$($deadline.ToString('o'))) after the launch guard: the leg's child was started (pid $($lp.childPid)) and killed at once (kill confirmed)"
+                        Set-Stop 'DEADLINE' 3; LogBest "DEADLINE batch=$batchNo leg=$($leg.name) phase=launch (the run deadline passed after the launch guard: the child was started (pid $($lp.childPid)) and killed at once, kill confirmed)"
+                    } elseif ($lp.reason -ceq 'DEADLINE') {
                         $b.endReason = 'DEADLINE'; $b.endDetail = "at the launch of leg $($leg.name): the run deadline passed (deadline=$($deadline.ToString('o'))) after the launch guard: no leg launched"
                         Set-Stop 'DEADLINE' 3; LogBest "DEADLINE batch=$batchNo leg=$($leg.name) phase=launch (the run deadline passed after the launch guard: no leg launched)"
                     } else {
+                        # r6 (Grok G8): the ROOM return is the launch guards eating the room, as at the other launch guards above: $launchShort, so a fresh lease's first leg is never retyped LEG_BUDGET_EXCEEDS_LEASE
+                        $launchShort = $true
                         $b.endReason = 'LEASE_REMAINING_SHORT'; $b.endDetail = "at the launch of leg $($leg.name): $([Math]::Round([Math]::Max(0.0, $lp.leftSec), 1)) s of the lease were left after the launch guard: it goes to the next batch"
                     }
                     break
@@ -3330,7 +3357,9 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEASE_EXPIRED'; outcome = 'INVALID'; class = 'LEASE_EXPIRED'; counted = $false; printedOutcome = $outcome; jobId = $legJobId; legSec = $legSec; legBoundSec = $legBoundSec; cancel = $cx.state; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }   # r6 (adversary r6 A2): a launched row keeps the reading the spread measures heavy keys from
                     $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEASE_EXPIRED' $row; $pending.RemoveAt(0)
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
-                    $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) was still running at the lease's end ($legSec s, bound $legBoundSec s): killed with its process tree; job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
+                    $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) was still running at the lease's end ($legSec s, bound $legBoundSec s): $(if ($lp.killConfirmed) { 'killed with its process tree' } else { 'kill UNCONFIRMED: the child may still be running' }); job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
+                    # r6 (Grok G10 field sweep): killConfirmed was never read for a leg: a tree kill that could not be confirmed left a child that may still be running, and the next batch opened a lease anyway. It stops the run (exit 7 kept).
+                    if (-not $lp.killConfirmed) { $b.legs[$b.legs.Count - 1] | Add-Member -NotePropertyName killConfirmed -NotePropertyValue $false -Force; Set-Stop 'LEG_KILL_UNCONFIRMED' 7; LogBest "LEG $($leg.name) KILL_UNCONFIRMED batch=$batchNo reason=LEASE_EXPIRED (kill UNCONFIRMED: the child may still be running; the run stops)" }
                     L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) (killed with its process tree at the lease's end)"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     break
