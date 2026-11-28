@@ -1643,6 +1643,13 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertEqual(answer, "False  [] True  True True", "an answer in hand only after the sampled end is a timeout (no exit), and a child that had exited on its own is a confirmed kill")
         plain = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 600 -CleanupWaitMs 3000" + tail)
         self.assertEqual(plain, "False  [] False 0 True True", "an answer inside the sampled end is accepted")
+        # r6 fix A4 (the first pass 15 on a8b9c3ed): a NaN end passed `-lt 1`, the child started, and [int]NaN threw at the wait with no cleanup: a NaN end is no room, and nothing is started
+        marker = Path(tempfile.mkdtemp(prefix="bounded-nan-")) / "started.txt"
+        nan = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command',\"Set-Content -LiteralPath '{marker}' -Value 1\") -TimeoutSec 5 -Clock $c -EndSec ([double]::NaN) -CleanupWaitMs 1000; "
+                        "\"$($r.notStarted) $($r.reason) [$($r.childPid)]\"")
+        self.assertEqual(nan, "True ROOM []")
+        self.assertFalse(marker.exists(), "a child was started on a NaN end")
+        shutil.rmtree(marker.parent, ignore_errors=True)
 
     def test_r11_bounded_process_cleanup_waits_share_one_budget_and_a_failed_tree_kill_is_never_confirmed(self) -> None:
         """EXPORT-VENUE-LEG-1 r11 (adversary r11 A5, A6). A6: after the bound, the kill wait and both stream waits shared 3 x 15 s past a caller's deadline; a grandchild that outlives its parent

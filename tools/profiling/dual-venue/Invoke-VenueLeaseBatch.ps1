@@ -488,6 +488,8 @@ function Invoke-BatchBoundedChild {
     if ($BoundedChildReturnDelaySec -gt 0) { [Threading.Thread]::Sleep($BoundedChildReturnDelaySec * 1000) }
     [pscustomobject]@{ started = $true; reason = ''; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $r.exit; timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; stdout = $r.stdout; stderr = $r.stderr; lateKind = ''; childPid = $r.childPid }
 }
+# r6 fix (adversary r6 pass 15 A5): a late answer that was also a timeout whose kill is unconfirmed says so (the late branch returns before the timeout branch's own wording)
+function Get-UnconfirmedKillText($Child) { if ($Child.timedOut -and -not $Child.killConfirmed) { ' (the child was also killed at its bound with the kill UNCONFIRMED: it may still be running)' } else { '' } }
 # r6 fix: the one wording of a bounded child that WAS started and killed at once (reason KILLED_AT_START), for the three preflights: when (lateKind), the pid and whether the kill is confirmed
 function Get-KilledAtStartText($Child) {
     "was started (pid $($Child.childPid)) $(if ($Child.lateKind -ceq 'ROOM') { 'with the room sampled for it already used up' } else { 'after -DeadlineUtc' }) and killed at once ($(if ($Child.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))"
@@ -1826,7 +1828,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     if (-not $bp.started -and $bp.reason -ceq 'KILLED_AT_START') { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight $(Get-KilledAtStartText $bp); no claim or lease is taken on it" }
     if (-not $bp.started) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, the room sampled for it ended before its launch ($($bp.reason): $([Math]::Round([Math]::Max(0.0, $bp.leftSec), 1)) s were left of it); no claim or lease is taken on it" }
     $boundSec = $bp.boundSec
-    if ($bp.late) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted; no claim or lease is taken on it" }
+    if ($bp.late) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted$(Get-UnconfirmedKillText $bp); no claim or lease is taken on it" }
     if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $text = (@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n"
     if ($text -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: $($Matches[0] -replace '\s+', ' ')" }
@@ -1843,7 +1845,7 @@ function Get-ExportBudgetRefusal([string]$Path) {
     if (-not $fp.started -and $fp.reason -ceq 'KILLED_AT_START') { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor $(Get-KilledAtStartText $fp); no claim or lease is taken on it" }
     if (-not $fp.started) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, the room sampled for it ended before its launch ($($fp.reason): $([Math]::Round([Math]::Max(0.0, $fp.leftSec), 1)) s were left of it); no claim or lease is taken on it" }
     $boundSec = $fp.boundSec
-    if ($fp.late) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip-independent export budget floor's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted; no claim or lease is taken on it" }
+    if ($fp.late) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip-independent export budget floor's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted$(Get-UnconfirmedKillText $fp); no claim or lease is taken on it" }
     if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $floorText = (@($fp.stdout, $fp.stderr) | Where-Object { $_ }) -join "`n"
     if ($floorText -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: the clip did not resolve here, and the clip-independent floor alone (a 0-byte clip) is refused: $($Matches[0] -replace '\s+', ' ')" }
@@ -1893,7 +1895,7 @@ function Get-LegSpecCommittedRefusal([string]$Path) {
         if (-not $bp.started -and $bp.reason -ceq 'KILLED_AT_START') { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight $(Get-KilledAtStartText $bp); no claim or lease is taken on it" }
         if (-not $bp.started) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight was not started, the room sampled for it ended before its launch ($($bp.reason): $([Math]::Round([Math]::Max(0.0, $bp.leftSec), 1)) s were left of it); no claim or lease is taken on it" }
         $boundSec = $bp.boundSec
-        if ($bp.late) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted; no claim or lease is taken on it" }
+        if ($bp.late) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted$(Get-UnconfirmedKillText $bp); no claim or lease is taken on it" }
         if ($bp.timedOut) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' })); no claim or lease is taken on it" }
         $answer = [string]$bp.stdout
         if ($bp.exit -eq 0 -and $answer -match '(?m)^DV_LEGSPEC_COMMITTED FOUND ') { return '', '' }

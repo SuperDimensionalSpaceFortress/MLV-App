@@ -6728,8 +6728,11 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertNotIn("$pending.Add", started)
         self.assertNotIn("no leg launched", started)
         self.assertIn("Add-Result $leg 'LEG_FAILED' $row", started, "a started-and-killed leg has a result row, confirmed or not (never NOT_RUN)")
+        self.assertEqual(len(re.findall(r"if \(\$(?:bp|fp)\.late\) \{ return '[A-Z_]+', [^\n]*\$\(Get-UnconfirmedKillText \$(?:bp|fp)\)", code)), 3, "r6 fix A5: a late answer whose child was also killed unconfirmed says so, at all three preflights")
         chain = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         body = chain[chain.index("function Invoke-VenueBoundedProcess"):chain.index("function Get-VenueDriverScriptMissing")]
+        self.assertNotRegex(body, r"\$EndSec - \$Clock\.Elapsed\.TotalSeconds\) -(?:lt|le) ", "r6 fix A4: every end comparison is written so that a NaN end is no room")
+        self.assertIn("-not ($waitMs -gt 0)", body)
         self.assertIn("'KILLED_AT_START'", body)
         self.assertNotRegex(body, r"\$lateStart\) \{ 'DEADLINE' \}")
         self.assertIn("childPid = $p.Id", body)

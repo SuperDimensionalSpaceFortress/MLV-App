@@ -2533,17 +2533,17 @@ function Invoke-VenueBoundedProcess {
     foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
     if ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'DEADLINE'; lateKind = ''; childPid = $null } }
-    if ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -lt 1) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'ROOM'; lateKind = ''; childPid = $null } }
+    if ($null -ne $Clock -and -not (($EndSec - $Clock.Elapsed.TotalSeconds) -ge 1)) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'ROOM'; lateKind = ''; childPid = $null } }
     if ($TestStartDelayMs -gt 0) { [Threading.Thread]::Sleep($TestStartDelayMs) }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
     $outTask = $p.StandardOutput.ReadToEndAsync(); $errTask = $p.StandardError.ReadToEndAsync()
-    $lateKind = $(if ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc) { 'DEADLINE' } elseif ($null -ne $Clock -and ($EndSec - $Clock.Elapsed.TotalSeconds) -le 0) { 'ROOM' } else { '' })
+    $lateKind = $(if ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc) { 'DEADLINE' } elseif ($null -ne $Clock -and -not (($EndSec - $Clock.Elapsed.TotalSeconds) -gt 0)) { 'ROOM' } else { '' })   # (r6 fix A4: written as "not greater", so a NaN end is no room, never a start)
     $lateStart = [bool]$lateKind
     if ($TestAfterStartDelayMs -gt 0) { [Threading.Thread]::Sleep($TestAfterStartDelayMs) }
     $waitMs = [double]$TimeoutSec * 1000.0
     if ($null -ne $Clock) { $waitMs = [Math]::Min($waitMs, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
-    $pastEnd = ($null -ne $Clock -and $waitMs -le 0)
+    $pastEnd = ($null -ne $Clock -and -not ($waitMs -gt 0))
     $timedOut = $(if ($lateStart -or $pastEnd) { $true } else { -not $p.WaitForExit([int][Math]::Max(0.0, [Math]::Min([double][int]::MaxValue, $waitMs))) })
     $killErrored = $false
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
