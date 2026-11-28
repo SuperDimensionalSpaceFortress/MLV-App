@@ -525,6 +525,18 @@ inline Debayered16ReconRefusal renderDebayered16FromSlot( mlvObject_t * video,
     return outcome;
 }
 
+/*! CPU-DEBAYERED-FRAME-MS-STALE-RESIDUE-1: the debayered_frame_ms an OutputDebayered16 draw reports.
+ *  threadRecordMs is getMlvLastDebayeredFrameMilliseconds(), the calling thread's LAST recording entry.
+ *  renderDebayered16FromSlot always runs one (each records its own total, 0 for a frame it copies), so
+ *  when it ran (cpuEntryRan) the record is this draw's. A frame drawFrame's GPU branch rendered (GPU
+ *  AMaZE, GPU bilinear, or the bilinear's own CPU fallback) ran no entry: the record is a previous
+ *  frame's (a warm-up's, say), so the draw reports only what that branch's CPU debayer took
+ *  (gpuBranchCpuDebayerMs, 0 when the GPU debayered it). */
+inline double debayered16DrawDebayeredFrameMs( bool cpuEntryRan, double threadRecordMs, double gpuBranchCpuDebayerMs )
+{
+    return cpuEntryRan ? threadRecordMs : gpuBranchCpuDebayerMs;
+}
+
 /*! What the render knows when it decides to reconstruct a frame itself. */
 struct Debayered16InlineReducedReconInputs
 {
