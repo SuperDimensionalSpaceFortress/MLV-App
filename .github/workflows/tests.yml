@@ -673,11 +673,11 @@ jobs:
             $windowIndex = [int]($offset / $testsPerShard)
             $shared = @($window | Where-Object { $_ -notmatch $soloPattern })
             if ($shared.Count -gt 0) {
-              $shards += @{ Name = ("exact-{0:D2}" -f $windowIndex); Filter = ($shared -join ':') }
+              $shards += @{ Name = ("exact-{0:D2}" -f $windowIndex); Filter = ($shared -join ':'); Index = $shards.Count }
             }
             $solo = @($window | Where-Object { $_ -match $soloPattern })
             for ($i = 0; $i -lt $solo.Count; $i++) {
-              $shards += @{ Name = ("exact-{0:D2}-solo{1}" -f $windowIndex, ($i + 1)); Filter = $solo[$i] }
+              $shards += @{ Name = ("exact-{0:D2}-solo{1}" -f $windowIndex, ($i + 1)); Filter = $solo[$i]; Index = $shards.Count }
             }
           }
           # Coverage proof: every discovered test name is in exactly one shard.
@@ -692,21 +692,39 @@ jobs:
           # and the same assignment, then runs only its own shards; the checks below prove the
           # parts are a disjoint cover, so the union of what the parts run is the one plan
           # above. Greedy longest-first onto the least-loaded part, seeded with the other
-          # oracle work a part carries (part 1: console_tests build and golden check; part 2:
-          # golden producers, stress, and display parity). Estimates, not bounds: the 240-second
-          # child bound below is what limits a shard.
+          # oracle work a part carries. Weights and seeds are MEASURED wall times in
+          # tools\testing\pipeline_test_weights.json (CI-FLAKE-PRODUCT-ORACLES-PART1-CHECK-GOLDEN-CAP-1:
+          # part 1 carries the console_tests build and golden check, about 1,000 s besides its
+          # shards, and the old flat 200 s seed with 30 s per solo and 17 s per shared shard left it
+          # about 41 min of work against 28 min for part 3; it hit the 60-minute job cap three
+          # times in 48 hours). A test the table does not list costs defaultTestMillis. The order is
+          # weight descending, then plan order, so no tie depends on a culture-aware string sort.
+          # tools\repo_hygiene\ci_pipeline_part_plan.py repeats this assignment and
+          # test_ci_pipeline_part_budget.py prices every part against a stated budget.
+          # Estimates, not bounds: the 240-second child bound below is what limits a shard.
           $partCount = 3
           $part = [int]'${{ matrix.part }}'
-          $partLoad = @(200.0, 140.0, 0.0)
+          $weightTable = Get-Content -LiteralPath 'tools\testing\pipeline_test_weights.json' -Raw | ConvertFrom-Json -AsHashtable
+          if ($weightTable.schema -ne 1 -or $weightTable.unit -ne 'milliseconds') { throw "pipeline test weights have an unexpected schema or unit" }
+          $partLoad = @($weightTable.partSeedMillis | ForEach-Object { [long]$_ })
+          if ($partLoad.Count -ne $partCount) { throw "pipeline part seeds must have one entry per part (seeds=$($partLoad.Count) parts=$partCount)" }
+          $defaultTestMillis = [long]$weightTable.defaultTestMillis
+          foreach ($planned in $shards) {
+            $weight = [long]0
+            foreach ($plannedTest in ($planned.Filter -split ':')) {
+              $weight += $(if ($weightTable.testMillis.ContainsKey($plannedTest)) { [long]$weightTable.testMillis[$plannedTest] } else { $defaultTestMillis })
+            }
+            $planned.Weight = $weight
+          }
           $partOf = @{}
-          $planOrder = @($shards | Sort-Object @{ Expression = { if ($_.Name -match '-solo') { 0 } else { 1 } } }, @{ Expression = { $_.Name } })
+          $planOrder = @($shards | Sort-Object @{ Expression = { $_.Weight }; Descending = $true }, @{ Expression = { $_.Index }; Descending = $false })
           foreach ($planned in $planOrder) {
             $target = 0
             for ($candidate = 1; $candidate -lt $partCount; $candidate++) {
               if ($partLoad[$candidate] -lt $partLoad[$target]) { $target = $candidate }
             }
             $partOf[$planned.Name] = $target + 1
-            $partLoad[$target] += $(if ($planned.Name -match '-solo') { 30.0 } else { 17.0 })
+            $partLoad[$target] += $planned.Weight
           }
           $partShardCounts = @(1..$partCount | ForEach-Object { $number = $_; @($shards | Where-Object { $partOf[$_.Name] -eq $number }).Count })
           if ($partOf.Count -ne $shards.Count -or
@@ -716,7 +734,7 @@ jobs:
           }
           $myShards = @($shards | Where-Object { $partOf[$_.Name] -eq $part })
           $myTestNames = @($myShards | ForEach-Object { $_.Filter -split ':' })
-          Write-Output ("PIPELINE-PART-PLAN part={0}/{1} shards={2}/{3} tests={4}/{5} estimatedSeconds={6}" -f $part, $partCount, $myShards.Count, $shards.Count, $myTestNames.Count, $testNames.Count, $partLoad[$part - 1])
+          Write-Output ("PIPELINE-PART-PLAN part={0}/{1} shards={2}/{3} tests={4}/{5} estimatedSeconds={6}" -f $part, $partCount, $myShards.Count, $shards.Count, $myTestNames.Count, $testNames.Count, ($partLoad[$part - 1] / 1000))
           Write-Output ("PIPELINE-PART-SHARDS part={0} {1}" -f $part, (($myShards | ForEach-Object { $_.Name }) -join ','))
           Write-Output ("PIPELINE-PART-TESTS part={0} {1}" -f $part, ($myTestNames -join ','))
           function Invoke-BoundedPipelineShard {
