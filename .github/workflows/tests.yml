@@ -70,18 +70,21 @@ jobs:
           retention-days: 30
 
   repo-hygiene-python-ubuntu-shard:
-    name: Repo Hygiene Python ubuntu shard ${{ matrix.shard }}/4
+    name: Repo Hygiene Python ubuntu shard ${{ matrix.shard }}/7
     runs-on: ubuntu-latest
-    # The whole suite on one ubuntu runner took 16-24 min. Shards 1-3 each run a third of
-    # the unittest classes (about 7.5 min measured) and shard 4 runs the remaining steps,
-    # so a shard is expected at 8-10 min including setup. 30 leaves 3x for runner variance.
+    # The whole suite on one ubuntu runner took 16-24 min. The ubuntu table weighs 3822 s, so
+    # shards 1-6 each run about 637 s of unittest classes (three shards held 1274 s each and
+    # hosted jobs measured 14.5-30.3 min, median 18-22, until shard 3/4 was cancelled at this
+    # cap on #928 71ef6f07) and shard 7 runs the remaining steps (about 12 s). A shard is
+    # expected at about 12 min including setup (about 45 s), at most half of the cap; 30
+    # leaves 2.5x for runner variance.
     # The `Repo Hygiene Python (ubuntu-latest)` check that branch protection pins is the
     # aggregator job below.
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7]
 
     steps:
       - name: Record the job start for the shard budget clock
@@ -107,23 +110,23 @@ jobs:
           python -m pip check
 
       - name: Prove the unittest shards cover every discovered test
-        # Fails unless shards 1-3 hold exactly the test ids that
+        # Fails unless shards 1-6 hold exactly the test ids that
         # `unittest discover -s tools/repo_hygiene -p "test_*.py" -t .` collects, each once.
         # A new tools/repo_hygiene/test_*.py file is collected automatically; a named-file
         # inclusion list would silently omit every file it forgets to name.
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
-        run: python -m tools.repo_hygiene.ci_unittest_shard --profile ubuntu --of 3 --verify-partition
+        run: python -m tools.repo_hygiene.ci_unittest_shard --profile ubuntu --of 6 --verify-partition
 
-      - name: Run repo hygiene unittest shard ${{ matrix.shard }}/3
-        if: matrix.shard <= 3
+      - name: Run repo hygiene unittest shard ${{ matrix.shard }}/6
+        if: matrix.shard <= 6
         # Guarded pwsh: the default wrapper ends with only the LAST command's exit code,
         # so a failing command above a passing one could stay green. The shell template
         # fails closed on the first failing native command.
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
-        run: python -m tools.repo_hygiene.ci_unittest_shard --profile ubuntu --of 3 --shard ${{ matrix.shard }}
+        run: python -m tools.repo_hygiene.ci_unittest_shard --profile ubuntu --of 6 --shard ${{ matrix.shard }}
 
       - name: Run repo hygiene tail steps
-        if: matrix.shard == 4
+        if: matrix.shard == 7
         shell: pwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ErrorActionPreference = 'Stop'; $PSNativeCommandUseErrorActionPreference = $true; . '{0}'"
         run: |
           python -m unittest tools.release.test_release_evidence -v
