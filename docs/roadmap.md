@@ -20,6 +20,8 @@ generated_from: 2026-11-25T04:42:20Z
 
 **macOS scope (owner ruling 2026-10-25T00:44:41Z).** Deferred: macOS feature, performance and GPU work (MAC-MINI-BUILD-HOST-1, CPU-SIMD-CLANG-X86-ENABLE-1, CPU-NEON-HOT-KERNELS-1, GPU-PORTABLE-BACKEND-RHI-1, GPU-METAL-BACKEND-1) until Windows CUDA and the portable GL/RHI path are solid. Not deferred: macOS compilation stays green (MAC-LINUX-BUILD-RESTORE-1, the compile canary, PR #671).
 
+**CPU playback goal (provisional; the owner may change it).** M16-1457 s1, CPU backend, windowed, presents at the clip's native 59.940 fps on Bachelor, Look Assist ON. Milestone 1 (BACHELOR-1457-CPU-HEADROOM-BASELINE-1, 2026-11-27): windowed 24.9 fps = 0.42 of native, fullscreen 22.7 fps = 0.38; top stage debayer (two legs each; windowed 21.1-28.8). Each later CPU lever reports windowed and fullscreen presented fps, the ratio to native and the top stage, on counted quiet Bachelor legs against milestone 1. The baseline summary first gave 1.04 and 0.95 against 23.976; that divisor is wrong for this clip and is not used here.
+
 | P | card | kind | state | queued since | order_chain |
 |---|---|---|---|---|---|
 | 1 | DEBAYER-ADVISOR-1 | product | queued | 2026-10-12 | ORDER-20261117T184523Z #3 after EXPORT-DEBAYER-QUALITY-1 |
@@ -102,19 +104,19 @@ does not drain (queued >= landed)
 
 - PRODUCT-PR-STRANDED-SWEEP-1 (P1): r2 DONE 14:45Z: #447 #459 #477 #516 merged master 0801141b, pushed ff; keys are mechanical-keys work, not a sweep round
 - CPU-SCOPE-LIVE-HEAP-CORRUPTION-1 (P1): PARKED and SPLIT by HUB-TICK 20261030T1357Z ruling: successors CPU-SCOPE-LIVE-HEAP-CORRUPTION-SRC-SPLIT-1 + HEAPDUMP-SOAK-ACCOUNTING-ONE-...
-- HFR-NATIVE-D4-HEAD-VISUAL-CELLS-1 (P1): HUB-TICK 20261031T1048Z: carried by HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r4 (live) and r5 (armed) on PR #420, same worktree
-- OUTPUT-BUDGET-M02-OPTIONAL-1 (P1): HUB-TICK 20261022T0853Z: r1 PARTIAL on NA-4 (gate-spec edit names owner footage path); blocked on NA4-CLIP-OR-NONE-AUTHORING-ROUTE-1 (par...
+- HFR-NATIVE-D4-HEAD-VISUAL-CELLS-1 (P1): carried by HFR-NATIVE-60FPS-FULLRES-1-MERGE-MASTER r4/r5 on PR #420
+- OUTPUT-BUDGET-M02-OPTIONAL-1 (P1): r1 PARTIAL on NA-4; blocked on NA4-CLIP-OR-NONE-AUTHORING-ROUTE-1
 - UM-FS-CUDA-QUIET-WINDOW-VERIFY-1 (P1): r1 UNJUDGED; UM route closed NO_GO; question moves to BACHELOR-FS-CUDA-QUIET-LEGS-1 (HUB RULING 10:51:06Z)
 - VENUE-CUDA-GOAL-REMEASURE-POST-450-1 (P1): owner deferred CUDA speedup 2026-10-21 (hub-tick-prompt D3-DEFER); r4 not dispatched
 - CPU-17V9-FPS-GAP-AB-1 (P1): closed by HUB RULING 2026-10-25T09:54:40Z: r7b VERDICT=confound, no regression cell (answered: not a regression)
-- PROCESSED8-MS-TELEMETRY-STUCK-1-VENUE-LEG (P1): closed done by HUB-TICK 20261025T1151Z: r4 8bcefec6 not a #553 regression; successors PROCESSED8-STALE-FIELD-CHECKER-PROMOTE-1 + PROCESSE...
-- PLAYBACK-CUDA-FULLSCREEN-BLUR-UPLOAD-STALL-POST-502-1 (P1): design NO_GO (UM host contention); successors UM-FS-CUDA-QUIET-WINDOW-VERIFY-1, PLAYBACK-HEALTH-SCAN-CONTENTION-CLASS-1; reopen only on a...
-- CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1 (P1): r2 PARTIAL FRINGE_NOT_CLOSED; successor chain S4-DECISION-1 (ruled 11:49:12Z) -> CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 (design runnin...
+- PROCESSED8-MS-TELEMETRY-STUCK-1-VENUE-LEG (P1): closed done by HUB-TICK 20261025T1151Z: r4 8bcefec6 not a #553 regression
+- PLAYBACK-CUDA-FULLSCREEN-BLUR-UPLOAD-STALL-POST-502-1 (P1): design NO_GO (UM host contention)
+- CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1 (P1): r2 PARTIAL FRINGE_NOT_CLOSED; successor CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1
 - CPU-DUALISO-REDUCED-RECON-EDGE-FRINGE-1-r2 (P1): round ended PARTIAL; successor CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1
 - CPU-DUALISO-REDUCED-RECON-S4-DECISION-1 (P1): decided by HUB RULING 2026-10-31T11:49:12Z; successor CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1
-- CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (P1): HUB RULING 2026-11-07T21:29:03Z: r4 judged pace-neutral on both arms; no master merge or keys for no measured gain on a HIGH-RISK playbac...
-- GPU-EVENT153-ROOTCAUSE-3 (P1): closed by HUB RULING 2026-11-10T11:07:16Z item 4 (HUB-TICK 1056Z): r2 DONE verdict gone B 0/12 at 424e8e6b; successor (a) is #743's next ...
-- CUDA-1457-FS-S2-SLIP-CHECK-1 (P1): folded into PLAYER-FULLSCREEN-KEEPS-PLAYING-1 r2 (#848): same 1457 s2 control-vs-head 2+2 quiet legs; SLIP_CHECK line in its summary.md (...
+- CPU-S1-RECON-UNDER-LOOK-PACE-LEVER-1 (P1): HUB RULING 2026-11-07T21:29:03Z: r4 judged pace-neutral on both arms
+- GPU-EVENT153-ROOTCAUSE-3 (P1): closed by HUB RULING 2026-11-10T11:07:16Z item 4: r2 DONE verdict gone B 0/12 at 424e8e6b
+- CUDA-1457-FS-S2-SLIP-CHECK-1 (P1): folded into PLAYER-FULLSCREEN-KEEPS-PLAYING-1 r2 (#848)
 - VENUE-FIFO-ADVERSARY-TAIL-1 (P1): HUB RULING 2026-11-24T15:30:24Z item 1: r11 FINAL sol CR B1+B2 r11-introduced; successor VENUE-FIXTURE-DRAINEDPOPEN-STDLIB-PARITY-1
 - REFERENCE-FRAME-PRESENTED-COUNT-LOOP-EXIT-1-FOLLOWUP-1 (P1): HELD by hub chat c8429ad2 2026-11-21T23:27Z: it edits the MainWindow.cpp loop-exit code that #881 (OPEN, head 970ef3f9, held on the Bache...
 - PINNED-OUTPUT-PIN-EXTENDED-PREFIX-1 (P1): HELD by hub chat c8429ad2 2026-11-21T23:27Z: the fix is at tools/release-runtime-admission.psm1:751 as changed by #862 (OPEN, draft, head...
