@@ -40,6 +40,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 . (Join-Path $PSScriptRoot "cuda-backend-architecture.ps1")
+# BENCH-LIGHT-ARM-GAIN-GATES-1: a presented-fps gain or cost verdict comes only from a LIGHT / LIGHT pair (hub ruling 2026-11-20T05:25:54Z item 2).
+Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force
 
 if ($Seconds -lt 1) {
     throw "-Seconds must be >= 1."
@@ -327,11 +329,73 @@ function Test-DeltaAtLeast {
     ($null -ne $parsed -and $parsed -ge $Threshold)
 }
 
+function Get-SmokeSummaryTelemetryArm {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm a smoke leg ran, from the launch block its own result recorded (result.launch: environment AND the argument
+    # list, which can carry --stage-log). A result with no recorded launch block, environment or arguments (older binary, missing file) is UNKNOWN, never LIGHT.
+    param([object]$Json)
+    # Get-FaProp keeps a one-element "launch" array whole (Get-NestedValue's output would unroll it into the object inside and classify it LIGHT; adversary r5 A6): the module reader does that.
+    # r14 (adversary r14 A1, the sol r13 B2 class): the WHOLE smoke record is judged, so a LIGHT launch beside a record-level observerControls entry is not LIGHT (Get-FpsArmFromSmokeRecord).
+    Get-FpsArmFromSmokeRecord $Json
+}
+
+function Get-PlaybackAbFpsVerdict {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: may this A/B's legs be compared on presented fps? Only when both legs of the pair ran the LIGHT telemetry arm (a HEAVY leg's fps
+    # measures the per-frame logger; UNKNOWN is refused like HEAVY). `candidate` judges baseline vs candidate (compare), `candidateSpeed` baseline vs the separate speed
+    # run (speedCompare); the top-level verdict is the refusal of either. Stage metrics stay allowed for every arm.
+    param(
+        [object]$BaselineSummary,
+        [object]$CandidateSummary,
+        [object]$CandidateSpeedSummary,
+        [switch]$SeparateCandidateSpeedRun
+    )
+
+    # the whole leg record is judged, not its arm word alone: a LIGHT leg that records an enabled observer control is UNKNOWN (Get-FpsArmFromLegRecord, adversary pass 4 A3)
+    $baselineArm = Get-FpsArmFromLegRecord $BaselineSummary
+    $candidate = Get-FpsPairVerdict -Baseline $baselineArm -Candidate (Get-FpsArmFromLegRecord $CandidateSummary) -BaselineName "baseline" -CandidateName "candidate"
+    $candidateSpeed = $null
+    if ($SeparateCandidateSpeedRun) {
+        $candidateSpeed = Get-FpsPairVerdict -Baseline $baselineArm -Candidate (Get-FpsArmFromLegRecord $CandidateSpeedSummary) -BaselineName "baseline" -CandidateName "candidate-speed"
+    }
+    $refused = @(@($candidate, $candidateSpeed) | Where-Object { $null -ne $_ -and -not $_.allowed })
+    [pscustomobject]@{
+        allowed = ($refused.Count -eq 0)
+        reason = $(if ($refused.Count -gt 0) { [string]$refused[0].reason } else { "" })
+        detail = $(if ($refused.Count -gt 0) { (@($refused | ForEach-Object { $_.detail }) -join " | ") } else { "" })
+        stageMetricsAllowed = $true
+        candidate = $candidate
+        candidateSpeed = $candidateSpeed
+    }
+}
+
+function Protect-PlaybackCompareFps {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: withhold the cross-leg fps deltas of a compare the arm gate refused (delta / deltaPercent -> $null, `refused` = the typed reason).
+    # Each leg's own raw value stays (a single leg's measurement is not a comparison) and every stage metric is untouched.
+    param(
+        [object]$Compare,
+        [object]$Verdict
+    )
+
+    if ($null -eq $Compare -or $null -eq $Verdict -or $Verdict.allowed) {
+        return $Compare
+    }
+    # r5 (adversary A9): avgPresentIntervalMs is the mean gap between two presents, the presented fps in another unit, so its cross-leg delta is withheld with the fps ones
+    foreach ($name in @("presentedFps", "timelineFps", "guiStatusFps", "visibleGuiFps", "avgPresentIntervalMs")) {
+        $metric = $Compare.PSObject.Properties[$name]
+        if ($null -ne $metric -and $null -ne $metric.Value) {
+            $metric.Value.delta = $null
+            $metric.Value.deltaPercent = $null
+            Add-Member -InputObject $metric.Value -NotePropertyName "refused" -NotePropertyValue ([string]$Verdict.reason) -Force
+        }
+    }
+    $Compare
+}
+
 function New-PlaybackAbAnalysis {
     param(
         [object]$Compare,
         [string[]]$ProofFailures,
-        [string]$ComparisonBasis = "candidate"
+        [string]$ComparisonBasis = "candidate",
+        [string]$FpsVerdictRefusal = ""
     )
 
     $fpsDeltaPct = Get-CompareDeltaPercent -Compare $Compare -Metric "presentedFps"
@@ -441,10 +505,19 @@ function New-PlaybackAbAnalysis {
         $confidence = "host_load_provisional"
     }
 
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the fps-derived diagnosis above is withheld for a pair the arm gate refused (a HEAVY leg's fps measures the logger). The stage
+    # deltas below stay in .evidence: they are what a HEAVY leg is for.
+    if (-not [string]::IsNullOrWhiteSpace($FpsVerdictRefusal)) {
+        $dominant = "fps-arm-refused"
+        $suggestion = "rerun_playback_ab_with_light_arm"
+        $confidence = "fps_arm_refused"
+    }
+
     [pscustomobject]@{
         schema = "mlvapp.playback_ab_analysis.v1"
         proofPassed = (@($ProofFailures).Count -eq 0)
         comparisonBasis = $ComparisonBasis
+        fpsVerdictRefusal = $FpsVerdictRefusal
         dominantBottleneck = $dominant
         suggestedOptimization = $suggestion
         confidence = $confidence
@@ -808,6 +881,7 @@ function Read-SmokeSummary {
             exists = $false
             exitCode = $ExitCode
             validationOk = $false
+            telemetryArm = (New-FpsArm "UNKNOWN" "environment" "smoke result JSON does not exist")
             hostLoadProvisional = $true
             hostLoadState = "unknown"
             hostLoadCollected = $false
@@ -840,6 +914,10 @@ function Read-SmokeSummary {
     $smokeParseError = $null
     $json = $null
     try {
+        # r14 (sol r13 B4, adversary r14 A2), kept beside master's reader at the merge: VenueChain's Find-VenueJsonDuplicateMember reads only the root and hostLoad, but the arm is judged from the recorded
+        # launch (nested), where ConvertFrom-Json keeps the LAST of a repeated member (a HEAVY environment entry written twice, the second clean, read LIGHT). A repeated member anywhere is refused here and
+        # reads as a provisional, arm-unknown leg (the same typed route as a parse error), never a throw and never collapsed to its last value.
+        Assert-FpsJsonNoRepeatedKey $smokeText $Path
         $json = ConvertFrom-Json -InputObject $smokeText -Depth 100 -NoEnumerate
     }
     catch {
@@ -981,6 +1059,9 @@ function Read-SmokeSummary {
         exists = $true
         exitCode = $ExitCode
         validationOk = $validationOk
+        telemetryArm = (Get-SmokeSummaryTelemetryArm -Json $json)
+        # the launch block the arm was derived from, recorded beside it so a saved leg is judged against its own launch (adversary r5 pass 2 A3: an arm label alone is not proof)
+        launch = (Get-FaProp $json 'launch')
         hostLoadProvisional = $hostLoadProvisional
         hostLoadState = $hostLoadState
         hostLoadCollected = $hostLoadCollected
@@ -1574,6 +1655,7 @@ $summary = [ordered]@{
             "When separateCandidateSpeedRun is true, candidate proves GL parity without the temporal detector and candidateSpeed measures cadence without heavy GL-vs-oracle readback.",
             "On Windows hybrid-GPU laptops the wrapper does not touch the per-app GPU preference (NA-8); the app requests the discrete GPU through its own exports and the candidate's GL_RENDERER is asserted. -NoHighPerformancePreference is accepted and ignored.",
             "A speed gain is quotable only for the host, clip, settings, and run duration captured in this summary.",
+            "A presented-fps gain or cost is quotable only when fpsVerdict.allowed is true (both legs ran the LIGHT telemetry arm); a HEAVY or UNKNOWN leg gives stage metrics only (fps-verdict-refused:heavy-arm / fps-verdict-refused:unknown-arm).",
             "UltraMagnus RTX 4090 results do not prove Dell laptop support; run this wrapper on the Dell laptop for that claim."
         )
     }
@@ -1690,6 +1772,13 @@ $proofFailures += @(Get-HostLoadProofFailures `
     -CandidateSummary $candidateSummary `
     -CandidateSpeedSummary $candidateSpeedSummary `
     -SeparateCandidateSpeedRun:$SeparateCandidateSpeedRun)
+# BENCH-LIGHT-ARM-GAIN-GATES-1: whether the legs may be compared on presented fps at all. Not a proof failure by itself (the proof is no-readback / parity, which a HEAVY
+# leg can show); it withholds the fps deltas and the fps-derived diagnosis below, and makes -RequireCandidateImprovesPresentedFps refuse, typed.
+$fpsVerdict = Get-PlaybackAbFpsVerdict `
+    -BaselineSummary $baselineSummary `
+    -CandidateSummary $candidateSummary `
+    -CandidateSpeedSummary $candidateSpeedSummary `
+    -SeparateCandidateSpeedRun:$SeparateCandidateSpeedRun
 $candidateTextureProofSummaries = @(
     [pscustomobject]@{ label = "candidate"; summary = $candidateSummary }
 )
@@ -1752,6 +1841,7 @@ if ($RequireCandidateGlParity) {
 }
 if ($RequireCandidateImprovesPresentedFps) {
     $candidateForSpeed = if ($SeparateCandidateSpeedRun) { $candidateSpeedSummary } else { $candidateSummary }
+    $comparedPairVerdict = if ($SeparateCandidateSpeedRun) { $fpsVerdict.candidateSpeed } else { $fpsVerdict.candidate }
     # round 4 (sol major): this requirement used to compare presentedFps unconditionally, even
     # when Get-HostLoadProofFailures (above) had already flagged one of these exact legs as
     # host-load provisional -- the overall proof still failed either way, but this check ALSO
@@ -1765,6 +1855,14 @@ if ($RequireCandidateImprovesPresentedFps) {
         $proofFailures += (
             "candidate-presented-fps-improvement-not-evaluated host-load-provisional " +
             "baseline=$($baselineSummary.hostLoadProvisional) candidate=$($candidateForSpeed.hostLoadProvisional)"
+        )
+    }
+    elseif (-not $comparedPairVerdict.allowed) {
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: an fps verdict from a HEAVY / UNKNOWN leg is refused, never computed: the per-frame logger is in the number.
+        # r5 (adversary A5): the verdict of the pair this requirement compares (baseline vs the separate speed run when there is one), not the aggregate: a HEAVY parity candidate must not
+        # refuse a valid speed-pair improvement check, and the parity pair's own refusal is reported by its compare.
+        $proofFailures += (
+            "candidate-presented-fps-improvement-not-evaluated $($comparedPairVerdict.reason) $($comparedPairVerdict.detail)"
         )
     }
     else {
@@ -1815,9 +1913,9 @@ function New-PlaybackCompare {
     }
 }
 
-$compare = New-PlaybackCompare -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary
+$compare = Protect-PlaybackCompareFps -Compare (New-PlaybackCompare -BaselineSummary $baselineSummary -CandidateSummary $candidateSummary) -Verdict $fpsVerdict.candidate
 $speedCompare = if ($SeparateCandidateSpeedRun) {
-    New-PlaybackCompare -BaselineSummary $baselineSummary -CandidateSummary $candidateSpeedSummary
+    Protect-PlaybackCompareFps -Compare (New-PlaybackCompare -BaselineSummary $baselineSummary -CandidateSummary $candidateSpeedSummary) -Verdict $fpsVerdict.candidateSpeed
 } else {
     $null
 }
@@ -1831,7 +1929,9 @@ $summary["candidateSpeed"] = $candidateSpeedSummary
 $summary["compare"] = $compare
 $summary["speedCompare"] = $speedCompare
 $summary["proofFailures"] = @($proofFailures)
-$summary["analysis"] = New-PlaybackAbAnalysis -Compare $analysisCompare -ProofFailures @($proofFailures) -ComparisonBasis $analysisBasis
+$summary["fpsVerdict"] = $fpsVerdict
+$analysisFpsRefusal = $(if ($SeparateCandidateSpeedRun -and $null -ne $fpsVerdict.candidateSpeed) { $fpsVerdict.candidateSpeed } else { $fpsVerdict.candidate })
+$summary["analysis"] = New-PlaybackAbAnalysis -Compare $analysisCompare -ProofFailures @($proofFailures) -ComparisonBasis $analysisBasis -FpsVerdictRefusal $(if ($analysisFpsRefusal.allowed) { "" } else { [string]$analysisFpsRefusal.reason })
 $summary["childOutput"] = [pscustomobject]@{
     baseline = $baselineResult.output
     candidate = $candidateResult.output

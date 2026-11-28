@@ -644,6 +644,8 @@ RECEIPT_ORACLE_EXEMPT: dict[str, str] = {
         "the gate and the oracle themselves: they name every token to refuse it and never launch the app.",
     "tools/profiling/bachelor/AttrCudaArtifacts.psm1":
         "spells the feature-probe text only; the attribution job's own source-frame oracle lives in this module.",
+    "tools/profiling/FpsArmGate.psm1":
+        "reads launch records/specs; never starts the app (BENCH-LIGHT-ARM-GAIN-GATES-1).",
     "tools/profiling/run-local-gpu-capability.ps1": "decode-only benchmark: a FIXED argument list, no Play action.",
     "tools/profiling/run-ultra-magnus-profile.ps1": "decode-only benchmark: a FIXED argument list, no Play action.",
     "tools/profiling/ssh-gpu-probe.ps1": "decode-only probe: a FIXED argument list, no Play action.",

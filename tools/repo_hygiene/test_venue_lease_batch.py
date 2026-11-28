@@ -1229,6 +1229,8 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         tree = self.case / "tree" / "tools" / "profiling"
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r3: the runner imports ..\FpsArmGate.psm1 and the dual-venue modules read neighbouring-folder modules; a scratch tree carries them all
+        copy_cross_tree_modules(MODULE, tree / "dual-venue")
         agent = AGENT.read_bytes()
         self.assertEqual(agent.count(b"[int]$LeaseBatchIdleSec = 300,"), 1, "the agent's idle bound moved: update this fixture")
         (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec = " + idle + b","))
@@ -2161,6 +2163,7 @@ class VenueLeaseBatchRunnerTests(unittest.TestCase):
         tree = self.case / "tree" / "tools" / "profiling"
         shutil.copytree(DV, tree / "dual-venue", ignore=shutil.ignore_patterns("look-receipts", "legs", "legsets"))
         (tree / "bachelor").mkdir()
+        copy_cross_tree_modules(MODULE, tree / "dual-venue")   # BENCH-LIGHT-ARM-GAIN-GATES-1 r3: ..\FpsArmGate.psm1 (the runner's import) and the neighbouring-folder modules
         agent = AGENT.read_bytes()
         (tree / "bachelor" / AGENT.name).write_bytes(agent.replace(b"[int]$LeaseBatchIdleSec = 300,", b"[int]$LeaseBatchIdleSec,"))
         self.runner = tree / "dual-venue" / RUNNER.name
@@ -3665,6 +3668,9 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # the validated, ordered plan is kept beside the receipts
         kept = json.loads((self.run_dir / "leg-plan.json").read_text(encoding="utf-8"))
         self.assertEqual([x["arm"] for x in kept["legs"]], ["A", "B", "A", "B"])
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: every leg states its derived telemetry arm (these fixture specs name none: UNKNOWN) and the plan its purpose (undeclared: null)
+        self.assertEqual([x["telemetryArm"] for x in kept["legs"]], ["UNKNOWN"] * 4)
+        self.assertIsNone(kept["purpose"])
         self.assertEqual(sorted((s["sourceCommit"], s["state"]) for s in kept["builds"]), [(a, "STAGED"), (b, "STAGED")])
 
     def test_the_plan_runs_as_given_without_the_interleave_option(self) -> None:
@@ -3737,6 +3743,53 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 with self.subTest(case=label, container=container):
                     doc = {"schema": "mlv-app/venue-lease-leg-plan/v1", "legs": legs} if container == "object" else legs
                     self.assert_whole_plan_refused(self.write_raw_plan(doc), f"BAD_ITEM_SHAPE item={n} ")
+
+    def write_plan_text(self, text: str) -> Path:
+        p = self.case / "plan.json"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_envelope_preempt_residue_a_bad_entry_beside_an_envelope_array_or_deep_nesting_keeps_its_position(self) -> None:
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 (sol r16 + key3 fable r16 blocker): the raw check's envelope-array rule and depth-256 cap ran BEFORE the positional item check, so these plans were
+        # LEG_PLAN_UNREADABLE with no item; the merge base c6ec83ae refuses each BAD_ITEM_SHAPE item=1. Now the shape rules run after every per-item check, so any per-item refusal the
+        # merge base gave (BAD_ITEM_SHAPE and the field checks alike) keeps its code and position.
+        ok_a = json.dumps(self.item(self.specs[0], "A", self.commit_a))
+        unstaged = json.dumps(self.item(self.specs[0], "A", "3" * 40, manifest="c" * 64))
+        mismatch = json.dumps(self.item(self.specs[0], "B", self.commit_a, manifest="d" * 64))
+        cases = {
+            "array entry holding an envelope array": ('[[{"proof":[]}]]', "BAD_ITEM_SHAPE item=1 "),
+            "same, object container": ('{"legs":[[{"proof":[]}]]}', "BAD_ITEM_SHAPE item=1 "),
+            "null entry beside a top-level envelope array": ('{"legs":[null],"proof":[]}', "BAD_ITEM_SHAPE item=1 "),
+            "null entry before an object holding an envelope array": ('[null,{"host":[]}]', "BAD_ITEM_SHAPE item=1 "),
+            "a 257-deep nested null": ("[" * 257 + "null" + "]" * 257, "BAD_ITEM_SHAPE item=1 "),
+            "valid item then a null, envelope array beside": ('{"legs":[' + ok_a + ',null],"proof":[]}', "BAD_ITEM_SHAPE item=2 "),
+            "valid item then an item whose envelope is an array": ('[' + ok_a + ',{"launch":[1]}]', "BAD_SOURCE_COMMIT item=2 "),
+            # adversary r1 A1: the build-staging refusals are per-item refusals too, so the deferred shape rules wait for them
+            "unstaged build beside an envelope array": ('{"legs":[' + unstaged + '],"proof":[]}', "BUILD_NOT_STAGED item=1 "),
+            "unstaged build beside depth-257 nesting": ('{"legs":[' + unstaged + '],"deep":' + "[" * 257 + "1" + "]" * 257 + '}', "BUILD_NOT_STAGED item=1 "),
+            "a later item's field refusal still precedes an earlier item's staging refusal": ('[' + ok_a + ',' + mismatch + ',{"host":[]}]', "BAD_SOURCE_COMMIT item=3 "),
+            "manifest digest mismatch then an envelope array": ('{"legs":[' + ok_a + ',' + mismatch + '],"inputs":["x"]}', "BUILD_MANIFEST_MISMATCH item=2 "),
+        }
+        for label, (text, want) in cases.items():
+            with self.subTest(case=label):
+                self.assert_whole_plan_refused(self.write_plan_text(text), want)
+
+    def test_envelope_preempt_residue_repeated_keys_and_the_deferred_shape_rules_still_refuse_the_plan(self) -> None:
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 KEEP: a repeated key is a parse-level defect and stays LEG_PLAN_UNREADABLE ahead of any item check (the r14 rule). The deferred shape rules still
+        # refuse a plan whose every item passes: an array under an envelope name, and nesting past depth 256, are LEG_PLAN_UNREADABLE before any staging read, claim or lease.
+        ok_a = json.dumps(self.item(self.specs[0], "A", self.commit_a))
+        schema = '"schema":"mlv-app/venue-lease-leg-plan/v1"'
+        cases = {
+            "repeated key beside a null entry": '[null,{"a":1,"A":2}]',
+            "repeated key in a valid item": '[' + ok_a[:-1] + ',"arm":"B"}]',
+            "repeated legs container": '{' + schema + ',"legs":[null],"legs":[' + ok_a + ']}',
+            "envelope array beside valid items": '{' + schema + ',"legs":[' + ok_a + '],"proof":[]}',
+            "envelope array inside a valid item": '[' + ok_a[:-1] + ',"inputs":["x"]}]',
+            "nesting past depth 256 beside valid items": '{' + schema + ',"legs":[' + ok_a + '],"deep":' + "[" * 257 + "1" + "]" * 257 + '}',
+        }
+        for label, text in cases.items():
+            with self.subTest(case=label):
+                self.assert_whole_plan_refused(self.write_plan_text(text), "LEG_PLAN_UNREADABLE")
 
     def test_a_legs_value_that_is_not_an_array_is_refused_not_wrapped_into_a_one_item_plan(self) -> None:
         one = self.item(self.specs[0], "A", self.commit_a)
@@ -6057,6 +6110,42 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                 for row in rows:
                     self.assertEqual(row, f"expect={want} read={want}", out)
 
+    def test_bench_light_arm_a7_two_plan_items_that_share_a_spec_path_never_judge_different_bytes_of_it(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary A7 on 245e26de): the judged digest was kept one per spec PATH, so item B's reads of changed bytes overwrote item A's digest and A's
+        # leg ran (bound to B's digest) on bytes its recorded arm never described. The stand-in budget child rewrites the shared spec after item 1's budget read, so item 2 judges other
+        # bytes of the same path. The batch must refuse the whole plan (typed SPEC_CHANGED_BETWEEN_PLAN_ITEMS, item 2) before any claim, lease or leg. Control: an unchanged shared spec is
+        # not refused for this reason.
+        fake = self.case / "fake-export-budget-a7.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames, [long]$DescribeTimeBudgetBytes = -1)\n"
+                        "if ($MaxFrames -gt 19000) { throw \"DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED $MaxFrames frames of $ClipId need a job timeout past the agent's cap\" }\n"
+                        "if ($env:FAKE_MUTATE_SPEC) { Copy-Item -LiteralPath $env:FAKE_MUTATE_FROM -Destination $env:FAKE_MUTATE_SPEC -Force }\n"
+                        "[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
+        doc = json.loads((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"))
+        doc["export"]["maxFrames"] = 480
+        judged_text = json.dumps(doc)
+        doc["export"]["maxFrames"] = 600
+        changed = self.case / "export-a7-changed.json"
+        changed.write_text(json.dumps(doc), encoding="utf-8")
+        spec = self.case / "export-a7.json"
+
+        def reset() -> None:
+            for p in (self.events, self.leg_args, self.claim_path):
+                p.unlink(missing_ok=True)
+            shutil.rmtree(self.run_dir, ignore_errors=True)
+            spec.write_text(judged_text, encoding="utf-8")
+        reset()
+        plan = self.write_plan([self.item(spec, "A", self.commit_a), self.item(spec, "B", self.commit_a)])
+        r = self.run_plan(plan, "-ExportBudgetScript", str(fake), FAKE_MUTATE_SPEC=str(spec), FAKE_MUTATE_FROM=str(changed))
+        out = r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertIn('"maxFrames": 600', spec.read_text(encoding="utf-8"), "the stand-in did not change the spec, so the test proves nothing. " + out)
+        self.assertEqual([k for k in self.kinds() if k.startswith("LEG")], [], "a leg ran on a spec its plan item's recorded arm did not describe. " + out)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), "a lease was opened on two items that judged different bytes of one spec. " + out)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=SPEC_CHANGED_BETWEEN_PLAN_ITEMS item=2 ", r.stderr, out)
+        reset()
+        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a), self.item(spec, "B", self.commit_a)]), "-ExportBudgetScript", str(fake))
+        self.assertNotIn("SPEC_CHANGED_BETWEEN_PLAN_ITEMS", r.stderr, "control: an unchanged shared spec. " + r.stdout[-3000:] + r.stderr[-3000:])
+
     def test_r19_b1_the_leg_refuses_spec_bytes_that_are_not_the_ones_the_budget_judged(self) -> None:
         # r19 (sol r18 B1, the dispatch site Invoke-VenueLeg.ps1:225): the bytes the LEG reads are the bytes run, so the leg compares them with -ExpectSpecSha256 and throws
         # DVE_LEG_SPEC_CHANGED before it generates or submits anything. Structural: the parameter, the comparison right after the one read, and the batch passing it at the launch.
@@ -6163,6 +6252,53 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn(f"was judged as sha256 {planned} but a later preflight read of the same path judged sha256 {hashlib.sha256(other.read_bytes()).hexdigest()}", r.stderr,
                       "old: the two names had two keys and the claim was taken before the content guard refused. " + out)
         self.assertEqual(self.kinds(), [], out)
+
+    def test_r10_r4_deadline_scalar_an_established_digest_mismatch_is_refused_before_a_later_entrys_path_lookup(self) -> None:
+        # R4-DEADLINE-RESIDUE-1 (sol r2 on 4b328ae0, B2): -LegSpec s.json,s.json,third.json where the two preflights of s.json judge different bytes. The parent refuses before visiting third.json;
+        # the scalar loop looked third.json up (a synchronous Test-Path) and only then compared the entries' digests, so a slow third lookup put SPEC_CHANGED_AFTER_PREFLIGHT past -DeadlineUtc.
+        # The mirror swaps s.json's bytes on its second visit and makes the third entry's lookup answer 60 s late: the refusal must come from the second entry, before that lookup.
+        s = self.case / "r4dl-s.json"
+        s.write_text(self.specs[0].read_text(encoding="utf-8"), encoding="utf-8")
+        other = self.case / "r4dl-other-bytes.json"
+        other.write_text(self.specs[1].read_text(encoding="utf-8"), encoding="utf-8")
+        third = self.case / "r4dl-third.json"
+        third.write_text(self.specs[1].read_text(encoding="utf-8"), encoding="utf-8")
+        swap = ("        if ([IO.Path]::GetFileName($path) -ceq 'r4dl-s.json') { $script:DvtVisits++; if ($script:DvtVisits -eq 2) { [IO.File]::Copy($env:DVT_SWAP_FROM, $path, $true) } }   # TEST FIXTURE: the second visit's bytes differ\n"
+                "        $shapeRefusal = Get-ScalarLegShapeRefusal $path\n")
+        lookup = "        try { if ($c -and (Test-Path -LiteralPath $c -PathType Leaf)) { return (Resolve-Path -LiteralPath $c).Path } } catch { }\n"
+        slow = ("        if ($c -and $c.EndsWith('r4dl-third.json')) { [Threading.Thread]::Sleep(60000) }   # TEST FIXTURE: the third entry's path lookup answers 60 s late\n" + lookup)
+        self._mirror_with_bad_sidecar(runner_patches=(("        $shapeRefusal = Get-ScalarLegShapeRefusal $path\n", swap), (lookup, slow)))
+        shas = self.case / "leg-spec-sha-r4dl.log"
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=50)
+        r = self.run_batch([s, s, third], "-DeadlineUtc", utc_iso(deadline), FAKE_LEG_SPEC_SHA=str(shas), DVT_SWAP_FROM=str(other))
+        ended = datetime.now(timezone.utc)
+        out = r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertEqual(s.read_bytes(), other.read_bytes(), "the fixture swapped s.json's bytes on its second visit. " + out)
+        self.assertFalse(shas.exists(), "a leg ran. " + out)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("SPEC_CHANGED_AFTER_PREFLIGHT", r.stderr, out)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the third entry's lookup held it). " + out)
+        self.assertEqual(self.kinds(), [], "no claim, lease or leg. " + out)
+        self.assertFalse(self.claim_path.exists(), out)
+
+    def test_r10_r4_deadline_a4_a_scalar_specs_zone_probe_is_bounded_by_the_deadline(self) -> None:
+        # R4-DEADLINE-RESIDUE-1 r3 (adversary ef31edb1 A4, sibling site): the scalar -LegSpec loop's Get-RunDirOutputRefusal is a synchronous probe of the share's own paths, and with a stalled one the
+        # preflight ran past -DeadlineUtc before any typed refusal. It runs on a worker given up on at the time left less 2 s now: no answer is OUTPUT_ZONE_UNRESOLVED, before the deadline.
+        spec = self.specs[0]
+        anchor = "    $hardLinkOf = ''; $hardLinkZone = $null; $script:refusalInputUnopened = $false; $script:refusalOutputUnresolved = $false\n"
+        stall = f"    if ($Path -like '*{spec.name}') {{ [Threading.Thread]::Sleep(40000) }}   # TEST FIXTURE: the output-zone probe of this spec answers 40 s late\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, stall + anchor),))
+        shas = self.case / "leg-spec-sha-r4dla4.log"
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_batch([spec], "-DeadlineUtc", utc_iso(deadline), FAKE_LEG_SPEC_SHA=str(shas))
+        ended = datetime.now(timezone.utc)
+        out = r.stdout[-3000:] + r.stderr[-3000:]
+        self.assertFalse(shas.exists(), "a leg ran. " + out)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("OUTPUT_ZONE_UNRESOLVED", r.stderr, out)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the output-zone probe held it). " + out)
+        self.assertEqual(self.kinds(), [], "no claim, lease or leg. " + out)
+        self.assertFalse(self.claim_path.exists(), out)
 
     def test_r10_a2_a_key_lookup_is_bounded_by_what_is_left_before_the_deadline(self) -> None:
         # adversary pass 1 on 5a73d8e8, A2: the lookup waited a fixed 1 s, so a spec preflight that started it with 250 ms left refused about 750 ms past -DeadlineUtc. The mirror sets the deadline 250 ms
@@ -6357,6 +6493,16 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertRegex(r.stderr, r"LEG_PLAN_REFUSED reason=(EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 |SPEC_READ_TIMEOUT item=1 |LEG_PLAN_UNREADABLE )")
         self.assertNotIn("LEG_PLAN_INVALID", r.stderr)
         self.assertFalse(pid_file.exists(), "no preflight child was started with no room left")
+        # R4-DEADLINE-RESIDUE-1 r4 (hosted CI on 2ee7d054): r3's bounded zone probe answered OUTPUT_ZONE_UNRESOLVED ahead of the typed timeout. The sites whose next step is the input's own bounded read
+        # (the plan file, a plan item's spec, a -LegSpec spec) skip the zone probe when no room is left; the staged-manifest site, whose read is already made, keeps its zone check.
+        source = RUNNER.read_text(encoding="utf-8")
+        skip = "$(if (Test-NoRoomForSpecRead) { '' } else { Get-RunDirOutputRefusalWithin "
+        for var in ("$planPath", "$path"):
+            self.assertIn(skip + var + " })", source)
+        self.assertEqual(source.count(skip), 3, "plan file, plan item spec and -LegSpec spec: three sites skip the probe with no room")
+        self.assertIn("$outputRefusal = Get-RunDirOutputRefusalWithin $st.path", source, "the staged manifest keeps its zone check")
+        # the no-room test is the spec read's own bound at 0, and never true without -DeadlineUtc (there is no bound to keep)
+        self.assertRegex(source, re.compile(r"function Test-NoRoomForSpecRead \{.*?if \(\$null -eq \(Get-ProbeBoundSec\)\) \{ return \$false \}\s*\n\s*\(Get-SpecReadBoundSec\) -le 0\.0", re.DOTALL))
 
     def test_dualvenue_bool_args_a_non_boolean_generatorargs_switch_is_refused_by_the_batch_entrypoint_before_the_claim(self) -> None:
         # DUAL-VENUE-RUNNER-BOOL-ARGS-STRICT-1 r2 (inherited A1, Dot pr-757): the strict-boolean refusal lives in the shared shape predicate; this drives it through
@@ -6709,6 +6855,18 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # 205-char basename + 32-char arm: the quiet output is 266 characters, the volume's component limit 255; redirecting into it failed AFTER the lease opened.
         spec = self._long_name_spec(205)
         r = self.run_plan(self.write_plan([self.item(spec, "A" * 32, self.commit_a)]))
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=OUTPUT_NAME_TOO_LONG item=1 ", r.stderr)
+        self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
+        self.assertFalse(self.claim_path.exists(), "no claim was written")
+
+    def test_envelope_preempt_residue_an_output_name_refusal_beside_an_envelope_array_keeps_its_item(self) -> None:
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 (adversary r1 pass 2 A1): OUTPUT_NAME_TOO_LONG is a per-item preflight refusal outside the plan block; the deferred raw shape check runs after it.
+        spec = self._long_name_spec(205)
+        doc = {"legs": [self.item(spec, "A" * 32, self.commit_a)], "proof": []}
+        p = self.case / "plan.json"
+        p.write_text(json.dumps(doc), encoding="utf-8")
+        r = self.run_plan(p)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         self.assertIn("LEG_PLAN_REFUSED reason=OUTPUT_NAME_TOO_LONG item=1 ", r.stderr)
         self.assertEqual(self.kinds(), [], "nothing is submitted: no open, no probe, no leg")
@@ -9714,6 +9872,160 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         self.assertEqual(json.loads(out.stdout), {"block": "A1 B3 A2 B4", "uneven": "A1 B4 A2 A3", "three": "A1 B3 C5 A2 B4 C6", "one": "A1 A2 A3", "mixed": "A1 B2 A4 B3"})
+
+    def test_artifact_preflight_r3_residue_a9_a_stalled_staged_build_read_ends_typed_before_the_batch_deadline(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1-R3-MERGE-RESIDUE-1 (sol 07d50621 A9, on 2ed556bb): a purpose-free plan whose optional arm read timed out goes on to the staging reads, and the pre-claim
+        # staged-build read had only its own 30 s probe / 300 s hash bounds, so it outlived -DeadlineUtc before its typed refusal. It is bounded by the deadline now (less the 2 s the refusal
+        # needs): the manifest read that never answers is SHARE_UNREACHABLE item=1 BEFORE the deadline, not 30 s after the read began. The arm read is not stalled here; the staging read
+        # is the one that is, and it is the same read the stalled-arm path reaches (a purpose-free plan never lets the arm refuse first).
+        c = self.commit_a
+        manifest_probe = self.case / "a9-manifest-probe.ps1"
+        manifest_probe.write_text("param($p)\n[Threading.Thread]::Sleep(120000)\n", encoding="utf-8")
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c)]), "-DeadlineUtc", utc_iso(deadline), "-StagedBuildProbeScript", str(manifest_probe))
+        ended = datetime.now(timezone.utc)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertLess(ended, deadline, f"the typed refusal came {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc")
+        self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
+        source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("-ArtifactProbeScript $artifactProbe -CallDeadlineUtc $deadline.AddSeconds(-2.0) -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }", source)
+
+    def test_artifact_preflight_r4_deadline_a9_the_refusal_logger_probe_never_holds_a_stalled_read_refusal_past_the_deadline(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1-R4-DEADLINE-RESIDUE-1 (sol r2 on 4b328ae0, B1 row 1): the stalled manifest read ends at -DeadlineUtc less 2 s, and Stop-PlanRefused then probed batch.log
+        # synchronously (Test-Path) BEFORE it printed SHARE_UNREACHABLE item=1: a share that answered that probe 8 s late put the typed refusal after the deadline. The refusal line is printed
+        # first now, and the probe is not made at all with under 3 s left. The mirror makes the batch.log probe answer 8 s late.
+        c = self.commit_a
+        manifest_probe = self.case / "r4dl-manifest-probe.ps1"
+        manifest_probe.write_text("param($p)\n[Threading.Thread]::Sleep(120000)\n", encoding="utf-8")
+        # (r3: the probe is the worker text Invoke-ProbeWithin runs; the stall sits in it, and with under 3 s left the probe is not made at all)
+        anchor = "if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, "[Threading.Thread]::Sleep(8000)   # TEST FIXTURE: the share that holds batch.log answers 8 s late\n" + anchor),))
+        self.plan_runner = self.runner
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c)]), "-DeadlineUtc", utc_iso(deadline), "-StagedBuildProbeScript", str(manifest_probe))
+        ended = datetime.now(timezone.utc)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the log probe held it)")
+        self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
+
+    def test_artifact_preflight_r4_deadline_a9_the_output_zone_probe_never_holds_an_artifact_hash_timeout_refusal_past_the_deadline(self) -> None:
+        # R4-DEADLINE-RESIDUE-1 (sol r2, B1 row 2): the manifest was read and its artifact hash got no answer (VenueChain: artifactsUnhashed, ending at -DeadlineUtc less 2 s); the preflight then
+        # ran the output-zone probe (Get-RunDirOutputRefusal on the manifest) before it could refuse. With under 3 s left the probe is skipped, the refusal is on stderr only (batch.log is not
+        # written: the zone check that would have shown the manifest is no run output was not made), and it lands before the deadline. The mirror makes that probe answer 8 s late.
+        c = self.commit_a
+        artifact_probe = self.case / "r4dl-artifact-probe.ps1"
+        artifact_probe.write_text("param($items)\n[Threading.Thread]::Sleep(120000)\n", encoding="utf-8")
+        # (r3: the stall sits in the manifest's zone probe itself; with under 3 s left it is not made at all)
+        anchor = "    $hardLinkOf = ''; $hardLinkZone = $null; $script:refusalInputUnopened = $false; $script:refusalOutputUnresolved = $false\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, "    if ($Path -like '*-build.json') { [Threading.Thread]::Sleep(8000) }   # TEST FIXTURE: the manifest's output-zone probe answers 8 s late\n" + anchor),))
+        self.plan_runner = self.runner
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", c)]), "-DeadlineUtc", utc_iso(deadline), "-ArtifactProbeScript", str(artifact_probe))
+        ended = datetime.now(timezone.utc)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("LEG_PLAN_REFUSED reason=SHARE_UNREACHABLE item=1 ", r.stderr)
+        self.assertIn("could not be hashed", r.stderr)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the output-zone probe held it)")
+        self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
+
+    # BENCH-LIGHT-ARM-GAIN-GATES-1-R4-DEADLINE-RESIDUE-1 r3 (adversary ef31edb1 A4, major, introduced by r1's own threshold): the 3 s admission skipped the batch.log probe and the output-zone probe only
+    # when almost no time was left; with MORE than 3 s left a stalled probe still ran to its own end, past -DeadlineUtc. Each probe now runs on a worker given up on at the time left less 2 s. The mirror
+    # stalls the probe 40 s with about 15 s left: the run must end with the typed refusal BEFORE -DeadlineUtc.
+    def _r4dl_a4_zone_stall_mirror(self, leaf: str) -> None:
+        anchor = "    $hardLinkOf = ''; $hardLinkZone = $null; $script:refusalInputUnopened = $false; $script:refusalOutputUnresolved = $false\n"
+        stall = f"    if ($Path -like '*{leaf}') {{ [Threading.Thread]::Sleep(40000) }}   # TEST FIXTURE: the output-zone probe of this path answers 40 s late\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, stall + anchor),))
+        self.plan_runner = self.runner
+
+    def _r4dl_a4_zone_stall_refused_before_the_deadline(self, leaf: str, item_text: str) -> None:
+        self._r4dl_a4_zone_stall_mirror(leaf)
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "A", self.commit_a)]), "-DeadlineUtc", utc_iso(deadline))
+        ended = datetime.now(timezone.utc)
+        out = r.stdout[-2000:] + r.stderr[-3000:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn(f"LEG_PLAN_REFUSED reason=OUTPUT_ZONE_UNRESOLVED{item_text} ", r.stderr, out)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the output-zone probe held it). " + out)
+        self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
+
+    def test_artifact_preflight_r4_deadline_a4_the_plan_files_zone_probe_is_bounded_by_the_deadline(self) -> None:
+        self._r4dl_a4_zone_stall_refused_before_the_deadline("plan.json", "")
+
+    def test_artifact_preflight_r4_deadline_a4_an_item_specs_zone_probe_is_bounded_by_the_deadline(self) -> None:
+        self._r4dl_a4_zone_stall_refused_before_the_deadline(self.specs[0].name, " item=1")
+
+    def test_artifact_preflight_r4_deadline_a4_a_staged_manifests_zone_probe_is_bounded_by_the_deadline(self) -> None:
+        self._r4dl_a4_zone_stall_refused_before_the_deadline("-build.json", " item=1")
+
+    def test_artifact_preflight_r4_deadline_a4_the_refusal_logger_probe_with_room_left_is_bounded_by_the_deadline(self) -> None:
+        # BAD_ARM item=1 is refused through Stop-PlanRefused, which probes batch.log (about 15 s are left, so the 3 s admission lets the probe run). The mirror stalls the probe 40 s.
+        anchor = "if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }\n"
+        self._mirror_with_bad_sidecar(runner_patches=((anchor, "[Threading.Thread]::Sleep(40000)   # TEST FIXTURE: the share that holds batch.log answers 40 s late\n" + anchor),))
+        self.plan_runner = self.runner
+        deadline = datetime.now(timezone.utc) + timedelta(seconds=22)
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "bad arm!", self.commit_a)]), "-DeadlineUtc", utc_iso(deadline))
+        ended = datetime.now(timezone.utc)
+        out = r.stdout[-2000:] + r.stderr[-3000:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=BAD_ARM item=1 ", r.stderr, out)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after -DeadlineUtc (the batch.log probe held it). " + out)
+        log = self.run_dir / "batch.log"
+        self.assertNotIn("LEG_PLAN_REFUSED", log.read_text(encoding="utf-8") if log.exists() else "", "a probe that did not answer leaves batch.log unwritten (the share may hold it)")
+        self.assertFalse(any(self.claims.iterdir()) if self.claims.exists() else False, "no claim was taken")
+
+    def test_artifact_preflight_r4_deadline_a4_a_slow_worker_startup_is_taken_out_of_the_probes_wait(self) -> None:
+        # adversary 4829e999 A1: the probe's bound was sampled BEFORE the worker started and Invoke-VenueBoundedRead was given no clock, so a worker that took 4 s to start (here VenueChain's
+        # pre-wait test seam) was then waited for the whole bound again and the refusal ended 2 s after -DeadlineUtc. The mirror sets the deadline 6 s away right before the batch.log probe (a bound of
+        # 4 s), stalls the probe 40 s and delays the wait 4 s: the call's end is its own clock's now, so the wait is what is left of the bound and the run ends before the deadline.
+        seam = "            $script:deadline = [DateTime]::UtcNow.AddSeconds(6); [Console]::Error.WriteLine('DVT_DEADLINE_UTC=' + $script:deadline.ToString('o')); & (Get-Module VenueChain) { $script:VenueTestPreWaitDelayMs = 4000 }   # TEST FIXTURE\n"
+        call = "            $probe = Invoke-ProbeWithin $script:LogProbeBlock @{ path = $batchLog; delayMs = (Get-RunDirReadSeamMs) }\n"
+        stall_anchor = "if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }\n"
+        self._mirror_with_bad_sidecar(runner_patches=((call, seam + call), (stall_anchor, "[Threading.Thread]::Sleep(40000)   # TEST FIXTURE: the share that holds batch.log answers 40 s late\n" + stall_anchor)))
+        self.plan_runner = self.runner
+        r = self.run_plan(self.write_plan([self.item(self.specs[0], "bad arm!", self.commit_a)]), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=90)))
+        ended = datetime.now(timezone.utc)
+        out = r.stdout[-2000:] + r.stderr[-3000:]
+        stamp = re.search(r"DVT_DEADLINE_UTC=(\S+)", r.stderr)
+        self.assertIsNotNone(stamp, out)
+        deadline = datetime.fromisoformat(stamp.group(1).replace("Z", "+00:00"))
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=timezone.utc)
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=BAD_ARM item=1 ", r.stderr, out)
+        self.assertLess(ended, deadline, f"the refusal ended the run {(ended - deadline).total_seconds():.1f} s after the deadline (the worker's startup was waited for on top of the bound). " + out)
+
+    def test_artifact_preflight_r4_deadline_a4_without_a_deadline_the_probe_runs_inline_and_the_refusal_is_logged(self) -> None:
+        # No -DeadlineUtc: nothing to bound a probe to ($script:deadline is then a 6 h default), so the plain probe answers and the refusal reaches batch.log, as before. The plan_cmd default
+        # -DeadlineUtc pair is dropped from the command.
+        args, e = self.plan_cmd(self.write_plan([self.item(self.specs[0], "bad arm!", self.commit_a)]))
+        i = args.index("-DeadlineUtc")
+        del args[i:i + 2]
+        r = subprocess.run(args, capture_output=True, text=True, timeout=120, env=e)
+        out = r.stdout[-2000:] + r.stderr[-3000:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn("LEG_PLAN_REFUSED reason=BAD_ARM item=1 ", r.stderr, out)
+        log = self.run_dir / "batch.log"
+        self.assertIn("LEG_PLAN_REFUSED reason=BAD_ARM item=1 ", log.read_text(encoding="utf-8") if log.exists() else "", out)
+
+    def test_artifact_preflight_r4_deadline_a4_the_probe_helper_runs_a_probe_inline_when_no_deadline_was_given(self) -> None:
+        # Invoke-ProbeWithin tested `$bound -le 0`, which is TRUE for the $null that Get-ProbeBoundSec returns without -DeadlineUtc: no deadline read as "no time left" and the probe never ran.
+        # The two helpers are lifted out of the runner and run with $DeadlineUtc empty: the probe's answer comes back, and nothing is counted as unanswered.
+        source = RUNNER.read_text(encoding="utf-8")
+        m = re.search(r"^function Get-ProbeBoundSec \{.*?^\}\r?\n.*?^function Invoke-ProbeWithin\(.*?^\}\r?\n", source, re.S | re.M)
+        self.assertIsNotNone(m, "the probe helpers moved: update this case")
+        # (adversary 8bb8cadc A1) the call's clock starts BEFORE the time left is sampled, so a caller descheduled between the two ends its wait earlier, never later; (adversary 8bb8cadc A2) the inline form
+        # is a { } literal run with `&`, never a string run at run time: the launch-site census (test_retire_lane_worktree.py, UNRESOLVED_EXECUTED_SITES) counts this file's executed strings exactly
+        within = m.group(0)[m.group(0).index("function Invoke-ProbeWithin("):]
+        self.assertLess(within.index("[Diagnostics.Stopwatch]::StartNew()"), within.index("$bound = Get-ProbeBoundSec"), "the clock must start before the sample")
+        self.assertNotIn("[scriptblock]::Create", source.split("function Get-ProbeBoundSec", 1)[1].split("function Stop-PlanRefused", 1)[0], "the probe helpers run no string built at run time")
+        script = ("$DeadlineUtc = ''; $script:ProbeUnanswered = $false\n" + m.group(0) +
+                  "\n$r = Invoke-ProbeWithin { param($a) $a.x * 2 } @{ x = 21 }\n"
+                  "ConvertTo-Json -Compress -InputObject @{ answered = $r.answered; value = @($r.value)[-1]; unanswered = $script:ProbeUnanswered; noBound = ($null -eq (Get-ProbeBoundSec)) }\n")
+        out = subprocess.run([PWSH, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(json.loads(out.stdout), {"answered": True, "value": 42, "unanswered": False, "noBound": True}, out.stdout + out.stderr)
 
 
 # the runner cases are inherited only for their fixtures: they run once, in their own class (unittest collects callable test_* attributes only)

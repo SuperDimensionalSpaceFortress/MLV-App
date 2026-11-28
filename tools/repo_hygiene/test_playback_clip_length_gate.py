@@ -1805,6 +1805,8 @@ PLAYBACK_LAUNCH_ALLOWLIST: dict[str, str] = {
         "the gate itself: it NAMES every play token in order to refuse them and never launches the app.",
     "tools/profiling/bachelor/AttrCudaArtifacts.psm1":
         "spells `--gui-smoke-playback --help` only (the feature probe text); it never launches a playback.",
+    "tools/profiling/FpsArmGate.psm1":
+        "reads launch records/specs; never starts the app (BENCH-LIGHT-ARM-GAIN-GATES-1).",
     "tools/profiling/run-local-gpu-capability.ps1":
         "decode-only `--profile-playback` benchmark with a FIXED argument list: no pass-through, no Play action.",
     "tools/profiling/run-ultra-magnus-profile.ps1":

@@ -4,6 +4,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# BENCH-LIGHT-ARM-GAIN-GATES-1: a presented-fps delta, diagnosis or suggestion comes only from a LIGHT / LIGHT playback A/B (hub ruling 2026-11-20T05:25:54Z item 2).
+Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force
 
 $Json = $false
 $OutputJson = ""
@@ -52,11 +54,23 @@ function Read-JsonRecords {
     $wholeParses = $true
     try { $wholeDuplicate = Find-VenueJsonDuplicateMember -Text $raw -All } catch { $wholeParses = $false }
     if ($wholeDuplicate) { throw "Input JSON repeats the member $wholeDuplicate in ${resolved}; a repeated member is never read as evidence." }
+    # r14 (sol r13 B4, adversary r14 A2): a repeated key is refused, never collapsed to its last value. A text that parses as ONE JSON document is checked whole (and the refusal is thrown
+    # outside the try, so it is not mistaken for a JSONL file); a JSONL text is checked line by line below.
+    $wholeParsed = $false
+    $wholeJson = $null
     try {
-        if (-not $wholeParses) { throw "not one JSON document" }
+        $wholeJson = ($raw | ConvertFrom-Json -Depth 100)
+        $wholeParsed = $true
+    }
+    catch { }
+    if ($wholeParsed) {
+        Assert-FpsJsonNoRepeatedKey $raw $resolved
+    }
+    try {
+        if (-not ($wholeParses -and $wholeParsed)) { throw 'not one JSON document' }
         return @([pscustomobject]@{
             source = $resolved
-            json = ($raw | ConvertFrom-Json -Depth 100)
+            json = $wholeJson
         })
     }
     catch {
@@ -74,6 +88,7 @@ function Read-JsonRecords {
             catch { throw "Input JSONL line ${lineNumber} in ${resolved} is not strict JSON, so its members cannot be proved unique: $($_.Exception.Message -replace '\s+', ' ')" }
             if ($lineDuplicate) { throw "Input JSONL repeats the member $lineDuplicate in ${resolved} at line ${lineNumber}; a repeated member is never read as evidence." }
             try {
+                Assert-FpsJsonNoRepeatedKey $line "${resolved}:$lineNumber"
                 $records += [pscustomobject]@{
                     source = "${resolved}:$lineNumber"
                     json = ($line | ConvertFrom-Json -Depth 100)
@@ -375,7 +390,14 @@ function Get-ProofSummarySuggestion {
     if ((Get-PlaybackAbHostLoadRefusal -Record $playbackAb).provisional) {
         return "rerun_playback_ab_with_quiet_host"
     }
-    if ($playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization) {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: neither the embedded analysis nor the fps delta below is trusted from a HEAVY / UNKNOWN pair.
+    if ((Get-PlaybackAbFpsArmRefusal -Record $playbackAb).refused) {
+        return "rerun_playback_ab_with_light_arm"
+    }
+    # r15 (adversary r14 pass 18 A7, sol r13 B3): the cached suggestion is repeated only when it is the gated pair's own (Test-FpsCachedAnalysisBound); one cached from the other pair (the HEAVY
+    # candidate beside a LIGHT candidateSpeed), or with no basis / evidence, falls through to the gated compare's own delta below.
+    if ($playbackAb.speedCompare) { $playbackAbBasis = "candidateSpeed" } else { $playbackAbBasis = "candidate" }
+    if ((Test-FpsCachedAnalysisBound -Analysis $playbackAb.analysis -Compare $playbackAbCompare -ComparisonBasis $playbackAbBasis) -and $playbackAb.analysis.suggestedOptimization) {
         return [string]$playbackAb.analysis.suggestedOptimization
     }
     $fpsDelta = Convert-ToNullableDouble $playbackAbCompare.presentedFps.delta
@@ -482,18 +504,52 @@ function Get-PlaybackAbHostLoadRefusal {
     # how $compare/$playbackComparisonBasis are chosen below).
     param([object]$Record)
 
-    # adversary-7efea617.json A3: a plain assignment, never `$x = if (...) { $list }`: an if-expression's output unrolls a one-element list into its member,
-    # so the list guard of Get-PlaybackAbLegHostLoadProvisional never saw it and the member's own clean standing counted
-    $candidateLeg = $Record.candidate
-    # adversary-b3d61554.json A6: the comparison basis is speedCompare alone (lines 362/520/883/890/947 all pick candidateSpeed on `$Record.speedCompare`), so the leg judged is
-    # candidateSpeed whenever speedCompare is there; a missing, null or empty candidateSpeed is then no leg at all, which reads provisional, never the ordinary candidate's clean standing
-    if ($Record.speedCompare) { $candidateLeg = $Record.candidateSpeed }
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A6, sibling): same leg choice as Get-PlaybackAbFpsArmRefusal below: a record with a speedCompare judges its candidateSpeed leg, and a missing one
+    # reads as provisional (Get-PlaybackAbLegHostLoadProvisional treats a null leg as provisional), never as the ordinary candidate.
+    # r6 (adversary pass 5 A3) and adversary-7efea617.json A3: the leg is ASSIGNED inside each branch. `$x = if (...) { $Record.candidateSpeed }` unrolls a one-element array into the leg inside it, so a malformed
+    # container the direct readers refuse was judged as that leg; an assignment keeps the container whole.
+    if ($Record.speedCompare) { $candidateLeg = $Record.candidateSpeed } else { $candidateLeg = $Record.candidate }
     $baselineProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $Record.baseline
     $candidateProvisional = Get-PlaybackAbLegHostLoadProvisional -Leg $candidateLeg
     [pscustomobject]@{
         provisional = ($baselineProvisional -or $candidateProvisional)
         baselineProvisional = $baselineProvisional
         candidateProvisional = $candidateProvisional
+    }
+}
+
+function Get-PlaybackAbFpsArmRefusal {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the arm gate for a mlvapp-cuda-playback-ab.v1 record, re-derived from the legs' own recorded telemetryArm (never from the record's cached
+    # fpsVerdict or analysis: an older or edited record could carry an `allowed` it never earned). Same leg choice as Get-PlaybackAbHostLoadRefusal. A leg that records no arm
+    # (a record written before this gate) is UNKNOWN and refused, exactly like HEAVY: an arm nobody can prove LIGHT is not LIGHT.
+    param([object]$Record)
+
+    # The leg judged is the leg the PUBLISHED compare came from: when the record carries a speedCompare the row / analysis / suggestion read it, so its candidateSpeed leg is judged, and an
+    # absent candidateSpeed there is UNKNOWN (a null leg), never a fall-back to the ordinary candidate (adversary A6).
+    # r6 (adversary pass 5 A3): assigned inside each branch so a one-element container is not unrolled into the leg inside it (see Get-PlaybackAbHostLoadRefusal)
+    if ($Record.speedCompare) { $candidateLeg = $Record.candidateSpeed } else { $candidateLeg = $Record.candidate }
+    $verdict = Get-FpsPairVerdict `
+        -Baseline (Get-FpsArmFromLegRecord $Record.baseline) `
+        -Candidate (Get-FpsArmFromLegRecord $candidateLeg)
+    # R2-RESIDUE-1 r1 (adversary 698fffb1 A7, sibling of summarize-local-cuda-proof.ps1): the compare this reader publishes must be measured on the very legs it just judged.
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A1): asked of EVERY published compare, not only one the arm gate allowed: a HEAVY pair beside a compare measured on other legs published that
+    # compare's per-leg fps and stage figures. A pair the arm gate refused keeps its ARM reason (the verdict the row publishes says why the pair was refused); `compareUnbound` is the separate fact
+    # that sends the per-leg figures back to the legs, whatever the reason.
+    if ($Record.speedCompare) { $judgedCompare = $Record.speedCompare } else { $judgedCompare = $Record.compare }
+    # R2-RESIDUE-1 r3 (sol 5add23cf A10): every metric the compare publishes is bound to the judged legs, so a compare without presentedFps is asked too
+    $bindingProblem = $null
+    if ($null -ne $judgedCompare) {
+        $bindingProblem = Get-FpsCompareBindingProblem -Compare $judgedCompare -Baseline $Record.baseline -Candidate $candidateLeg
+    }
+    if ($null -ne $bindingProblem -and $verdict.allowed) {
+        return [pscustomobject]@{ refused = $true; reason = "fps-verdict-refused:compare-not-judged-pair"; detail = [string]$bindingProblem; compareUnbound = $true; compareProblem = [string]$bindingProblem }
+    }
+    [pscustomobject]@{
+        refused = (-not $verdict.allowed)
+        reason = [string]$verdict.reason
+        detail = [string]$verdict.detail
+        compareUnbound = ($null -ne $bindingProblem)
+        compareProblem = [string]$bindingProblem
     }
 }
 
@@ -510,7 +566,18 @@ function Get-PlaybackAbAnalysis {
         }
     }
 
-    if ($Record.analysis -and
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the diagnosis is driven by the presented-fps delta, so it is withheld for a HEAVY / UNKNOWN pair too.
+    if ((Get-PlaybackAbFpsArmRefusal -Record $Record).refused) {
+        return [pscustomobject]@{
+            dominantBottleneck = "fps-arm-refused"
+            suggestedOptimization = "rerun_playback_ab_with_light_arm"
+        }
+    }
+
+    # r15 (adversary r14 pass 18 A7, sol r13 B3): the cached diagnosis is trusted only when it is bound to the pair this reader gated (same basis, same presented-fps deltaPercent); otherwise it
+    # is re-derived below from that pair's own compare.
+    if ($Record.speedCompare) { $cachedBasis = "candidateSpeed"; $cachedCompare = $Record.speedCompare } else { $cachedBasis = "candidate"; $cachedCompare = $Record.compare }
+    if ((Test-FpsCachedAnalysisBound -Analysis $Record.analysis -Compare $cachedCompare -ComparisonBasis $cachedBasis) -and
         $Record.analysis.dominantBottleneck -and
         [string]$Record.analysis.dominantBottleneck -ne "cadence-bound") {
         return [pscustomobject]@{
@@ -968,13 +1035,29 @@ function New-PlaybackAbSummaryRow {
     # matching gap for the raw delta number itself. Refused to $null, with an explicit reason
     # field (not just an absence a reader could mistake for "not computed yet").
     $hostLoadRefusal = Get-PlaybackAbHostLoadRefusal -Record $Record
-    $fpsDeltaRefused = [bool]$hostLoadRefusal.provisional
-    $fpsDeltaRefusedReason = if ($fpsDeltaRefused) {
-        "host_load_provisional: an fps delta computed against a leg whose host load was " +
-            "exceeded or could not be measured is never usable as a regression or acceptance signal."
-    } else {
-        $null
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: and the delta is refused the same way when either leg ran the HEAVY telemetry arm (a mixed pair too) or its arm is unrecorded: a HEAVY leg's
+    # presented fps measures the per-frame logger (about 20-27 % on M16-1457 CUDA fullscreen s1), so only a LIGHT / LIGHT pair may publish an fps gain or cost.
+    $fpsArmRefusal = Get-PlaybackAbFpsArmRefusal -Record $Record
+    # R2-RESIDUE-1 r3 (sol 5add23cf A5): a compare that is not measured on the judged pair is not where the per-leg numbers come from either (20 and 60 published beside two legs that both measured 40): the
+    # legs' own figures are read from the legs, and a leg that records none leaves the number empty
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A1): keyed on the fact (`compareUnbound`), not on the reason: a HEAVY pair keeps its arm reason and still reads its fps from its legs
+    if ($fpsArmRefusal.compareUnbound) {
+        $judgedCandidateLeg = if ($Record.speedCompare) { $Record.candidateSpeed } else { $Record.candidate }
+        $baselinePresented = Convert-ToNullableDouble $Record.baseline.presentedFps
+        $candidatePresented = Convert-ToNullableDouble $judgedCandidateLeg.presentedFps
     }
+    $fpsDeltaRefused = ([bool]$hostLoadRefusal.provisional -or [bool]$fpsArmRefusal.refused)
+    $fpsDeltaRefusedReasons = @()
+    if ($hostLoadRefusal.provisional) {
+        $fpsDeltaRefusedReasons += (
+            "host_load_provisional: an fps delta computed against a leg whose host load was " +
+            "exceeded or could not be measured is never usable as a regression or acceptance signal."
+        )
+    }
+    if ($fpsArmRefusal.refused) {
+        $fpsDeltaRefusedReasons += "$($fpsArmRefusal.reason): $($fpsArmRefusal.detail); only a LIGHT / LIGHT pair may publish a presented-fps gain or cost (stage metrics stay)."
+    }
+    $fpsDeltaRefusedReason = if ($fpsDeltaRefused) { ($fpsDeltaRefusedReasons -join " ") } else { $null }
     $suggestion = if ([string]::IsNullOrWhiteSpace([string]$analysis.suggestedOptimization)) {
         if ([string]$Record.status -ne "success") {
             "fix_playback_ab_proof_failures"
@@ -994,6 +1077,7 @@ function New-PlaybackAbSummaryRow {
         presented_fps = if ($null -ne $candidatePresented) { [math]::Round($candidatePresented, 3) } else { $null }
         playback_fps_delta_pct = if ($fpsDeltaRefused -or $null -eq $deltaPct) { $null } else { [math]::Round($deltaPct, 3) }
         playback_fps_delta_refused_reason = $fpsDeltaRefusedReason
+        playback_fps_arm_verdict = if ($fpsArmRefusal.refused) { $fpsArmRefusal.reason } else { "allowed" }
         no_readback_pct = $null
         fallback_pct = $null
         fallback_count = $null

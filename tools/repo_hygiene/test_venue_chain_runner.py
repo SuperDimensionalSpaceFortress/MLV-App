@@ -266,6 +266,17 @@ class VenueFixtureModuleCopyTests(unittest.TestCase):
         # VENUE-STAGE-SAME-SHA-RESTAGE-GUARD-1 r5 (hosted Tests run 43580040634): VenueChain.psm1 reads ..\bachelor\AttrCudaArtifacts.psm1 as text (Get-VenueClaimShapeSource)
         self.assertIn("..\\bachelor\\AttrCudaArtifacts.psm1", cross_tree_modules(MODULE))
 
+    def test_r3_ci_the_derived_cross_tree_set_names_the_runners_parent_folder_arm_gate_module(self) -> None:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r3 (hosted Tests run 44737591712): the lease-batch RUNNER (not VenueChain.psm1) imports `(Split-Path -Parent $here) 'FpsArmGate.psm1'`, the
+        # module one level up in tools/profiling; the derivation scanned only the module and its siblings, so a scratch tree had no FpsArmGate.psm1 and the runner died at line 260
+        self.assertIn("..\\FpsArmGate.psm1", cross_tree_modules(MODULE))
+
+    def test_r3_ci_a_scratch_copy_carries_the_runners_parent_folder_module_beside_the_scratch_dir(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ci-r3-") as tmp:
+            folder = Path(os.path.realpath(tmp)) / "dual-venue"
+            copy_with_siblings(MODULE, folder)
+            self.assertTrue((folder.parent / "FpsArmGate.psm1").is_file(), "the runner's parent-folder module was not copied beside the scratch dir")
+
     def test_r5_ci_a_scratch_copy_reads_the_claim_shape_predicate_from_its_own_scratch_tree(self) -> None:
         # the staged-manifest read takes the predicate's text from <module dir>\..\bachelor; a scratch copy must find the scratch tree's copy, never the repo's
         with tempfile.TemporaryDirectory(prefix="ci-r5-") as tmp:

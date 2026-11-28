@@ -96,7 +96,9 @@ class _ProbeCase(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
         self.probe = self.tmp / "probe.ps1"
-        self.probe.write_text(self.preamble + _extract_functions(self.script, self.functions), encoding="utf-8")
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: the real scripts import the shared arm gate; an extracted function that calls it needs the module in the probe too.
+        arm_gate = ROOT / "tools" / "profiling" / "FpsArmGate.psm1"
+        self.probe.write_text(f"Import-Module '{arm_gate}' -Force\n" + self.preamble + _extract_functions(self.script, self.functions), encoding="utf-8")
 
     def run_snippet(self, body: str) -> subprocess.CompletedProcess:
         script = self.tmp / "run.ps1"
@@ -2134,29 +2136,44 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         "Convert-ToNullableDouble",
         "Get-PlaybackAbLegHostLoadProvisional",
         "Get-PlaybackAbHostLoadRefusal",
+        "Get-PlaybackAbFpsArmRefusal",
         "Get-CompareDeltaPercent",
         "Test-DeltaAtLeast",
         "Get-PlaybackAbAnalysis",
     ]
 
-    def _leg(self, provisional: bool, state: str = None) -> str:
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r12: the all-literal head of a LIGHT leg is its own class-level statement, with no
+    # runtime variable beside it, so the hidden-spawn text scan (test_hidden_spawn_flags.py::_could_launch) never reads
+    # a wildcard next to the launch-argument literals. The text is unchanged; nothing here starts a process.
+    _LIGHT_LEG_HEAD = (
+        "[pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
+        "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_CRASH_FORENSICS_LOG_DIR = 'C:/logs' }; "
+        "arguments = @('--gui-smoke-playback', '--input', 'C:/clip.mlv', '--seconds', '7', '--start-frame', '0', '--settle-ms', '2500', '--settle-cpu-percent', '10', "
+        "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000') }; hostLoadProvisional = "
+    )
+
+    def _leg(self, provisional: bool, state: str = None, presented_fps: float = None) -> str:
         # round 5: legs are now built WITH hostLoadState by default (as every real round-4+
         # producer emits it alongside hostLoadProvisional) -- state defaults to the value implied
         # by provisional so callers that only care about the boolean keep working unchanged.
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: and WITH telemetryArm LIGHT (a leg that records no arm is UNKNOWN and refused, so these host-load cases need the LIGHT arm to stay about host load).
+        # R2-RESIDUE-1 r2: and WITH the presentedFps its compare names (a compare is published only when it is measured on the judged legs).
         resolved_state = state if state is not None else ("exceeded" if provisional else "quiet")
         provisional_literal = "$true" if provisional else "$false"
-        return (
-            "[pscustomobject]@{ hostLoadProvisional = " + provisional_literal +
-            "; hostLoadState = '" + resolved_state + "'; hostLoadCollected = $true }"
-        )
+        fps_literal = "" if presented_fps is None else "; presentedFps = " + repr(float(presented_fps))
+        return self._LIGHT_LEG_HEAD + provisional_literal + "; hostLoadState = '" + resolved_state + "'; hostLoadCollected = $true" + fps_literal + " }"
 
     def _record(self, baseline_provisional: bool, candidate_provisional: bool, fps_delta_pct: float = -40.0) -> str:
-        baseline = self._leg(baseline_provisional)
-        candidate = self._leg(candidate_provisional)
+        # the pair the compare is measured on: 50 fps -> 30 fps is -40 % (the default); any other percent keeps baseline 50
+        baseline_fps = 50.0
+        candidate_fps = baseline_fps * (1.0 + fps_delta_pct / 100.0)
+        baseline = self._leg(baseline_provisional, presented_fps=baseline_fps)
+        candidate = self._leg(candidate_provisional, presented_fps=candidate_fps)
         return (
             "[pscustomobject]@{ "
             f"baseline = {baseline}; candidate = {candidate}; candidateSpeed = $null; "
-            f"compare = [pscustomobject]@{{ presentedFps = [pscustomobject]@{{ deltaPercent = {fps_delta_pct} }} }} "
+            f"compare = [pscustomobject]@{{ presentedFps = [pscustomobject]@{{ baseline = {baseline_fps}; candidate = {candidate_fps}; "
+            f"delta = {candidate_fps - baseline_fps}; deltaPercent = {fps_delta_pct} }} }} "
             "}"
         )
 
@@ -2187,6 +2204,8 @@ class CompareMachinePerfPlaybackAbHostLoadRefusalTests(_ProbeCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertNotIn("DOMINANT=host-load-provisional", proc.stdout)
+        # R2-RESIDUE-1 r2: the compare is measured on the two legs, so the arm gate does not refuse it either (a refusal would also pass the line above)
+        self.assertNotIn("DOMINANT=fps-arm-refused", proc.stdout)
 
     def test_leg_missing_hostloadprovisional_property_is_treated_as_provisional(self) -> None:
         # Same fail-toward-provisional stance as item 3: a leg object present but lacking the
@@ -2277,33 +2296,44 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         "Assert-MachineFingerprint",
         "Get-PlaybackAbLegHostLoadProvisional",
         "Get-PlaybackAbHostLoadRefusal",
+        "Get-PlaybackAbFpsArmRefusal",
         "Get-CompareDeltaPercent",
         "Test-DeltaAtLeast",
         "Get-PlaybackAbAnalysis",
         "New-PlaybackAbSummaryRow",
     ]
 
-    def _leg(self, provisional: bool, state: str = None) -> str:
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r12: same all-literal class-level head as the class above (see its comment).
+    _LIGHT_LEG_HEAD = (
+        "[pscustomobject]@{ telemetryArm = 'LIGHT'; launch = [pscustomobject]@{ environment = [pscustomobject]@{ MLVAPP_PLAYBACK_SMOKE_TELEMETRY = '1'; "
+        "MLVAPP_PLAYBACK_SMOKE_TELEMETRY_DISABLE_FRAME_LOG = '1'; MLVAPP_CRASH_FORENSICS_LOG_DIR = 'C:/logs' }; "
+        "arguments = @('--gui-smoke-playback', '--input', 'C:/clip.mlv', '--seconds', '7', '--start-frame', '0', '--settle-ms', '2500', '--settle-cpu-percent', '10', "
+        "'--settle-cpu-stable-ms', '1000', '--settle-cpu-max-ms', '45000') }; hostLoadProvisional = "
+    )
+
+    def _leg(self, provisional: bool, state: str = None, presented_fps: float = None) -> str:
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: LIGHT arm, so these cases stay about host load (an unrecorded arm is UNKNOWN and refused).
+        # R2-RESIDUE-1 r2: and WITH the presentedFps the compare names: the row publishes a delta only for a compare measured on the judged legs (a leg that records no presentedFps cannot bind it).
         resolved_state = state if state is not None else ("exceeded" if provisional else "quiet")
         provisional_literal = "$true" if provisional else "$false"
-        return (
-            "[pscustomobject]@{ hostLoadProvisional = " + provisional_literal +
-            "; hostLoadState = '" + resolved_state + "'; hostLoadCollected = $true }"
-        )
+        fps_literal = "" if presented_fps is None else "; presentedFps = " + repr(float(presented_fps))
+        return self._LIGHT_LEG_HEAD + provisional_literal + "; hostLoadState = '" + resolved_state + "'; hostLoadCollected = $true" + fps_literal + " }"
 
     def _record(
         self, baseline_provisional: bool, candidate_provisional: bool,
-        baseline_fps: float = 10.0, candidate_fps: float = 20.0, delta_pct: float = 100.0,
+        baseline_fps: float = 10.0, candidate_fps: float = 20.0, delta_pct: float = 100.0, published_delta: float | None = None,
     ) -> str:
-        baseline_leg = self._leg(baseline_provisional)
-        candidate_leg = self._leg(candidate_provisional)
+        # published_delta: what the compare publishes as delta when it is not candidate - baseline (a record whose figures do not follow from its endpoints)
+        delta = candidate_fps - baseline_fps if published_delta is None else published_delta
+        baseline_leg = self._leg(baseline_provisional, presented_fps=baseline_fps)
+        candidate_leg = self._leg(candidate_provisional, presented_fps=candidate_fps)
         return (
             "[pscustomobject]@{ schema = 'mlvapp-cuda-playback-ab.v1'; status = 'success'; "
             "machineFingerprint = [pscustomobject]@{ schema = 'machine-fingerprint.v1'; "
             "hostname = 'H'; cpu = 'x'; gpu = 'y'; os = 'z'; build_sha = 'abc1234' }; "
             f"baseline = {baseline_leg}; candidate = {candidate_leg}; candidateSpeed = $null; "
             "compare = [pscustomobject]@{ presentedFps = [pscustomobject]@{ "
-            f"baseline = {baseline_fps}; candidate = {candidate_fps}; deltaPercent = {delta_pct} }} }} }}"
+            f"baseline = {baseline_fps}; candidate = {candidate_fps}; delta = {delta}; deltaPercent = {delta_pct} }} }} }}"
         )
 
     def _row(self, record: str) -> subprocess.CompletedProcess:
@@ -2335,6 +2365,17 @@ class CompareMachinePerfPlaybackAbFpsDeltaRefusalTests(_ProbeCase):
         self.assertIn("REASON=", proc.stdout)
         self.assertNotIn("REASON=host_load_provisional", proc.stdout)
         self.assertIn("PROVISIONAL=False", proc.stdout)
+
+    def test_r2_residue_r2_a_compare_not_measured_on_the_judged_legs_publishes_no_delta(self) -> None:
+        # a quiet LIGHT/LIGHT pair whose legs record no presentedFps cannot bind the compare (the fixture gap that reddened hosted CI on da6248b1): the typed refusal, no delta
+        unbound = self._record(False, False).replace("; presentedFps = 10.0", "").replace("; presentedFps = 20.0", "")
+        proc = self._row(unbound)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DELTA= REASON=fps-verdict-refused:compare-not-judged-pair:", proc.stdout)
+        # luna r1b A1 through the row: both legs 40 fps, the compare says delta 40 / +100 %
+        proc = self._row(self._record(False, False, baseline_fps=40.0, candidate_fps=40.0, delta_pct=100.0, published_delta=40.0))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("DELTA= REASON=fps-verdict-refused:compare-not-judged-pair:", proc.stdout)
 
     def test_exceeded_false_baseline_still_refuses_the_delta(self) -> None:
         # round 8 (sol MAJOR item 3), exact repro: "baseline hostLoadState='exceeded',
@@ -2369,7 +2410,8 @@ class CompareMachinePerfHostLoadWiringTests(unittest.TestCase):
         source = COMPARE_MACHINE_PERF_SCRIPT.read_text(encoding="utf-8")
         self.assertIn("rerun_playback_ab_with_quiet_host", source)
         refusal_check = source.index("(Get-PlaybackAbHostLoadRefusal -Record $playbackAb).provisional")
-        trusts_embedded_analysis = source.index("$playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization")
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 r15 (adversary r14 pass 18 A7): the cached analysis is trusted only through Test-FpsCachedAnalysisBound (bound to the gated pair); still after the refusal
+        trusts_embedded_analysis = source.index("(Test-FpsCachedAnalysisBound -Analysis $playbackAb.analysis")
         self.assertLess(
             refusal_check, trusts_embedded_analysis,
             "the host-load refusal must be checked before trusting the record's own cached analysis",
@@ -3558,7 +3600,8 @@ class LocalCudaProofSummarizerHostLoadGuardTests(unittest.TestCase):
     def test_fps_not_improved_diagnostic_is_skipped_when_host_load_is_provisional(self) -> None:
         source = CUDA_PROOF_SUMMARIZER_SCRIPT.read_text(encoding="utf-8")
         guard_start = source.index("if (-not $playbackAbHostLoadProvisional -and")
-        guard_block = source[guard_start:guard_start + 500]
+        # BENCH-LIGHT-ARM-GAIN-GATES-1: the guard grew one condition (the arm refusal), so the window is 700 chars, not 500.
+        guard_block = source[guard_start:guard_start + 700]
         self.assertIn("PLAYBACK_PRESENTED_FPS_NOT_IMPROVED", guard_block)
 
 
@@ -3575,7 +3618,9 @@ class LocalCudaProofSummarizerGuardExecutesTests(_ProbeCase):
     script = CUDA_PROOF_SUMMARIZER_SCRIPT
     functions = ["Get-Field", "New-Diagnostic", "Add-Diagnostic"]
 
-    START_MARKER = "$playbackAbCandidateLeg = $playbackAb.candidate\n"
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A3 sibling): the summarizer now assigns the candidate leg inside each branch of the if (a one-element container is not unrolled into the
+    # leg inside it), so the block starts at that comment; the guard that follows is unchanged.
+    START_MARKER = "# r6 (adversary pass 5 A3 sibling) and adversary-7efea617.json A3: assigned inside each branch"
     END_MARKER = (
         "an fps number measured under provisional or unrecorded host load is not a property "
         "of the build."
@@ -3795,7 +3840,7 @@ class ResidueR2CudaAbReadSmokeSummaryTests(_ProbeCase):
 
     script = CUDA_AB_SCRIPT
     functions = ["Convert-PlaybackLogLineToObject", "Get-ScopedPlaybackLogLines", "Add-NullableDouble", "Get-AverageOrNull", "Convert-ToNullableDouble",
-                 "Convert-ToNullableInt64", "Get-NestedValue", "Get-SmokeSummaryHostLoadFields", "Read-SmokeSummary"]
+                 "Convert-ToNullableInt64", "Get-NestedValue", "Get-SmokeSummaryHostLoadFields", "Get-SmokeSummaryTelemetryArm", "Read-SmokeSummary"]
     preamble = f"Import-Module '{VENUE_CHAIN_MODULE}' -Function ConvertFrom-VenueSmokeResultText, Find-VenueJsonDuplicateMember -DisableNameChecking\n"
 
     def _summary(self, text: str) -> subprocess.CompletedProcess:
@@ -3840,7 +3885,10 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
             record.write_text('{"schema":"release-cuda-playback-ab.v1","baseline":' + baseline + ',"candidate":' + clean + '}', encoding="utf-8", newline="")
             proc = _run_ps_file(COMPARE_MACHINE_PERF_SCRIPT, str(record))
             self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn("is not strict JSON", _flat_pwsh_text(proc.stdout + proc.stderr), proc.stdout + proc.stderr)
+            # the strict scanner cannot read the comment ("is not strict JSON"), or, on this branch, the arm gate's own repeated-key check (which reads past a comment) refuses the same record first
+            # (BENCH-LIGHT-ARM-GAIN-GATES-1, the master merge); either way the row is refused, never compared
+            flat = _flat_pwsh_text(proc.stdout + proc.stderr)
+            self.assertTrue("is not strict JSON" in flat or "FPS_JSON_REPEATED_KEY" in flat, proc.stdout + proc.stderr)
             summary = Path(tmp) / "summary.json"
             summary.write_text('{"status":"PASS","proof":{"playbackAb":{"baseline":' + baseline + ',"candidate":' + clean + '}}}', encoding="utf-8", newline="")
             proc = _run_ps_file(CUDA_PROOF_SUMMARIZER_SCRIPT, "-SummaryPath", str(summary))
@@ -4081,7 +4129,8 @@ class ResidueR2SiblingReaderTests(unittest.TestCase):
                 self.assertIsNotNone(report, proc.stdout + proc.stderr)
                 self.assertEqual(report["fps"]["smokePresentedFps"]["before"], published, report["fps"]["smokePresentedFps"])
                 if published is None:
-                    self.assertTrue(any("not one object" in str(f) for f in report["failures"]), report["failures"])
+                    # the arm gate's raw check (r7, adversary 55acb091 A1) now refuses the array root first and names it ("is a JSON Array, not an object"); the reader's own "not one object" stays behind it
+                    self.assertTrue(any("not one object" in str(f) or "JSON Array, not an object" in str(f) for f in report["failures"]), report["failures"])
                     self.assertEqual(report["verdict"], "INCONCLUSIVE")
         source = _extract_functions(COMPARE_SCRIPT, ["Read-SmokeSourceOnce"])
         self.assertIn("ConvertFrom-Json -InputObject $parseText -Depth 100 -NoEnumerate", source)

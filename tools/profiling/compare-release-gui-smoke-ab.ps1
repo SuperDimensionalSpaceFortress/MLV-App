@@ -18,6 +18,8 @@ $ErrorActionPreference = "Stop"
 # gap: this comparator's own list used to omit capture-invalid and capture-too-dark, so an
 # A/B leg with an unusable or artifacted capture could still report PASS.
 . (Join-Path $PSScriptRoot 'gui-smoke-color-artifact-scan.ps1')
+# BENCH-LIGHT-ARM-GAIN-GATES-1: a presented-fps delta comes only from a LIGHT / LIGHT pair (hub ruling 2026-11-20T05:25:54Z item 2).
+Import-Module (Join-Path $PSScriptRoot 'FpsArmGate.psm1') -Force
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r6 (sol r5 B1): the host-load block is judged by the venue reader's ONE strict rule (VenueChain.psm1
 # ConvertFrom-VenueSmokeHostLoad and Get-VenueReferenceHostLoadRefusal), never by a second, looser parser here.
 Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function ConvertFrom-VenueSmokeHostLoad, Get-VenueReferenceHostLoadRefusal, ConvertFrom-VenueSmokeResultText -DisableNameChecking
@@ -29,7 +31,9 @@ function Read-SmokeJson {
     if (-not (Test-Path -LiteralPath $resolved)) {
         throw "Smoke JSON not found: $resolved"
     }
-    Get-Content -LiteralPath $resolved -Raw | ConvertFrom-Json -Depth 100
+    $raw = Get-Content -LiteralPath $resolved -Raw
+    Assert-FpsJsonNoRepeatedKey $raw $resolved   # r14 (sol r13 B4, adversary r14 A2): a repeated key is refused, never collapsed to its last value
+    $raw | ConvertFrom-Json -Depth 100
 }
 
 function Get-SmokeFileIdentity {
@@ -128,6 +132,9 @@ function Read-SmokeSourceOnce {
         try {
             # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1-R4-NARROW-1 r2 (adversary-6596e055.json A7): -NoEnumerate, so a root that is a ONE-element array stays an array (refused below as "not one object"),
             # never unwrapped into its member and read as the figure object
+            # r14 (sol r13 B4, adversary r14 A2) and r7 (adversary 55acb091 A1): this is the ACTIVE reader, and ConvertFrom-Json keeps the LAST of a repeated member (a launch environment's per-frame-log opt-out
+            # written 0 then 1 read LIGHT). The repeat is refused before the parse and reads as a typed parse error (empty figures), the same route as a text the parser refuses.
+            Assert-FpsJsonNoRepeatedKey $parseText $resolved
             $smoke = ConvertFrom-Json -InputObject $parseText -Depth 100 -NoEnumerate
         }
         catch {
@@ -600,6 +607,56 @@ function Get-HostLoadComparisonEvidence {
     [pscustomobject]@{
         evidence = [pscustomobject]$evidence
         failures = @($failures)
+    }
+}
+
+function Get-FpsArmComparisonEvidence {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: may the two smokes be compared on fps? Each smoke's arm is read from the launch environment its own result recorded
+    # (launch.environment and launch.arguments); only LIGHT / LIGHT is allowed. A HEAVY leg (per-frame logging on), a mixed pair and a smoke that recorded no environment (UNKNOWN) are refused,
+    # typed. Not a verdict failure: the screenshot / colour comparison does not depend on the arm, so only the fps deltas are withheld (Hide-FpsComparisonDeltas).
+    param(
+        [object]$BeforeSmoke,
+        [object]$AfterSmoke
+    )
+
+    # Get-FaProp, not Get-NestedValue: Get-NestedValue's pipeline output unrolls a one-element array into its element, so "launch": [ { ... } ] read as the object inside and classified LIGHT
+    # (adversary r5 A6); Get-FaProp keeps the array whole and Get-FpsArmFromLaunch refuses it.
+    # r14 (sol r13 B2): the whole smoke record is judged (Get-FpsArmFromSmokeRecord): a LIGHT launch beside a record-level observerControls entry is not proof of LIGHT.
+    $beforeArm = Get-FpsArmFromSmokeRecord $BeforeSmoke
+    $afterArm = Get-FpsArmFromSmokeRecord $AfterSmoke
+    $verdict = Get-FpsPairVerdict -Baseline $beforeArm -Candidate $afterArm -BaselineName "before" -CandidateName "after"
+    [pscustomobject]@{
+        refused = (-not $verdict.allowed)
+        reason = [string]$verdict.reason
+        detail = [string]$verdict.detail
+        stageMetricsAllowed = $true
+        before = $beforeArm
+        after = $afterArm
+    }
+}
+
+function Hide-FpsComparisonDeltas {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: for a refused pair every presented / GUI / timeline fps delta and the auto decision's fps-equivalent delta become $null, with the typed reason
+    # beside them. Each leg's own raw before / after value stays (a single leg's measurement is not a comparison); every ms stage figure is untouched.
+    param(
+        [object]$Result,
+        [object]$Evidence
+    )
+
+    if (-not $Evidence.refused) {
+        return
+    }
+    $targets = @()
+    foreach ($name in @('visibleBottomLeftGuiFps', 'smokePresentedFps', 'smokeTimelineFps')) {
+        $targets += $Result.fps.$name
+    }
+    $targets += $Result.autoDecision.averageFpsEquivalent
+    foreach ($target in $targets) {
+        if ($null -ne $target) {
+            $target.delta = $null
+            $target.deltaPercent = $null
+            Add-Member -InputObject $target -NotePropertyName 'refused' -NotePropertyValue $Evidence.reason -Force
+        }
     }
 }
 
@@ -1188,6 +1245,8 @@ foreach ($leg in @(
 # adversary-de8e3799.json A1: the host load is judged from each smoke file's own text (no root/hostLoad unrolling, a repeated member is unknown)
 $hostLoadComparison = Get-HostLoadComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke -BeforeText $beforeSmokeText -AfterText $afterSmokeText -BeforeRefused ($null -ne $beforeSource.parseError) -AfterRefused ($null -ne $afterSource.parseError)
 $hostLoadEvidence = $hostLoadComparison.evidence
+# BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm of each smoke (fps deltas are withheld below for any pair that is not LIGHT / LIGHT; it does not change the verdict).
+$fpsArmComparison = Get-FpsArmComparisonEvidence -BeforeSmoke $beforeSmoke -AfterSmoke $afterSmoke
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-1 r3 (sol r2 B1): a host-load refusal is no longer a failure (it read FAIL);
 # it is kept in hostLoadRefusals and makes the verdict INCONCLUSIVE (Get-GuiSmokeAbVerdict, below).
 $hostLoadRefusals = @($hostLoadComparison.failures)
@@ -1268,6 +1327,7 @@ $result = [pscustomobject]@{
     screenshot = $screenshotCompare
     presentedFrameEvidence = [pscustomobject]$presentedFrameEvidence
     hostLoadEvidence = $hostLoadEvidence
+    fpsVerdict = $fpsArmComparison
     autoDecision = New-AutoDecisionComparison `
         -BeforeSmoke $beforeSmoke `
         -AfterSmoke $afterSmoke
@@ -1352,6 +1412,8 @@ if ([string]::Equals([string]$result.verdict, 'INCONCLUSIVE', [StringComparison]
         changedSampleRatio = $null
     }
 }
+
+Hide-FpsComparisonDeltas -Result $result -Evidence $fpsArmComparison
 
 $json = $result | ConvertTo-Json -Depth 24
 if (-not [string]::IsNullOrWhiteSpace($Output)) {

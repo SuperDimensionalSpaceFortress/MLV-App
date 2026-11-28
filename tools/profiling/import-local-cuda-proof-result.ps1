@@ -9,6 +9,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6): the speed-authority predicate the packager shares
+Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force
 
 function Resolve-RepoPath {
     param(
@@ -89,7 +91,7 @@ if (!(Test-Path -LiteralPath $packetFullPath -PathType Leaf)) {
 $packetItem = Get-Item -LiteralPath $packetFullPath
 
 if ([string]::IsNullOrWhiteSpace($DestinationRoot)) {
-    $DestinationRoot = Join-Path $root ".claude-state\profiling\local-cuda-proof-packets\imported"
+    $DestinationRoot = Join-Path $root ".claude-state/profiling/local-cuda-proof-packets/imported"
 }
 else {
     $DestinationRoot = Resolve-RepoPath -Root $root -Path $DestinationRoot
@@ -128,11 +130,19 @@ if (!(Test-Path -LiteralPath $proofReportMarkdownPath -PathType Leaf)) {
 $manifest = $null
 $summary = $null
 $proofReport = $null
+$proofReportRaw = $null
+$proofReportJudgedSha256 = $null
 if ($failures.Count -eq 0) {
     try {
         $manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json -Depth 100
         $summary = Get-Content -LiteralPath $summaryPath -Raw | ConvertFrom-Json -Depth 100
-        $proofReport = Get-Content -LiteralPath $proofReportJsonPath -Raw | ConvertFrom-Json -Depth 100
+        # (sol c29f8dc1 A3, importer sibling: the report is read ONCE, as bytes, and the hash of those very bytes is kept, so the manifest check below can be bound to the report that was judged and not to
+        # whatever is at the path when the file is hashed later)
+        $proofReportBytes = [System.IO.File]::ReadAllBytes($proofReportJsonPath)
+        $proofReportJudgedSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($proofReportBytes))
+        # r7 (adversary 55acb091 A3, sibling): decoded by its BOM (UTF-8, UTF-16 LE/BE, UTF-32), as the Get-Content this one read replaced did; no BOM reads UTF-8
+        $proofReportRaw = [System.IO.StreamReader]::new([System.IO.MemoryStream]::new($proofReportBytes), [System.Text.UTF8Encoding]::new($false), $true).ReadToEnd().TrimStart([char]0xFEFF)
+        $proofReport = $proofReportRaw | ConvertFrom-Json -Depth 100
     }
     catch {
         Add-Message $failures "Failed to parse packet JSON: $($_.Exception.Message)"
@@ -204,6 +214,13 @@ $proofReportStatus = if ($proofReport) { [string]$proofReport.status } else { $n
 if ($StrictQuotable -and $proofReportStatus -ne "QUOTABLE_PASS") {
     Add-Message $failures "Strict quotable import required QUOTABLE_PASS; packet proof report status was '$proofReportStatus'."
 }
+# adversary 1ce472bc A8: a speed claim is quotable only from a report this import verified: no failure, and a manifest hash check that passed for the very proof-report.json that was read
+# (a manifest with no files, or one that does not list it, verified nothing)
+# (sol c29f8dc1 A3: and the hash that check verified is the hash of the bytes that were parsed: a report replaced between the read and the hash makes the two differ, and no speed claim is bound)
+# (sol 5add23cf A9: the spelling is compared the way the volume compares names, because the report was OPENED by that name: on a case-insensitive volume (Windows) a packet built with -ReportPath ...\Proof-Report.md
+# lists Proof-Report.json and this run opened the very same file as proof-report.json, so a case variant of the genuine report keeps its authority; any other name (another file, a path below it, a suffix) never gains it)
+$nameComparison = Get-VolumeNameComparison -ExistingFile $proofReportJsonPath   # (sol 5add23cf A8: asked of the volume the file was opened on, not guessed from the path separator)
+$speedHashBound = ($failures.Count -eq 0) -and (-not [string]::IsNullOrEmpty([string]$proofReportJudgedSha256)) -and (@($fileChecks | Where-Object { [bool]$_.ok -and [string]::Equals([string]$_.relativePath, "proof-report.json", $nameComparison) -and [string]::Equals([string]$_.actualSha256, [string]$proofReportJudgedSha256, [StringComparison]::OrdinalIgnoreCase) }).Count -eq 1)
 $proofDiagnostics = if ($proofReport) { @($proofReport.diagnostics) } else { @() }
 $proofDiagnosticSummary = if ($proofReport) { $proofReport.diagnosticSummary } else { $null }
 $proofActionPlan = if ($proofReport) { $proofReport.actionPlan } else { $null }
@@ -229,6 +246,11 @@ $result = [ordered]@{
         [ordered]@{
             path = $proofReportJsonPath
             status = $proofReport.status
+            # r15 (adversary r14 pass 18 A6): speed authority is the report's claimAuthority.speed (exactly $true), never the support status; a report without it grants none
+            # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A6): one predicate with the packager (Test-FpsProofReportSpeedQuotable): the PASS playbackSpeed section, no singleton arrays, no repeated key
+            speedQuotable = ($speedHashBound -and (Test-FpsProofReportSpeedQuotable -Report $proofReport -RawText $proofReportRaw))
+            speedHashBound = $speedHashBound
+            claimAuthority = $proofReport.claimAuthority
             topLevelStatus = $proofReport.topLevelStatus
             blockers = @($proofReport.blockers)
             warnings = @($proofReport.warnings)
@@ -256,7 +278,7 @@ $result = [ordered]@{
     }
     boundaries = @(
         "Import validates packet structure and artifact hashes only.",
-        "Hardware support or speed remains quotable only when proofReport.status is QUOTABLE_PASS for the same host being claimed.",
+        "Hardware support remains quotable only when proofReport.status is QUOTABLE_PASS for the same host being claimed; playback speed only when proofReport.speedQuotable is also true.",
         "A NOT_QUOTABLE packet is an actionable diagnostic packet, not a success proof."
     )
     warnings = @($warnings)

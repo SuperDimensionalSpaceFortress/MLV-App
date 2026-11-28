@@ -101,7 +101,7 @@
 #         venue with exactly that manifest (Get-VenueStagedBuildManifest, the file Invoke-VenueLeg hashes) and its cached exe, dll and package zip present and
 #         hashing to the manifest's digests (-VerifyArtifacts; BUILD_ARTIFACT_MISSING / BUILD_ARTIFACT_MISMATCH). One bad item refuses the whole plan on stderr,
 #         BATCH_USAGE LEG_PLAN_REFUSED reason=<BAD_ITEM_SHAPE | BAD_SOURCE_COMMIT | BAD_MANIFEST_SHA256 | BAD_BACKEND | BAD_ARM | LEG_SPEC_MISSING | BUILD_NOT_STAGED |
-#         BUILD_MANIFEST_MISMATCH | BUILD_ARTIFACT_MISSING | BUILD_ARTIFACT_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
+#         BUILD_MANIFEST_MISMATCH | BUILD_ARTIFACT_MISSING | BUILD_ARTIFACT_MISMATCH | SHARE_UNREACHABLE | LEG_SPEC_INVALID | BAD_PURPOSE | FPS_AB_HEAVY_ARM | FPS_AB_UNKNOWN_ARM> item=<n> (or LEG_PLAN_UNREADABLE | LEG_PLAN_INVALID), exit 2: nothing is submitted, so no lease ever fails
 #         halfway on a build. A spec that is not a mlv-app/dual-venue-leg/v1 spec, does not list the item's backend, or has a field Invoke-VenueLeg casts or validates
 #         (playSeconds, visualCapture and its opt-out reason, scaleFactor, acceptedEffectiveScale) it would throw on, is refused here (LEG_SPEC_INVALID, BAD_BACKEND)
 #         because Invoke-VenueLeg would throw on it only after the lease is open.
@@ -120,6 +120,9 @@
 #         given up on, goes to stderr only: showing batch.log is no input would read the inputs again with no bound. Each read keeps its 30 s, and the claim, gate and open checks refuse on their first as before; only the claim check that follows an unfinished pass is cut to the deadline.
 #         A SHARE_UNREACHABLE from any of these checks says guardReads(sec): what each read took ('+' = still running when given up on; start = the worker's own start, nothing read yet) and
 #         claimWaitBefore=yes|no (waitedSec: first denied poll to the grant, or to now while still denied).
+#         BENCH-LIGHT-ARM-GAIN-GATES-1: the plan object may declare "purpose": "fps-ab" (its legs are compared on presented fps) or "stage-attribution" (stage metrics only). An fps-ab plan is refused
+#         FPS_AB_HEAVY_ARM when any leg's spec runs the HEAVY telemetry arm (generatorArgs.telemetryArm; a HEAVY leg's fps measures the per-frame logger) and FPS_AB_UNKNOWN_ARM when a spec names
+#         no arm; any other purpose is BAD_PURPOSE. leg-plan.json records the purpose and each leg's derived telemetryArm (tools\profiling\FpsArmGate.psm1).
 #      b. The legs run in plan order (-PlanOrder AsGiven), or with the arms INTERLEAVED, A B A B (-PlanOrder Interleave, Get-VenueInterleavedLegPlan), so lease
 #         position and venue heat fall on every arm alike. Per-leg budget, re-check, claim loss and deadline handling are the scalar form's, leg by leg.
 #      c. Each leg process gets its own -SourceCommit / -BuildManifestSha256 / -Backend; each batch leg row and run result carries name, arm, backend, sourceCommit
@@ -272,6 +275,7 @@ $here = $PSScriptRoot
 Import-Module (Join-Path $here 'VenueChain.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $here 'VenueThermalGate.psm1') -Force
 Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force -DisableNameChecking   # LEASE-BATCH-RECEIPT-ROOT-1: Test-DvUnderClaudeState, the leg's own receipt-root rule
+Import-Module (Join-Path (Split-Path -Parent $here) 'FpsArmGate.psm1') -Force   # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry-arm classifier and the fps-A/B plan rule
 # r9 (sol r8 B2): every thermal-helper call passes its optional parameters explicitly (the dispatch grace below, the Stopwatch now), so an ambient $PSDefaultParameterValues
 # entry can never widen the one-second dispatch grace (a probe admitted 50 s past the deadline) or freeze the thermal clock
 $ThermalDispatchGraceSec = 1
@@ -401,6 +405,91 @@ function LogBest([string]$Message) {
     }
 }
 
+# R4-DEADLINE-RESIDUE-1 r2 (adversary ef31edb1 A4, major, introduced by r1's own threshold): r1 made the two synchronous preflight probes (the batch.log probe, the output-zone probe)
+# skip when under 3 s was left, but a stalled probe with MORE than 3 s left still ran to its own end, past -DeadlineUtc. A threshold admits a probe; it does not bound one. Each probe now
+# runs on a worker the caller gives up on at the time left before -DeadlineUtc less 2 s (VenueChain's Invoke-VenueBoundedRead, as every other bounded read here), so the typed refusal
+# lands before the deadline whatever the share does. A worker that does not answer is abandoned and counted (VenueAbandonedReads), so Complete-VenueProcess exits at once, and the
+# refusal goes to stderr only (nothing more is written into -RunDir: the share that stalled may hold it). No -DeadlineUtc: the probe runs inline, as before.
+$script:ProbeReserveSec = 2.0
+$script:ProbeUnanswered = $false
+function Get-ProbeBoundSec {
+    # $null = no -DeadlineUtc was given (the probe runs inline; $script:deadline is then a 6 h default, never a bound to hold a probe to); 0 = under the least bound (1 s) is left;
+    # else the longest a probe may take now, capped at the bounded read's own 600 s
+    if (-not $DeadlineUtc) { return $null }
+    $room = ($script:deadline - [DateTime]::UtcNow).TotalSeconds - $script:ProbeReserveSec
+    if ($room -lt 1.0) { return 0.0 }
+    [Math]::Min(600.0, $room)
+}
+function Invoke-ProbeWithin($Probe, $Argument) {
+    # $Probe: a { } LITERAL of this file (run inline without -DeadlineUtc, and handed to the worker as its text with it) or, for the one probe that is built at run time, the worker's text alone.
+    # [pscustomobject]@{ answered; value; error }: the probe's output, or no answer (the bound ended, no room was left, or the worker threw)
+    # R4-DEADLINE-RESIDUE-1 r3 (adversary 4829e999 A1, then 8bb8cadc A1): the call's end is fixed on its own clock, and that clock starts BEFORE the time left is sampled, so a caller
+    # descheduled between the two can only end the wait EARLIER than the sample says, never later. The worker's startup is inside the wait (Invoke-VenueBoundedRead takes the time left to the end
+    # on this clock, not the whole bound again), and an answer seen after the end is never acted on (-EndIsBoundEnd: the end is the end of the bound itself, as VenueChain's own bounded reads pass it).
+    $clock = [Diagnostics.Stopwatch]::StartNew()
+    $bound = Get-ProbeBoundSec
+    # no -DeadlineUtc: the plain inline probe. This branch comes FIRST: `$null -le 0` is TRUE, so the test below read "no deadline" as "no time left"
+    if ($null -eq $bound) {
+        if ($Probe -isnot [scriptblock]) { return [pscustomobject]@{ answered = $false; value = @(); error = 'a probe given as text has no inline form' } }
+        try { return [pscustomobject]@{ answered = $true; value = @(& $Probe $Argument); error = $null } }
+        catch { return [pscustomobject]@{ answered = $false; value = @(); error = $_.Exception.Message } }
+    }
+    if ($bound -le 0) { $script:ProbeUnanswered = $true; return [pscustomobject]@{ answered = $false; value = @(); error = 'no time is left before -DeadlineUtc for it' } }
+    $text = $(if ($Probe -is [scriptblock]) { $Probe.ToString() } else { [string]$Probe })
+    $r = & (Get-Module VenueChain) { param($t, $a, $s, $c) Invoke-VenueBoundedRead -ScriptText $t -Argument $a -TimeoutSec $s -Clock $c -EndSec $s -EndIsBoundEnd } $text $Argument $bound $clock
+    if (-not $r.answered -and [string]$r.error -match '^(no answer in|an answer seen)') { $script:ProbeUnanswered = $true }   # a stall, or an answer that came too late (the worker is abandoned or its answer dropped); a worker that threw is not one
+    $r
+}
+# the batch.log probe, one { } literal for the worker (its text) and the inline call: 'plain' when batch.log is absent or a one-name file that is no link, else 'other'. The file identity is read through
+# the compiled type Get-PhysicalPath loaded (assemblies are process-wide, so the worker sees it); $A.delayMs is the offline -GuardReadDelay seam (0 in production). A literal, never a string run at
+# run time: the launch-site census (tests/coordination/test_retire_lane_worktree.py, UNRESOLVED_EXECUTED_SITES) classifies this file's executed strings one by one.
+$script:LogProbeBlock = {
+    param($A)
+    $batchLog = $A.path
+    if ($A.delayMs -gt 0) { [Threading.Thread]::Sleep([int]$A.delayMs) }
+    if (-not (Test-Path -LiteralPath $batchLog)) { return 'plain' }
+    if (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        [uint32]$links = 0
+        $null = [VenueLeaseBatchFinalPath]::Identity([IO.Path]::GetFullPath($batchLog), [ref]$links)
+        if ([int]$links -le 1) { return 'plain' }
+    }
+    'other'
+}
+function Get-RunDirReadSeamMs {
+    # Wait-RunDirReadSeam's own condition, as the delay the probe worker sleeps (the same stderr line, said once here); 0 in production
+    $d = $script:guardDelaySeam
+    if ($null -ne $d -and $d.read -ceq 'rundir' -and $d.guard -ceq $script:lastGuardSeam) { [Console]::Error.WriteLine('GUARD_READ_DELAY_SEAM rundir (a -RunDir read after the guard)'); return [int]$d.ms }
+    0
+}
+$script:ZoneProbeFunctions = @('Get-RunDirOutputRefusal', 'Get-OutputZones', 'Get-PhysicalPath', 'Get-FileIdentity', 'Remove-TrailingSeparator', 'Wait-GuardReadSeam')
+function Get-RunDirOutputRefusalWithin([string]$Path) {
+    # Get-RunDirOutputRefusal, bounded by -DeadlineUtc (same answer, same $script:refusalInputUnopened / refusalOutputUnresolved flags). A probe that gives no answer is the refusal
+    # OUTPUT_ZONE_UNRESOLVED ("an output location could not be resolved": nothing vouches for it), and nothing more is written into -RunDir. No -DeadlineUtc: the plain call.
+    if ($null -eq (Get-ProbeBoundSec)) { return Get-RunDirOutputRefusal $Path }
+    $script:ProbeUnanswered = $false
+    $fn = ($script:ZoneProbeFunctions | ForEach-Object { "function $_ {`n$((Get-Item -LiteralPath "function:$_").Definition)`n}" }) -join "`n"
+    $vars = @{ RunDir = $RunDir; RunDirOutputLeafPatterns = $script:RunDirOutputLeafPatterns; RunDirOutputDirs = $script:RunDirOutputDirs; ClaimDirPath = $script:ClaimDirPath
+        ClaimDirOutputLeafPatterns = $script:ClaimDirOutputLeafPatterns; ClaimDirOutputDirs = $script:ClaimDirOutputDirs; guardDelaySeam = $null }
+    $text = "`$A = `$args[0]; `$ErrorActionPreference = 'Stop'`nforeach (`$k in `$A.vars.Keys) { Set-Variable -Name `$k -Value `$A.vars[`$k] -Scope Global }`n$fn`n" +
+        "`$r = Get-RunDirOutputRefusal `$A.path`n[pscustomobject]@{ refusal = [string]`$r; unopened = [bool]`$script:refusalInputUnopened; unresolved = [bool]`$script:refusalOutputUnresolved }"
+    $r = Invoke-ProbeWithin $text @{ path = $Path; vars = $vars }
+    $o = $(if ($r.answered) { @($r.value | Where-Object { $null -ne $_ -and $null -ne $_.PSObject.Properties['refusal'] })[-1] } else { $null })
+    if ($null -eq $o) {
+        $script:refusalInputUnopened = $false; $script:refusalOutputUnresolved = $true; $script:RunOutputAliased = $true
+        return "'$Path' cannot be checked against this run's outputs: the check did not answer within the time left before -DeadlineUtc ($($r.error)); the input itself opens, and outputs whose location is unknown are refused"
+    }
+    $script:refusalInputUnopened = [bool]$o.unopened; $script:refusalOutputUnresolved = [bool]$o.unresolved
+    [string]$o.refusal
+}
+function Test-NoRoomForSpecRead {
+    # R4-DEADLINE-RESIDUE-1 r4 (hosted CI on 2ee7d054; round-11 contract): with no room left before -DeadlineUtc a leg input is refused as the budget/timeout (SPEC_READ_TIMEOUT, or LEG_PLAN_UNREADABLE for the
+    # plan file) BEFORE any probe or claim. An output-zone check is a probe, so r3's bounded Get-RunDirOutputRefusalWithin answered OUTPUT_ZONE_UNRESOLVED first. The three call sites whose NEXT step is
+    # the input's own bounded read (the plan file, a plan item's spec, a -LegSpec spec) skip the zone check when this is true: that read starts nothing on a bound of 0 and refuses at once, before any claim
+    # or lease, so nothing is accepted unchecked. NOT for the staged-manifest site: its read has already been made and the run would go on to accept it. No -DeadlineUtc: never true (no bound to keep).
+    if ($null -eq (Get-ProbeBoundSec)) { return $false }
+    (Get-SpecReadBoundSec) -le 0.0
+}
+
 function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
     # LEASE-BATCH-MULTI-BUILD-1 (item 9a): a -LegPlan item that cannot run refuses the WHOLE plan before any claim, open or lease. Nothing was submitted.
     $line = "LEG_PLAN_REFUSED reason=$Reason$(if ($Item -gt 0) { " item=$Item" }) $Detail"
@@ -410,21 +499,34 @@ function Stop-PlanRefused([string]$Reason, [int]$Item, [string]$Detail) {
     # names (a staged manifest refused for its digest), so only a plain one-name batch.log, or none yet, is appended to. One that cannot be read is not appended to either.
     # r4: nor once the guard could not verify where an input is (Invoke-InputGuard, locationUnknown): batch.log may be that input. r5 (sol r4 B1 sibling): and then batch.log is not
     # even probed -- the guard gave up on that location, and a -RunDir that stopped answering would hold the probe before the typed refusal
+    # R4-DEADLINE-RESIDUE-1 (sol r2 on 4b328ae0, B1): the typed refusal is printed FIRST, before any batch.log probe or append: a refusal reached under -DeadlineUtc (a stalled staged-build
+    # read ends 2 s before it) must not wait on a synchronous probe of a share that may be the one that stalled. And with under 3 s left the probe is not made at all: the line is on stderr only.
+    [Console]::Error.WriteLine("BATCH_USAGE $line")
+    $logRoomSec = $(if ($script:deadline -is [datetime]) { ($script:deadline - [DateTime]::UtcNow).TotalSeconds } else { [double]::PositiveInfinity })
     $logPlain = $false
     # r7: nor for an input that no longer resolves (it is exactly when a write is unsafe), and only through the write guard (Test-RunDirWrite)
     # r7 pass 3 (adversary r7 pass 2 A4): nor for OUTPUT_ZONE_UNRESOLVED: the guard could not tell whether the refused input is batch.log (before any input is accepted nothing is compared)
-    if (-not $script:RunOutputAliased -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT', 'INPUT_VANISHED', 'INPUT_UNREADABLE', 'OUTPUT_ZONE_UNRESOLVED')) {
-        try {
-            Wait-RunDirReadSeam
-            if (-not (Test-Path -LiteralPath $batchLog)) { $logPlain = $true }
-            elseif (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (Get-FileIdentity $batchLog).links -le 1) { $logPlain = $true }
-        } catch { }
+    # r14 (sol r13 B5): nor for a bounded read that got no answer (SPEC_READ_TIMEOUT, EXPORT_BUDGET_PREFLIGHT_TIMEOUT): the share that stalled may hold -RunDir too, and the synchronous batch.log
+    # probe below would hold the typed refusal past the deadline the bound was there to keep; stderr carries the line.
+    if (-not $script:RunOutputAliased -and $logRoomSec -ge 3.0 -and $Reason -cnotin @('LEG_SPEC_IS_RUN_OUTPUT', 'LEG_PLAN_IS_RUN_OUTPUT', 'BUILD_MANIFEST_IS_RUN_OUTPUT', 'INPUT_VANISHED', 'INPUT_UNREADABLE', 'OUTPUT_ZONE_UNRESOLVED', 'SPEC_READ_TIMEOUT', 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT')) {
+        if ($DeadlineUtc) {
+            # R4-DEADLINE-RESIDUE-1 r3 (adversary ef31edb1 A4): the 3 s test above ADMITS the probe, it does not bound it. With more than 3 s left a stalled probe still ran to its own end,
+            # past -DeadlineUtc. It runs on a worker given up on at the time left less 2 s (Invoke-ProbeWithin); no answer leaves batch.log unwritten and every later line on stderr.
+            $probe = Invoke-ProbeWithin $script:LogProbeBlock @{ path = $batchLog; delayMs = (Get-RunDirReadSeamMs) }
+            if (-not $probe.answered) { if ($script:ProbeUnanswered) { $script:RunOutputAliased = $true } }   # a stall: the share may hold -RunDir; a probe that threw only leaves batch.log unwritten, as before
+            elseif (@($probe.value)[-1] -ceq 'plain') { $logPlain = $true }
+        } else {
+            try {
+                Wait-RunDirReadSeam
+                if (-not (Test-Path -LiteralPath $batchLog)) { $logPlain = $true }
+                elseif (-not ((Get-Item -LiteralPath $batchLog -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) -and (Get-FileIdentity $batchLog).links -le 1) { $logPlain = $true }
+            } catch { }
+        }
     }
     if ($logPlain -and (Test-RunDirWrite $batchLog)) {
         # r3 pass 3 (adversary r3 A1): a failed append is counted when a summary follows (a refusal once a batch receipt exists), so the count that summary reports includes it
         try { Add-Content -LiteralPath $batchLog -Value "$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')) $line" } catch { if ($script:summaryBeforeExit) { Register-LogFailure $_.Exception.Message } }
     }
-    [Console]::Error.WriteLine("BATCH_USAGE $line")
     # r3 pass 3: the summary is the LAST thing this run writes, after the refusal line, so no append it reports on is still to come
     if ($script:summaryBeforeExit) { & $script:summaryBeforeExit }
     try { Complete-VenueProcess -ExitCode 2 } catch { }
@@ -1442,10 +1544,35 @@ function Get-LegSpecId([string]$Path) {
     $legId
 }
 
+function Get-LegSpecTelemetryArm([string]$Path) {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the telemetry arm (LIGHT / HEAVY / UNKNOWN) a -LegPlan item's spec will run, derived from generatorArgs.telemetryArm by the same bounded read as
+    # Get-LegSpecId. A spec that cannot be read or parsed in the bound is UNKNOWN (refused like HEAVY for an fps A/B), never LIGHT.
+    # Adversary A4: the arm is judged from the SAME bytes the leg will run. The export-budget preflight (Get-ExportBudgetRefusal, which runs just before this call) recorded the sha256 of the
+    # bytes it judged in $script:SpecBudgetSha256, and the leg is bound to them by -ExpectSpecSha256. These bytes must hash to that digest; a spec that changed between the two reads (a
+    # HEAVY file shown LIGHT to this read and put back for the run) is UNKNOWN, never the arm this read happened to see. No recorded digest is UNKNOWN too.
+    $spec = $null
+    try {
+        $r = Read-SpecBytesWithin $Path (Get-SpecReadBoundSec)
+        # r6 (adversary pass 5 A5): a read that got no answer in its bound is a TIMEOUT the caller must see (readTimedOut), not a quiet UNKNOWN the plan goes on from toward a refusal after -DeadlineUtc
+        if ($r.state -ceq 'TIMEOUT') { return [pscustomobject]@{ arm = 'UNKNOWN'; source = 'spec'; reason = 'the spec read for the arm did not answer within the time left before -DeadlineUtc'; readTimedOut = $true } }
+        if ($r.state -ceq 'OK') {
+            # (merge with #903: the digests are keyed by Get-SpecDigestKey, the file's identity, never the spelled path)
+            $armDigestKey = Get-SpecDigestKey $Path
+            $judged = if ($script:SpecBudgetSha256 -is [hashtable] -and $script:SpecBudgetSha256.ContainsKey($armDigestKey)) { [string]$script:SpecBudgetSha256[$armDigestKey] } else { '' }
+            # r14 (sol r13 B4): a spec that repeats a key throws here (caught below: the arm is UNKNOWN), never collapses to the last value
+            if ($judged -and ((Get-BytesSha256 ([byte[]]$r.bytes)) -ceq $judged)) { $specText = [Text.Encoding]::UTF8.GetString([byte[]]$r.bytes); Assert-FpsJsonNoRepeatedKey $specText $Path; $spec = $specText | ConvertFrom-Json }
+            else { return (New-FpsArm 'UNKNOWN' 'spec' 'the spec bytes read for the arm are not the bytes the preflight judged and the leg is bound to (changed between reads, or no judged digest)') }
+        }
+    } catch { $spec = $null }
+    Get-FpsArmFromLegSpec $spec
+}
+
 function Get-SpecReadBoundSec {
     # r19 (sol r18 B2 = pass20-A2): the longest a spec read may take now: what is left before -DeadlineUtc less the refusal's reserve, under the preflight child's own cap (120 s). A guard
     # worker (no -DeadlineUtc in its scope) has the cap: the worker is itself given up on at its guard budget, and its callers pass that budget's remainder instead.
-    $dl = Get-Variable -Name deadline -ValueOnly -ErrorAction Ignore
+    # R4-DEADLINE-RESIDUE-1 r6 (adversary d68bc1e8 A3): the deadline is read from the script scope directly. Get-Variable took its scope from $PSDefaultParameterValues, so a caller's
+    # 'Get-Variable:Scope'='Global' sent the lookup to a scope with no deadline and the spec read got the 120 s cap instead of the time left (SPEC_READ_TIMEOUT after -DeadlineUtc).
+    $dl = $script:deadline
     $cap = 120.0
     if ($dl -isnot [datetime]) { return $cap }
     # adversary pass 22 A1 (on d8ad4c8d): no floor. A 1 s floor let a read that started with 0.25 s left end 0.75 s past the deadline; a room under the reserve is a bound of 0, and
@@ -1678,6 +1805,24 @@ function Get-ScalarLegShapeRefusal([string]$Path) {
     $(if ($null -ne $refusal) { [string]$refusal } else { '' })
 }
 
+function Get-SpecPathJudgedConflict([hashtable]$Seen, [string]$Path) {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary A7, on 245e26de): the judged digests are kept one per spec PATH ($script:SpecBudgetSha256), so two plan items that share a path
+    # overwrote each other's: item A's arm was read from the bytes it judged, then the file changed, item B judged the new bytes, and A's leg ran (bound to B's digest) on bytes its recorded
+    # arm never described. A path is judged ONCE per run: the first item (or scalar entry) to pass the shape and budget checks records the digest in $Seen, and any later entry whose own
+    # judged digest for the same path differs is the typed refusal below (fail closed; no claim, lease or leg). Returns '' when this path's digest is new or unchanged.
+    # (merge with #903: the digest is READ under Get-SpecDigestKey, the file's identity, where it is stored; this rule's own table stays keyed by the SPELLED path, so a second spelling of one
+    # file (a hard link, a junction) is still refused by #903's own check below with its own code, SPEC_CHANGED_AFTER_PREFLIGHT, and only a path named twice is this rule's)
+    $now = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey $Path)]
+    if ($Seen.ContainsKey($Path) -and [string]$Seen[$Path] -cne $now) {
+        return "'$Path' cannot be run: two entries of this run name the same leg spec and judged different bytes of it (sha256 $($Seen[$Path]), then $(if ($now) { $now } else { 'none recorded' })); one recorded arm and one leg binding must describe one set of bytes, so no claim or lease is taken"
+    }
+    $Seen[$Path] = $now
+    ''
+}
+# R3-MERGE-CI-RESIDUE-1 r2: ORDINAL, as #903's SpecBudgetSha256 / SpecShapeSha256 are (r3 A2: A.json and a.json are two files of a case-sensitive directory). `@{}` is case-INSENSITIVE, so a case twin
+# (S.JSON / s.json) or two distinct files read as one path judged twice and were refused here, ahead of the key and per-entry refusals #903 owns for them.
+$specJudgedOnce = [Collections.Hashtable]::new([StringComparer]::Ordinal)
+
 # The planned legs: name, spec path, backend ('' = whatever the spec lists). Same naming as Invoke-VenueChain.
 $plan = [System.Collections.Generic.List[object]]::new()
 $planRecord = $null
@@ -1687,12 +1832,17 @@ if ($legPlanMode) {
         Import-Module (Join-Path $here 'DualVenueRunner.psm1') -Force   # the leg process's own spec predicates, run in preflight (Get-LegSpecRefusal)
         $planPath = $(if (Test-Path -LiteralPath $LegPlan -PathType Leaf) { (Resolve-Path -LiteralPath $LegPlan).Path } else { $null })
         if (-not $planPath) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "no plan file at '$LegPlan'" }
-        $outputRefusal = Get-RunDirOutputRefusal $planPath   # r9: the plan is an input too (leg-plan.json is written over it once the claim is held)
+        $outputRefusal = $(if (Test-NoRoomForSpecRead) { '' } else { Get-RunDirOutputRefusalWithin $planPath })   # r9: the plan is an input too (leg-plan.json is written over it once the claim is held); r3: bounded by -DeadlineUtc (A4 sibling); r4: with no room the plan's own bounded read below refuses first (LEG_PLAN_UNREADABLE)
         if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'LEG_PLAN_IS_RUN_OUTPUT') 0 "the plan file $outputRefusal" }
         # r19 (sol r18 B2 sibling sweep): the plan's read is bounded by the room before -DeadlineUtc too; no answer in it is the typed LEG_PLAN_UNREADABLE, never a read past the deadline
         $planRead = Read-SpecBytesWithin $planPath (Get-SpecReadBoundSec)
-        if ($planRead.state -ceq 'TIMEOUT') { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' could not be read within the time left before -DeadlineUtc" }
-        $doc = try { if ($planRead.state -cne 'OK') { throw [string]$planRead.error }; [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$planRead.bytes), $true).ReadToEnd() | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
+        # r14 (adversary r14 pass 17 A4 / pass 18 A5, the sol r13 B5 class): a plan read that got no answer refuses without probing batch.log first (the stalled share may hold -RunDir too),
+        # the same rule as a location the guard gave up on (RunOutputAliased); stderr carries the typed line. The code stays LEG_PLAN_UNREADABLE.
+        if ($planRead.state -ceq 'TIMEOUT') { $script:RunOutputAliased = $true; Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' could not be read within the time left before -DeadlineUtc" }
+        # r14 (sol r13 B4): a plan that repeats a key (a `purpose` written twice) is LEG_PLAN_UNREADABLE, never the last value the parser kept
+        # ENVELOPE-PREEMPT-RESIDUE-1 r1 (sol r16 + key3 fable r16): only the PARSE-LEVEL rules run here (a repeated key, unparsable text). The raw SHAPE rules (an array under a receipt-envelope
+        # name, the depth-256 cap) run after every per-item check below, so a null or non-object entry is still BAD_ITEM_SHAPE item=<n> at its original position, as at the merge base.
+        $doc = try { if ($planRead.state -cne 'OK') { throw [string]$planRead.error }; $planText = [IO.StreamReader]::new([IO.MemoryStream]::new([byte[]]$planRead.bytes), $true).ReadToEnd(); Assert-FpsJsonNoRepeatedKey $planText $planPath -ParseLevelOnly; $planText | ConvertFrom-Json -NoEnumerate } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' is not JSON: $($_.Exception.Message)" }
         # Dot B1: the entries are kept exactly as written, nulls included, so each is shape-checked at its ORIGINAL position below. Nothing here filters, unrolls or wraps them.
         $rawItems = $null
         if ($doc -is [array]) { $rawItems = $doc }
@@ -1703,6 +1853,11 @@ if ($legPlanMode) {
         }
         if ($null -eq $rawItems -or $rawItems.Count -eq 0) { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' names no legs (an array of items, or an object with a legs array)" }
         $planDir = Split-Path -Parent $planPath
+        # (read here, before the item loop, because the arm read's timeout refusal applies only to a plan that declares a purpose; the purpose itself is judged after the loop)
+        $planPurposeDeclared = ($doc -is [System.Management.Automation.PSCustomObject]) -and ($null -ne $doc.PSObject.Properties['purpose'])
+        # (adversary 1ce472bc A5: the arm decides only for the scalar string 'fps-ab'; a 'stage-attribution' plan accepts any arm, and a declared purpose that is not a known scalar is BAD_PURPOSE, judged below
+        # and never pre-empted by a stalled arm read)
+        $armDecides = $planPurposeDeclared -and ($doc.PSObject.Properties['purpose'].Value -is [string]) -and [string]::Equals([string]$doc.PSObject.Properties['purpose'].Value, 'fps-ab', [StringComparison]::Ordinal)
         $items = [System.Collections.Generic.List[object]]::new()
         for ($i = 0; $i -lt $rawItems.Count; $i++) {
             $it = $rawItems[$i]; $n = $i + 1
@@ -1716,19 +1871,37 @@ if ($legPlanMode) {
             $path = $(if ($ref) { Resolve-LegSpecPath $ref $planDir } else { $null })
             if (-not $path) { Stop-PlanRefused 'LEG_SPEC_MISSING' $n "no leg spec at '$ref'" }
             # adversary r7 pass 2 A1, r9: a spec that IS one of the files this run writes under -RunDir (the one list above) would be overwritten after the lease opened.
-            $outputRefusal = Get-RunDirOutputRefusal $path
+            $outputRefusal = $(if (Test-NoRoomForSpecRead) { '' } else { Get-RunDirOutputRefusalWithin $path })   # r3: bounded by -DeadlineUtc (A4 sibling); r4: with no room the spec's own bounded read below refuses first (SPEC_READ_TIMEOUT)
             if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'LEG_SPEC_IS_RUN_OUTPUT') $n "the leg spec $outputRefusal" }
             $specRefusal = Get-LegSpecRefusal $path $be
             if ($specRefusal[0]) { Stop-PlanRefused $specRefusal[0] $n $specRefusal[1] }
             $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): an export window the agent's job cap refuses is refused HERE, before any claim or lease
             if ($budgetRefusal[0]) { Stop-PlanRefused $budgetRefusal[0] $n $budgetRefusal[1] }
+            $judgedConflict = Get-SpecPathJudgedConflict $specJudgedOnce $path   # r6 (adversary A7): one judged digest per spec path
+            if ($judgedConflict) { Stop-PlanRefused 'SPEC_CHANGED_BETWEEN_PLAN_ITEMS' $n $judgedConflict }
+            $armRead = Get-LegSpecTelemetryArm $path
+            # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A1): the arm only decides anything for a plan that declares a purpose. A purpose-free plan records the arm (UNKNOWN when its read got no
+            # answer) and goes on to the base's own reads, so a stalled arm read never pre-empts its staging refusal (BUILD_NOT_STAGED item=<n>).
+            if ($armRead.readTimedOut -and $armDecides) { Stop-PlanRefused 'SPEC_READ_TIMEOUT' $n "'$path' cannot be run: the leg spec could not be read for its telemetry arm within the time left before -DeadlineUtc; no claim or lease is taken on it" }   # r6 (adversary pass 5 A5)
             $items.Add([pscustomobject]@{ item = $n; legId = (Get-LegSpecId $path); spec = $path; backend = $be.ToLowerInvariant(); arm = $arm; sourceCommit = $sc.ToLowerInvariant(); buildManifestSha256 = $ms.ToLowerInvariant()
+                    telemetryArm = $armRead.arm
                     specSha256 = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey $path)] })   # r2 (adversary A1 class): THIS item's judged bytes
         }
+        # BENCH-LIGHT-ARM-GAIN-GATES-1 (hub ruling 2026-11-20T05:25:54Z item 2): a plan may declare `purpose`. 'fps-ab' = its legs are compared on presented fps, so every leg must run the LIGHT
+        # telemetry arm (a HEAVY leg's fps measures the per-frame logger; a spec that names no arm is UNKNOWN and refused alike). 'stage-attribution' = stage metrics only: HEAVY allowed. No
+        # purpose: nothing is refused here, and every gain/cost reader still refuses an fps verdict from a HEAVY / UNKNOWN pair. Checked with the items, before any claim, lease or staging read.
+        # The purpose is passed AS PARSED, never coerced to a string: a one-element ["fps-ab"] would otherwise read as 'fps-ab' (adversary A3). A declared purpose that is not the scalar string is BAD_PURPOSE.
+        $planPurpose = $null
+        if ($planPurposeDeclared) { $planPurpose = $doc.PSObject.Properties['purpose'].Value }
+        $purposeRefusal = Get-FpsLegPlanRefusal -Purpose $planPurpose -Items @($items | ForEach-Object { [pscustomobject]@{ item = $_.item; arm = $_.telemetryArm } }) -Declared:$planPurposeDeclared
+        if ($purposeRefusal[0]) { Stop-PlanRefused ([string]$purposeRefusal[0]) ([int]$purposeRefusal[1]) ([string]$purposeRefusal[2]) }
         # Each build once (the read Invoke-VenueChain's supplementary leg makes): staged on the venue, and with exactly the manifest the item names.
         $builds = [ordered]@{}
         foreach ($it in $items) {
-            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }
+            # R3-MERGE-RESIDUE-1 (sol 07d50621 A9): this read is bounded by -DeadlineUtc too (less the 2 s the typed refusal needs, as Get-SpecReadBoundSec leaves). A purpose-free plan whose optional arm
+            # read timed out goes on to the staging refusal below, and the manifest's 30 s probe and 300 s artifact hash would otherwise outlive the batch deadline before it. No room left is the
+            # read's own UNREACHABLE answer, so the typed SHARE_UNREACHABLE refusal lands before the deadline.
+            if (-not $builds.Contains($it.sourceCommit)) { $builds[$it.sourceCommit] = Get-VenueStagedBuildManifest -AgentShare $AgentShare -SourceCommit $it.sourceCommit -ProbeScript $stagedBuildProbe -ArtifactProbeScript $artifactProbe -CallDeadlineUtc $deadline.AddSeconds(-2.0) -TimeoutSec 30 -VerifyArtifacts -ArtifactTimeoutSec 300 }
             $st = $builds[$it.sourceCommit]
             $short = $it.sourceCommit.Substring(0, 12)
             # #705 r14 (adversary r14 pass 2 A1): a manifest that WAS read, whose cached artifacts could not be hashed (artifactsUnhashed: a locked or stalled artifact), is refused only
@@ -1738,7 +1911,19 @@ if ($legPlanMode) {
             # r12 (adversary r12 A1): the manifest is an input the legs read, so it gets the guard the plan and the specs get: a hard link or a link that makes it one of the files this run writes
             # (leg-plan.json, a batch receipt, ...) would have it overwritten after the lease opened. r16 (adversary r16 A1): BEFORE its digest and content refusals, as the specs' guard
             # comes before theirs: a manifest that is batch.log was appended to by the BUILD_MANIFEST_MISMATCH refusal's own log line.
-            $outputRefusal = Get-RunDirOutputRefusal $st.path
+            # R4-DEADLINE-RESIDUE-1 (sol r2 on 4b328ae0, B1 row 2): an artifact hash that got no answer ends 2 s before -DeadlineUtc, and the zone probe below is a synchronous read of the share's
+            # own paths. With under 3 s left it is not made: the same typed refusal as after the probe, on stderr only (the zone check that would have shown the manifest is not batch.log was not made).
+            if ($st.artifactsUnhashed -and ($script:deadline -is [datetime]) -and (($script:deadline - [DateTime]::UtcNow).TotalSeconds -lt 3.0)) {
+                $script:RunOutputAliased = $true
+                Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error); no time is left before -DeadlineUtc for the output-zone check, so batch.log is not written (this refusal is on stderr only)"
+            }
+            # R4-DEADLINE-RESIDUE-1 r3 (adversary ef31edb1 A4): the 3 s test above only skips the probe when almost no time is left; with more left it runs on a worker given up on at the time left
+            # less 2 s. An unhashed manifest whose zone check got no answer is the same typed SHARE_UNREACHABLE on stderr only; any other manifest is OUTPUT_ZONE_UNRESOLVED (nothing vouches for it).
+            $outputRefusal = Get-RunDirOutputRefusalWithin $st.path
+            if ($st.artifactsUnhashed -and $script:ProbeUnanswered) {
+                $script:RunOutputAliased = $true
+                Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error); the output-zone check did not answer within the time left before -DeadlineUtc, so batch.log is not written (this refusal is on stderr only)"
+            }
             if ($outputRefusal) { Stop-PlanRefused (Get-OutputRefusalCode 'BUILD_MANIFEST_IS_RUN_OUTPUT') $it.item "the staged build manifest for $short $outputRefusal" }
             if ($st.artifactsUnhashed) { Stop-PlanRefused 'SHARE_UNREACHABLE' $it.item "the staged build manifest for $short could not be read at $($st.path): $($st.error)" }
             if ($st.sha256 -cne $it.buildManifestSha256) { Stop-PlanRefused 'BUILD_MANIFEST_MISMATCH' $it.item "the staged build manifest for $short is sha256 $($st.sha256), not $($it.buildManifestSha256) (a different build is never substituted)" }
@@ -1747,7 +1932,8 @@ if ($legPlanMode) {
             # LEASE-BATCH-PLAN-ARTIFACT-PREFLIGHT-1: and the cached artifacts the manifest's digests name must exist and hash to them (the leg job throws on either after the lease opened)
             if ($st.artifactProblem) { $ap = $st.artifactProblem -split ' ', 2; Stop-PlanRefused $ap[0] $it.item "the staged build for ${short}: $($ap[1])" }
         }
-        $ordered = $(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
+        # (ENVELOPE-PREEMPT-RESIDUE-1 r1: the deferred raw shape check runs after every per-item preflight refusal, below the input identity guard.)
+        $ordered =$(if ($PlanOrder -ceq 'Interleave') { @(Get-VenueInterleavedLegPlan -Items @($items)) } else { @($items) })
         $spread = $null
         if ($PlanOrder -ceq 'ThermalSpread') {
             # item 10: heavy is measured from the -HeatFrom receipts (a leg key whose next leg on the same lease read hot), never a hand-kept list
@@ -1759,10 +1945,10 @@ if ($legPlanMode) {
         }
         foreach ($it in $ordered) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}-{3}' -f ($plan.Count + 1), $it.legId, $it.backend, $it.arm); spec = $it.spec; backend = $it.backend
-                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; specSha256 = $it.specSha256 })
+                    arm = $it.arm; sourceCommit = $it.sourceCommit; buildManifestSha256 = $it.buildManifestSha256; planItem = $it.item; telemetryArm = $it.telemetryArm; specSha256 = $it.specSha256 })
         }
-        $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
-            legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
+        $planRecord = [ordered]@{ schema = 'mlv-app/venue-lease-leg-plan-run/v1'; legPlan = $planPath; order = $PlanOrder; purpose = $planPurpose; arms = @($plan | ForEach-Object { $_.arm } | Select-Object -Unique)
+            legs = @($plan | ForEach-Object { [ordered]@{ name = $_.name; planItem = $_.planItem; arm = $_.arm; telemetryArm = $_.telemetryArm; backend = $_.backend; sourceCommit = $_.sourceCommit; buildManifestSha256 = $_.buildManifestSha256; spec = $_.spec } })
             builds = @($builds.Keys | ForEach-Object { [ordered]@{ sourceCommit = $_; state = $builds[$_].state; sha256 = $builds[$_].sha256; path = $builds[$_].path } }) }
         if ($null -ne $spread) { $planRecord.thermalSpread = $spread }
     } catch {
@@ -1797,6 +1983,8 @@ if ($legPlanMode) {
         if ($entryBoundSha -cne [string]$e.specSha256) {
             Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($e.specPath)' cannot be run: the leg spec read as sha256 $entryBoundSha after the leg-set planner judged sha256 $($e.specSha256) (planned_sha256=$($e.specSha256)); no claim or lease is taken on bytes the planner did not judge"
         }
+        # R3-MERGE-CI-RESIDUE-1 r2: no judged-once call here. A set naming one path twice whose bytes changed between the preflights is refused by #903's per-entry loop below (SPEC_CHANGED_AFTER_PREFLIGHT,
+        # before any claim, in every form); the A7 rule above is the -LegPlan arm read's own (it records an arm per item), and answering first here named the wrong code.
         $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f $e.seq, $e.legId, $e.backend); spec = $e.specPath; backend = $e.backend; specSha256 = [string]$e.specSha256 })
     }
 } else {
@@ -1804,7 +1992,7 @@ if ($legPlanMode) {
     foreach ($ref in $LegSpec) {
         $path = Resolve-LegSpecPath $ref ''
         if (-not $path) { Stop-Usage "no leg spec at '$ref'" }
-        $outputRefusal = Get-RunDirOutputRefusal $path   # r9: the same guard as a -LegPlan item's spec
+        $outputRefusal = $(if (Test-NoRoomForSpecRead) { '' } else { Get-RunDirOutputRefusalWithin $path })   # r9: the same guard as a -LegPlan item's spec; r3: bounded by -DeadlineUtc (A4 sibling); r4: with no room the shape read below refuses first (SPEC_READ_TIMEOUT)
         if ($outputRefusal) { Stop-Usage "$(Get-OutputRefusalCode 'LEG_SPEC_IS_RUN_OUTPUT') the leg spec $outputRefusal" }
         # CPU-DUALISO-REDUCED-RECON-PLAYBACK-ONLY-1 r8 (adversary r8 A3): the leg's shape refusals (Get-DvLegSpecShapeRefusal: a non-object control container, a look
         # leg with no look, a malformed look.pairedSeekFrames) are refused HERE, before any claim or lease, as the -LegPlan preflight refuses them; the leg would
@@ -1814,10 +2002,22 @@ if ($legPlanMode) {
         if ($shapeRefusal) { Stop-Usage "LEG_SPEC_INVALID '$path' cannot be run: $shapeRefusal" }
         $budgetRefusal = Get-ExportBudgetRefusal $path   # r8 (adversary r7 A3): before any claim or lease, as -LegPlan does
         if ($budgetRefusal[0]) { Stop-Usage "$($budgetRefusal[0]) $($budgetRefusal[1])" }
+        # R3-MERGE-CI-RESIDUE-1 r2: no judged-once call here either (see the -LegSet loop): #903's per-entry loop below refuses a -LegSpec path named twice, or one file under two spellings, whose
+        # bytes changed between the preflights (SPEC_CHANGED_AFTER_PREFLIGHT, or SPEC_KEY_UNRESOLVED when a key lookup got no answer), before any claim.
         $legId = Get-LegSpecId $path
         $judgedSha = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey $path)]   # r2 (adversary A1 class): THIS entry's judged bytes
         for ($r = 1; $r -le $Repeats; $r++) {
             $plan.Add([pscustomobject]@{ name = ('{0:00}-{1}-{2}' -f ($plan.Count + 1), $legId, $(if ($Backend) { $Backend } else { 'spec' })); spec = $path; backend = $(if ($Backend) { $Backend } else { '' }); specSha256 = $judgedSha })
+        }
+        # R4-DEADLINE-RESIDUE-1 (sol r2 on 4b328ae0, B2): a digest mismatch THIS entry's preflight just established (an earlier entry for the same file was judged as other bytes) is refused now,
+        # before the next entry's path lookup (a synchronous Test-Path that a stalled share can hold past -DeadlineUtc), in the order the planner paths refuse. Only entries with a judged digest and
+        # a resolved key are compared here, with the post-loop check's own message; an unjudged or unresolved one still gets its own typed refusal there, first. The key is memoised: no new read.
+        foreach ($earlier in $plan) {
+            if (Get-UnresolvedSpecKeyRefusal ([string]$earlier.spec)) { continue }
+            $boundNow = [string]$script:SpecBudgetSha256[(Get-SpecDigestKey ([string]$earlier.spec))]
+            if ($earlier.specSha256 -and $boundNow -and [string]$earlier.specSha256 -cne $boundNow) {
+                Stop-Usage "SPEC_CHANGED_AFTER_PREFLIGHT '$($earlier.spec)' cannot be run: leg $($earlier.name) was judged as sha256 $($earlier.specSha256) but a later preflight read of the same path judged sha256 $boundNow (planned_sha256=$($earlier.specSha256)); no claim or lease is taken on bytes this leg's checks did not judge"
+            }
         }
     }
 }
@@ -1869,6 +2069,10 @@ foreach ($g in $script:guardedInputs) {
         Stop-InputIsOutput ([pscustomobject]@{ kind = 'unresolved'; input = $g.kind; item = $g.item; code = $code; path = $g.path; why = "$label '$($g.path)' could not be identified as it was accepted (no destination could be compared with it)" })
     }
 }
+# ENVELOPE-PREEMPT-RESIDUE-1 r1 (+ adversary r1 A1, r1 pass 2 A1): the raw shape rules the plan's parse-level read deferred (r15 A1: an array under a receipt-envelope name; the depth-256 cap)
+# run only after EVERY per-item preflight refusal (shape and field checks, purpose, build staging, OUTPUT_NAME_TOO_LONG, the input identity guard), so each keeps its merge-base code and item
+# number. Still before any claim or lease; a bare-array plan root is allowed (the plan reader shape-checks its entries itself).
+if ($legPlanMode) { try { Assert-FpsJsonNoRepeatedKey $planText $planPath -AllowArrayRoot } catch { Stop-PlanRefused 'LEG_PLAN_UNREADABLE' 0 "'$planPath' has a shape the raw JSON check refuses: $($_.Exception.Message)" } }
 if ($LegSet) { $hit = Get-InputOutputRefusal; if ($hit) { Stop-InputIsOutput $hit } }
 # r5 (sol r4 B1, key3 H-B): -RunDir's physical path and file identity as the preflight found them, read ONCE here, before any claim. A guard that gave up on a location read
 # (locationUnknown) may have given up on -RunDir itself, so Test-OpenOutputAlias then never reads -RunDir again unbounded (a stalled UNC or junction would hold it). r7 (sol r6 B2):

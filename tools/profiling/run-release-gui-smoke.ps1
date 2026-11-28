@@ -1240,6 +1240,24 @@ function New-ScreenshotAspectEvidence {
     }
 }
 
+function Add-InheritedMlvAppEnvironmentRecord {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A1): the launch record carried only the overrides this runner set, so a parent MLVAPP_STAGE_TIMING=1 (or any other MLVAPP_* control) reached the
+    # child unrecorded and a recorded LIGHT launch ran a per-frame logger. Every MLVAPP_* variable of this process that the child will inherit (not set by the launch itself, not one the launch
+    # clears) is recorded with the value it will have, so the arm gate reads what ran. The value is the one the child inherits anyway: what runs is unchanged.
+    param(
+        [object]$Target,
+        [string[]]$Cleared = @()
+    )
+
+    foreach ($entry in [System.Environment]::GetEnvironmentVariables().GetEnumerator()) {
+        $name = [string]$entry.Key
+        if ($name -notmatch '^(MLVAPP_|DUALISO_)') { continue }   # r14 (sol r13 B6): DUALISO_DEBUG_SOURCE_SMOOTH_DIR is an app control too (dualiso.c)
+        if ($Target.Contains($name)) { continue }
+        if (@($Cleared | Where-Object { [string]::Equals([string]$_, $name, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) { continue }
+        $Target[$name] = [string]$entry.Value
+    }
+}
+
 function Add-EnvironmentPairs {
     param(
         [object]$Target,
@@ -1751,6 +1769,11 @@ if (-not $PreserveExperimentalEnvironment) {
     $clearedEnvironment += $experimentalEnvironmentToClear
 }
 $clearedEnvironment = @($clearedEnvironment | Select-Object -Unique)
+# BENCH-LIGHT-ARM-GAIN-GATES-1 r6 (adversary pass 5 A1): the recorded launch environment shows every MLVAPP_* variable the child inherits (same values, so what runs is unchanged)
+# ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 8747fced A7): the child's own environment block (below) also removes these when this launch does not set them (a blank -GpuPlaybackReconBackend,
+# no informational pace mode) or sets them itself (the two run nonces), so a parent value never reaches the child and is not recorded as inherited either
+$childReplacedEnvironment = @(@("MLVAPP_GPU_PLAYBACK_RECON_BACKEND", $script:GuiSmokePaceModeEnvironment, "MLVAPP_GUI_SMOKE_RUN_NONCE", "MLVAPP_RUN_NONCE") | Where-Object { -not $launchEnv.Contains($_) })
+Add-InheritedMlvAppEnvironmentRecord -Target $launchEnv -Cleared (@($clearedEnvironment) + $childReplacedEnvironment)
 $effectiveExpectedVisualScaleRequest = if ($ExpectedVisualScaleRequest -eq -2) {
     $ExpectedScaleRequest
 } else {

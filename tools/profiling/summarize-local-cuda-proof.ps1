@@ -2,10 +2,14 @@ param(
     [string]$RepoRoot = ".",
     [string]$SummaryPath = "",
     [string]$Output = "",
-    [switch]$Json
+    [switch]$Json,
+    # R2-RESIDUE-1 r3 (sol 5add23cf A8): the packager hands the summarizer a private copy of the summary (the bytes it read once); the report names the summary it was made FROM, not the copy
+    [string]$SourceSummaryLabel = ""
 )
 
 $ErrorActionPreference = "Stop"
+# BENCH-LIGHT-ARM-GAIN-GATES-1: a presented-fps gain or cost reading comes only from a LIGHT / LIGHT playback A/B (hub ruling 2026-11-20T05:25:54Z item 2).
+Import-Module (Join-Path $PSScriptRoot "FpsArmGate.psm1") -Force
 
 function Resolve-RepoPath {
     param(
@@ -252,13 +256,47 @@ function Add-ActionStep {
     }
 }
 
+function Get-ProofSpeedClaimAuthority {
+    # r15 (adversary r14 pass 18 A6): QUOTABLE_PASS is the SUPPORT gate (a REFUSED playback-speed section keeps `passed`, so the overall status can pass); it never by itself grants SPEED
+    # authority. Speed is quotable only when the packet is QUOTABLE_PASS AND its playbackSpeed section reads exactly PASS: a REFUSED section (its presented-fps pair refused by the arm gate),
+    # a BLOCKED one or a missing one carries no authority to quote playback speed.
+    # ENVELOPE-PREEMPT-R1-RESIDUE-1 r1 (adversary 835a5faf A5, 8747fced A4): -SpeedCompare is the compare the section judged. A PASS section whose compare holds no presented-fps pair (compare:{},
+    # or only stage metrics) printed "presented FPS: n/a" and still granted speed; speed now also needs a numeric baseline and candidate presented fps in that compare.
+    param([Parameter(Mandatory = $true)][string]$OverallStatus, [AllowNull()]$PlaybackSpeedVerdict, [AllowNull()]$SpeedCompare)
+    $sectionStatus = if ($null -eq $PlaybackSpeedVerdict) { $null } else { $PlaybackSpeedVerdict.status }
+    $presentedFps = Get-Field $SpeedCompare "presentedFps"
+    # (adversary 0e9672e5 A1: and FINITE; valid JSON 1e400 parses to +Infinity, which is no measurement)
+    $isNumber = { param($v) $null -ne $v -and ($v -is [double] -or $v -is [single] -or $v -is [decimal] -or $v -is [int] -or $v -is [long]) -and [double]::IsFinite([double]$v) }
+    # (adversary 698fffb1 A4: a leaf is read WHOLE, never through Get-Field's pipeline output, which unrolls a singleton array [30] into the number 30)
+    $leaf = { param($o, $n) if ($o -is [System.Collections.IDictionary]) { if ($o.Contains($n)) { , $o[$n] } else { $null } } elseif ($null -ne $o -and $null -ne $o.PSObject.Properties[$n]) { , $o.PSObject.Properties[$n].Value } else { $null } }
+    $fpsMeasured = ($null -ne $presentedFps) -and (& $isNumber (& $leaf $presentedFps "baseline")) -and (& $isNumber (& $leaf $presentedFps "candidate"))
+    # (adversary 1ce472bc A3: the pair's published delta and deltaPercent are part of the measurement; a present one that is not a finite number (1e400 parses to Infinity) is no measurement either)
+    if ($fpsMeasured) {
+        foreach ($deltaName in @("delta", "deltaPercent")) {
+            $deltaValue = & $leaf $presentedFps $deltaName
+            if ($null -ne $deltaValue -and -not (& $isNumber $deltaValue)) { $fpsMeasured = $false }
+        }
+    }
+    $speed = ($OverallStatus -ceq "QUOTABLE_PASS") -and ($sectionStatus -is [string]) -and ($sectionStatus -ceq "PASS") -and $fpsMeasured
+    $reason = if ($speed) { "" } elseif ($OverallStatus -cne "QUOTABLE_PASS") { "packet-not-quotable" } elseif (($sectionStatus -is [string]) -and ($sectionStatus -ceq "PASS")) { "presented-fps-not-measured" } else { "playback-speed-section-$(if ($sectionStatus -is [string] -and $sectionStatus) { $sectionStatus } else { 'missing' })" }
+    [pscustomobject]@{
+        support = ($OverallStatus -ceq "QUOTABLE_PASS")
+        speed = [bool]$speed
+        speedRefusal = $reason
+        playbackSpeedStatus = $sectionStatus
+    }
+}
+
 function New-ActionPlan {
     param(
         [Parameter(Mandatory = $true)][string]$Status,
         [object[]]$Diagnostics,
         [AllowNull()]$DiagnosticSummary,
-        [AllowNull()]$Summary
+        [AllowNull()]$Summary,
+        # r15 (adversary r14 pass 18 A6): Get-ProofSpeedClaimAuthority's verdict; absent means no speed authority
+        [AllowNull()]$ClaimAuthority
     )
+    $speedQuotable = ($null -ne $ClaimAuthority) -and ($ClaimAuthority.speed -is [bool]) -and $ClaimAuthority.speed
 
     $steps = [System.Collections.Generic.List[object]]::new()
     $clip = [string](Get-Field $Summary.inputs "clipPath")
@@ -273,14 +311,28 @@ function New-ActionPlan {
     $importCommand = "pwsh.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File .\tools\profiling\import-local-cuda-proof-result.ps1 -RepoRoot . -PacketPath <mlvapp-local-cuda-proof.zip>"
 
     if ($Status -eq "QUOTABLE_PASS") {
-        Add-ActionStep -Steps $steps -Step (New-ActionStep `
-            -Id "QUOTE_WITH_BOUNDARIES" `
-            -Priority 10 `
-            -Area "claim-boundary" `
-            -Title "Review and quote only host-scoped support/speed claims." `
-            -Detail "The packet passed the fail-closed gate. Quote only the host, clip, receipt, codec set, max-frame count, release/backend hashes, and run order captured in this report." `
-            -Commands @($directSummaryCommand, $importCommand) `
-            -ProofBoundary "A QUOTABLE_PASS packet is still scoped evidence, not a universal GPU support claim.")
+        if ($speedQuotable) {
+            Add-ActionStep -Steps $steps -Step (New-ActionStep `
+                -Id "QUOTE_WITH_BOUNDARIES" `
+                -Priority 10 `
+                -Area "claim-boundary" `
+                -Title "Review and quote only host-scoped support/speed claims." `
+                -Detail "The packet passed the fail-closed gate. Quote only the host, clip, receipt, codec set, max-frame count, release/backend hashes, and run order captured in this report." `
+                -Commands @($directSummaryCommand, $importCommand) `
+                -ProofBoundary "A QUOTABLE_PASS packet is still scoped evidence, not a universal GPU support claim.")
+        }
+        else {
+            # r15 (adversary r14 pass 18 A6): the support gate passed but the playback-speed section did not read PASS (refused by the arm gate, or missing), so no speed claim is granted
+            Add-ActionStep -Steps $steps -Step (New-ActionStep `
+                -Id "QUOTE_SUPPORT_ONLY_SPEED_REFUSED" `
+                -Priority 10 `
+                -Area "claim-boundary" `
+                -ReasonCodes @("PLAYBACK_AB_FPS_ARM_REFUSED") `
+                -Title "Review and quote only host-scoped support claims; playback speed is not quotable from this packet." `
+                -Detail "The packet passed the fail-closed support gate, but its playbackSpeed section is $(if ($ClaimAuthority) { $ClaimAuthority.playbackSpeedStatus } else { 'not judged' }) (claimAuthority.speed=false). Quote only the support boundary (host, clip, receipt, codec set, max-frame count, release/backend hashes, run order); quote no playback speed, gain or cost." `
+                -Commands @($directSummaryCommand, $importCommand) `
+                -ProofBoundary "A refused presented-FPS pair carries no authority to quote playback speed; rerun the playback A/B with both legs on the LIGHT arm.")
+        }
         if (Test-DiagnosticCode -Diagnostics $Diagnostics -Codes @("PLAYBACK_PRESENTED_FPS_NOT_IMPROVED")) {
             Add-ActionStep -Steps $steps -Step (New-ActionStep `
                 -Id "QUOTE_PLAYBACK_SUPPORT_NOT_SPEEDUP" `
@@ -457,7 +509,7 @@ function New-ActionPlan {
         steps = $orderedSteps
         proofBoundary = @(
             "Action plans are triage guidance, not proof.",
-            "Only QUOTABLE_PASS from the same host unlocks support or speed claims.",
+            "Only QUOTABLE_PASS from the same host unlocks support claims; speed claims also need claimAuthority.speed=true (playbackSpeed.status=PASS).",
             "If multiple steps are listed, address them in priority order and rerun the packet."
         )
     }
@@ -465,7 +517,7 @@ function New-ActionPlan {
 
 $root = (Resolve-Path -LiteralPath $RepoRoot).Path
 if ([string]::IsNullOrWhiteSpace($SummaryPath)) {
-    $SummaryPath = Join-Path $root ".claude-state\profiling\local-cuda-playback-dng-smoke-latest.json"
+    $SummaryPath = Join-Path $root ".claude-state/profiling/local-cuda-playback-dng-smoke-latest.json"
 }
 else {
     $SummaryPath = Resolve-RepoPath -Root $root -Path $SummaryPath
@@ -475,14 +527,16 @@ if (!(Test-Path -LiteralPath $SummaryPath -PathType Leaf)) {
 }
 
 $summaryFullPath = (Resolve-Path -LiteralPath $SummaryPath).Path
+$sourceSummaryShown = if ([string]::IsNullOrWhiteSpace($SourceSummaryLabel)) { $summaryFullPath } else { $SourceSummaryLabel }
 $summaryText = Get-Content -LiteralPath $summaryFullPath -Raw
 # adversary-ac6205bd.json A2: ConvertFrom-Json keeps the LAST of two same-named members ("hostLoadCollected":false,"hostLoadCollected":true reads true),
 # so a summary that repeats a member anywhere is refused, never summarized
-Import-Module (Join-Path $PSScriptRoot 'dual-venue\VenueChain.psm1') -Function Find-VenueJsonDuplicateMember -DisableNameChecking
+Import-Module (Join-Path $PSScriptRoot 'dual-venue/VenueChain.psm1') -Function Find-VenueJsonDuplicateMember -DisableNameChecking
 # VENUE-LEG-HOSTLOAD-CIM-UNKNOWN-RESIDUE-1 r2 (adversary-07b6a932.json A2): a summary the strict scanner cannot read (a comment between two repeated
 # members: ConvertFrom-Json accepts it and keeps the LAST value) is refused, never summarized by the looser reader.
 $summaryDuplicate = try { Find-VenueJsonDuplicateMember -Text $summaryText -All } catch { throw "Summary JSON is not strict JSON ($summaryFullPath), so its members cannot be proved unique: $($_.Exception.Message -replace '\s+', ' ')" }
 if ($summaryDuplicate) { throw "Summary JSON repeats the member $summaryDuplicate ($summaryFullPath); a repeated member is never read as evidence." }
+Assert-FpsJsonNoRepeatedKey $summaryText $summaryFullPath   # r14 (sol r13 B4, adversary r14 A2): a repeated key is refused, never collapsed to its last value
 $summary = $summaryText | ConvertFrom-Json -Depth 100
 $failures = @($summary.failures | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
 $warnings = @($summary.warnings | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | ForEach-Object { [string]$_ })
@@ -656,9 +710,12 @@ else {
     # host load at all. Check the relevant legs' hostLoadProvisional independently, defaulting a
     # missing/absent property to provisional (fail toward provisional, same stance as every other
     # reader in this card).
-    # adversary-7efea617.json A3: a plain assignment, never `$x = if (...) { $list }` (an if-expression unrolls a one-element list into its member, past the list guard)
-    $playbackAbCandidateLeg = $playbackAb.candidate
-    if ($playbackAbComparisonBasis -eq "candidateSpeed") { $playbackAbCandidateLeg = $playbackAb.candidateSpeed }
+    # r6 (adversary pass 5 A3 sibling) and adversary-7efea617.json A3: assigned inside each branch, so a one-element container is not unrolled into the leg inside it
+    if ($playbackAbComparisonBasis -eq "candidateSpeed") {
+        $playbackAbCandidateLeg = $playbackAb.candidateSpeed
+    } else {
+        $playbackAbCandidateLeg = $playbackAb.candidate
+    }
     $playbackAbHostLoadLegs = @(
         [pscustomobject]@{ Name = "baseline"; Leg = $playbackAb.baseline },
         [pscustomobject]@{ Name = $playbackAbComparisonBasis; Leg = $playbackAbCandidateLeg }
@@ -698,7 +755,52 @@ else {
                 -NextAction "Rerun the playback A/B stage on a quiet host; an fps number measured under provisional or unrecorded host load is not a property of the build."
         }
     }
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: the arm gate, re-derived from the two compared legs' own recorded telemetryArm (never the packet's cached fpsVerdict). A HEAVY leg, a mixed
+    # pair, or a leg that records no arm (UNKNOWN: a packet written before this gate) is refused: no fps-delta diagnostic and no presented / GUI fps delta line below; the
+    # stage lines (intervals, render totals) stay.
+    $playbackAbFpsArmVerdict = Get-FpsPairVerdict `
+        -Baseline (Get-FpsArmFromLegRecord $playbackAb.baseline) `
+        -Candidate (Get-FpsArmFromLegRecord $playbackAbCandidateLeg) `
+        -BaselineName "baseline" `
+        -CandidateName $playbackAbComparisonBasis
+    $playbackAbFpsArmRefusal = [pscustomobject]@{
+        refused = (-not $playbackAbFpsArmVerdict.allowed)
+        reason = [string]$playbackAbFpsArmVerdict.reason
+        detail = [string]$playbackAbFpsArmVerdict.detail
+        compareUnbound = $false
+        compareProblem = ""
+    }
+    # (adversary 698fffb1 A7: the arm gate judged these two legs; the compare that carries the fps must be measured on them, or the pair is refused like any other the gate refuses)
+    # (R2-RESIDUE-1 r3, sol 5add23cf A10: EVERY metric the compare publishes is bound, so the check runs for any published compare, not only one that carries presentedFps)
+    # (R4-DEADLINE-RESIDUE-1 r5, adversary 82d6f070 A1: the binding is asked of EVERY published compare, whether or not the arm gate refused the pair. It ran only for a pair the arm gate allowed, so a HEAVY
+    # pair beside a compare that was measured on other legs still printed that compare's render total. A pair the arm gate refused keeps its ARM reason (every reader of it, and the verdict the row
+    # publishes, say why the pair was refused); `compareUnbound` is the separate fact that withholds the compare's figures, whatever the reason.)
+    if ($playbackAbSpeedCompare) {
+        $playbackAbCompareProblem = Get-FpsCompareBindingProblem -Compare $playbackAbSpeedCompare -Baseline $playbackAb.baseline -Candidate $playbackAbCandidateLeg
+        if ($null -ne $playbackAbCompareProblem) {
+            if ($playbackAbFpsArmRefusal.refused) {
+                $playbackAbFpsArmRefusal = [pscustomobject]@{ refused = $true; reason = $playbackAbFpsArmRefusal.reason; detail = $playbackAbFpsArmRefusal.detail; compareUnbound = $true; compareProblem = [string]$playbackAbCompareProblem }
+            } else {
+                $playbackAbFpsArmRefusal = [pscustomobject]@{ refused = $true; reason = "fps-verdict-refused:compare-not-judged-pair"; detail = [string]$playbackAbCompareProblem; compareUnbound = $true; compareProblem = [string]$playbackAbCompareProblem }
+            }
+        }
+    }
+    if ($playbackAbFpsArmRefusal.refused) {
+        # r5 (adversary A8): a packet written before this gate carries the wrapper's own "candidate-presented-fps-not-improved ..." failure, computed from an fps pair this gate now refuses. The proof-failure
+        # loop above copied it into the blockers and a diagnostic before the arm was judged; it is not a finding about a refused pair, so it is taken back out here (every other failure stays).
+        [void]$playbackAbBlockers.RemoveAll([Predicate[string]]{ param($b) $b.StartsWith('candidate-presented-fps-not-improved', [StringComparison]::Ordinal) })
+        [void]$diagnostics.RemoveAll([Predicate[object]]{ param($d) ($d.code -ceq 'PLAYBACK_AB_PROOF_FAILURE') -and ([string]$d.message).StartsWith('candidate-presented-fps-not-improved', [StringComparison]::Ordinal) })
+        Add-Diagnostic `
+            -Diagnostics $diagnostics `
+            -Area "playback-speed" `
+            -Code "PLAYBACK_AB_FPS_ARM_REFUSED" `
+            -Severity "warning" `
+            -Message "Playback A/B presented-FPS comparison refused: $($playbackAbFpsArmRefusal.reason)." `
+            -Evidence @($playbackAbFpsArmRefusal.detail) `
+            -NextAction "Treat this packet as stage attribution only: rerun the playback A/B with both legs on the LIGHT telemetry arm (frame log opted out) before quoting an fps gain or cost."
+    }
     if (-not $playbackAbHostLoadProvisional -and
+        -not $playbackAbFpsArmRefusal.refused -and
         $playbackAbSpeedCompare -and $null -ne $playbackAbSpeedCompare.presentedFps) {
         $fpsDelta = Convert-ToNullableDouble (Get-Field $playbackAbSpeedCompare.presentedFps "delta")
         if ($null -ne $fpsDelta -and $fpsDelta -le 0) {
@@ -718,19 +820,43 @@ else {
 }
 $playbackSpeedEvidence = @()
 if ($playbackAb -and $playbackAbSpeedCompare) {
+    # BENCH-LIGHT-ARM-GAIN-GATES-1: for a refused pair the two fps delta lines are replaced by the typed refusal; the stage lines below are kept.
+    $playbackSpeedFpsLines = if ($playbackAbFpsArmRefusal.refused) {
+        @("presented / GUI status FPS delta: refused ($($playbackAbFpsArmRefusal.reason); $($playbackAbFpsArmRefusal.detail))")
+    } else {
+        @(
+            (Format-MetricDeltaLine -Label "presented FPS" -Metric $playbackAbSpeedCompare.presentedFps),
+            (Format-MetricDeltaLine -Label "GUI status FPS" -Metric $playbackAbSpeedCompare.guiStatusFps)
+        )
+    }
     $playbackSpeedEvidence = @(
-        "comparison_basis=$playbackAbComparisonBasis",
-        (Format-MetricDeltaLine -Label "presented FPS" -Metric $playbackAbSpeedCompare.presentedFps),
-        (Format-MetricDeltaLine -Label "GUI status FPS" -Metric $playbackAbSpeedCompare.guiStatusFps),
-        (Format-MetricDeltaLine -Label "avg present interval" -Metric $playbackAbSpeedCompare.avgPresentIntervalMs -Unit " ms" -LowerIsBetter),
+        "comparison_basis=$playbackAbComparisonBasis"
+    ) + $playbackSpeedFpsLines + @(
+        # r5 (adversary A9): the mean gap between two presents IS the presented fps in another unit (50 ms vs 40 ms = 20 vs 25 fps; no stage is timed by it), so a refused pair prints no delta for it
+        $(if ($playbackAbFpsArmRefusal.refused) { "avg present interval: withheld ($($playbackAbFpsArmRefusal.reason)); the gap between presents is the fps in another unit" } else { (Format-MetricDeltaLine -Label "avg present interval" -Metric $playbackAbSpeedCompare.avgPresentIntervalMs -Unit " ms" -LowerIsBetter) }),
         (Format-MetricDeltaLine -Label "render total" -Metric $playbackAbSpeedCompare.avgRenderTotalMs -Unit " ms" -LowerIsBetter)
     )
-    if ($playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization) {
+    # R2-RESIDUE-1 r3 (sol 5add23cf A5, A10): a compare that is not bound to the judged pair publishes NO figure of its own: the stage lines above read the same unbound compare (a render total of 50 -> 25 ms
+    # beside two legs that both measured 10 ms), so all of them are replaced by the typed refusal. A pair refused for its ARM keeps its stage lines (the legs' own stage metrics are valid; only the fps is not).
+    # R4-DEADLINE-RESIDUE-1 r5 (adversary 82d6f070 A1): keyed on the fact (`compareUnbound`), not on the reason: a HEAVY pair keeps its arm reason and still withholds an unbound compare's stage lines
+    if ($playbackAbFpsArmRefusal.refused -and $playbackAbFpsArmRefusal.compareUnbound) {
+        $playbackAbUnboundNote = if ([string]$playbackAbFpsArmRefusal.reason -ceq 'fps-verdict-refused:compare-not-judged-pair') { "" } else { "; the compare is not measured on the judged pair either: $($playbackAbFpsArmRefusal.compareProblem)" }
+        $playbackSpeedEvidence = @(
+            "comparison_basis=$playbackAbComparisonBasis",
+            "speed compare: withheld ($($playbackAbFpsArmRefusal.reason); $($playbackAbFpsArmRefusal.detail)$playbackAbUnboundNote); a compare that was not measured on the judged pair publishes no presented, GUI, interval or render figure"
+        )
+    }
+    # BENCH-LIGHT-ARM-GAIN-GATES-1 (adversary A9): the packet's cached suggestion is fps-delta-derived, so it is not repeated for a pair the arm gate refused.
+    # r15 (adversary r14 pass 18 A7, sol r13 B3): and only when the cached analysis is the judged pair's own (its basis and presented-fps deltaPercent match the published compare)
+    if ($playbackAb.analysis -and $playbackAb.analysis.suggestedOptimization -and -not $playbackAbFpsArmRefusal.refused -and
+        (Test-FpsCachedAnalysisBound -Analysis $playbackAb.analysis -Compare $playbackAbSpeedCompare -ComparisonBasis $playbackAbComparisonBasis)) {
         $playbackSpeedEvidence += "suggested_optimization=$($playbackAb.analysis.suggestedOptimization)"
     }
 }
+# BENCH-LIGHT-ARM-GAIN-GATES-1 r2 (adversary advisory A4): the label never reads PASS for a section whose presented-fps comparison the arm gate refused. `passed` is unchanged (the stage proof
+# itself passed), so the overall status keeps its meaning; BLOCKED still outranks REFUSED.
 $playbackAbVerdict = New-SectionVerdict `
-    -Status $(if ($playbackAbBlockers.Count -eq 0) { "PASS" } else { "BLOCKED" }) `
+    -Status $(if ($playbackAbBlockers.Count -ne 0) { "BLOCKED" } elseif ($null -ne $playbackAbFpsArmRefusal -and $playbackAbFpsArmRefusal.refused) { "REFUSED" } else { "PASS" }) `
     -Passed ($playbackAbBlockers.Count -eq 0) `
     -Evidence $playbackSpeedEvidence `
     -Blockers @($playbackAbBlockers)
@@ -1021,17 +1147,21 @@ foreach ($section in @($playbackVerdict, $playbackAbVerdict, $cdngVerdict)) {
 $overallStatus = if ($overallBlockers.Count -eq 0) { "QUOTABLE_PASS" } else { "NOT_QUOTABLE" }
 $diagnosticList = @($diagnostics)
 $diagnosticSummary = Get-DiagnosticSummary -Diagnostics $diagnosticList
+$claimAuthority = Get-ProofSpeedClaimAuthority -OverallStatus $overallStatus -PlaybackSpeedVerdict $playbackAbVerdict -SpeedCompare $playbackAbSpeedCompare
 $actionPlan = New-ActionPlan `
     -Status $overallStatus `
     -Diagnostics $diagnosticList `
     -DiagnosticSummary $diagnosticSummary `
-    -Summary $summary
+    -Summary $summary `
+    -ClaimAuthority $claimAuthority
 
 $report = [pscustomobject]@{
     schema = "mlvapp-local-cuda-proof-report.v1"
     createdAtUtc = (Get-Date).ToUniversalTime().ToString("o")
-    sourceSummary = $summaryFullPath
+    sourceSummary = $sourceSummaryShown
     status = $overallStatus
+    # r15 (adversary r14 pass 18 A6): the machine-readable claim gate; `status` stays the support gate
+    claimAuthority = $claimAuthority
     topLevelStatus = $topStatus
     dryRun = $dryRun
     host = [pscustomobject]@{
@@ -1052,7 +1182,8 @@ $report = [pscustomobject]@{
     diagnosticSummary = $diagnosticSummary
     actionPlan = $actionPlan
     proofBoundary = @(
-        "Quote support or speed only when status is QUOTABLE_PASS and this summary was produced on the same host being claimed.",
+        "Quote support only when status is QUOTABLE_PASS and this summary was produced on the same host being claimed.",
+        "Quote playback speed only when, in addition, claimAuthority.speed is true (playbackSpeed.status=PASS); a REFUSED playback-speed section carries no speed authority.",
         "Playback proof requires correctnessValidated=true, GPU Tex NR/no-readback frames, zero fallback frames, active GL parity probes, and zero GL mismatches.",
         "DNG proof requires CDNG PASS, DNG hash PASS, candidate GPU attempted/replaced frames for the full measured set, and trusted GPU frames when trusted export was requested.",
         "Speed deltas are scoped to this host, clip, receipt, codec set, max-frame count, release/backend hashes, and run order."
@@ -1063,7 +1194,8 @@ $lines = [System.Collections.Generic.List[string]]::new()
 [void]$lines.Add("# MLVApp Local CUDA Proof Report")
 [void]$lines.Add("")
 [void]$lines.Add("- Status: $($report.status)")
-[void]$lines.Add("- Source summary: $summaryFullPath")
+[void]$lines.Add("- Speed claim authority: $(if ($claimAuthority.speed) { 'granted' } else { "none ($($claimAuthority.speedRefusal))" })")
+[void]$lines.Add("- Source summary: $sourceSummaryShown")
 [void]$lines.Add("- Host: $($report.host.name)")
 [void]$lines.Add("- NVIDIA: $(if ($nvidiaRows.Count -gt 0) { $nvidiaRows -join '; ' } else { 'not reported' })")
 [void]$lines.Add("- Dry run: $dryRun")
