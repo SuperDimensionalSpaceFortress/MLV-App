@@ -6608,6 +6608,25 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertGreaterEqual(len(re.findall(r"Invoke-BatchBoundedChild -FilePath", code)), 4, "the three preflight children and the leg all go through the helper")
         self.assertEqual(len(re.findall(r"\$(?:bp|fp)\.late\b", code)), 3, "each of the three preflight answers is refused when it is late")
 
+    # r5 fix (adversary r5 pass 13 A1, A2). A1: the helper's -AtLeastOneSec turned an expired sampled end back into a 1 s bound, and a caller that did not pass it inherited it from PSDefaultParameterValues: no caller can ask for
+    # a child past the end it sampled. A2: the leg launch was handed no deadline, so a parent delayed after the launch guard started a leg after -DeadlineUtc; every caller now hands the run deadline as -StartBeforeUtc.
+    def test_legspec_committed_r5_a1_the_helper_never_restores_a_bound_the_sampled_end_has_used_up(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("function Invoke-BatchBoundedChild")
+        helper = text[start:text.index("\nfunction ", start + 10)]
+        self.assertNotIn("AtLeastOneSec", text)
+        self.assertNotRegex(helper, r"\$boundSec\s*=\s*1\b")
+        for call in re.findall(r"Invoke-BatchBoundedChild -FilePath[^\n]*", "\n".join(l for l in text.splitlines() if not l.lstrip().startswith("#"))):
+            self.assertIn("-StartBeforeUtc $deadline", call, "every bounded child is handed the run deadline it may not be started after: " + call[:200])
+
+    def test_legspec_committed_r5_a2_a_leg_is_not_started_when_the_run_deadline_passed_after_the_launch_guard(self) -> None:
+        self._reset_committed_case()
+        r = self.run_batch([self.specs[0]], "-BoundedChildLaunchDelaySec", "50", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=45)))
+        out = r.stdout[-1500:] + r.stderr[-1500:]
+        self.assertEqual([k for k in self.kinds() if k.startswith("LEG:")], [], "a leg was started after -DeadlineUtc: " + out)
+        self.assertEqual(r.returncode, 3, out)
+        self.assertIn("DEADLINE", r.stdout, out)
+
     # G6 (improvement): a probe that is not started for lack of room (under 1 s) used to leave the stand-in accepted on the comment "every later gate refuses on the deadline". It fails closed: production-shaped, every seam refused.
     def test_legspec_committed_r5_g6_no_room_for_the_location_probe_refuses_every_stand_in_seam(self) -> None:
         child, pid = self._g5_found_child("g6-child.ps1")
