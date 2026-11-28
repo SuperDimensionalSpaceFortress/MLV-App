@@ -2995,9 +2995,32 @@ function Publish-AttrCudaVisualCaptures {
     $pubDir = Join-Path $PubRoot 'visual'
     [void](New-AttrCudaDirectory -Path $pubDir)
     [void](Publish-AttrCudaText -Path (Join-Path $pubDir 'visual-capture-request.json') -Value ($Record | ConvertTo-Json -Depth 4))
+    # R6-BURST-CUTOFF-RESIDUE-1 r10 (sol A1 on a95fca2f): the loop below enumerates the SOURCE, so a capture this job did not take (its source absent)
+    # never visited its slot, and an older image there was published beside the fresh visual.json and bound to its labels. Every capture slot (the
+    # names the loop publishes, and visual.json) is emptied first, forwarded or not, and only through Assert-AttrCudaWritableFileSlot: a plain one-name
+    # file is removed, and a directory, reparse point or multi-link file throws its ATTRCUDA_SLOT_* refusal untouched
+    # r10 fix 1 (sol A1 on 4dcd3a13): Windows names are case-insensitive, so visual.json is matched case-insensitively (-eq), as the .png names are
+    # (-match): an older VISUAL.JSON is the same slot the downstream visual.json path resolves. The source selector below matches the same way.
+    Get-ChildItem -LiteralPath $pubDir -Force | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -eq 'visual.json' } | ForEach-Object {
+        [void](Assert-AttrCudaWritableFileSlot -Path $_.FullName)
+    }
     if ($Record['forwarded'] -and $SourceDir -and (Test-Path -LiteralPath $SourceDir -PathType Container)) {
-        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -ceq 'visual.json' } | ForEach-Object {
-            [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination (Join-Path $pubDir $_.Name))
+        Get-ChildItem -LiteralPath $SourceDir -File | Where-Object { $_.Name -match '^(play-\d+|play-unbound-\d+|play-first-unbound-\d+|stop-unbound|stop|paused-unbound|paused)\.png$' -or $_.Name -eq 'visual.json' } | ForEach-Object {
+            # R6-BURST-CUTOFF-RESIDUE-1 r6 (sol A2 on 806d496b): a play-first-unbound burst image is optional evidence; one the job cannot copy (held with
+            # FileShare.None) is left out (the runner reads that row as not captured), never a throw that loses the measured job's RESULT line
+            # r9 (sol A2 on 2cec2ecf): left out means ABSENT. An older image already in that slot would be published beside the fresh visual.json and bound to
+            # its labels, so after a failed copy the slot is emptied; a slot that cannot be emptied throws, as a locked non-burst image does.
+            # r9 fix 2 (sol A1 on 5040821c): a slot OWNERSHIP refusal (ATTRCUDA_SLOT_*: a directory, a reparse point, a multi-link file) stands and the refused
+            # object is untouched; the slot is emptied only by Assert-AttrCudaWritableFileSlot, which removes a plain one-name file and refuses anything else
+            if ($_.Name -match '^play-first-unbound-\d+\.png$') {
+                $burstDest = Join-Path $pubDir $_.Name
+                try { [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination $burstDest) }
+                catch {
+                    if ([string]$_.Exception.Message -match '^ATTRCUDA_SLOT_') { throw }
+                    [void](Assert-AttrCudaWritableFileSlot -Path $burstDest)
+                }
+            }
+            else { [void](Publish-AttrCudaFileCopy -Source $_.FullName -Destination (Join-Path $pubDir $_.Name)) }
         }
     }
     return $pubDir

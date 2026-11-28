@@ -1704,9 +1704,12 @@ static bool setPlaybackDisplayRequiredExecutionState( bool required )
 static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
                                                   QWidget *viewportWidget,
                                                   QRect *viewportRectOut,
-                                                  QString *reasonOut )
+                                                  QString *reasonOut,
+                                                  const std::function<bool()> &mayStartNow = std::function<bool()>(),
+                                                  bool *startRefusedOut = nullptr )
 {
     if( viewportRectOut ) *viewportRectOut = QRect();
+    if( startRefusedOut ) *startRefusedOut = false;
 #ifdef Q_OS_WIN
     if( !topLevel )
     {
@@ -1749,6 +1752,14 @@ static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
 #ifndef PW_RENDERFULLCONTENT
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
+        // R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A3): the start is decided HERE, after all setup, right before PrintWindow
+        if( mayStartNow && !mayStartNow() )
+        {
+            if( startRefusedOut ) *startRefusedOut = true;
+            if( reasonOut ) *reasonOut = QStringLiteral( "start_refused_at_cutoff" );
+        }
+        else
+        {
         const BOOL printed = PrintWindow( hwnd, memoryDc, PW_RENDERFULLCONTENT );
         GdiFlush();
         if( printed )
@@ -1760,6 +1771,7 @@ static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
         else if( reasonOut )
         {
             *reasonOut = QStringLiteral( "print_window_failed error=%1" ).arg( static_cast<qulonglong>( GetLastError() ) );
+        }
         }
         SelectObject( memoryDc, previous );
     }
@@ -1797,13 +1809,18 @@ static QImage captureTopLevelWindowByPrintWindow( QWidget *topLevel,
  * labelled N. With paint set, the pending frame is painted synchronously first: the GL window's paintGL()+swap, else
  * the viewport widget's repaint() (the --screenshot path's idiom). Returns whether the serial of the frame now painted
  * is known, in *paintedSerialOut: the GL window's / GL viewport's own record of what its paintGL() drew, or, on the
- * QGraphicsPixmapItem route, the item's serial once repaint() has drawn it (unknown without the forced paint). Only
+ * QGraphicsPixmapItem route, the item's serial once repaint() has drawn it (without the forced paint: its composed-paint record, below). Only
  * ever called by --visual-capture-dir, after the measured interval has closed.
  * PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-2 r2: *basisOut names where the painted serial came from, so a reader can tell a
  * paint-path record from one that holds by construction: "gl_window_paint" / "gl_viewport_paint" (the paintGL() that
  * drew the frame recorded it), "pixmap_item_by_construction" (the pixmap route: the serial the item was handed with its
  * pixmap, the same request serial the label is stamped from, so painted == label holds by construction and proves only
- * that repaint() ran), or "none" (no painted serial is known). */
+ * that repaint() ran), or "none" (no painted serial is known).
+ * EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R5-RESIDUE-1 (sol r1 B1): without paint, on the QGraphicsPixmapItem route, the basis is
+ * "pixmap_composed_paint": the pixmap route's own record of the serial its last composed paintEvent drew (GraphicsZoomView.cpp:253-255,
+ * GraphicsZoomView::composedPixmapPaintedSerial; an offscreen grab never sets it), so painted == label is a paint-path fact there, not a
+ * construction. That hand-off serial (MainWindow.cpp presentPlaybackPreparedFrame: task.requestSerial) and the label's serial
+ * (recordPresentedFrame: readyFrame.requestSerial) name the same request: task.requestSerial is set from readyFrame.requestSerial. */
 static bool paintPresentedFrameForCapture( QGraphicsView *view,
                                            QWidget *viewportWidget,
                                            bool glWindowRoute,
@@ -1833,6 +1850,14 @@ static bool paintPresentedFrameForCapture( QGraphicsView *view,
         serial = pixmapItemSerial;
         valid = serial != 0;
         if( valid ) basis = QStringLiteral("pixmap_item_by_construction");
+    }
+    else if( !paint )
+    {
+        // R5-RESIDUE-1 (sol r1 B1): an unforced capture on the pixmap route never paints; it reads the view's own record of the serial its
+        // last composed paintEvent drew, never the item's hand-off serial
+        const GraphicsZoomView *zoomView = qobject_cast<const GraphicsZoomView *>( view );
+        valid = zoomView && zoomView->composedPixmapPaintedSerial( &serial );
+        if( valid ) basis = QStringLiteral("pixmap_composed_paint");
     }
     if( paintedSerialOut ) *paintedSerialOut = valid ? serial : 0;
     if( basisOut ) *basisOut = basis;
@@ -11929,7 +11954,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             : ( ui->graphicsView ? ui->graphicsView->viewport() : nullptr );
         QElapsedTimer visualTailClock;
         int visualForcedPaints = 0;
-        auto grabVisual = [&]( const QString &kind, int index, bool settled )
+        // R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): startCutoffMs >= 0 (the early burst only) makes the capture start only while the tail clock,
+        // read immediately before it starts, plus startReserveMs is before that cutoff; a refused capture is not appended. Every other call
+        // passes no cutoff and always captures.
+        auto grabVisual = [&]( const QString &kind, int index, bool settled, qint64 startCutoffMs = -1, qint64 startReserveMs = 0 )
         {
             VisualGrab grab;
             grab.kind = kind;
@@ -11956,17 +11984,38 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             grab.serial = static_cast<qulonglong>( m_lastPresentedRequestSerial );
             grab.playActive = ui->actionPlay->isChecked();
             grab.clip = visual_capture_source_difference::clipToken( m_clipLifecycleBarrier, m_pMlvObject );
+            // R6-BURST-CUTOFF-RESIDUE-1: the clock read that decides the start is the last statement before it. r2 (luna A1 on c4d5d5f6): the capture
+            // timer starts before that read, so only the branch separates the read from the PrintWindow call, and the decision keeps a 1 ms margin
+            // (kCaptureStartMarginMs) for elapsed()'s whole-millisecond truncation. r4 (sol A3 on 560c9642): the deciding read moved INTO the
+            // capture function, after its HWND / DC / DIB setup and immediately before the native PrintWindow call (mayStartNow).
             QElapsedTimer captureClock;
             captureClock.start();
-            grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason );
-            grab.captureMs = static_cast<double>( captureClock.nsecsElapsed() ) / 1.0e6;
-            grab.capturedUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
-            visualGrabs.append( grab );
+            bool captureStartRefused = false;
+            grab.image = captureTopLevelWindowByPrintWindow( this, visualViewportWidget, &grab.viewport, &grab.reason,
+                visual_capture_source_difference::captureStartGate( visualTailClock, startReserveMs, startCutoffMs ),
+                &captureStartRefused );
+            if( !captureStartRefused )
+            {
+                grab.captureMs = static_cast<double>( captureClock.nsecsElapsed() ) / 1.0e6;
+                grab.capturedUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
+                visualGrabs.append( grab );
+            }
         };
 
         // (1) the measured interval ends HERE, before the first capture.
         m_contactSheetCaptureActive = false;   // no in-pass contact-sheet grab can land in the tail
         const qulonglong visualMeasuredSession = static_cast<qulonglong>( m_playbackSmokeSessionId );
+        // R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A1 + A2 on 560c9642): the prep counters at the tail's start. The burst_end record below carries how
+        // far each moved by the burst's end, written whether or not MLVAPP_INTERACTIVE_TRACE is on (the per-invalidation record is trace-only, so
+        // with tracing off a resize that dropped and reissued the target was invisible to the runner, A2), and it ends the window the runner
+        // counts invalidations in (the normal play-stop invalidation after the burst no longer refuses a target the burst already proved, A1).
+        // r4 pass 3 (sol A1 on a02d8246): read BEFORE finishPlaybackSmokeTelemetry loads the summary's counters, so a drop between that load and
+        // these reads is in the deltas (one in both is a refusal twice, never a miss)
+        const quint64 visualBurstGeneration0 = static_cast<quint64>( m_playbackPresentationGeneration.load( std::memory_order_acquire ) );
+        const quint64 visualBurstStaleDrops0 = static_cast<quint64>( m_playbackPrepStaleDropCount.load( std::memory_order_acquire ) );
+        const quint64 visualBurstGenerationDrops0 = static_cast<quint64>( m_playbackPrepGenerationDropCount.load( std::memory_order_acquire ) );
+        const quint64 visualBurstReplacedBefore0 = static_cast<quint64>( m_playbackPrepReplacedBeforeComputeCount.load( std::memory_order_acquire ) );
+        const quint64 visualBurstReplacedAfter0 = static_cast<quint64>( m_playbackPrepReplacedAfterComputeCount.load( std::memory_order_acquire ) );
         finishPlaybackSmokeTelemetry( "visual-capture" );
         const QString visualTailBeginUtc = QDateTime::currentDateTimeUtc().toString( Qt::ISODateWithMs );
         logInteractionEvent(
@@ -11974,13 +12023,71 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             QStringLiteral("measured_session=%1 tail_ms=%2 play_frames=%3 tail_begin_utc=%4")
                 .arg( visualMeasuredSession ).arg( visualTailMs ).arg( visualPlayFrames ).arg( visualTailBeginUtc ) );
         visualTailClock.start();
+        const int visualHalfMs = visualTailMs / 2;
+
+        // (2a) EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1: a short UNFORCED burst (play_first_unbound, at most 4) BEFORE the
+        // first forced paint, until the first forced play capture's target time. The runner's in-flight tail credit (Get-DvTailInFlightCredit,
+        // r4 A1) admits only a capture no forced paint preceded (forced_paints_before=0): with the forced loop first, every unforced play
+        // capture follows six forced paints, so the credit could never fire. Each burst capture reads what the display itself last painted;
+        // one is taken on the first pass and again only when the painted serial (paintPresentedFrameForCapture with paint=false: the GL
+        // window's / GL viewport's own record of what its paintGL() last drew; on the pixmap route the view's composed-paint record) changes, so the burst follows the
+        // display's own paints and never paints. The frozen check never sees these rows: it is judged on play_unbound only.
+        // R5-RESIDUE-1 (sol r1 B2): (a) the clock is re-read AFTER the event pump and the probe, right before a capture would start: the loop's
+        // own check ran before processEvents, which can come back past the target, so no burst capture STARTS at or after it; (b) a later capture
+        // starts only while the time left exceeds the longest burst capture so far (a prediction, not a bound: adversary A2 on 4de735e6), so one
+        // slower than every earlier one can still end past the target, by at most its own excess over that longest; (c) the pixmap route now
+        // reports its composed paint (basis pixmap_composed_paint), so the burst follows that route's own paints too.
+        // R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): the check below is admission only; a read of 124 ms there could still be followed by a
+        // capture starting at 125 ms. The deciding read is inside grabVisual, immediately before the capture starts (visualFirstForcedMs is its
+        // cutoff, visualBurstLongestMs its reserve), so no burst capture starts at or after the first forced target; a refused one ends the burst.
+        {
+            const qint64 visualFirstForcedMs = static_cast<qint64>( ( 2 * 0 + 1 ) * visualHalfMs / ( 2 * visualPlayFrames ) );
+            const int visualBurstMax = 4;
+            int visualBurstCount = 0;
+            bool visualBurstLastValid = false;
+            quint64 visualBurstLastSerial = 0;
+            qint64 visualBurstLongestMs = 0;
+            while( visualTailClock.elapsed() < visualFirstForcedMs && visualBurstCount < visualBurstMax )
+            {
+                qApp->processEvents( QEventLoop::AllEvents );
+                quint64 visualBurstProbeSerial = 0;
+                const bool visualBurstProbeValid = paintPresentedFrameForCapture( ui->graphicsView, visualViewportWidget, visualUseGlContainer,
+                                                                                  m_graphicsItemPresentedSerial, false, &visualBurstProbeSerial, nullptr );
+                if( visualBurstCount == 0 || visualBurstProbeValid != visualBurstLastValid
+                 || ( visualBurstProbeValid && visualBurstProbeSerial != visualBurstLastSerial ) )
+                {
+                    if( visualTailClock.elapsed() + visualBurstLongestMs >= visualFirstForcedMs ) break;
+                    const qint64 visualBurstGrabStartMs = visualTailClock.elapsed();
+                    const int visualBurstGrabsBefore = visualGrabs.size();
+                    grabVisual( QStringLiteral("play_first_unbound"), visualBurstCount, false, visualFirstForcedMs, visualBurstLongestMs );
+                    if( visualGrabs.size() == visualBurstGrabsBefore ) break;   // R6: refused at the read immediately before the start
+                    visualBurstLongestMs = qMax( visualBurstLongestMs, visualTailClock.elapsed() - visualBurstGrabStartMs );
+                    visualBurstLastValid = visualGrabs.last().paintedSerialValid;
+                    visualBurstLastSerial = static_cast<quint64>( visualGrabs.last().paintedSerial );
+                    ++visualBurstCount;
+                }
+                else
+                {
+                    sleepGuiThreadForSmokeRunner( 2 );
+                }
+            }
+            // r4 (sol A1 + A2 on 560c9642): never trace-only; the runner credits a burst capture only when every delta here is 0
+            logInteractionEvent(
+                QStringLiteral("gui_smoke.visual_capture.burst_end"),
+                QStringLiteral("measured_session=%1 burst_captures=%2 generation_changes=%3 stale_drops=%4 generation_drops=%5 replaced_before=%6 replaced_after=%7")
+                    .arg( visualMeasuredSession ).arg( visualBurstCount )
+                    .arg( static_cast<qulonglong>( static_cast<quint64>( m_playbackPresentationGeneration.load( std::memory_order_acquire ) ) - visualBurstGeneration0 ) )
+                    .arg( static_cast<qulonglong>( static_cast<quint64>( m_playbackPrepStaleDropCount.load( std::memory_order_acquire ) ) - visualBurstStaleDrops0 ) )
+                    .arg( static_cast<qulonglong>( static_cast<quint64>( m_playbackPrepGenerationDropCount.load( std::memory_order_acquire ) ) - visualBurstGenerationDrops0 ) )
+                    .arg( static_cast<qulonglong>( static_cast<quint64>( m_playbackPrepReplacedBeforeComputeCount.load( std::memory_order_acquire ) ) - visualBurstReplacedBefore0 ) )
+                    .arg( static_cast<qulonglong>( static_cast<quint64>( m_playbackPrepReplacedAfterComputeCount.load( std::memory_order_acquire ) ) - visualBurstReplacedAfter0 ) ) );
+        }
 
         // (2) K forced, bound play frames evenly spaced across the FIRST half of the untimed tail (the centres of K equal
         // slices), then K unforced ones across the SECOND half (what the display itself shows: the frozen check is judged
         // on these). r3 (Dot 7dc103f1 B2): r2 took unforced k then forced k in each slice, so with the display's own paint
         // stuck, unforced k+1 showed forced k's paint and a frozen display read as K moving pictures. Now no forced paint
         // falls between two unforced play captures, or between the last of them and stop_unbound.
-        const int visualHalfMs = visualTailMs / 2;
         for( int k = 0; k < visualPlayFrames; ++k )
         {
             const qint64 targetMs = static_cast<qint64>( ( 2 * k + 1 ) * visualHalfMs / ( 2 * visualPlayFrames ) );
@@ -12048,13 +12155,14 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         // reads for its display_frame), read here because Play has stopped, once per distinct frame.
         // The verdict across them is visual.json's source_difference (VisualCaptureSourceDifference.h).
         // Both play kinds carry a source_id: the forced "play" captures and the unforced "play_unbound"
-        // ones (the runner judges the frozen check on the unforced ones whenever they exist).
+        // ones (the runner judges the frozen check on the unforced ones whenever they exist). R4-RESIDUE-1: so does the
+        // play_first_unbound burst (isSourceBoundCaptureKind; the tail credit needs it), which is never decide() input.
         // r7 (adversary r6 pass 3 A2): bound to the clip each capture was taken from (visualCaptureClip): a capture from another clip, or
         // any capture once the open clip has changed, gets no source_id, so a FileOpen during the waits above never lends B's ids to A.
         QVector<visual_capture_source_difference::CaptureClip> visualCaptureClips;
         for( const VisualGrab &grab : visualGrabs )
         {
-            if( !visual_capture_source_difference::isPlayCaptureKind( grab.kind ) ) continue;
+            if( !visual_capture_source_difference::isSourceBoundCaptureKind( grab.kind ) ) continue;
             visual_capture_source_difference::CaptureClip capture;
             capture.kind = grab.kind;
             capture.displayFrame = grab.displayFrame;
@@ -12082,10 +12190,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         }
         const visual_capture_source_difference::Verdict visualSourceVerdict =
             visual_capture_source_difference::decide( visualSourceIds.playIdentities );
-        int visualPlayAt = 0;   // the play capture's position in visualCaptureClips / visualSourceIds
+        int visualPlayAt = 0;   // the source-bound capture's position in visualCaptureClips / visualSourceIds
         for( const VisualGrab &grab : visualGrabs )
         {
-            const int playAt = visual_capture_source_difference::isPlayCaptureKind( grab.kind ) ? visualPlayAt++ : -1;
+            const int playAt = visual_capture_source_difference::isSourceBoundCaptureKind( grab.kind ) ? visualPlayAt++ : -1;
             const QString fileStem = QString( grab.kind ).replace( QLatin1Char('_'), QLatin1Char('-') );
             const QString fileName = grab.kind.startsWith( QStringLiteral("play") )
                 ? QStringLiteral("%1-%2.png").arg( fileStem ).arg( grab.index )
@@ -12105,7 +12213,7 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
             frameJson.insert( QStringLiteral("forced_paints_before"), grab.forcedPaintsBefore );
             frameJson.insert( QStringLiteral("play_active"), grab.playActive );
             frameJson.insert( QStringLiteral("capture_ms"), grab.captureMs );
-            if( visual_capture_source_difference::isPlayCaptureKind( grab.kind ) && grab.displayFrame >= 0 )
+            if( visual_capture_source_difference::isSourceBoundCaptureKind( grab.kind ) && grab.displayFrame >= 0 )
             {
                 if( playAt >= 0 && playAt < visualSourceIds.valid.size() && visualSourceIds.valid.at( playAt ) )
                     frameJson.insert( QStringLiteral("source_id"),
@@ -12146,7 +12254,10 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
                 viewportJson.insert( QStringLiteral("h"), savedViewport.height() );
                 frameJson.insert( QStringLiteral("viewport"), viewportJson );
                 if( saved ) ++visualFramesWritten;
-                else if( visualError.isEmpty() ) visualError = QStringLiteral( "%1 could not be written" ).arg( fileName );
+                // r4 (sol A4 on 560c9642): a burst PNG that could not be written leaves its row saved=false (no tail credit) but never latches the
+                // error, which would skip every later save, the late play_unbound evidence the frozen-display check reads included
+                else if( visualError.isEmpty() && grab.kind != QStringLiteral("play_first_unbound") )
+                    visualError = QStringLiteral( "%1 could not be written" ).arg( fileName );
             }
             frameJson.insert( QStringLiteral("saved"), saved );
             frameJson.insert( QStringLiteral("reason"), grab.reason );
@@ -12156,6 +12267,9 @@ int MainWindow::runGuiPlaybackSmoke(const GuiPlaybackSmokeOptions & options)
         visualJson.insert( QStringLiteral("schema"), QStringLiteral("mlv-app/visual-capture/v1") );
         visualJson.insert( QStringLiteral("method"), QStringLiteral("PrintWindow(PW_RENDERFULLCONTENT)") );
         visualJson.insert( QStringLiteral("measured_session"), static_cast<double>( visualMeasuredSession ) );
+        // R4-RESIDUE-1 (r4 pass-5 A8): the launcher's run nonce (MLVAPP_RUN_NONCE, the one the summary line echoes), so the tail credit binds
+        // this file to THIS run: a session number and a millisecond tail_begin_utc can repeat across runs and hosts
+        visualJson.insert( QStringLiteral("run_nonce"), automationRunNonce() );
         visualJson.insert( QStringLiteral("tail_ms"), visualTailMs );
         visualJson.insert( QStringLiteral("play_frames_requested"), visualPlayFrames );
         visualJson.insert( QStringLiteral("tail_begin_utc"), visualTailBeginUtc );

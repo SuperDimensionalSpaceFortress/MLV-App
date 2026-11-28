@@ -21,6 +21,7 @@
 #include <QTemporaryDir>
 #include <QThread>
 #include <cstdio>
+#include <limits>
 
 #include <QFile>
 #include <QJsonObject>
@@ -190,11 +191,102 @@ TEST(VisualCaptureSourceDifferenceWiring, BothPlayCaptureKindsCarryASourceId)
     const QString header = readRepoFile(QStringLiteral("platform/qt/VisualCaptureSourceDifference.h"));
     ASSERT_TRUE(header.contains(QStringLiteral(
         "return kind == QStringLiteral(\"play\") || kind == QStringLiteral(\"play_unbound\");")));
+    // EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1: the binding sites take every source-bound kind (the play_first_unbound
+    // burst included); decide() still sees only the two play kinds (bindSourceIds' playIdentities, pinned below)
     ASSERT_TRUE(source.contains(QStringLiteral(
-        "if( !visual_capture_source_difference::isPlayCaptureKind( grab.kind ) ) continue;")));
+        "if( !visual_capture_source_difference::isSourceBoundCaptureKind( grab.kind ) ) continue;")));
     ASSERT_TRUE(source.contains(QStringLiteral(
-        "if( visual_capture_source_difference::isPlayCaptureKind( grab.kind ) && grab.displayFrame >= 0 )")));
+        "if( visual_capture_source_difference::isSourceBoundCaptureKind( grab.kind ) && grab.displayFrame >= 0 )")));
     ASSERT_FALSE(source.contains(QStringLiteral("if( grab.kind != QStringLiteral(\"play\") ) continue;")));
+}
+
+// EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1 C1: the unforced burst the capture block takes before its first forced paint
+// (play_first_unbound) is source-bound (the runner's in-flight tail credit requires a source_id), but it is not a play capture.
+TEST(VisualCaptureSourceDifference, TheFirstUnforcedBurstIsSourceBoundButNotAPlayCapture)
+{
+    ASSERT_TRUE(vcsd::isSourceBoundCaptureKind(QStringLiteral("play")));
+    ASSERT_TRUE(vcsd::isSourceBoundCaptureKind(QStringLiteral("play_unbound")));
+    ASSERT_TRUE(vcsd::isSourceBoundCaptureKind(QStringLiteral("play_first_unbound")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QStringLiteral("stop")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QStringLiteral("stop_unbound")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QStringLiteral("paused")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QStringLiteral("paused_unbound")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QStringLiteral("Play_First_Unbound")));
+    ASSERT_FALSE(vcsd::isSourceBoundCaptureKind(QString()));
+    ASSERT_FALSE(vcsd::isPlayCaptureKind(QStringLiteral("play_first_unbound")));
+}
+
+// EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): the burst's admission check read 124 ms, the next clock
+// read 125 ms, and a capture still STARTED at the 125 ms cutoff, delaying forced play 0. grabVisual now re-reads the tail clock immediately before the
+// capture starts and asks captureMayStartBeforeCutoff; the burst is not unit-reachable (MainWindow.cpp is not linked here), so the decision it takes
+// at that read is tested here with the scripted clock of sol's counterexample, and the wiring test pins where the read sits.
+TEST(VisualCaptureSourceDifference, ABurstCaptureNeverStartsWhenTheReadBeforeItsStartIsAtTheCutoff)
+{
+    const qint64 cutoffMs = 125;   // the first forced play capture's target time
+    const qint64 clockReads[] = { 123, 125 };   // the admission read, then the read immediately before the capture starts
+    int capturesStarted = 0;
+    const bool admitted = vcsd::captureMayStartBeforeCutoff(clockReads[0], 0, cutoffMs);
+    ASSERT_TRUE(admitted);
+    if (admitted && vcsd::captureMayStartBeforeCutoff(clockReads[1], 0, cutoffMs)) ++capturesStarted;
+    ASSERT_EQ(0, capturesStarted);
+
+    // at, past and just before the cutoff, with no earlier burst capture (reserve 0); r2: a read of 124 is within the 1 ms start margin
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(123, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(124, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(125, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(126, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(164, 0, 125));   // an event pump that came back late
+    // a later capture also reserves the longest earlier burst capture: elapsed 34 + longest 90 + the 1 ms margin reaches 125
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(35, 90, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(34, 90, 125));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(33, 90, 125));
+    // a capture with no cutoff (every capture outside the burst passes -1) always starts, whatever the clock reads
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(0, 0, -1));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(3000, 0, -1));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(3000, 90, -1));
+}
+
+// R6-BURST-CUTOFF-RESIDUE-1 r2 (luna A1 on c4d5d5f6): QElapsedTimer::elapsed() truncates to whole milliseconds, so the read immediately before the
+// capture can say 124 while the true time is 124.9 ms, and the capture then begins at 125 ms, the cutoff (cutoff 125, reserve 0: the first burst
+// capture). The decision keeps a margin of one whole millisecond: a read of N starts a capture only when N + reserve + 1 < cutoff, so the true start
+// time is below cutoff - 1 + 1 ms of truncation, i.e. before the cutoff, unless the thread is preempted for over a millisecond across the branch.
+TEST(VisualCaptureSourceDifference, ABurstCaptureNeverStartsWhenTheReadIsWithinOneMillisecondOfTheCutoff)
+{
+    ASSERT_EQ(1, vcsd::kCaptureStartMarginMs);
+    const qint64 cutoffMs = 125;
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(124, 0, cutoffMs));   // luna's input: read 124, the capture would begin at 125
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(123, 0, cutoffMs));    // true time below 124 ms: the start is before the cutoff
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(100, 24, cutoffMs));  // the margin adds to the reserve, it does not replace it
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(100, 23, cutoffMs));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(124, 0, -1));          // no cutoff: no margin either
+}
+
+// R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A13 on 560c9642): captureMayStartBeforeCutoff(INT64_MAX, 0, 125) used to add the margin to INT64_MAX (signed
+// overflow, undefined behaviour). The predicate now never forms that sum: a huge read or reserve refuses, a negative one refuses.
+TEST(VisualCaptureSourceDifference, TheCutoffPredicateNeverOverflowsOnAnExtremeRead)
+{
+    const qint64 maxMs = std::numeric_limits<qint64>::max();
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(maxMs, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(0, maxMs, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(maxMs, maxMs, maxMs));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(-1, 0, 125));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(0, -1, 125));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(maxMs - 2, 0, maxMs));
+    ASSERT_FALSE(vcsd::captureMayStartBeforeCutoff(maxMs - 1, 0, maxMs));
+    ASSERT_TRUE(vcsd::captureMayStartBeforeCutoff(maxMs, maxMs, -1));
+}
+
+// R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A3 on 560c9642): the gate the capture function asks immediately before PrintWindow reads the tail clock at
+// that call: no cutoff always starts; a cutoff of 0 or 1 ms never does (the margin); a far cutoff on a just-started clock does.
+TEST(VisualCaptureSourceDifference, TheCaptureStartGateDecidesOnTheClockReadWhenAsked)
+{
+    QElapsedTimer clock;
+    clock.start();
+    ASSERT_TRUE(vcsd::captureStartGate(clock, 0, -1)());
+    ASSERT_FALSE(vcsd::captureStartGate(clock, 0, 0)());
+    ASSERT_FALSE(vcsd::captureStartGate(clock, 0, 1)());
+    ASSERT_TRUE(vcsd::captureStartGate(clock, 0, 3600000)());
+    ASSERT_FALSE(vcsd::captureStartGate(clock, 3600000, 3600000)());
 }
 
 // r7 (adversary r6 pass 3 A2 on 3663c8a3): the capture path pumps events after the play captures (the post-stop drain at the
@@ -335,6 +427,44 @@ TEST(VisualCaptureSourceDifference, AClipThatStaysOpenKeepsEveryIdentityAndOnlyP
     ASSERT_TRUE(bound.valid.at(3));
     ASSERT_EQ(2, clips.hashCalls);     // one hash per distinct display frame
     ASSERT_EQ(0, bound.clipChangedCaptures);
+}
+
+// EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1 C2: a play_first_unbound capture gets a source id like a play capture, and is
+// refused like one when its clip is not the capture run's, but it never reaches decide(): the verdict's input is the play captures alone.
+TEST(VisualCaptureSourceDifference, TheFirstUnforcedBurstGetsASourceIdButNeverReachesDecide)
+{
+    ClipHarness clips;
+    const vcsd::ClipToken captureClip = clips.now();
+    QVector<vcsd::CaptureClip> captures;
+    vcsd::CaptureClip burst = playCapture(9, clips.now());
+    burst.kind = QStringLiteral("play_first_unbound");
+    captures.append(burst);
+    captures.append(playCapture(10, clips.now()));
+    captures.append(playCapture(12, clips.now()));
+    const vcsd::BoundSourceIds bound = clips.bind(captures, captureClip);
+    ASSERT_EQ(3, bound.valid.size());
+    ASSERT_TRUE(bound.valid.at(0));     // the burst is bound to its clip by a source id
+    ASSERT_EQ(kStaticAHash, bound.hash.at(0));
+    ASSERT_EQ(2, bound.playIdentities.size());   // decide() input is unchanged: the two play captures only
+    ASSERT_EQ(10, bound.playIdentities.at(0).displayFrame);
+    ASSERT_EQ(12, bound.playIdentities.at(1).displayFrame);
+    ASSERT_EQ(0, bound.clipChangedCaptures);
+
+    // a burst capture taken from another clip is counted as clip-changed and gets no id, still without entering decide()
+    ClipHarness moved;
+    const vcsd::ClipToken movedClip = moved.now();
+    QVector<vcsd::CaptureClip> movedCaptures;
+    vcsd::CaptureClip foreignBurst = playCapture(9, moved.now());
+    foreignBurst.kind = QStringLiteral("play_first_unbound");
+    foreignBurst.clip.generation = movedClip.generation + 1;   // not the capture run's clip
+    movedCaptures.append(foreignBurst);
+    movedCaptures.append(playCapture(10, moved.now()));
+    movedCaptures.append(playCapture(12, moved.now()));
+    const vcsd::BoundSourceIds movedBound = moved.bind(movedCaptures, movedClip);
+    ASSERT_FALSE(movedBound.valid.at(0));
+    ASSERT_EQ(1, movedBound.clipChangedCaptures);
+    ASSERT_EQ(2, movedBound.playIdentities.size());
+    ASSERT_TRUE(vcsd::decide(movedBound.playIdentities) == vcsd::Verdict::Identical);
 }
 
 TEST(VisualCaptureSourceDifferenceWiring, TheCaptureRunBindsItsSourceIdsToTheClipItStartedOn)

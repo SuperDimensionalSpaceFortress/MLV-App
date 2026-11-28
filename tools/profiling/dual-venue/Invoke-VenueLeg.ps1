@@ -1158,7 +1158,8 @@ $outcome = $resolved.outcome; $detail = $resolved.detail
 if ($outcome -eq 'CAPTURED') {
     $criteria = $spec.criteria.$role.$Backend
     # r19 (sol r18 B2): the criteria also see the run log's measured conform fields (Get-DvCriteriaMetrics); receipt.metrics stays verbatim
-    $verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics (Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback)
+    $criteriaMetrics = (Get-DvCriteriaMetrics -Metrics $receipt.metrics -Playback $receipt.playback -Visual (Get-DvTailVisualEvidence -EvidenceDir $evidenceDir -LegId ([string]$spec.legId) -ExpectedSha256 ([string](Get-DvProp $receipt.visual 'appVisualJsonSha256')) -RecordedFrames (Get-DvProp $receipt.visual 'frames')))
+    $verdictCriteria = Test-DvCriteria -Criteria $criteria -Metrics $criteriaMetrics
     $sheetMissing = $isLook -and ($null -eq $receipt.look -or $null -eq $receipt.look.contactSheet)
     # (a capture that published NO run log has no proof at all -- no rendered scale to read, no source frames -- and ends INVALID below, not here)
     if (-not $scale.honoured -and $null -ne $runLogText) {
@@ -1170,6 +1171,8 @@ if ($outcome -eq 'CAPTURED') {
     elseif ($sheetMissing) { $outcome = 'FAIL'; $detail = 'CAPTURED but the LOOK leg produced no contact sheet' }
     elseif (-not $verdictCriteria.pass) { $outcome = 'FAIL'; $detail = 'CAPTURED; criteria failed: ' + ($verdictCriteria.failures -join '; ') }
     else { $outcome = 'PASS'; $detail = $(if ($verdictCriteria.informational) { 'CAPTURED; no gating criteria for this role/backend (informational)' } else { 'CAPTURED; every criterion for this role/backend held' }) }
+    # EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r2 (fable r1 H2): an in-flight tail credit the criteria were judged with is written into the receipt's detail
+    if ($outcome -in @('PASS', 'FAIL')) { $detail += Get-DvTailCreditDetail -CriteriaMetrics $criteriaMetrics }
     # A declared clamp (the CUDA texture route renders at 1 whatever the request) still passes, but never silently: the detail carries both numbers.
     if ($outcome -in @('PASS', 'FAIL') -and $scale.verdict -ceq 'DECLARED_CLAMP') { $detail += "; $scaleNote (the spec declares this backend renders at $($scale.acceptedEffectiveScale) [$(Get-DvScaleLabel -Factor $scale.acceptedEffectiveScale)])" }
 }

@@ -14,6 +14,20 @@ read perfect while the display is frozen. So the capture runs after the measured
    REACHED its own stop condition: `finishPlaybackSmokeTelemetry("visual-capture")` closes the measured session (the
    `playback_smoke.summary` / `gate` lines, and every oracle number, are written there), while the SAME Play keeps running -- no
    new Play, no restart, no loop (the clip-length gate's stop-site pin counts this one pause). Then, untimed:
+   * a short unforced burst, `play-first-unbound-<n>.png` (kind `play_first_unbound`, at most 4), from the tail's start until the first
+     forced capture's target time: one at once, then one each time the display's own painted serial changes
+     (EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1). These are the only captures no forced paint precedes
+     (`forced_paints_before` = 0), so they are what the in-flight tail credit below can use. The frozen check never judges them
+     (it judges `play_unbound`, else `play`), and they are not input to `source_difference`. The burst re-reads the tail clock after
+     each event pump (R5-RESIDUE-1, sol r1 B2) to admit a capture, and the read that decides the start is taken immediately before the
+     capture starts, with nothing but the branch between them (R6-BURST-CUTOFF-RESIDUE-1: an admission read of 124 ms followed by
+     125 ms refuses; r2, luna A1: the capture timer starts before that read, and the read must be at least one whole millisecond plus the
+     reserve before the target, because the clock truncates to whole milliseconds, so a read of 124 against a 125 ms target refuses too).
+     So no burst capture starts at or after the first forced capture's target unless the GUI thread is preempted for over a millisecond
+     across that branch, and a refused one ends the burst; and a burst
+     capture starts only while the time left before that target exceeds the longest burst capture so far. That is a prediction, not a
+     bound (adversary A2): a capture slower than every earlier one can still end past the target, by at most its own excess over the
+     longest earlier one;
    * 6 forced, bound play captures, `play-<k>.png`, across the FIRST half of a ~3 s tail (the centres of six equal slices of it);
    * then 6 unforced play captures, `play-unbound-<k>.png`, across the SECOND half (the centres of six equal slices of it): what the
      display itself shows, and what the frozen check judges;
@@ -35,7 +49,11 @@ read perfect while the display is frozen. So the capture runs after the measured
    Each capture is the WHOLE window via `PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT)` -- the compositor's view of the window,
    GL child windows included, never an in-app readback -- saved at most 1920 wide after Play has stopped, with the video
    viewport rectangle (in the saved image's pixels) and the frame the app says it showed in `visual.json`. A capture failure is
-   recorded there and never changes the run's exit code.
+   recorded there and never changes the run's exit code. `visual.json` carries `run_nonce` (top level, a JSON string): the launcher's
+   `MLVAPP_RUN_NONCE` as the app reads it (`automationRunNonce()`: the launcher's value when `sanitizeRunNonce` in
+   `platform/qt/PlaybackFrameRange.h` accepts it, "letters and digits only, 8..64 of them" (ASCII), else `none`), the same nonce the
+   `playback_smoke.summary` line echoes, so the file is bound to the run that wrote it (R4-RESIDUE-1, r4 pass-5 A8). The launchers
+   mint 32 lowercase hex, and the in-flight tail credit below accepts only that form.
 
    **Binding (PLAYBACK-CPU-VISUAL-CAPTURE-TIMING-1).** PrintWindow reads the LAST PAINTED surface, but the CPU route paints a
    presented frame later (the pixmap item's or GL viewport's `update()`), while its label (`display_frame`, `serial`) is stamped
@@ -193,7 +211,8 @@ after the scan -- cannot make a static clip read "known to differ", and no byte 
 differently: the DHT class/id byte liblj92 zeroes in place, and a table symbol the bitstream never selects.)
 
 * `frames[].source_id` (play entries only, both the forced `play` and the unforced `play_unbound` captures -- the frozen check is
-  judged on the unforced ones whenever they exist): that hash as 16 lowercase hex digits. Absent when it could not be read.
+  judged on the unforced ones whenever they exist -- and the `play_first_unbound` burst, which the in-flight tail credit needs; the
+  burst is never `source_difference` input): that hash as 16 lowercase hex digits. Absent when it could not be read.
 * `source_difference` (top level), a JSON string, exactly one of:
   * `"differ"`: at least two play frames' source ids differ;
   * `"identical"`: every play frame has a source id, they span at least two distinct `display_frame` values, and all are equal;
@@ -210,11 +229,48 @@ clip has no source id and the field is omitted. The policy is `platform/qt/Visua
 may show an older frame than its label, and the measured CPU stop-vs-paused difference swung 0.969-8.266 run to run on such
 builds (CUDA, which paints before labelling, read 0.65-1.69). Judge CPU divergence only on a bound capture (`labelBound` true).
 On the pixmap route (`labelBoundBasis` `pixmap_item_by_construction`) a bound capture shows the forced repaint ran, not an
-independent paint-path record; an acceptance that counts `label_bound` there must say so.
+independent paint-path record; an acceptance that counts `label_bound` there must say so. An UNFORCED pixmap capture's basis is
+`pixmap_composed_paint` (R5-RESIDUE-1, sol r1 B1): the view's own record of the serial its last composed paint drew
+(`GraphicsZoomView::composedPixmapPaintedSerial`, set by its `paintEvent`, never by an offscreen grab), so `label_bound` there is a
+paint-path fact, not a construction.
 
 **Look Assist (D4b, `Get-DvLookAssistEvidence`).** A leg whose spec says Look Assist ON (a LOOK leg, or `generatorArgs.forceLookAssist`)
 counts only when the app's own last `gui_smoke.visual_state` line says `look_assist_enabled=1`; `0`, a missing field or a missing
 line is `INVALID` (`LOOK_ASSIST_NOT_HONOURED`), and the receipt's `lookAssist` block records what the app reported.
+
+**In-flight tail credit (EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-1 r4, `Get-DvTailInFlightCredit`).** An every-frame conform reading
+credits an engine target that was still in flight at the measured close only from a capture that proves the app painted it, never
+the observer. A capture counts only when ALL hold: it is unforced (`play_unbound` or `play_first_unbound`) and taken before any
+forced repaint (`forced_paints_before` = JSON integer 0), saved, label-bound with a paint-path `label_bound_basis` (ordinally
+`gl_window_paint`, `gl_viewport_paint` or `pixmap_composed_paint`; a forced repaint's `pixmap_item_by_construction`, `none` or
+anything else never qualifies: R5-RESIDUE-1), carries a `source_id` (bound to the clip), names its own
+file (`play-unbound-<index>.png` / `play-first-unbound-<index>.png`), has its recorded, decodable PNG, and shows Play active. The
+qualifying captures must be in paint order (by `tail_elapsed_ms`, display frame and serial never decrease). The order, equal-time,
+burst, behind-close and close-frame refusals run over EVERY unforced, label-bound row that records a paint (display frame, painted
+serial, tail time, Play active, paint-path basis, `forced_paints_before` 0), saved or not: being saved, a recorded sha256, a decodable
+PNG and a `source_id` decide only which of those rows may credit (R6-BURST-CUTOFF-RESIDUE-1 r11, A1). The visual record is bound
+to this run: visual.json's `run_nonce` must be 32 lowercase hex (`TAIL_VISUAL_NONCE_ABSENT` otherwise: absent, `none`, upper case,
+another length, a trailing newline, or not a JSON string) and ordinal-equal to BOTH the launcher's nonce (result.json, `expectedRunNonce`)
+and the nonce the app echoed on its summary line (`observedRunNonce`) (`TAIL_VISUAL_NONCE_MISMATCH` otherwise: two runs can share a
+session number and a millisecond `tail_begin_utc`); the hashed run log's
+one `gui_smoke.visual_capture.begin` record must carry the measured session and the same `tail_begin_utc` as visual.json, and the
+log carries no `gui_smoke.visual_capture.clip_changed` record. Any dropped or replaced prepared result (`prep_stale_drops`,
+`prep_generation_drops`, `prep_replaced_*` non-zero, or a `playback_prep.invalidate_generation` record logged between the begin record
+and the app's one `gui_smoke.visual_capture.burst_end` record) or a non-zero or absent `paint_wait_escapes` refuses the credit.
+R6-BURST-CUTOFF-RESIDUE-1 r4: `burst_end` is never trace-only. It carries the presentation-generation, stale-drop, generation-drop and
+replaced-before/after deltas since the tail began, and any non-zero delta refuses the credit. A missing, duplicated, other-session or
+unreadable `burst_end` also refuses. An invalidation after `burst_end`, such as the normal play-stop, comes after every burst capture,
+so it does not refuse. The burst capture's start is decided inside the capture function, after its HWND, DC and DIB setup and
+immediately before PrintWindow (`captureStartGate`). Typed
+refusals: `TAIL_CREDIT_PREP_DROPPED`, `TAIL_CREDIT_PAINT_WAIT_ESCAPES`, `TAIL_VISUAL_NONCE_ABSENT`, `TAIL_VISUAL_NONCE_MISMATCH`,
+`TAIL_VISUAL_NOT_THIS_RUN`, `TAIL_VISUAL_FILE_AMBIGUOUS`, `TAIL_CREDIT_PAINT_ORDER`, `TAIL_CREDIT_EQUAL_TIME`,
+`TAIL_CREDIT_BURST_NOT_LOGGED`, `TAIL_VISUAL_ROW_UNREADABLE`, `TAIL_VISUAL_UNREADABLE` (the validator re-throws
+it as `DVE_EVIDENCE_VALIDATION_IO`). A credit the criteria were judged with must appear in the receipt's `outcomeDetail`
+(`OUTCOME_DETAIL_TAIL_CREDIT_ABSENT` otherwise). The app's `play_first_unbound` burst (R4-RESIDUE-1) is the capture that can
+qualify: every `play_unbound` capture follows the six forced `play` paints. It can qualify on all three display routes: the GL
+window, the GL viewport, and (R5-RESIDUE-1) the QGraphicsPixmapItem route through `pixmap_composed_paint`. A Play start that drops
+one prepared result (`prep_stale_drops=1`) still refuses the credit (`TAIL_CREDIT_PREP_DROPPED`) until each target carries a
+drop/reissue identity (EVERY-FRAME-TAIL-PREP-DROP-IDENTITY-1).
 
 ## Opting out
 

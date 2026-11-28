@@ -37,6 +37,26 @@
       ]
     },
     {
+      "path": "platform/qt/VisualCaptureSourceDifference.h",
+      "anchor": "if ( cutoffMs < 0 ) return true ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R6-BURST-CUTOFF-RESIDUE-1 r2/r4: captureMayStartBeforeCutoff. cutoffMs < 0 is the 'no cutoff' sentinel every --visual-capture-dir capture outside the early burst passes (-1), so such a capture always starts. A capture-admission decision on a config sentinel, never whether any stage ran.",
+      "lines": [
+        106
+      ]
+    },
+    {
+      "path": "platform/qt/VisualCaptureSourceDifference.h",
+      "anchor": "if ( nowMs < 0 || reserveMs < 0 ) return false ;",
+      "class": "value_fallback_select",
+      "clock": "other",
+      "justification": "EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A13 on 560c9642): captureMayStartBeforeCutoff refuses a negative tail-clock read or reserve, so the margin arithmetic that follows never overflows qint64. A capture-admission refusal on malformed inputs, never whether any stage ran.",
+      "lines": [
+        107
+      ]
+    },
+    {
       "path": "platform/qt/ViewerIdlePolicy.h",
       "anchor": "if ( tick != Tick :: None && rearmMs && pollMs > 0 && * rearmMs > pollMs ) * rearmMs = pollMs ;",
       "class": "value_fallback_select",

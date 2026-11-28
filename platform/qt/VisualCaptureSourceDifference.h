@@ -13,6 +13,7 @@
  * >= 2 distinct display frames. A repeated display index is a stuck playback clock, not
  * evidence of a static clip. Without that evidence the field is removed, never null or empty. */
 
+#include <QElapsedTimer>
 #include <QHash>
 #include <QJsonObject>
 #include <QJsonValue>
@@ -20,6 +21,8 @@
 #include <QString>
 #include <QVector>
 #include <QtGlobal>
+
+#include <functional>
 
 namespace visual_capture_source_difference
 {
@@ -76,6 +79,44 @@ inline bool isPlayCaptureKind( const QString &kind )
     return kind == QStringLiteral("play") || kind == QStringLiteral("play_unbound");
 }
 
+/* EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R4-RESIDUE-1: which capture kinds are bound to their clip by a source_id. The two play
+ * kinds above, plus "play_first_unbound": the short unforced burst taken before the tail's first forced paint (the only captures the
+ * runner's in-flight tail credit can use, and it requires a source_id). That burst is NOT a play capture for decide(): it would add
+ * pictures from the first instant of the tail to the source_difference verdict, so isPlayCaptureKind stays the two kinds above. */
+inline bool isSourceBoundCaptureKind( const QString &kind )
+{
+    return isPlayCaptureKind( kind ) || kind == QStringLiteral("play_first_unbound");
+}
+
+/* EVERY-FRAME-TAIL-INFLIGHT-VS-NEVER-PAINTED-R6-BURST-CUTOFF-RESIDUE-1 (sol r1 on d0dab270): whether a --visual-capture-dir capture may START, decided
+ * on the tail-clock read taken immediately before it starts (MainWindow::runGuiPlaybackSmoke grabVisual). The early play_first_unbound burst passes
+ * the first forced play capture's target as cutoffMs and the longest burst capture so far as reserveMs: the capture starts only while that read plus
+ * the reserve is strictly before the cutoff, so no burst capture starts at or after it (an admission check that read 124 ms followed by a read of
+ * 125 ms refuses). Every other capture passes cutoffMs < 0: no cutoff, it always starts. Lives here, not in MainWindow.cpp, so console_tests can
+ * call it (MainWindow.cpp is not linked there) and because the capture block is pinned to contain no `return`.
+ * r2 (luna A1 on c4d5d5f6): QElapsedTimer::elapsed() truncates to whole milliseconds, so a read of 124 can be 124.9 ms and the capture that follows
+ * could begin at 125 ms, the cutoff, even with reserve 0 (the first burst capture). kCaptureStartMarginMs keeps one whole millisecond: a read of N
+ * starts a capture only when N + reserve + 1 < cutoff, so the true start is before the cutoff unless the GUI thread is preempted for more than a
+ * millisecond across the branch between that read and the PrintWindow call (the capture timer starts before the read, so nothing else runs there). */
+constexpr qint64 kCaptureStartMarginMs = 1;
+inline bool captureMayStartBeforeCutoff( qint64 nowMs, qint64 reserveMs, qint64 cutoffMs )
+{
+    // r4 (sol A13 on 560c9642): never forms nowMs + reserveMs + margin, which overflows qint64 for a large nowMs; a negative read or reserve
+    // refuses (a tail clock read is never negative). With cutoffMs >= 0, cutoffMs - kCaptureStartMarginMs cannot overflow.
+    if( cutoffMs < 0 ) return true;
+    if( nowMs < 0 || reserveMs < 0 ) return false;
+    const qint64 room = cutoffMs - kCaptureStartMarginMs;   // the start must be strictly before cutoff - margin
+    return nowMs < room && reserveMs < room - nowMs;
+}
+
+/* R6-BURST-CUTOFF-RESIDUE-1 r4 (sol A3 on 560c9642): the start decision as the predicate captureTopLevelWindowByPrintWindow asks AFTER its HWND, DC and
+ * DIB setup, immediately before the native PrintWindow call: each call reads tailClock then and decides with captureMayStartBeforeCutoff. Lives here
+ * because the capture block is pinned to contain no `return` (a lambda body there would). tailClock must outlive the returned predicate. */
+inline std::function<bool()> captureStartGate( const QElapsedTimer &tailClock, qint64 reserveMs, qint64 cutoffMs )
+{
+    return [&tailClock, reserveMs, cutoffMs]() { return captureMayStartBeforeCutoff( tailClock.elapsed(), reserveMs, cutoffMs ); };
+}
+
 /* A frame's source_id in visual.json: 16 lowercase hex digits, zero-padded. */
 inline QString sourceIdHex( quint64 hash )
 {
@@ -117,7 +158,7 @@ struct CaptureClip
 };
 
 /* Per capture (same order as the input): whether it has a source id, and the id. playIdentities holds
- * the play captures only, in order, for decide(). */
+ * the play captures only (isPlayCaptureKind), in order, for decide(). */
 struct BoundSourceIds
 {
     QVector<bool> valid;
@@ -153,7 +194,7 @@ inline BoundSourceIds bindSourceIds( const QVector<CaptureClip> &captures, const
     {
         bool valid = false;
         quint64 hash = 0;
-        if( isPlayCaptureKind( capture.kind ) )
+        if( isSourceBoundCaptureKind( capture.kind ) )
         {
             const bool fromCaptureClip = sameClip( capture.clip, captureClip );
             if( !fromCaptureClip ) ++out.clipChangedCaptures;
@@ -183,11 +224,14 @@ inline BoundSourceIds bindSourceIds( const QVector<CaptureClip> &captures, const
             {
                 ++out.clipChangedCaptures;   // the open clip, or its bytes, are no longer the capture's
             }
-            PlayIdentity identity;
-            identity.displayFrame = capture.displayFrame;
-            identity.valid = valid;
-            identity.hash = hash;
-            out.playIdentities.append( identity );
+            if( isPlayCaptureKind( capture.kind ) )   // R4-RESIDUE-1: the play_first_unbound burst is source-bound but never decide() input
+            {
+                PlayIdentity identity;
+                identity.displayFrame = capture.displayFrame;
+                identity.valid = valid;
+                identity.hash = hash;
+                out.playIdentities.append( identity );
+            }
         }
         out.valid.append( valid );
         out.hash.append( hash );
