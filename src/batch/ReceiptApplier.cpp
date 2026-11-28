@@ -48,7 +48,8 @@ static bool headlessDualIsoEnabled( ReceiptSettings *receipt, mlvObject_t *mlvOb
     return receipt
         && mlvObject
         && llrpGetDualIsoValidity( mlvObject ) != DISO_INVALID
-        && receipt->dualIso() > 0;
+        /* r3 (adversary 9a8772dd A3): only modes 1 and 2 are dual-ISO; llrpSetDualIsoMode stores any other value as 0 */
+        && ( receipt->dualIso() == 1 || receipt->dualIso() == 2 );
 }
 
 static uint16_t headlessAutoCorrectRawWhiteLevel( ReceiptSettings *receipt, mlvObject_t *mlvObject )

@@ -509,12 +509,71 @@ playback generator's resolver, venue-table reader and owner-part path allowlist 
     CDNG `<frame>` (sol r2 B1) is a `uint32` padded to six digits: six digits, or seven to ten with no leading zero, at most `4294967295`.
     From r3 `RENDER_START` must also be the ProRes producer's own declaration: `codec=prores container=mov` (the strings `BatchRenderedVideoPlan.h` names for ProRes and
     Mov), source and output dimensions above 0, and an fps that is a finite decimal above 0. Anything else is `EXPORT_PROFILE_FOREIGN`.
-    **Dual-ISO fails closed (r3, KNOWN GAP).** A `llrawproc_dual_iso` time above 0 is the time of the dual-ISO *attempt*. `llrawproc.c` times the attempt, and `dualiso.c`
-    can refuse the reconstruction inside it (a receipt's `dualIsoInterpolation 2`). The rendered path publishes no producer signal that the reconstruction was *applied*.
-    So a ProRes run with any frame timed above 0 has `dualIsoActiveFrames` and `dualIsoClassAgrees` null, with `CouldNotCheck` `DUALISO_APPLIED_UNKNOWN`. On a
-    dual-ISO leg the shipped `dualIsoClassAgrees eq true` then fails on that typed reason, and no ProRes leg can PASS until successor
-    `EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1` adds the applied signal. A run timed 0 on every frame ran no reconstruction: the class is readable (a dual-ISO leg is
-    `CLIP_CLASS_MISMATCH`). A no-dual-ISO leg whose run attempted dual-ISO stays `CLIP_CLASS_MISMATCH`. The CDNG profile's `active = ms > 0` rule above is unchanged.
+    **Dual-ISO fails closed (r3) without the applied signal.** A `llrawproc_dual_iso` time above 0 is the time of the dual-ISO *attempt*. `llrawproc.c` times the attempt,
+    and `dualiso.c` can refuse the reconstruction inside it (a receipt's `dualIsoInterpolation 2`). The time alone is no proof the reconstruction was *applied*. So a
+    ProRes log with no outcome marker (below) and any frame timed above 0 has `dualIsoActiveFrames` and `dualIsoClassAgrees` null, with `CouldNotCheck`
+    `DUALISO_APPLIED_UNKNOWN`, and a dual-ISO leg's shipped `dualIsoClassAgrees eq true` fails on that typed reason. A run timed 0 on every frame ran no reconstruction: the
+    class is readable (a dual-ISO leg is `CLIP_CLASS_MISMATCH`). A no-dual-ISO leg whose run attempted dual-ISO stays `CLIP_CLASS_MISMATCH`. The CDNG profile's
+    `active = ms > 0` rule above is unchanged (successor `EXPORT-CDNG-DUALISO-APPLIED-SIGNAL-1`).
+    **The applied signal (`EXPORT-RENDER-DUALISO-APPLIED-SIGNAL-1`).** `llrawproc.c` records each run's dual-ISO outcome on its thread (`llrpGetLastDualIsoOutcome`:
+    applied, attempted and not applied, or not attempted), and `video_mlv.c` writes one marker record right after each `llrawproc_dual_iso` record:
+    `llrawproc_dual_iso_applied`, `llrawproc_dual_iso_not_applied` or `llrawproc_dual_iso_not_attempted`, always `ms=0.000`. Markers carry no share and no nesting. A
+    marker that does not directly follow a `llrawproc_dual_iso` record of its frame, a second marker after one record, or a marker figure that is not a zero is
+    `EXPORT_RECORD_INVALID`. Any marker means the log carries the signal, and then it is read instead of the time. It must mark exactly the frames `processed16_total` is
+    timed on (otherwise both metrics are null with `DUALISO_OUTCOME_WINDOW_MISMATCH`, and from r3 the run is INVALID with the problem
+    `EXPORT_STAGE_WINDOW_MISMATCH: DUALISO_OUTCOME_WINDOW_MISMATCH: ...`, an incomplete capture, whatever the criteria). On a dual-ISO leg: every frame applied gives `dualIsoActiveFrames` = N and
+    `dualIsoClassAgrees` true; any frame not applied is a FAIL typed `DUALISO_NOT_APPLIED` (agrees false, `dualIsoActiveFrames` = the applied count,
+    `dualIsoNotAppliedFrames` = k); a frame whose markers disagree, or applied frames beside not-attempted ones, is a FAIL typed `DUALISO_OUTCOME_MIXED`; every frame not
+    attempted is `CLIP_CLASS_MISMATCH`. On a no-dual-ISO leg any attempted frame is `CLIP_CLASS_MISMATCH`, and every frame not attempted agrees. The typed reason of a
+    read-but-failing metric is `<metric>FailReason`, which `Test-DvCriteria` puts first in the failure text. The build identity decides too: a build whose
+    `src/debug/StageTiming.h` defines `MLV_STAGE_LLRAWPROC_DUAL_ISO_APPLIED`, beside a log with `llrawproc_dual_iso` records and no marker, is an incomplete capture
+    (`EXPORT_PROFILE_ABSENT`, never the r3 reading); markers beside a build that cannot write them are `EXPORT_PROFILE_FOREIGN`.
+    From its r3 the marker is bound to the run it reports. "Directly follows" is among the records **of its frame**: the MLV cache threads decode frames side by side, so
+    the stream interleaves frames, but one run's `llrawproc`, `llrawproc_dual_iso` and marker are one thread's notes, in that order. A marker is `EXPORT_RECORD_INVALID`
+    when its `llrawproc_dual_iso` record does not itself directly follow that frame's `llrawproc` record (the parentless dual-ISO leaf stays a timing rule and never feeds
+    the signal), and a `not_attempted` marker after a `llrawproc_dual_iso` time above 0 is `EXPORT_RECORD_INVALID` too (`llrawproc.c` adds to that time only inside an
+    attempt). `DUALISO_NOT_APPLIED` and `DUALISO_OUTCOME_MIXED` are the run's product failure: `Get-DvExportOutcome` returns that FAIL before it reads the leg's
+    criteria, so no criteria (or `dualIsoClassAgrees eq false`) turn it into a PASS. A marker-free log keeps the base reader's `DUALISO_APPLIED_UNKNOWN` text byte for
+    byte, so a receipt written before the signal re-derives the same metrics. On the producer side, `dual_iso` 1 (full) and 2 (preview) are the only modes:
+    `llrpSetDualIsoMode` (and the playback runtime setter) store any other value (a receipt can carry any integer) as 0, so every reader, pixel repair included, runs it
+    as `dual_iso` 0 and the run is `not_attempted` with a zero time. The build class reads a build's `StageTiming.h` once and decides both macros from those bytes.
+    **r4: the reader follows the real, pipelined producer.** Both r3 Bachelor ProRes legs on `04004b4e` (receipts `82f50eaf`, `43d898b5`) read INVALID on the reader's
+    own rules. Before the frame loop's first write, the MLV cache threads decode frames and run `llrawproc` on them without dual-ISO (`not_attempted`, no render), and
+    they interleave in the log (frames 0..11 of M16-1243, 0..31 of M16-1456). The loop then renders each of those frames again. The loop itself is one thread
+    (`BatchRunner.cpp`: render, scale, write, frame by frame). Three rules now read that shape, each per frame:
+    * **Order.** The frame loop's order is held per frame: no scale or write before the frame's `processed16_total`, one total, at most one scale (before the write),
+      nothing of the frame after its total but its scale and write, and nothing after its write. Every frame with a record must be written. Records of other frames may
+      come in between. The writes still come once each in rising frame order, since one loop writes them.
+    * **Pairing.** A `llrawproc_dual_iso` record pairs with the previous record **of its frame**, which must be `llrawproc`. It is never paired with the line before it.
+    * **Outcome.** A rendered frame's dual-ISO outcome comes from the runs of its *render's* decode. That decode starts at the frame's last `raw_uint16` record before
+      its `processed16_total`. A marker from an earlier decode of the frame (a cache-thread prefetch) is still held to every marker rule, but it never makes the frame
+      `DUALISO_OUTCOME_MIXED`, and it never rescues a render that did not apply. Two runs inside the render's own decode that disagree are still `mixed`.
+    * **Fix 1 (adversary `25ae968d`).** An earlier decode's timings are never summed into the frame's stage figures (A1). An earlier decode ends at its last
+      `llrawproc` record, dual-ISO record or marker before the render's `raw_uint16`. A frame carrying only a whole decode run (`raw_uint16` and `llrawproc`), outside
+      the written frames, is a start-up decode of a cache thread. It is skipped by the order and kept out of the sums; a lone stray record is still refused (A2).
+      The render decode must come after the write that precedes its `processed16_total`, because the loop decodes a frame only after writing the one before. It must
+      also fit inside its `debayered_frame`. Otherwise the frame has no decode of its own render: `EXPORT_RECORD_INVALID` (A3). The render-only records
+      (`debayered_frame`, `processing`, `processed16_cache_store`, `processed16_total`, `export_scale`, `export_pipe_write`) are one block per frame (A4). `%:` is read as
+      `#` in `StageTiming.h` (A5). In `dualiso.c`, a preview with no regression sample (weight 0, so `a` and `b` are NaN) returns 0 before the rowscale: `NOT_APPLIED`,
+      and the frame stays as decoded (A6).
+    * **r5: the render-decode mark (adversary `22d1a0a7` A1).** Position alone could not tell a cache thread's decode from the render's. Example: a frame whose only
+      decode is a cache thread's run, placed before the first write, read as its render. `video_mlv.c` now writes one `llrawproc_dual_iso_render ms=0.000` record
+      (`StageTiming.h` `MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER`) right after the outcome marker. It writes it for each `llrawproc` run made while the render's
+      `getMlvProcessedFrame16` entry is on the thread (a thread-local depth), and never for a cache thread's run. The reader rules on the mark:
+      * **What counts as a mark.** A 0.000 record that directly follows (among its frame's records) an outcome marker closing one `llrawproc` run of that frame, before
+        the frame's `processed16_total`. Anything else is `EXPORT_RECORD_INVALID`.
+      * **Outcome.** A frame's outcome is read from its marked runs only. The render decode starts at the frame's last `raw_uint16` before the first marked run.
+      * **Unmarked runs.** Every unmarked run is held to the marker rules, then set aside for the outcome and kept out of the sums, wherever it lies.
+      * **Missing mark.** When the log carries the applied signal, a frame its render closes with no marked run is `EXPORT_RECORD_INVALID: DUALISO_RENDER_MARK_MISSING`,
+        and the class is not read. A log from a build without the mark (`22d1a0a7` and earlier) is refused that way too, so its legs are re-run on a build that writes it.
+    * **r6 (sol r5 B1-B3).** One rule now decides whether the class is published at all:
+      * **Unreadable signal.** If any tagged record does not conform, the read is `EXPORT_RECORD_INVALID` and every dual-ISO class metric is null with that reason. This
+        covers a malformed or negative figure, a misplaced or repeated mark, and a stage named like the dual-ISO signal that is none of its records (for example
+        `llrawproc_dual_iso_appplied`). The receipt writer stores the reader's metrics, so it never copies a class out of an INVALID read.
+      * **Foreign evidence.** Render-decode marks beside a build whose `StageTiming.h` lacks `MLV_STAGE_LLRAWPROC_DUAL_ISO_RENDER` (such as `22d1a0a7`) are
+        `EXPORT_PROFILE_FOREIGN`. The same rule applies to outcome markers beside a build without the applied-signal macro. In both cases the class is null.
+      * **Linear reader.** The stage-log reader indexes writes, other-run spans and render-decode sums in single passes. Its cost grows linearly with the record
+        count, so a 100,000-frame window no longer means 10 billion comparisons.
     From r5 a run timed `0.000` on every frame is not read as agreement on a **no**-dual-ISO leg either: the figure is rounded to the microsecond (`StageTiming.h` `%.3f`),
     so an attempt under half a microsecond prints it too. That leg's `dualIsoClassAgrees` is null with `DUALISO_APPLIED_UNKNOWN`, while a dual-ISO leg's all-zero run is still
     `CLIP_CLASS_MISMATCH` (no reconstruction takes under half a microsecond).
