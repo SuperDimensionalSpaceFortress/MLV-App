@@ -41,6 +41,7 @@ from pathlib import Path
 from unittest import mock
 
 from tools.repo_hygiene.venue_fixture_modules import copy_cross_tree_modules, offline_tmp_root
+from tools.repo_hygiene.venue_orphan_fixture import grandchild_pid, kill_tree, pid_is_alive, write_orphan_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -6719,13 +6720,14 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildReturnDelaySec", "122", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
         self._assert_g5_refused("FOUND after the sampled end, descendant alive", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
         pid = self._descendant_pid(desc)
-        self.assertIn("kill confirmed", r.stderr)
-        self.assertNotIn("UNCONFIRMED", r.stderr)
+        # r10 (Grok G14): the root had already exited when the helper made this kill, so it is root-only: the descendant of the root is still swept (below), but the kill is never reported confirmed from the root alone
+        self.assertIn("kill UNCONFIRMED", r.stderr)
+        self.assertNotIn("kill confirmed", r.stderr)
         for _ in range(50):
             if not self._pid_is_alive(pid):
                 break
             time.sleep(0.2)
-        self.assertFalse(self._pid_is_alive(pid), "a timeout reported as a confirmed kill left a descendant of the answered root running (pid %d)" % pid)
+        self.assertFalse(self._pid_is_alive(pid), "the kill of the answered root's tree left a direct descendant of the root running (pid %d)" % pid)
         text = RUNNER.read_text(encoding="utf-8")
         helper = text[text.index("function Invoke-BatchBoundedChild"):text.index("function Get-UnconfirmedKillText")]
         self.assertNotIn("killConfirmed = $r.killConfirmed;", helper, "the helper copies the module's confirmation into a timeout it made itself")
@@ -6741,6 +6743,30 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self.assertIn("kill UNCONFIRMED", r.stderr)
         self.assertNotIn("kill confirmed", r.stderr)
         self.assertTrue(self._pid_is_alive(pid), "the seam made the kill fail, so the descendant must still be there (the test proves the report, not a kill)")
+
+    def test_legspec_committed_r10_g14_a_late_answer_whose_root_and_intermediate_parent_exited_is_root_only_and_never_a_confirmed_kill(self) -> None:
+        """r10 (Grok G14 = adversary r9 pass 20/21 A1): the helper's late-answer branch killed an already-exited root and read killConfirmed from the root's HasExited, so an orphaned grandchild ran on under "kill confirmed".
+        The same fixture the module test builds (root exited, intermediate exited, grandchild orphaned and alive) must read kill UNCONFIRMED here, and the helper records the root's state BEFORE the kill (killScope root-only)."""
+        d = self.case / "r10-g14-orphan"
+        pid_file = d / "grandchild.pid"
+        root = write_orphan_fixture(d, pid_file, answer="DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x")
+        self.addCleanup(lambda: pid_file.exists() and kill_tree(grandchild_pid(pid_file)))
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=10))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(root), "-BoundedChildReturnDelaySec", "122", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("FOUND after the sampled end, orphaned grandchild alive", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        self.assertTrue(pid_file.exists(), "the fixture's grandchild never started: the test proves nothing")
+        self.assertTrue(pid_is_alive(grandchild_pid(pid_file)), "the fixture's orphaned grandchild is gone, so the case under test was not built")
+        self.assertIn("kill UNCONFIRMED", r.stderr, "a kill made after the root had exited was reported confirmed from the root alone while a grandchild ran on")
+        self.assertNotIn("kill confirmed", r.stderr)
+        text = RUNNER.read_text(encoding="utf-8")
+        helper = text[text.index("function Invoke-BatchBoundedChild"):text.index("function Get-UnconfirmedKillText")]
+        code = "\n".join(l for l in helper.splitlines() if not l.lstrip().startswith("#"))
+        self.assertLess(code.index("$rootExitedBeforeKill = [bool]($r.process -and $r.process.HasExited)"), code.index("$r.process.Kill($true)"), "the root's state is read before the helper's kill")
+        self.assertIn("-not $rootExitedBeforeKill) { [void]$r.process.WaitForExit(", code, "a root that had exited before the kill is never confirmed from its own HasExited")
+        self.assertIn("'root-only'", code)
+        unconfirmed = text[text.index("function Get-UnconfirmedKillText"):text.index("function Get-KilledAtStartText")]
+        self.assertIn("root-only", unconfirmed, "the unconfirmed-kill wording says the root alone was checked")
 
     def test_legspec_committed_r5_g5_the_export_budget_siblings_are_bounded_by_the_same_sampled_end(self) -> None:
         pid = self.case / "g5-budget.pid"

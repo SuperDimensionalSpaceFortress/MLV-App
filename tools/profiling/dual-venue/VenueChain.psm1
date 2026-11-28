@@ -2511,8 +2511,8 @@ function Invoke-VenueBoundedProcess {
     .SYNOPSIS
     Run one child process and give up on it after -TimeoutSec (the child and its tree are killed). .exit is $null when it timed out.
     .OUTPUTS
-    [pscustomobject]@{ exit; timedOut; killConfirmed; stdout; stderr; notStarted; reason (DEADLINE | ROOM: nothing was started; KILLED_AT_START: started after -StartBeforeUtc and killed at once; '' otherwise); childPid }. killConfirmed (EXPORT-VENUE-LEG-1 r11) is $true when the child exited on its own, or was killed and HasExited read true after the 15 s wait; a caller that
-    must not leave a child behind reads it.
+    [pscustomobject]@{ exit; timedOut; killConfirmed; stdout; stderr; notStarted; reason (DEADLINE | ROOM: nothing was started; KILLED_AT_START: started after -StartBeforeUtc and killed at once; '' otherwise); childPid }. killConfirmed (EXPORT-VENUE-LEG-1 r11) is $true when the child exited on its own, or was killed while it was still running and HasExited read true after the 15 s wait; a caller that
+    must not leave a child behind reads it. r10 (Grok G14): a timeout whose root had ALREADY exited before the kill is killScope 'root-only' and killConfirmed $false (a descendant may still be running; the tree was not checked); killScope is 'tree' for a kill of a running root and 'none' when nothing timed out.
     #>
     param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][ValidateRange(1, 86400)][int]$TimeoutSec,
           [ValidateRange(100, 60000)][int]$CleanupWaitMs = 15000,
@@ -2536,8 +2536,8 @@ function Invoke-VenueBoundedProcess {
     $psi = [Diagnostics.ProcessStartInfo]::new($FilePath)
     foreach ($a in $ArgumentList) { [void]$psi.ArgumentList.Add($a) }
     $psi.UseShellExecute = $false; $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; $psi.RedirectStandardInput = $true; $psi.CreateNoWindow = $true
-    if ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'DEADLINE'; lateKind = ''; childPid = $null } }
-    if ($null -ne $Clock -and -not (($EndSec - $Clock.Elapsed.TotalSeconds) -ge 1)) { return [pscustomobject]@{ exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'ROOM'; lateKind = ''; childPid = $null } }
+    if ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc) { return [pscustomobject]@{ exit = $null; timedOut = $false; killScope = 'none'; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'DEADLINE'; lateKind = ''; childPid = $null } }
+    if ($null -ne $Clock -and -not (($EndSec - $Clock.Elapsed.TotalSeconds) -ge 1)) { return [pscustomobject]@{ exit = $null; timedOut = $false; killScope = 'none'; killConfirmed = $true; stdout = ''; stderr = ''; notStarted = $true; reason = 'ROOM'; lateKind = ''; childPid = $null } }
     if ($TestStartDelayMs -gt 0) { [Threading.Thread]::Sleep($TestStartDelayMs) }
     $p = [Diagnostics.Process]::Start($psi)
     $p.StandardInput.Close()
@@ -2584,9 +2584,13 @@ function Invoke-VenueBoundedProcess {
     }
     # r8 (adversary r8 pass 18 A3): the tree is killed on EVERY timeout, also when the root had already exited (a descendant that outlived it keeps running: Kill($true) of an exited root takes its surviving descendants and does not
     # throw, measured), so killConfirmed never reads a root that merely exited as a tree that is gone. (-TestKillThrows: the kill is not made and reads as failed.)
+    # r10 (Grok G14 = adversary r9 pass 20/21 A1): "confirmed" means the tree was CHECKED, never inferred from the root alone. Whether the root had already exited is read BEFORE the kill: Kill($true) of an exited root is a best-effort
+    # sweep of whatever it can still reach, and the root's HasExited afterwards says nothing about a grandchild whose parent exited first (the chain the kill walks is gone). Such a kill is killScope 'root-only' and killConfirmed $false;
+    # a kill made on a root that was still running is killScope 'tree' (confirmed when it did not throw and the root is gone); no timeout is killScope 'none'.
+    $rootExitedBeforeKill = ($timedOut -and [bool]$p.HasExited)
     if ($timedOut) { if ($TestKillThrows) { $killErrored = $true } else { try { $p.Kill($true) } catch { $killErrored = $true } }; [void]$p.WaitForExit([int][Math]::Max([Math]::Min($CleanupWaitMs, 500), $CleanupWaitMs - $cleanup.ElapsedMilliseconds)) }   # (a floor of 500 ms: a drain that used the whole budget must still leave the kill time to land)
     [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
-    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
+    [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killScope = $(if (-not $timedOut) { 'none' } elseif ($rootExitedBeforeKill) { 'root-only' } else { 'tree' }); killConfirmed = $(if ($timedOut) { (-not $killErrored) -and (-not $rootExitedBeforeKill) -and [bool]$p.HasExited } else { $true })
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }); notStarted = $lateStart; reason = $(if ($lateStart) { 'KILLED_AT_START' } else { '' }); lateKind = $lateKind; childPid = $p.Id; process = $p }   # (r9 G13: the Process, so a caller that judges the answer late AFTER this return can kill the tree of a root that answered)
 }
 

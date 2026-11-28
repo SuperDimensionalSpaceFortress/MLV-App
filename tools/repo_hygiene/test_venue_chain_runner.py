@@ -31,6 +31,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from tools.repo_hygiene.venue_fixture_modules import copy_with_siblings, cross_tree_modules, sibling_modules
+from tools.repo_hygiene.venue_orphan_fixture import grandchild_pid, kill_tree, pid_is_alive, write_orphan_fixture
 
 ROOT = Path(__file__).resolve().parents[2]
 DV = ROOT / "tools" / "profiling" / "dual-venue"
@@ -1640,7 +1641,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         self.assertEqual(late, "True KILLED_AT_START [DEADLINE] True  True True")
         # A2: the child exits at once; the parent is held (after Process.Start) until the sampled end is past: a finished child's answer is still late
         answer = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 3 -TestAfterStartDelayMs 6000 -CleanupWaitMs 3000" + tail)
-        self.assertEqual(answer, "False  [] True  True True", "an answer in hand only after the sampled end is a timeout (no exit), and a child that had exited on its own is a confirmed kill")
+        self.assertEqual(answer, "False  [] True  False True", "an answer in hand only after the sampled end is a timeout (no exit), and a child that had exited on its own before the kill is never a confirmed kill (r10 G14: root-only)")
         plain = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 600 -CleanupWaitMs 3000" + tail)
         self.assertEqual(plain, "False  [] False 0 True True", "an answer inside the sampled end is accepted")
         # r6 fix A4 (the first pass 15 on a8b9c3ed): a NaN end passed `-lt 1`, the child started, and [int]NaN threw at the wait with no cleanup: a NaN end is no room, and nothing is started
@@ -1677,7 +1678,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
         tail = "; \"$($r.notStarted) $($r.timedOut) [$($r.exit)] $($r.killConfirmed) [$($r.stdout.Trim())]\"; exit 0"
         late = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 4 -TestBeforeWaitDelayMs 6000 -CleanupWaitMs 3000" + tail)
-        self.assertEqual(late, "False True [] True [answer]", "a child that exited before the parent got to wait, observed after the sampled end, is a timeout with no exit code")
+        self.assertEqual(late, "False True [] False [answer]", "a child that exited before the parent got to wait, observed after the sampled end, is a timeout with no exit code and no confirmed kill (r10 G14: root-only)")
         inside = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -Clock $c -EndSec 600 -TestBeforeWaitDelayMs 1000 -CleanupWaitMs 3000" + tail)
         self.assertEqual(inside, "False False [0] True [answer]", "an answer inside the sampled end is accepted")
         none = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Write-Output answer; exit 0') -TimeoutSec 60 -CleanupWaitMs 3000" + tail)
@@ -1704,7 +1705,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
         tail = "; \"$($r.notStarted) $($r.timedOut) [$($r.exit)] $($r.killConfirmed) $([int][Math]::Floor($c.Elapsed.TotalSeconds))\"; exit 0"
         held = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Process -FilePath pwsh -ArgumentList ''-NoProfile'',''-Command'',''Start-Sleep 10'' -NoNewWindow; Write-Output hi') -TimeoutSec 60 -Clock $c -EndSec 3 -CleanupWaitMs 15000" + tail).split()
-        self.assertEqual(held[:4], ["False", "True", "[]", "True"], held)
+        self.assertEqual(held[:4], ["False", "True", "[]", "False"], held)   # (r10 G14: the root had exited, a descendant held the stdout: root-only, never confirmed)
         self.assertLess(int(held[4]), 7, "the stream drain ran on past the sampled end: " + " ".join(held))
 
     def test_r8_a3_a_timeout_after_the_root_exited_still_kills_its_descendants_and_never_confirms_a_kill_it_did_not_make(self) -> None:
@@ -1715,7 +1716,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
                "-TimeoutSec 60 -Clock $c -EndSec 3 -TestAfterStartDelayMs 6000 -CleanupWaitMs 1000; "
                "$kids = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$($r.childPid)\" | Where-Object { $_.Name -like 'pwsh*' }); "
                "\"$($r.timedOut) $($r.killConfirmed) kids=$($kids.Count)\"; $kids | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; exit 0")
-        self.assertEqual(pwsh_text(run), "True True kids=0", "a descendant of a root that had already exited survived a timeout reported as a confirmed kill")
+        self.assertEqual(pwsh_text(run), "True False kids=0", "a descendant of a root that had already exited survived a timeout, or the kill of an exited root was reported confirmed (r10 G14: root-only is never confirmed)")
         text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
         self.assertNotIn("elseif (-not $p.HasExited) { try { $p.Kill($true) }", body, "the tree kill is no longer skipped for a root that already exited")
@@ -1730,7 +1731,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
                "$kids = @(Get-CimInstance Win32_Process -Filter \"ParentProcessId=$($r.childPid)\" | Where-Object { $_.Name -like 'pwsh*' }); "
                "\"$($r.timedOut) [$($r.exit)] $($r.killConfirmed) $sec kids=$($kids.Count)\"; $kids | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; exit 0")
         got = pwsh_text(run).split()
-        self.assertEqual([got[0], got[1], got[2], got[4]], ["True", "[]", "True", "kids=0"], got)
+        self.assertEqual([got[0], got[1], got[2], got[4]], ["True", "[]", "False", "kids=0"], got)   # (r10 G14: the root had exited before the kill: root-only, never confirmed)
         self.assertLess(int(got[3]), 16, "the stream drain was held on past the sampled end by a wait sized before the pause: " + " ".join(got))
         text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
@@ -1747,7 +1748,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         expired = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','{spawn}Start-Sleep 60') -TimeoutSec 4 -Clock $c -EndSec 600 -CleanupWaitMs 3000; " + kids)
         self.assertEqual(expired, "True [] True kids=0", "the wait that expired on a running root left a descendant")
         after_end = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','{spawn}exit 0') -TimeoutSec 60 -Clock $c -EndSec 4 -TestBeforeWaitDelayMs 6000 -CleanupWaitMs 3000; " + kids)
-        self.assertEqual(after_end, "True [] True kids=0", "an answer observed after the sampled end left a descendant of the exited root")
+        self.assertEqual(after_end, "True [] False kids=0", "an answer observed after the sampled end left a descendant of the exited root, or its kill was reported confirmed (r10 G14: root-only)")
         text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
         code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
@@ -1755,6 +1756,30 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         kill_at = code.index("if ($timedOut) { if ($TestKillThrows)")
         for m in re.finditer(r"\$timedOut = \$true", code):
             self.assertLess(m.start(), kill_at, "a site sets $timedOut after the one kill: it would time out without killing")
+
+    def test_r10_g14_a_kill_after_the_root_and_its_intermediate_parent_exited_is_root_only_and_never_confirmed(self) -> None:
+        """r10 (Grok G14 = adversary r9 pass 20/21 A1): a timeout whose ROOT had already exited was reported killConfirmed from the root's HasExited, so a grandchild whose parent exited first (the chain Kill($true) walks
+        is gone) ran on under a confirmed kill. Whether the root was gone is read BEFORE the kill: that kill is killScope 'root-only' and never confirmed; a kill of a running root is 'tree'; no timeout is 'none'.
+        The fixture (tools/repo_hygiene/venue_orphan_fixture.py) is the one the batch test uses too: root exited, intermediate exited, grandchild orphaned and alive."""
+        d = Path(tempfile.mkdtemp(prefix="orphan-chain-"))
+        pid_file = d / "grandchild.pid"
+        root = write_orphan_fixture(d, pid_file)
+        self.addCleanup(shutil.rmtree, d, True)
+        self.addCleanup(lambda: pid_file.exists() and kill_tree(grandchild_pid(pid_file)))
+        lead = f"$env:MLV_VENUE_BOUNDED_TEST_SEAMS = '1'; Import-Module '{MODULE}' -Force -DisableNameChecking; $c = [Diagnostics.Stopwatch]::StartNew(); "
+        tail = "; \"$($r.timedOut) [$($r.exit)] $($r.killConfirmed) $($r.killScope)\"; exit 0"
+        orphan = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-File','{root}') -TimeoutSec 60 -Clock $c -EndSec 3 -TestAfterStartDelayMs 20000 -CleanupWaitMs 3000" + tail)
+        self.assertTrue(pid_file.exists(), "the fixture's grandchild never started: the test proves nothing")
+        self.assertTrue(pid_is_alive(grandchild_pid(pid_file)), "the fixture's grandchild is gone, so the case under test (an orphan alive after the kill) was not built")
+        self.assertEqual(orphan, "True [] False root-only", "a kill after the root and its intermediate parent exited was confirmed from the root alone, with an orphaned grandchild alive")
+        running = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','Start-Sleep 60') -TimeoutSec 2 -CleanupWaitMs 3000" + tail)
+        self.assertEqual(running, "True [] True tree", "a kill of a root that was still running is a checked tree kill")
+        plain = pwsh_text(lead + f"$r = Invoke-VenueBoundedProcess -FilePath '{PWSH}' -ArgumentList @('-NoProfile','-Command','exit 0') -TimeoutSec 60" + tail)
+        self.assertEqual(plain, "False [0] True none", "no timeout is no kill")
+        text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
+        body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
+        code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+        self.assertLess(code.index("$rootExitedBeforeKill = ($timedOut -and [bool]$p.HasExited)"), code.index("$p.Kill($true)"), "the root's state is read before the kill, never after it")
 
     def test_r11_bounded_process_cleanup_waits_share_one_budget_and_a_failed_tree_kill_is_never_confirmed(self) -> None:
         """EXPORT-VENUE-LEG-1 r11 (adversary r11 A5, A6). A6: after the bound, the kill wait and both stream waits shared 3 x 15 s past a caller's deadline; a grandchild that outlives its parent
@@ -1773,7 +1798,7 @@ class VenueChainSupplementaryTests(unittest.TestCase):
         text = (DV / "VenueChain.psm1").read_text(encoding="utf-8")
         body = text[text.index("function Invoke-VenueBoundedProcess"):text.index("function Get-VenueDriverScriptMissing")]
         self.assertIn("try { $p.Kill($true) } catch { $killErrored = $true }", body, "a tree kill that threw is recorded, not swallowed")
-        self.assertIn("killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })", body)
+        self.assertIn("killConfirmed = $(if ($timedOut) { (-not $killErrored) -and (-not $rootExitedBeforeKill) -and [bool]$p.HasExited } else { $true })", body)
 
     def test_staged_manifest_states(self) -> None:
         q = f"Import-Module '{MODULE}' -Force -DisableNameChecking; $r = Get-VenueStagedBuildManifest -AgentShare '{{}}' -SourceCommit '{SHA}' -TimeoutSec 20; \"$($r.state) $($r.sha256)\""

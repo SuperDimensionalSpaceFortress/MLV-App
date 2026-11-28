@@ -482,12 +482,12 @@ function Invoke-BatchBoundedChild {
     $leftSec = $EndSec - $Clock.Elapsed.TotalSeconds
     $boundSec = $(if ([double]::IsNaN($leftSec)) { 0 } else { [int][Math]::Min($CapSec, [Math]::Floor([Math]::Max(0.0, $leftSec))) })
     $notStarted = $(if ([DateTime]::UtcNow -ge $StartBeforeUtc) { 'DEADLINE' } elseif ($boundSec -lt 1) { 'ROOM' } else { '' })
-    if ($notStarted) { return [pscustomobject]@{ started = $false; reason = $notStarted; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = ''; lateKind = ''; childPid = $null } }
+    if ($notStarted) { return [pscustomobject]@{ started = $false; reason = $notStarted; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killScope = 'none'; killConfirmed = $true; stdout = ''; stderr = ''; lateKind = ''; childPid = $null } }
     # (r5 pass 14 A2: the module is handed the stopwatch, the end and the deadline too, so the wait it makes AFTER Process.Start is what is left of the sampled end, not a fresh relative bound, and a child that came to
     # life only after the deadline is killed at once and comes back notStarted)
     $r = Invoke-VenueBoundedProcess -FilePath $FilePath -ArgumentList $ArgumentList -TimeoutSec $boundSec -CleanupWaitMs $CleanupWaitMs -Clock $Clock -EndSec $EndSec -StartBeforeUtc $StartBeforeUtc -TestStartDelayMs ($BoundedChildStartDelaySec * 1000) -TestKillThrows:$BoundedChildKillFails
     # r6 (Grok G10): reason KILLED_AT_START is a child that WAS started (childPid) and killed at once, so started stays $false (no answer) but killConfirmed and childPid say what became of it; every caller reads them
-    if ($r.notStarted) { return [pscustomobject]@{ started = $false; reason = [string]$r.reason; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = [bool]$r.killConfirmed; stdout = ''; stderr = ''; lateKind = [string]$r.lateKind; childPid = $r.childPid } }
+    if ($r.notStarted) { return [pscustomobject]@{ started = $false; reason = [string]$r.reason; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killScope = [string]$r.killScope; killConfirmed = [bool]$r.killConfirmed; stdout = ''; stderr = ''; lateKind = [string]$r.lateKind; childPid = $r.childPid } }
     if ($BoundedChildReturnDelaySec -gt 0) { [Threading.Thread]::Sleep($BoundedChildReturnDelaySec * 1000) }
     # r8 (adversary r8 pass 18 A2): an answer in hand only after the SAMPLED END is a timeout, whatever -NotAfterUtc says (the run deadline can be minutes beyond a 120 s capped end): the module judges it up to its own return,
     # and the return path above (a parent descheduled after it) is judged here, from the same stopwatch.
@@ -495,17 +495,22 @@ function Invoke-BatchBoundedChild {
     # r9 (Grok G13, adversary r9 pass 19 A2): a timeout made HERE is not one the module killed: the module read the answer in time (killConfirmed $true, nothing killed), so a descendant of the root that answered can still be
     # running. The tree is killed from the module's Process (Kill($true) of an exited root takes its surviving descendants, measured in r8), and killConfirmed is read from THAT kill: no kill error and the root gone; a kill
     # that cannot be made (no Process, a throw, -BoundedChildKillFails) is not confirmed, so Get-UnconfirmedKillText and LEG_KILL_UNCONFIRMED see it. A timeout the module made keeps the module's own kill and confirmation.
+    # r10 (Grok G14 = adversary r9 pass 20/21 A1): the confirmation above is read from a root's HasExited, and a root that had ALREADY exited before this kill says nothing about a grandchild whose parent exited first (the chain
+    # Kill($true) walks is gone). Whether the root was gone is read BEFORE the kill; such a kill is made (best effort) but is killScope 'root-only' and killConfirmed $false, never confirmed from the root alone.
     $killConfirmed = $r.killConfirmed
+    $killScope = [string]$r.killScope
     if (-not $answered -and -not $r.timedOut) {
         $killErrored = $false
+        $rootExitedBeforeKill = [bool]($r.process -and $r.process.HasExited)
         if (-not $r.process) { $killErrored = $true } elseif ($BoundedChildKillFails) { $killErrored = $true } else { try { $r.process.Kill($true) } catch { $killErrored = $true } }
         $killConfirmed = $false
-        if (-not $killErrored) { [void]$r.process.WaitForExit([Math]::Max(500, [Math]::Min($CleanupWaitMs, 5000))); $killConfirmed = [bool]$r.process.HasExited }
+        $killScope = $(if ($rootExitedBeforeKill) { 'root-only' } else { 'tree' })
+        if (-not $killErrored -and -not $rootExitedBeforeKill) { [void]$r.process.WaitForExit([Math]::Max(500, [Math]::Min($CleanupWaitMs, 5000))); $killConfirmed = [bool]$r.process.HasExited }
     }
-    [pscustomobject]@{ started = $true; reason = ''; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $(if ($answered) { $r.exit } else { $null }); timedOut = (-not $answered); killConfirmed = $killConfirmed; stdout = $r.stdout; stderr = $r.stderr; lateKind = ''; childPid = $r.childPid }
+    [pscustomobject]@{ started = $true; reason = ''; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $(if ($answered) { $r.exit } else { $null }); timedOut = (-not $answered); killScope = $killScope; killConfirmed = $killConfirmed; stdout = $r.stdout; stderr = $r.stderr; lateKind = ''; childPid = $r.childPid }
 }
 # r6 fix (adversary r6 pass 15 A5): a late answer that was also a timeout whose kill is unconfirmed says so (the late branch returns before the timeout branch's own wording)
-function Get-UnconfirmedKillText($Child) { if ($Child.timedOut -and -not $Child.killConfirmed) { ' (the child was also killed at its bound with the kill UNCONFIRMED: it may still be running)' } else { '' } }
+function Get-UnconfirmedKillText($Child) { if ($Child.timedOut -and -not $Child.killConfirmed) { ' (the child was also killed at its bound with the kill UNCONFIRMED: it may still be running' + $(if ($Child.killScope -ceq 'root-only') { '; the root had already exited, so only the root was checked and a descendant of it may remain' } else { '' }) + ')' } else { '' } }
 # r6 fix: the one wording of a bounded child that WAS started and killed at once (reason KILLED_AT_START), for the three preflights: when (lateKind), the pid and whether the kill is confirmed
 function Get-KilledAtStartText($Child) {
     "was started (pid $($Child.childPid)) $(if ($Child.lateKind -ceq 'ROOM') { 'with the room sampled for it already used up' } else { 'after -DeadlineUtc' }) and killed at once ($(if ($Child.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))"
@@ -3332,7 +3337,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                         $inFlightLeg = $null
                         $kc = [bool]$lp.killConfirmed
                         $lateWhy = $(if ($lp.lateKind -ceq 'ROOM') { "with the lease's sampled end already used up" } else { "after the run deadline (deadline=$($deadline.ToString('o')))" })
-                        $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; class = $(if ($kc) { 'KILLED_AT_START' } else { 'KILL_UNCONFIRMED' }); counted = $false; killConfirmed = $kc; lateKind = [string]$lp.lateKind; childPid = $lp.childPid; jobId = $null; legSec = 0; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }
+                        $row = [ordered]@{ batch = $batchNo; attempt = $attempt; status = 'LEG_FAILED'; outcome = 'INVALID'; class = $(if ($kc) { 'KILLED_AT_START' } else { 'KILL_UNCONFIRMED' }); counted = $false; killConfirmed = $kc; killScope = [string]$lp.killScope; lateKind = [string]$lp.lateKind; childPid = $lp.childPid; jobId = $null; legSec = 0; heatAtProbe = $th.firstHeat; heatAtProbeText = $th.firstHeatText }
                         $b.legs.Add([pscustomobject]$row); Add-Result $leg 'LEG_FAILED' $row; $pending.RemoveAt(0)
                         Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                         $startedText = "was started (pid $($lp.childPid)) $lateWhy and killed at once ($(if ($kc) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))"
@@ -3391,7 +3396,7 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                     Add-PlanIdentity $b.legs[$b.legs.Count - 1] $leg
                     $b.endReason = 'LEASE_EXPIRED'; $b.endDetail = "leg $($leg.name) was still running at the lease's end ($legSec s, bound $legBoundSec s): $(if ($lp.killConfirmed) { 'killed with its process tree' } else { 'kill UNCONFIRMED: the child may still be running' }); job $legJobId cancel=$($cx.state)$(if ($cx.error) { " ($($cx.error))" })"
                     # r6 (Grok G10 field sweep): killConfirmed was never read for a leg: a tree kill that could not be confirmed left a child that may still be running, and the next batch opened a lease anyway. It stops the run (exit 7 kept).
-                    if (-not $lp.killConfirmed) { $b.legs[$b.legs.Count - 1] | Add-Member -NotePropertyName killConfirmed -NotePropertyValue $false -Force; Set-Stop 'LEG_KILL_UNCONFIRMED' 7; LogBest "LEG $($leg.name) KILL_UNCONFIRMED batch=$batchNo reason=LEASE_EXPIRED (kill UNCONFIRMED: the child may still be running; the run stops)" }
+                    if (-not $lp.killConfirmed) { $b.legs[$b.legs.Count - 1] | Add-Member -NotePropertyName killConfirmed -NotePropertyValue $false -Force; $b.legs[$b.legs.Count - 1] | Add-Member -NotePropertyName killScope -NotePropertyValue ([string]$lp.killScope) -Force; Set-Stop 'LEG_KILL_UNCONFIRMED' 7; LogBest "LEG $($leg.name) KILL_UNCONFIRMED batch=$batchNo reason=LEASE_EXPIRED (kill UNCONFIRMED: the child may still be running; the run stops)" }
                     L "LEG $($leg.name) LEASE_EXPIRED batch=$batchNo legSec=$legSec boundSec=$legBoundSec outcome=INVALID counted=False jobId=$legJobId cancel=$($cx.state) ($(if ($lp.killConfirmed) { "killed with its process tree at the lease's end" } else { "kill UNCONFIRMED at the lease's end: the child may still be running" }))"
                     if ($exitCode -eq 0) { $exitCode = 7 }
                     break
