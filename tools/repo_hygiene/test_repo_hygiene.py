@@ -1573,9 +1573,12 @@ class RepoHygieneTests(unittest.TestCase):
         self.assertIn(f"Windows Product Oracles part ${{{{ matrix.part }}}}/{len(part_numbers)}", part)
         self.assertEqual(re.findall(r"(?m)^\s*\$partCount = (\d+)$", part), [str(len(part_numbers))])
         self.assertIn("$part = [int]'${{ matrix.part }}'", part)
-        seeds = re.findall(r"(?m)^\s*\$partLoad = @\(([0-9., ]+)\)$", part)
-        self.assertEqual(len(seeds), 1)
-        self.assertEqual(len(seeds[0].split(",")), len(part_numbers))
+        # The seeds are measured data (CI-FLAKE-PRODUCT-ORACLES-PART1-CHECK-GOLDEN-CAP-1), one per
+        # part; test_ci_pipeline_part_budget.py prices every part against a stated budget.
+        self.assertEqual(len(re.findall(r"(?m)^\s*\$partLoad = @\(", part)), 1)
+        self.assertIn("$partLoad = @($weightTable.partSeedMillis | ForEach-Object { [long]$_ })", part)
+        weights = json.loads((ROOT / "tools" / "testing" / "pipeline_test_weights.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(weights["partSeedMillis"]), len(part_numbers))
         # Coverage: the plan is split by an assignment over the full plan, proven a disjoint
         # cover in every part, and each part runs only its own shards.
         self.assertIn("pipeline parts do not cover each shard exactly once", part)
