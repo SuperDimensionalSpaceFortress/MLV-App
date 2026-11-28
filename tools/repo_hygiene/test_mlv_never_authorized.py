@@ -9158,5 +9158,515 @@ for _case in CASES:
         setattr(Na6DifferentialTests, _name, _make_differential(_case))
 
 
+# ---------------------------------------------------- HOOK-NA2-OWN-RUNDIR-EDIT-AND-CREATE-1
+#
+# One row per measured NA-2 deny the card cites (the run dir's deny-rows.md, rows 1-19), plus
+# TP controls.  A flip row (FP, or a TP-by-rule slip the card admits) expects ALLOW and is RED on
+# master; a TP row expects DENY on both.  The calling lane's run dir is a DIRECT child of the
+# tmp board's fleet-runs named `lane-*`, and MLV_LANE_PROMPT points at its prompt.md, exactly as
+# the dispatcher sets it.  Heredoc bodies and trailing commands the cited summaries elide are
+# benign stand-ins.
+
+NA2_OWN_LEAF = "lane-NA2-OWN-r1-20261118T0000Z"
+NA2_OTHER_LEAF = "lane-NA2-OTHER-r8-20261117T1050Z"
+NA2_OWN_EXISTING = {
+    "claim_check_r12.py": "x = 1  # a scratch file the lane wrote earlier\n",
+    "disp-0e54cef3.json": '{"disposition": "a longer earlier draft of this file"}\n',
+    "fast-suites-2.args.txt": "a\nb\nc\nd\ne\nf\n",
+    "reread-r21.ps1": "Write-Output ('{0} {1}' -f $a, $b)\n",
+    "summary.md": "PARTIAL in-progress (lane started; this line is replaced at the end)\n",
+    "existing.txt": "already here\n",
+}
+
+
+def _na2_own_run(paths, with_prompt):
+    fleet = os.path.join(paths["BOARD"], ".claude-state", "fleet-runs")
+    own = os.path.join(fleet, NA2_OWN_LEAF)
+    other = os.path.join(fleet, NA2_OTHER_LEAF)
+    hub = os.path.join(fleet, "hub-tools")
+    for name, text in NA2_OWN_EXISTING.items():
+        _write(os.path.join(own, name), text)
+        _write(os.path.join(other, name), text)
+    _write(os.path.join(other, "sonnet-001.out.txt"), '{"command": "stand-in"}\n')
+    _write(os.path.join(hub, "Start-AdversaryPass.ps1"), "# stand-in\n")
+    prompt = os.path.join(own, "prompt.md")
+    _write(prompt, "# NA2 own-run-dir lane prompt\n")
+    paths.update(
+        {"FLEET": fleet, "OWN_RUN": own, "OWN_LEAF": NA2_OWN_LEAF, "OTHER_RUN": other,
+         "HUB_TOOLS": hub}
+    )
+    return {"MLV_LANE_PROMPT": prompt} if with_prompt else {}
+
+
+FIXTURES["na2_own_run"] = lambda paths: _na2_own_run(paths, True)
+FIXTURES["na2_own_run_no_prompt"] = lambda paths: _na2_own_run(paths, False)
+
+
+def _na2_row(name, tool, value, expect, fixture="na2_own_run", **extra):
+    if tool in ("Bash", "PowerShell"):
+        tool_input = {"command": value}
+    else:
+        tool_input = value
+    row = {"name": "NA2-OWN " + name, "tool": tool, "input": tool_input, "expect": expect,
+           "fixture": fixture}
+    if expect == "DENY":
+        row["na"] = extra.pop("na", "NA-2")
+    row.update(extra)
+    return row
+
+
+_HEREDOC = "cat > \"{OWN_RUN}/%s\" <<'EOF'\nprint(\"stand-in body\")\nEOF\npy -3 \"{OWN_RUN}/%s\""
+
+NA2_OWN_RUN_ROWS = [
+    # ---- flip rows: DENY on master, ALLOW here
+    _na2_row("row 01 ROADMAP r1 Out-File create of red.txt", "PowerShell",
+             'Set-Location "{WORKTREE}"; py -3 -m unittest tools.coordination.test_render_roadmap'
+             ' -v 2>&1 | Out-File -FilePath "{OWN_RUN}\\red.txt"; "exit=$LASTEXITCODE"', "ALLOW"),
+    _na2_row("row 02 OWNER r5 heredoc create of patch_hdr.py", "Bash",
+             _HEREDOC % ("patch_hdr.py", "patch_hdr.py"), "ALLOW"),
+    _na2_row("row 03 OWNER r6 git show redirect create", "Bash",
+             'git show fork/master:tools/coordination/render_roadmap.py > "{OWN_RUN}/master_rr.py"',
+             "ALLOW"),
+    _na2_row("row 04 OWNER r8 Remove-Item Env drive after commit-tree", "PowerShell",
+             "$run='{OWN_RUN}'; $env:GIT_AUTHOR_NAME='Lane'; "
+             "$env:GIT_AUTHOR_EMAIL='lane@example.invalid'; "
+             "$env:GIT_AUTHOR_DATE='2026-11-17T11:00:00Z'; "
+             'git -C "{WORKTREE}" commit-tree 0123abc -p 4567def -F "$run\\msg-1.txt"; '
+             "Remove-Item Env:GIT_AUTHOR_NAME, Env:GIT_AUTHOR_EMAIL, Env:GIT_AUTHOR_DATE",
+             "ALLOW"),
+    _na2_row("row 05 OWNER r11 fast-suites redirect create", "Bash",
+             "py -3 tools/coordination/doctrine_outbox.py --repo . check-commits --range "
+             "fork/master..HEAD 2>&1 | tail -5; pwsh -NoProfile -File "
+             '"{HUB_TOOLS}/fast-suites-for-diff.ps1" -WorkDir "{WORKTREE}" -Run > '
+             '"{OWN_RUN}/fast-suites.txt" 2>&1; echo "exit=$?"', "ALLOW"),
+    _na2_row("row 06 DOCTRINE r7 Remove-Item Env GIT_DIR with ErrorAction", "PowerShell",
+             "$run='{OWN_RUN}'\nSet-Location '{WORKTREE}'\n"
+             "Remove-Item Env:GIT_DIR -ErrorAction SilentlyContinue\n"
+             "py -3 -m pytest tests/coordination/test_doctrine_outbox.py -q 2>&1 | "
+             'Out-File -Append -Encoding utf8 "$run\\pytest-r7.txt"', "ALLOW"),
+    _na2_row("row 07 DOCTRINE r9 heredoc create of trim_card.py", "Bash",
+             _HEREDOC % ("trim_card.py", "trim_card.py"), "ALLOW"),
+    _na2_row("row 08 DOCTRINE r11 heredoc create of rewrite.py", "Bash",
+             _HEREDOC % ("rewrite.py", "rewrite.py"), "ALLOW"),
+    _na2_row("row 09 DOCTRINE r12 shrinking Edit of claim_check_r12.py", "Edit",
+             {"file_path": "{OWN_RUN}/claim_check_r12.py",
+              "old_string": "x = 1  # a scratch file the lane wrote earlier",
+              "new_string": "x = 1  # scratch"}, "ALLOW"),
+    _na2_row("row 10 MINI3 r24 tee create beside a quoted cp ln pattern", "Bash",
+             'git diff fork/master...HEAD --name-only | tee "{OWN_RUN}\\pr-files-r24.txt" | '
+             "head -80; grep -nEi '\\$(cp|ln)\\b' tools/coordination/x.sh | head -20", "ALLOW"),
+    _na2_row("row 11 CI-HYGIENE r4 shorter Write of disp json", "Write",
+             {"file_path": "{OWN_RUN}/disp-0e54cef3.json", "content": '{"d": 1}\n'}, "ALLOW"),
+    _na2_row("row 12 LOOK-LABEL r3 shorter Write of args txt", "Write",
+             {"file_path": "{OWN_RUN}/fast-suites-2.args.txt", "content": "a\nb\nc\n"},
+             "ALLOW"),
+    _na2_row("row 13 HFR r4 shrinking Edit of reread ps1", "Edit",
+             {"file_path": "{OWN_RUN}/reread-r21.ps1",
+              "old_string": "Write-Output ('{0} {1}' -f $a, $b)", "new_string": "Write-Output $a"},
+             "ALLOW"),
+    _na2_row("row 14 CI-FLAKE r2 heredoc create of edit1.py", "Bash",
+             _HEREDOC % ("edit1.py", "edit1.py"), "ALLOW"),
+    _na2_row("row 15 this card r1 quoted Remove-Item pattern over another lane", "PowerShell",
+             'Get-Date -AsUTC; $o="{OTHER_RUN}\\sonnet-001.out.txt"; (Get-Item $o).Length; '
+             "Select-String -Path $o -Pattern 'Remove-Item Env:' -SimpleMatch | Select-Object "
+             "-First 1 | ForEach-Object { $l=$_.Line; $i=$l.IndexOf('\"command\"'); "
+             "$l.Substring([Math]::Max(0,$i), [Math]::Min(3000, $l.Length-[Math]::Max(0,$i))) }",
+             "ALLOW"),
+    _na2_row("row 19 hub listing with rm- inside a quoted match regex", "PowerShell",
+             'Get-ChildItem -LiteralPath "{HUB_TOOLS}" -Filter *.ps1 | Where-Object '
+             "{ $_.Name -match 'Confirm|rm-' } | Select-Object -ExpandProperty Name", "ALLOW"),
+    # ---- rows that stay DENY
+    _na2_row("row 16 VENUE-SMOKE r7 rm of a variable path after cd", "Bash",
+             'cd /c/mlvtmp/lane-VENUE-SMOKE-PROCESS-TIMEOUT-BOUND-1-20261117 && R="{OWN_RUN}"; '
+             'rm -f "$R/red.txt"; py -3 -B -m pytest tools/repo_hygiene/test_x.py -q', "DENY",
+             reason_contains="deleting"),
+    _na2_row("row 17 HUB-TICK quoted rm passed to a script by the call operator", "PowerShell",
+             "$fr='{BOARD}\\.claude-state\\fleet-runs'; & "
+             '"{BOARD}\\.claude-state\\hub-autopilot\\Add-PendingAction.ps1" -Id x -Run y '
+             '-RunArgs "-RunDir `"$fr\\lane-X`" -Why `"r7 PARTIAL HOOK_DENY NA-2 (own rm -f) '
+             'after RED`"" -WhenSlotFree', "DENY", reason_contains="deleting"),
+    _na2_row("row 18 lane Edit of its own gate", "Edit",
+             {"file_path": "{REPO}/tools/hooks/mlv-never-authorized.py", "old_string": "a",
+              "new_string": "b"}, "DENY", na="NA-10"),
+    # ---- TP controls (DENY on both)
+    _na2_row("tp other lane run dir shrinking Edit", "Edit",
+             {"file_path": "{OTHER_RUN}/claim_check_r12.py",
+              "old_string": "x = 1  # a scratch file the lane wrote earlier",
+              "new_string": "x = 1"}, "DENY", reason_contains="shrinking"),
+    _na2_row("tp no lane prompt shrinking Edit", "Edit",
+             {"file_path": "{OWN_RUN}/claim_check_r12.py",
+              "old_string": "x = 1  # a scratch file the lane wrote earlier",
+              "new_string": "x = 1"}, "DENY", fixture="na2_own_run_no_prompt"),
+    _na2_row("tp subdirectory shell create", "PowerShell",
+             '"x" | Out-File -FilePath "{OWN_RUN}\\sub\\new.txt"', "DENY",
+             reason_contains="truncating write"),
+    _na2_row("tp guarded summary shrinking Edit", "Edit",
+             {"file_path": "{OWN_RUN}/summary.md",
+              "old_string": "PARTIAL in-progress (lane started; this line is replaced at the end)",
+              "new_string": "DONE"}, "DENY", reason_contains="shrinking"),
+    _na2_row("tp guarded adversary deadline shell create", "PowerShell",
+             'Get-Date | Out-File -FilePath "{OWN_RUN}\\adversary-deadline.txt"', "DENY"),
+    _na2_row("tp guarded seat guard file shell create", "PowerShell",
+             '"import sys" | Out-File -FilePath "{OWN_RUN}\\opus-001.lane-no-background.py"',
+             "DENY"),
+    _na2_row("tp existing file shell truncate", "PowerShell",
+             'py -3 -c "print(1)" > "{OWN_RUN}\\existing.txt"', "DENY"),
+    _na2_row("tp glob spelling shell create", "PowerShell",
+             '"x" | Out-File -FilePath "{OWN_RUN}\\fresh*.txt"', "DENY"),
+    _na2_row("tp dotdot spelling shell create", "PowerShell",
+             '"x" | Out-File -FilePath "{FLEET}\\lane-new\\..\\{OWN_LEAF}\\fresh-b.txt"', "DENY"),
+    _na2_row("tp short name alias shrinking Edit", "Edit",
+             {"file_path": "{OWN_RUN}/SUMMAR~1.MD", "old_string": "PARTIAL in-progress",
+              "new_string": "X"}, "DENY"),
+    _na2_row("tp trailing dot alias shrinking Edit", "Edit",
+             {"file_path": "{OWN_RUN}/claim_check_r12.py.",
+              "old_string": "x = 1  # a scratch file the lane wrote earlier",
+              "new_string": "x = 1"}, "DENY"),
+    _na2_row("tp New-Item HardLink then redirect in one command", "PowerShell",
+             'New-Item -ItemType HardLink -Path "{OWN_RUN}\\fresh-link.txt" -Target '
+             '"{OWN_RUN}\\summary.md"; "" > "{OWN_RUN}\\fresh-link.txt"', "DENY"),
+    _na2_row("tp Env drive beside a real run dir operand", "PowerShell",
+             'Remove-Item Env:X, "{OWN_RUN}\\summary.md"', "DENY", reason_contains="deleting"),
+    _na2_row("tp pipeline fed Remove-Item", "PowerShell",
+             'Get-ChildItem "{OWN_RUN}" -Filter *.tmp | Remove-Item', "DENY",
+             reason_contains="deleting"),
+    _na2_row("tp literal own run delete", "PowerShell",
+             'Remove-Item -LiteralPath "{OWN_RUN}\\existing.txt"', "DENY",
+             reason_contains="deleting"),
+    _na2_row("tp literal own run move", "PowerShell",
+             'Move-Item "{OWN_RUN}\\existing.txt" "{OWN_RUN}\\moved.txt"', "DENY",
+             reason_contains="moving"),
+    _na2_row("tp NA-6 test delete in its own statement beside an Env drive delete",
+             "PowerShell",
+             "Remove-Item Env:GIT_DIR; Remove-Item tests/coordination/test_x.py", "DENY",
+             na="NA-6"),
+    _na2_row("tp quoted verb with an evaluator in the command", "PowerShell",
+             "pwsh -NoProfile -Command 'Remove-Item Env:X'; "
+             'Get-Item "{OTHER_RUN}\\sonnet-001.out.txt"', "DENY", reason_contains="deleting"),
+]
+
+
+class Na2OwnRunDirRowTests(unittest.TestCase):
+    """HOOK-NA2-OWN-RUNDIR-EDIT-AND-CREATE-1: one method per deny row and TP control."""
+
+    maxDiff = None
+    setUp = MlvNeverAuthorizedHookTests.setUp
+    _substitute = MlvNeverAuthorizedHookTests._substitute
+    _render_content = MlvNeverAuthorizedHookTests._render_content
+    _bind_the_enable_literal = MlvNeverAuthorizedHookTests._bind_the_enable_literal
+    _invoke = MlvNeverAuthorizedHookTests._invoke
+    _run_case = MlvNeverAuthorizedHookTests._run_case
+
+    def _link_case(self, make_link, tool_input_for):
+        overrides = FIXTURES["na2_own_run"](self.paths)
+        alias = os.path.join(self.paths["OWN_RUN"], "alias.txt")
+        try:
+            make_link(os.path.join(self.paths["OWN_RUN"], "summary.md"), alias)
+        except (OSError, AttributeError, NotImplementedError) as exc:
+            self.skipTest("this OS refused the link: %s" % exc)
+        stdin_text = json.dumps({"tool_name": "Write", "tool_input": tool_input_for(alias)})
+        completed = self._invoke(stdin_text, overrides)
+        self.assertEqual(completed.returncode, 2, completed.stderr)
+        self.assertTrue(completed.stderr.strip().startswith("NA-2:"), completed.stderr)
+
+    def test_na2_own_hardlinked_file_shrinking_write_stays_deny(self):
+        self._link_case(os.link, lambda alias: {"file_path": alias, "content": "x"})
+
+    def test_na2_own_symlinked_file_shrinking_write_stays_deny(self):
+        self._link_case(os.symlink, lambda alias: {"file_path": alias, "content": "x"})
+
+
+for _case in NA2_OWN_RUN_ROWS:
+    _name = "test_" + _slug(_case["name"])
+    if _name in _seen:
+        raise RuntimeError("duplicate table row name: %s" % _case["name"])
+    _seen.add(_name)
+    setattr(Na2OwnRunDirRowTests, _name, _make_test(_case))
+
+
+# G2 (differential): a caller that HAS an own run dir must never turn a table DENY into an
+# ALLOW, except for the rows named here (reviewed in the PR body).  Every DENY row of CASES is
+# replayed with its own fixture plus MLV_LANE_PROMPT at a `lane-*` run dir -- the first one its
+# input names, else a default -- so the admits are exercised against every refusal the table
+# already pins.
+OWN_RUN_DIR_INTENDED_ALLOWS = frozenset()
+_G2_DEFAULT_LEAF = "lane-DIFF-OWN-r1-20261118T0000Z"
+
+
+class Na2OwnRunDirDifferentialTests(unittest.TestCase):
+    """G2: every DENY row of CASES stays DENY when the caller has an own run dir."""
+
+    maxDiff = None
+    setUp = MlvNeverAuthorizedHookTests.setUp
+    _substitute = MlvNeverAuthorizedHookTests._substitute
+    _render_content = MlvNeverAuthorizedHookTests._render_content
+    _bind_the_enable_literal = MlvNeverAuthorizedHookTests._bind_the_enable_literal
+    _invoke = MlvNeverAuthorizedHookTests._invoke
+
+    def _own_run_differential(self, case):
+        overrides = FIXTURES[case.get("fixture", "default")](self.paths)
+        self._bind_the_enable_literal()
+        if "raw" in case:
+            stdin_text = case["raw"]
+        else:
+            stdin_text = json.dumps(
+                {
+                    "tool_name": case["tool"],
+                    "tool_input": self._render_content(self._substitute(case["input"])),
+                }
+            )
+        if "MLV_LANE_PROMPT" not in overrides:
+            named = re.search(r"fleet-runs[\\/]+(lane-[^\\/\"'\s]+)", stdin_text)
+            leaf = named.group(1) if named else _G2_DEFAULT_LEAF
+            prompt = os.path.join(self.paths["BOARD"], ".claude-state", "fleet-runs", leaf,
+                                  "prompt.md")
+            if not os.path.exists(prompt):
+                _write(prompt, "# G2 own-run-dir lane prompt\n")
+            overrides = dict(overrides)
+            overrides["MLV_LANE_PROMPT"] = prompt
+        completed = self._invoke(stdin_text, overrides)
+        if case["name"] in OWN_RUN_DIR_INTENDED_ALLOWS:
+            return
+        self.assertEqual(
+            completed.returncode,
+            2,
+            "row %r became ALLOW with an own run dir: %r" % (case["name"], completed.stderr),
+        )
+
+
+def _make_own_run_differential(case):
+    def method(self):
+        self._own_run_differential(case)
+
+    method.__doc__ = "%s -> still DENY with an own run dir" % case["name"]
+    return method
+
+
+for _case in CASES:
+    if _case["expect"] == "DENY":
+        setattr(
+            Na2OwnRunDirDifferentialTests,
+            "test_" + _slug(_case["name"]),
+            _make_own_run_differential(_case),
+        )
+
+
+# ------------------------------------- HOOK-NA2-OWN-RUNDIR-EDIT-AND-CREATE-1 r4 (Dot B1, PR #843)
+#
+# B1-BASH-BOOLEAN-VARIABLE-ATTRIBUTION: `true`, `false` and `null` are ordinary assignable Bash
+# variables, so the PowerShell `$true/$false/$null` exemption must never let a Bash `rm $true`
+# bind to its own statement: an unresolved Bash expansion binds to the WHOLE command.  Every
+# DENY row below is admitted on 721ffe9c (RED) and refused with the fix.  The class rows pin the
+# other PowerShell-only exemptions (drive operands, preference values) and Bash tilde expansion
+# the same way; the PowerShell constants stay ALLOW.
+
+_B1_SEPARATORS = (("semicolon", "; "), ("newline", "\n"), ("and-and", " && "))
+
+NA2_BASH_BOOLEAN_ROWS = []
+for _var in ("true", "false", "null"):
+    for _sep_name, _sep in _B1_SEPARATORS:
+        _label = "b1 bash %s variable %s" % (_var, _sep_name)
+        NA2_BASH_BOOLEAN_ROWS.append(_na2_row(
+            _label + " protected delete", "Bash",
+            '%s="{OTHER_RUN}/existing.txt"%srm -f $%s' % (_var, _sep, _var), "DENY",
+            reason_contains="deleting"))
+        NA2_BASH_BOOLEAN_ROWS.append(_na2_row(
+            _label + " protected move", "Bash",
+            '%s="{OTHER_RUN}/existing.txt"%smv $%s "{WORKTREE}/moved.txt"' % (_var, _sep, _var),
+            "DENY", reason_contains="moving"))
+        NA2_BASH_BOOLEAN_ROWS.append(_na2_row(
+            _label + " NA-6 test delete", "Bash",
+            "%s=tests/coordination/test_x.py%srm -f $%s" % (_var, _sep, _var), "DENY",
+            na="NA-6"))
+
+NA2_BASH_BOOLEAN_ROWS += [
+    # ---- the class: every other PowerShell-only exemption is PowerShell-only too
+    _na2_row("b1 class bash Env drive operand after cd protected delete", "Bash",
+             'cd "{OTHER_RUN}" && rm -f Env:existing.txt', "DENY", reason_contains="deleting"),
+    _na2_row("b1 class bash Variable drive operand after cd protected move", "Bash",
+             'cd "{OTHER_RUN}" && mv Variable:existing.txt "{WORKTREE}/moved.txt"', "DENY",
+             reason_contains="moving"),
+    _na2_row("b1 class bash Alias drive operand after cd NA-6 test delete", "Bash",
+             "cd tests/coordination && rm -f Alias:test_x.py", "DENY", na="NA-6"),
+    _na2_row("b1 class bash preference value is an operand after cd", "Bash",
+             'cd "{OTHER_RUN}" && rm -f -ea stop "{WORKTREE}/scratch.txt"', "DENY",
+             reason_contains="deleting"),
+    _na2_row("b1 class bash tilde expands an assigned HOME", "Bash",
+             'HOME="{OTHER_RUN}"; rm -f ~/existing.txt', "DENY", reason_contains="deleting"),
+    # ---- controls: the PowerShell constants keep their exemption (ALLOW on both heads)
+    _na2_row("b1 control powershell true switch beside a protected read", "PowerShell",
+             'Remove-Item Env:X -Recurse:$true; Get-Content "{OTHER_RUN}\\existing.txt"',
+             "ALLOW"),
+    _na2_row("b1 control powershell false switch newline protected read", "PowerShell",
+             'Remove-Item Env:X -Confirm:$false\nGet-Content "{OTHER_RUN}\\existing.txt"',
+             "ALLOW"),
+    _na2_row("b1 control powershell null sink beside a protected read", "PowerShell",
+             '$null = Remove-Item Env:X; Get-Content "{OTHER_RUN}\\existing.txt"', "ALLOW"),
+    _na2_row("b1 control powershell false switch on a move beside a protected read",
+             "PowerShell",
+             'Rename-Item Env:X Y -Force:$false; Get-Content "{OTHER_RUN}\\existing.txt"',
+             "ALLOW"),
+    _na2_row("b1 control powershell false switch beside a test run", "PowerShell",
+             "Remove-Item Env:GIT_DIR -Confirm:$false; "
+             "py -3 -m pytest tests/coordination/test_x.py -q", "ALLOW"),
+    _na2_row("b1 control bash literal delete beside a protected read", "Bash",
+             'rm -f "{WORKTREE}/scratch.txt"; cat "{OTHER_RUN}/existing.txt"', "ALLOW"),
+]
+
+
+class Na2BashBooleanVariableTests(unittest.TestCase):
+    """Dot B1: the PowerShell-only exemptions never reach a Bash statement (full hook, inert)."""
+
+    maxDiff = None
+    setUp = MlvNeverAuthorizedHookTests.setUp
+    _substitute = MlvNeverAuthorizedHookTests._substitute
+    _render_content = MlvNeverAuthorizedHookTests._render_content
+    _bind_the_enable_literal = MlvNeverAuthorizedHookTests._bind_the_enable_literal
+    _invoke = MlvNeverAuthorizedHookTests._invoke
+    _run_case = MlvNeverAuthorizedHookTests._run_case
+
+
+for _case in NA2_BASH_BOOLEAN_ROWS:
+    _name = "test_" + _slug(_case["name"])
+    if _name in _seen:
+        raise RuntimeError("duplicate table row name: %s" % _case["name"])
+    _seen.add(_name)
+    setattr(Na2BashBooleanVariableTests, _name, _make_test(_case))
+
+
+# ------------------------------------- HOOK-NA2-OWN-RUNDIR-EDIT-AND-CREATE-1 r5 (PR #843)
+#
+# CMD-ARGUMENT-DELIMITER-ATTRIBUTION (safety-lint parity rows defeater-delimiter-15 and
+# main:defeater-delimiter-15, LOOSENED since r3): in cmd.exe `;`, `,`, `=`, space and tab are
+# ARGUMENT delimiters and only `&`, `&&`, `||` and `|` separate commands, so splitting a cmd body
+# on `;` detached `rd /s /q` from `;<run dir>`.  Inside a cmd body the verb binds the whole body,
+# a body cmd would read differently (`^`, `%`, `!name!`) binds the whole command, and a verb or
+# `cd` that cmd reaches past a leading `,`, `=` or `@` is still a verb.  Every "red" row is
+# admitted on 8b677fca and refused with the fix.  A "pin" row (a `,` or `=` ALONE before the
+# target, which the tokenizer already splits) is DENY on both heads.  The controls -- true `&`
+# and `&&` separators, an outer `;` before the cmd word -- are ALLOW on both.
+
+_R5_SPELLINGS = (
+    ("c", "semicolon", ";", "cmd /c"),
+    ("c", "comma", ",", "CMD.EXE /C"),
+    ("c", "equals", "=", "C:\\Windows\\System32\\cmd.exe /c"),
+    ("k", "semicolon", ";", "cmd /k"),
+    ("k", "comma", ",", "cmd.exe /K"),
+    ("k", "equals", "=", "Cmd /K"),
+)
+
+
+def _r5_switches(delim, first, second):
+    """`<first> <second>;` for `;`; else `<first>;<second><delim>` (still red on 8b677fca)."""
+    if delim == ";":
+        return "%s %s;" % (first, second)
+    return "%s;%s%s" % (first, second, delim)
+
+
+NA2_CMD_DELIMITER_ROWS = []
+for _switch, _dname, _delim, _cmd in _R5_SPELLINGS:
+    _label = "r5 red cmd %s %s" % (_switch, _dname)
+    NA2_CMD_DELIMITER_ROWS += [
+        _na2_row(_label + " protected dir delete", "PowerShell",
+                 '%s rd %s"{OTHER_RUN}"' % (_cmd, _r5_switches(_delim, "/s", "/q")), "DENY",
+                 reason_contains="deleting"),
+        _na2_row(_label + " protected file delete", "PowerShell",
+                 '%s del %s"{OTHER_RUN}\\existing.txt"' % (_cmd, _r5_switches(_delim, "/f", "/q")),
+                 "DENY", reason_contains="deleting"),
+        _na2_row(_label + " protected move", "PowerShell",
+                 '%s move %s"{OTHER_RUN}\\existing.txt" "{WORKTREE}\\moved.txt"'
+                 % (_cmd, _r5_switches(_delim, "/-y", "/y")), "DENY", reason_contains="moving"),
+        _na2_row(_label + " NA-6 test delete", "PowerShell",
+                 "%s del %stests/coordination/test_x.py" % (_cmd, _r5_switches(_delim, "/f", "/q")),
+                 "DENY", na="NA-6"),
+    ]
+
+NA2_CMD_DELIMITER_ROWS += [
+    # ---- red: the same class from Git Bash
+    _na2_row("r5 red bash cmd double slash c semicolon protected file delete", "Bash",
+             'cmd //c del /f /q;"{OTHER_RUN}/existing.txt"', "DENY", reason_contains="deleting"),
+    _na2_row("r5 red bash cmd c semicolon NA-6 test delete", "Bash",
+             "cmd /c del /f /q;tests/coordination/test_x.py", "DENY", na="NA-6"),
+    # ---- red: cmd skips a leading `,` `=` `@` before a command name, so these are verbs
+    _na2_row("r5 red cmd comma led del after a harmless delete", "PowerShell",
+             'cmd /c del /q "{WORKTREE}\\scratch.txt" & ,del /q "{OTHER_RUN}\\existing.txt"',
+             "DENY", reason_contains="deleting"),
+    _na2_row("r5 red cmd at led rd after a harmless delete", "PowerShell",
+             'cmd /c del /q "{WORKTREE}\\scratch.txt" & @rd /s /q "{OTHER_RUN}"', "DENY",
+             reason_contains="deleting"),
+    _na2_row("r5 red cmd equals led move after a harmless move", "PowerShell",
+             'cmd /c move /y "{WORKTREE}\\a.txt" "{WORKTREE}\\b.txt" & '
+             '=move /y "{OTHER_RUN}\\existing.txt" "{WORKTREE}\\moved.txt"', "DENY",
+             reason_contains="moving"),
+    _na2_row("r5 red cmd comma led cd then a relative delete", "PowerShell",
+             'cmd /c ,cd /d "{OTHER_RUN}" & del /q existing.txt', "DENY",
+             reason_contains="deleting"),
+    _na2_row("r5 red cmd at led cd then a relative NA-6 test delete", "PowerShell",
+             "cmd /c @cd tests\\coordination & del /q test_x.py", "DENY", na="NA-6"),
+    # ---- red: the own-run-dir create admit never covers a delete or move cmd can see
+    _na2_row("r5 red own run create after a comma led move of a run dir file", "PowerShell",
+             'cmd /c ,move /y "{OWN_RUN}\\existing.txt" "{OWN_RUN}\\fresh-cmd-a.txt" & '
+             'echo x > "{OWN_RUN}\\fresh-cmd-a.txt"', "DENY"),
+    _na2_row("r5 red own run create after an equals led ren of a run dir file", "PowerShell",
+             'cmd /c =ren "{OWN_RUN}\\existing.txt" fresh-cmd-b.txt & '
+             'echo x > "{OWN_RUN}\\fresh-cmd-b.txt"', "DENY"),
+    _na2_row("r5 red own run create after an at led del of a run dir file", "PowerShell",
+             'cmd /c @del /q "{OWN_RUN}\\existing.txt" & echo x > "{OWN_RUN}\\fresh-cmd-c.txt"',
+             "DENY"),
+    # ---- red: a body cmd reads differently from the lexer binds the whole command
+    _na2_row("r5 red cmd FOR variable carries the protected dir to rd", "PowerShell",
+             'cmd /c for %f in ("{OTHER_RUN}") do echo %f & rd /s /q %f', "DENY",
+             reason_contains="deleting"),
+    _na2_row("r5 red cmd caret escaped ampersand keeps the protected dir a del operand",
+             "PowerShell",
+             'cmd /c del /q "{WORKTREE}\\scratch.txt" ^& "{OTHER_RUN}"', "DENY",
+             reason_contains="deleting"),
+    _na2_row("r5 red cmd delayed expansion carries the protected dir to rd", "PowerShell",
+             'cmd /v:on /c set d="{OTHER_RUN}" & rd /s /q !d!', "DENY",
+             reason_contains="deleting"),
+    # ---- pins: a `,` or `=` ALONE before the target (DENY on both heads)
+    _na2_row("r5 pin cmd c comma alone before a protected file delete", "PowerShell",
+             'cmd /c del /f /q,"{OTHER_RUN}\\existing.txt"', "DENY", reason_contains="deleting"),
+    _na2_row("r5 pin cmd k equals alone before a protected move", "PowerShell",
+             'cmd /k move /y="{OTHER_RUN}\\existing.txt" "{WORKTREE}\\moved.txt"', "DENY",
+             reason_contains="moving"),
+    _na2_row("r5 pin cmd c comma alone before an NA-6 test delete", "PowerShell",
+             "cmd /c del /f /q,tests/coordination/test_x.py", "DENY", na="NA-6"),
+    # ---- controls: true cmd separators still end a statement (ALLOW on both heads)
+    _na2_row("r5 control cmd ampersand harmless read then own run create", "PowerShell",
+             'cmd /c type "{WORKTREE}\\notes.txt" & echo x > "{OWN_RUN}\\fresh-cmd-d.txt"',
+             "ALLOW"),
+    _na2_row("r5 control cmd ampersand harmless delete then protected read", "PowerShell",
+             'cmd /c del /q "{WORKTREE}\\scratch.txt" & type "{OTHER_RUN}\\existing.txt"',
+             "ALLOW"),
+    _na2_row("r5 control cmd k and-and harmless delete then protected read", "PowerShell",
+             'cmd /k del /q "{WORKTREE}\\scratch.txt" && type "{OTHER_RUN}\\existing.txt"',
+             "ALLOW"),
+    _na2_row("r5 control outer semicolon before the cmd word still ends a statement",
+             "PowerShell",
+             'Remove-Item Env:X; cmd /c type "{OTHER_RUN}\\existing.txt"', "ALLOW"),
+]
+
+
+class Na2CmdDelimiterTests(unittest.TestCase):
+    """PR #843 r5: cmd argument delimiters never end a statement (full hook, inert)."""
+
+    maxDiff = None
+    setUp = MlvNeverAuthorizedHookTests.setUp
+    _substitute = MlvNeverAuthorizedHookTests._substitute
+    _render_content = MlvNeverAuthorizedHookTests._render_content
+    _bind_the_enable_literal = MlvNeverAuthorizedHookTests._bind_the_enable_literal
+    _invoke = MlvNeverAuthorizedHookTests._invoke
+    _run_case = MlvNeverAuthorizedHookTests._run_case
+
+
+for _case in NA2_CMD_DELIMITER_ROWS:
+    _name = "test_" + _slug(_case["name"])
+    if _name in _seen:
+        raise RuntimeError("duplicate table row name: %s" % _case["name"])
+    _seen.add(_name)
+    setattr(Na2CmdDelimiterTests, _name, _make_test(_case))
+
+
 if __name__ == "__main__":
     unittest.main()
