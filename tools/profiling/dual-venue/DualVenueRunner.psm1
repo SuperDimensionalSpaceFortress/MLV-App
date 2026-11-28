@@ -8017,6 +8017,50 @@ $script:TailRowFieldTypes = [ordered]@{
     tail_elapsed_ms = 'number'; label_bound_basis = 'string'; source_id = 'string'
 }
 
+function Get-DvJsonTypeWord {
+    <#
+    .SYNOPSIS
+    EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r4 (Grok CoS #929 G3, sol pass 3 A1). The JSON type a value read by ConvertFrom-Json HAS, as a word for a reason: null,
+    string, boolean, number, array or object. A [datetime] and a [datetimeoffset] are a JSON string (ConvertFrom-Json turns a date-shaped string into one), and every
+    numeric type ([bigint], [decimal], [single], the integer widths and [double]) is a JSON number. Never calls a method on the value (a JSON object may carry a member
+    named GetType or ToString); pure; never throws.
+    #>
+    param($Value)
+    if ($null -eq $Value) { return 'null' }
+    if (($Value -is [string]) -or ($Value -is [datetime]) -or ($Value -is [datetimeoffset])) { return 'string' }
+    if ($Value -is [bool]) { return 'boolean' }
+    if (($Value -is [int]) -or ($Value -is [long]) -or ($Value -is [double]) -or ($Value -is [decimal]) -or ($Value -is [single]) -or ($Value -is [System.Numerics.BigInteger]) -or
+        ($Value -is [int16]) -or ($Value -is [uint16]) -or ($Value -is [uint32]) -or ($Value -is [uint64]) -or ($Value -is [byte]) -or ($Value -is [sbyte])) { return 'number' }
+    if ($Value -is [array]) { return 'array' }
+    return 'object'
+}
+
+function Get-DvJsonShownValue {
+    <#
+    .SYNOPSIS
+    EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r4 (Grok CoS #929 G3): a value as a reason shows it, in its JSON form, so a wrong value never reads as a valid one. null and
+    a boolean are the JSON words; a string is its text (40 characters at most); a date-shaped string ConvertFrom-Json turned into a DateTime is `<string>` (its original text
+    is gone and a rendering of the DateTime would be a different text); a double is its round-trip text in the invariant culture with `.0` kept on an integral one (479.0
+    stays `479.0`, never `479`); any other number is its invariant text; an array or an object is `<array>` or `<object>`. Pure; never throws.
+    #>
+    param($Value)
+    $inv = [Globalization.CultureInfo]::InvariantCulture
+    switch (Get-DvJsonTypeWord $Value) {
+        'null' { return 'null' }
+        'boolean' { return $(if ($Value) { 'true' } else { 'false' }) }
+        'string' {
+            if ($Value -isnot [string]) { return '<string>' }
+            return $(if ($Value.Length -gt 40) { $Value.Substring(0, 40) + '...' } else { $Value })
+        }
+        'number' {
+            $text = $(if ($Value -is [double]) { $Value.ToString('R', $inv) } elseif ($Value -is [single]) { $Value.ToString('R', $inv) } else { ([System.IFormattable]$Value).ToString($null, $inv) })
+            if ((($Value -is [double]) -or ($Value -is [single])) -and ($text -match '^-?[0-9]+$')) { $text += '.0' }
+            return $(if ($text.Length -gt 40) { $text.Substring(0, 40) + '...' } else { $text })
+        }
+        default { return "<$_>" }
+    }
+}
+
 function Get-DvTailRowTypeProblem {
     <#
     .SYNOPSIS
@@ -8043,11 +8087,9 @@ function Get-DvTailRowTypeProblem {
         }
         if (-not $ok) {
             # r2 (sol A4 on e4958b93): the type is named without calling a method on the value (a JSON object may carry a member named GetType or ToString)
-            $found = $(if ($null -eq $value) { 'null' } elseif ($value -is [string]) { 'string' } elseif ($value -is [bool]) { 'boolean' }
-                       elseif (($value -is [int]) -or ($value -is [long]) -or ($value -is [double])) { 'number' } elseif ($value -is [array]) { 'array' } else { 'object' })
-            $shown = $(if ($null -eq $value) { 'null' } elseif (($value -is [string]) -or ($value -is [bool]) -or ($value -is [int]) -or ($value -is [long]) -or ($value -is [double])) {
-                           $text = [string]$value; if ($text.Length -gt 40) { $text.Substring(0, 40) } else { $text } } else { "<$found>" })
-            return "$name=$shown (a JSON $found), not a JSON $wanted"
+            # r4 (Grok CoS #929 G3, sol pass 3 A1): the type word and the shown value come from Get-DvJsonTypeWord and Get-DvJsonShownValue (a DateTime is a JSON string, a
+            # BigInteger a JSON number, an integral double shows its `.0`); the refusal above is unchanged
+            return "$name=$(Get-DvJsonShownValue $value) (a JSON $(Get-DvJsonTypeWord $value)), not a JSON $wanted"
         }
     }
     return $null
@@ -8145,7 +8187,7 @@ function Get-DvTailVisualEvidence {
             if (([string]::Equals($kind, 'play', [StringComparison]::Ordinal) -or [string]::Equals($kind, 'play_unbound', [StringComparison]::Ordinal) -or
                  [string]::Equals($kind, 'play_first_unbound', [StringComparison]::Ordinal)) -and
                 (-not (($index -is [int]) -or ($index -is [long])) -or [int64]$index -lt 0)) {
-                return (& $refuse "TAIL_VISUAL_ROW_UNREADABLE: a $kind capture carries index=$([string]$index), not a non-negative JSON integer, so a paint it records cannot be ordered and the post-close tail is not credited")
+                return (& $refuse "TAIL_VISUAL_ROW_UNREADABLE: a $kind capture carries index=$(Get-DvJsonShownValue $index) (a JSON $(Get-DvJsonTypeWord $index)), not a non-negative JSON integer, so a paint it records cannot be ordered and the post-close tail is not credited")
             }
             # EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1 (Grok CoS #913 G7): a play row whose ordering or binding field is PRESENT with the wrong JSON type is
             # read below as false or $null, so it would leave the credit's order and repeat checks (or be counted beside the rows that credit): it refuses the whole

@@ -24084,6 +24084,72 @@ class EveryFrameTailWrongTypeFieldRefusalTests(ModuleMutationMixin, unittest.Tes
                     self.assertTrue(note.startswith("TAIL_VISUAL_ROW_UNREADABLE"), out)
                     self.assertIn(f"carries {field}=", note, out)
 
+    # ---- r4 (Grok CoS #929 G3, sol adversary pass 3 A1 on 34eea0f5): the reason names the JSON type the value HAS, and shows a number as written ----
+    # (field, the wrong value, the whole text the reason must carry). The refusal itself is the r1 refusal in every row; only its words are under test, and the TYPE WORD
+    # (`(a JSON <type>)`) is asserted, not only the `carries <field>=` prefix.
+    R4_TYPE_WORD_ARMS = {
+        "string": ("play_active", "true", "play_active=true (a JSON string), not a JSON bool"),
+        "datetime": ("serial", "2026-11-28T00:00:00Z", "(a JSON string), not a JSON integer"),
+        "number": ("play_active", 1, "play_active=1 (a JSON number), not a JSON bool"),
+        "bigint": ("serial", 123456789012345678901234567890, "serial=123456789012345678901234567890 (a JSON number), not a JSON integer"),
+        "double-integral": ("serial", 479.0, "serial=479.0 (a JSON number), not a JSON integer"),
+        "double-fraction": ("serial", 485.5, "serial=485.5 (a JSON number), not a JSON integer"),
+        "bool": ("serial", True, "serial=true (a JSON boolean), not a JSON integer"),
+        "null": ("serial", None, "serial=null (a JSON null), not a JSON integer"),
+        "array": ("serial", [1, 2], "serial=<array> (a JSON array), not a JSON integer"),
+        "object": ("serial", {"a": 1}, "serial=<object> (a JSON object), not a JSON integer"),
+    }
+
+    def test_r4_g3_the_reason_names_the_json_type_of_each_kind_of_wrong_value(self) -> None:
+        """G3, its inputs: play_active="2026-11-28T00:00:00Z" was reported `(a JSON object)` (ConvertFrom-Json made it a DateTime; in JSON it is a string),
+        serial=123456789012345678901234567890 was reported `(a JSON object)` (a BigInteger; in JSON a number), and serial=479.0 was shown `479 (a JSON number), not a JSON
+        integer` (the shown value looked like a valid integer). One row per arm of the classifier."""
+        for arm, (field, wrong, expected) in self.R4_TYPE_WORD_ARMS.items():
+            with self.subTest(arm=arm):
+                out = self.out_for("hidden", field, wrong)
+                self.assert_no_credit(out, 2)
+                note = out["m"]["conformTailInFlightCreditNote"]
+                self.assertTrue(note.startswith("TAIL_VISUAL_ROW_UNREADABLE"), out)
+                self.assertIn(f"carries {field}=", note, out)
+                self.assertIn(expected, note, out)
+        with self.subTest(arm="a date-shaped string is never an object"):
+            out = self.out_for("hidden", "play_active", "2026-11-28T00:00:00Z")
+            self.assertNotIn("(a JSON object)", out["m"]["conformTailInFlightCreditNote"], out)
+            self.assertIn("(a JSON string), not a JSON bool", out["m"]["conformTailInFlightCreditNote"], out)
+
+    def test_r4_g3_a_double_is_shown_in_round_trip_form_checked_against_an_exact_oracle(self) -> None:
+        """The oracle is Python's own float and fractions.Fraction: the text the reason shows for a double field must parse back to the very double the file held, be
+        exactly that number (Fraction) for an integral double below 2**53, and, for a value with no fractional part, must not read as a plain integer (a JSON
+        integer is what the field wants, so `479` would look valid)."""
+        from fractions import Fraction
+        values = [479.0, 0.0, -0.0, -3.0, 1.0, 1234567.0, 2.0 ** 53, 1e15, 1e16, 1e20, 485.5, 0.1, 1e-7, 123456789.125, -479.0, 1e300]
+        for value in values:
+            with self.subTest(value=repr(value)):
+                out = self.out_for("hidden", "serial", value)
+                self.assert_no_credit(out, 2)
+                note = out["m"]["conformTailInFlightCreditNote"]
+                m = re.search(r"carries serial=(\S+) \(a JSON number\), not a JSON integer", note)
+                self.assertIsNotNone(m, out)
+                shown = m.group(1)
+                self.assertEqual(float(shown), value, (shown, out))   # round-trip: the shown text parses back to the very double the file held
+                if abs(value) < 2.0 ** 53 and value == int(value):
+                    self.assertEqual(Fraction(shown), Fraction(value), (shown, out))   # an integral double below 2**53 is exact, so the text is exactly that number
+                if value == int(value):
+                    self.assertIsNone(re.fullmatch(r"-?\d+", shown), f"{shown!r} reads as a plain integer")
+
+    def test_r4_g3_sibling_the_index_refusal_names_the_type_and_shows_a_double_as_written(self) -> None:
+        """The same reader's other refusal of a value by a PowerShell type: a play row whose index is no non-negative JSON integer (`index=$([string]$index)` showed
+        1.0 as `1` and a string "1" as `1`, with no type word). Each row is refused as before; the reason now carries the type word and the value as written."""
+        cases = {"double-integral": (1.0, "index=1.0 (a JSON number)"), "string": ("1", "index=1 (a JSON string)"), "negative": (-1, "index=-1 (a JSON number)"),
+                 "bool": (True, "index=true (a JSON boolean)"), "null": (None, "index=null (a JSON null)"), "object": ({"a": 1}, "index=<object> (a JSON object)")}
+        for name, (wrong, expected) in cases.items():
+            with self.subTest(index=name):
+                out = self.out_for("tail", "index", wrong)
+                self.assert_no_credit(out, 2)
+                note = out["m"]["conformTailInFlightCreditNote"]
+                self.assertTrue(note.startswith("TAIL_VISUAL_ROW_UNREADABLE"), out)
+                self.assertIn(f"carries {expected}, not a non-negative JSON integer", note, out)
+
     def test_an_absent_field_is_not_a_wrong_type_and_another_kind_of_row_is_not_read(self) -> None:
         for field in ("saved", "play_active", "label_bound", "painted_serial_valid", "forced_paints_before", "label_bound_basis", "serial", "painted_serial",
                       "display_frame", "tail_elapsed_ms", "source_id"):
