@@ -8027,20 +8027,27 @@ function Get-DvTailRowTypeProblem {
     (the credit refuses a row it needs a field of). Pure; never throws.
     #>
     param($Row)
+    if ($null -eq $Row -or $null -eq $Row.PSObject) { return $null }
     foreach ($name in $script:TailRowFieldTypes.Keys) {
         $property = $Row.PSObject.Properties[$name]
         if ($null -eq $property) { continue }
         $value = $property.Value
         $wanted = [string]$script:TailRowFieldTypes[$name]
+        # r2 (sol A2 on e4958b93): ConvertFrom-Json reads a JSON string that looks like a date ("2026-11-28T00:00:00Z") as a [datetime]; it is still a JSON string, and the
+        # readers below judge it with `-is [string]` (so it never credits); only a number, a boolean, null, an object or an array is a wrong type for a string field
         $ok = switch ($wanted) {
             'bool' { $value -is [bool] }
             'integer' { ($value -is [int]) -or ($value -is [long]) }
             'number' { ($value -is [int]) -or ($value -is [long]) -or ($value -is [double]) }
-            'string' { $value -is [string] }
+            'string' { ($value -is [string]) -or ($value -is [datetime]) -or ($value -is [datetimeoffset]) }
         }
         if (-not $ok) {
-            $found = $(if ($null -eq $value) { 'null' } else { $value.GetType().Name })
-            return "$name=$(if ($null -eq $value) { 'null' } elseif ($value -is [string] -and $value.Length -gt 40) { $value.Substring(0, 40) } else { [string]$value }) (a JSON $found), not a JSON $wanted"
+            # r2 (sol A4 on e4958b93): the type is named without calling a method on the value (a JSON object may carry a member named GetType or ToString)
+            $found = $(if ($null -eq $value) { 'null' } elseif ($value -is [string]) { 'string' } elseif ($value -is [bool]) { 'boolean' }
+                       elseif (($value -is [int]) -or ($value -is [long]) -or ($value -is [double])) { 'number' } elseif ($value -is [array]) { 'array' } else { 'object' })
+            $shown = $(if ($null -eq $value) { 'null' } elseif (($value -is [string]) -or ($value -is [bool]) -or ($value -is [int]) -or ($value -is [long]) -or ($value -is [double])) {
+                           $text = [string]$value; if ($text.Length -gt 40) { $text.Substring(0, 40) } else { $text } } else { "<$found>" })
+            return "$name=$shown (a JSON $found), not a JSON $wanted"
         }
     }
     return $null
@@ -8143,7 +8150,9 @@ function Get-DvTailVisualEvidence {
             # EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1 (Grok CoS #913 G7): a play row whose ordering or binding field is PRESENT with the wrong JSON type is
             # read below as false or $null, so it would leave the credit's order and repeat checks (or be counted beside the rows that credit): it refuses the whole
             # tail, typed, naming the field, exactly as an unreadable index does above
-            if ($kind -ceq 'play' -or $kind -ceq 'play_unbound' -or $kind -ceq 'play_first_unbound') {
+            # r2 (sol A1 on e4958b93): the kind is matched ORDINALLY like every other kind compare here (`-ceq` is a culture compare: "play" + U+0000 equals "play")
+            if ([string]::Equals($kind, 'play', [StringComparison]::Ordinal) -or [string]::Equals($kind, 'play_unbound', [StringComparison]::Ordinal) -or
+                [string]::Equals($kind, 'play_first_unbound', [StringComparison]::Ordinal)) {
                 $typeProblem = Get-DvTailRowTypeProblem -Row $row
                 if ($null -ne $typeProblem) {
                     return (& $refuse "TAIL_VISUAL_ROW_UNREADABLE: the $kind capture $index carries $typeProblem, so a paint it records cannot be ordered or bound and the post-close tail is not credited")

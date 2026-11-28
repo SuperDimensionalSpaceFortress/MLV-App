@@ -23942,6 +23942,7 @@ class EveryFrameTailInFlightVsNeverPaintedTests(ModuleMutationMixin, unittest.Te
             self.assertIsNone(derived["visualTailPrepDrops"], derived)
 
 
+@requires_windows_pwsh
 class EveryFrameTailWrongTypeFieldRefusalTests(ModuleMutationMixin, unittest.TestCase):
     """EVERY-FRAME-TAIL-WRONG-TYPE-FIELD-REFUSAL-1 r1 (Grok CoS #913 G7, hub ACK 7230207984): the GUARD class for the card. Get-DvTailVisualEvidence read each field of a
     play capture row through Get-DvProp and normalised a field that was PRESENT with the WRONG TYPE (play_active "true", forced_paints_before "0", label_bound_basis 7,
@@ -24046,6 +24047,42 @@ class EveryFrameTailWrongTypeFieldRefusalTests(ModuleMutationMixin, unittest.Tes
 
     def test_source_id_of_the_wrong_type_refuses_the_row(self) -> None:
         self.assert_field_refused("tail", "source_id", [123, True, None])
+
+    # ---- r2 adversary pass on e4958b93 (A1, A2, A4; A3 is the class decorator above): each RED on e4958b93 ----
+    def test_r2_a1_a_kind_that_only_culture_compares_equal_to_play_is_not_a_play_row(self) -> None:
+        """A1, its input: a row {"kind": "play\\u0000", "index": 0, "tail_elapsed_ms": 2000, "saved": "no"} appended to the tail rows (credited 2 on the base). `-ceq` is a
+        culture compare that ignores the NUL, so the row entered the new field guard and refused the whole tail; the kind filter below it is ordinal and ignores the
+        row. A kind is matched ordinally here too (siblings: every kind compare in Get-DvTailVisualEvidence is [string]::Equals(..., Ordinal))."""
+        rows, count = self.rows("tail")
+        for kind in ("play\u0000", "play_unbound\u0000", "play_first_unbound\u0000", "play​", "PLAY"):
+            with self.subTest(kind=kind):
+                other = {"kind": kind, "index": 0, "tail_elapsed_ms": 2000, "saved": "no", "play_active": "no", "forced_paints_before": "x", "serial": "x"}
+                out = self.metrics({"visualBurstCaptures": count}, app=self.app_json(*rows, other), criteria=self.BOTH)
+                self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+                self.assertNotIn("TAIL_VISUAL_ROW_UNREADABLE", out["m"].get("conformTailInFlightCreditNote", ""), out)
+
+    def test_r2_a2_a_json_string_that_powershell_reads_as_a_date_is_a_string(self) -> None:
+        """A2, its input: the `unbound` shape's middle row (records no paint) carries source_id (and, in a second run, label_bound_basis) "2026-11-28T00:00:00Z".
+        ConvertFrom-Json turns that JSON string into a DateTime, so the guard called it not-a-string and refused the whole tail; the base ignores that row and credits
+        the two valid targets. A JSON string is a string whatever PowerShell makes of it; a number, a boolean and null stay wrong types (the tests above)."""
+        for field in ("source_id", "label_bound_basis"):
+            for text in ("2026-11-28T00:00:00Z", "2026-11-28", "2026-11-28T00:00:00+01:00"):
+                with self.subTest(field=field, text=text):
+                    out = self.out_for("unbound", field, text)
+                    self.assertEqual(out["m"].get("conformTailInFlightCreditedFrames"), 2, out)
+                    self.assertNotIn("TAIL_VISUAL_ROW_UNREADABLE", out["m"].get("conformTailInFlightCreditNote", ""), out)
+
+    def test_r2_a4_a_field_object_that_shadows_gettype_is_still_refused_by_name(self) -> None:
+        """A4 (advisory, introduced), its input: saved={"GetType": "x"}. `$value.GetType()` resolved to the JSON member, the helper threw, the reader's catch returned
+        $null and the named refusal was lost (the tail was still not credited). The helper never calls a method on a value it is judging."""
+        for field, shape in (("saved", "tail"), ("play_active", "hidden"), ("serial", "unbound"), ("source_id", "tail")):
+            for wrong in ({"GetType": "x"}, {"ToString": 1}, [1, 2]):
+                with self.subTest(field=field, wrong=wrong):
+                    out = self.out_for(shape, field, wrong)
+                    self.assert_no_credit(out, 2)
+                    note = out["m"]["conformTailInFlightCreditNote"]
+                    self.assertTrue(note.startswith("TAIL_VISUAL_ROW_UNREADABLE"), out)
+                    self.assertIn(f"carries {field}=", note, out)
 
     def test_an_absent_field_is_not_a_wrong_type_and_another_kind_of_row_is_not_read(self) -> None:
         for field in ("saved", "play_active", "label_bound", "painted_serial_valid", "forced_paints_before", "label_bound_basis", "serial", "painted_serial",
