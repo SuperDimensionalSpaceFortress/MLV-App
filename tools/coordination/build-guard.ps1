@@ -89,7 +89,9 @@
 #     mode), never from an environment variable, so it cannot leak into a nested or sibling guard call. Only the exact strings 'shared'
 #     and 'exclusive-short' are accepted (ordinal: 'Exclusive-Short', ' shared', a trailing U+00AD are refused), and exclusive-short needs
 #     0 < HeavySlotEtaMinutes <= 15 (heavy-slot's promotion limit, README.md:103-109): anything else is BUILD_HEAVY_SLOT_REFUSED
-#     reason=invalid-option (the line carries HeavySlotClass=<raw>), exit 2, nothing launched, never clamped. heavy-slot then admits the
+#     reason=invalid-option (the line carries HeavySlotClass=<raw>), exit 2, nothing launched, never clamped. The class is judged right
+#     after the deadline and BEFORE the shim is looked for, so a host without heavy-slot (a fail-open build) refuses it too; Command mode's
+#     -HeavySlotEtaMinutes and -HeavySlotWaitMinutes are [double], so 15.49 is never rounded to 15. heavy-slot then admits the
 #     ticket at the next job boundary ahead of shared tickets younger than 60 min (it never preempts the running holder). The label is
 #     mlv:venue-stage:<lane>, so the one demotion key is mlv:venue-stage: a unit that runs past 15 min loses promotion for good for that
 #     key, and cannot touch mlv:<lane>:build or mlv:hub:*. Clearing a demotion is the OWNER's (heavy-slot's demoted.json, never edited
@@ -179,8 +181,10 @@ param(
     [string]$ProcessTableFile = '',
     [string]$HeavySlotCmd = '',
     [string]$HeavySlotSha256 = '691efb4c2cc1b98cd5a7379e03a2bb5b9eebaa1174a03b11ee7a48741fc06534',
-    [int]$HeavySlotEtaMinutes = 20,
-    [int]$HeavySlotWaitMinutes = 60,
+    # [double], never [int]: an [int] parameter binds 15.49 as 15 and 0.5 as 0 before any check can see the figure (adversary e6b3762c-A2/A3),
+    # so exclusive-short's 15 min cap and the 0..10080 range were judged on a rounded value. Whole numbers bind exactly as before.
+    [double]$HeavySlotEtaMinutes = 20,
+    [double]$HeavySlotWaitMinutes = 60,
     [string]$HeavySlotClass = 'shared',
     [string]$Command = ''
 )
@@ -1012,7 +1016,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     # (a caller's $PSDefaultParameterValues cannot bend it) and assigns nothing.
     @('Options', 'Label', 'raw', 'at', 'styles', 'deadline', 'maxMin', 'slackMin', 'cmd', 'shim', 'cli', 'actual', 'expected', 'lock', 'dir', 'exe', 'pct',
         'why', 'id', 'lease', 'giveUp', 'inv', 'boundNote', 'waitMin', 'etaMin', 'd', 'waitArg', 'etaArg', 'a', 'e', 'psi', 'v', 'heldDropped',
-        'notCanonical', 'holderCmd', 'head', 'tail', 'logArg', 'quoted', 'waitClock', 'admitted', 's', 'holder', 'code', 'i', 'what', 'num', 'back', 'classRaw', 'classArg').Where(
+        'notCanonical', 'holderCmd', 'head', 'tail', 'logArg', 'quoted', 'waitClock', 'admitted', 's', 'holder', 'code', 'i', 'what', 'num', 'back', 'classRaw', 'classArg', 'classWhy', 'etaProbe').Where(
         { $null -ne $ExecutionContext.SessionState.PSVariable.Get($_) -and ($ExecutionContext.SessionState.PSVariable.Get($_).Options -band [System.Management.Automation.ScopedItemOptions]::AllScope) }, 'First').ForEach(
         { Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=caller-allscope-variable name={1} utc={2}' -f $Label, $_, [DateTime]::UtcNow.ToString('o')); exit 2 })
     @('HeavySlotGiveUpSlackMinutes', 'BuildGuardDefaults').Where(
@@ -1045,6 +1049,32 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     }
     if ($deadline.Why) {
         Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} ({3}) utc={4}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($deadline.Why -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
+        exit 2
+    }
+    # VENUE-STAGE-HEAVY-SLOT-RESERVE-FOR-VENUE-CHAINS-1: the class is judged right after the deadline and BEFORE the shim is looked for, like
+    # it: every fail-open return below (no shim, a path with '%', a lease directory or log that cannot be made) builds WITHOUT the slot, so a
+    # class judged after them was never refused on a host without heavy-slot (adversary e6b3762c-A1). It comes ONLY from Options.HeavySlotClass,
+    # never from an environment variable (an env value would reach every nested or sibling guard call), is read as text, and is accepted only when
+    # it is, byte for byte (ordinal: 'Exclusive-Short', ' shared' or a trailing U+00AD is a refusal, never a shared fallback), 'shared' or
+    # 'exclusive-short'. heavy-slot promotes exclusive-short only for an eta of 15 min or less (its $ExclusiveShortLimit), so exclusive-short with
+    # an eta not above 0 and at most 15 is refused too, never clamped. $classRaw is what the refusal line shows.
+    $classRaw = ''
+    $classArg = ''
+    $classWhy = ''
+    try {
+        # A key that is absent is the default (Invoke-BuildGuard merges the defaults, so only a direct caller of this function can omit it);
+        # one that is present is judged as given, '' and $null included.
+        $classRaw = if ($Options.ContainsKey('HeavySlotClass')) { [string]$Options['HeavySlotClass'] } else { 'shared' }
+        if ([string]::Equals($classRaw, 'shared', [StringComparison]::Ordinal)) { $classArg = 'shared' }
+        elseif ([string]::Equals($classRaw, 'exclusive-short', [StringComparison]::Ordinal)) { $classArg = 'exclusive-short' }
+        else { $classWhy = "HeavySlotClass is not 'shared' or 'exclusive-short'" }
+        if ($classArg -ceq 'exclusive-short') {
+            $etaProbe = [double]$Options.HeavySlotEtaMinutes
+            if (-not ($etaProbe -gt 0 -and $etaProbe -le 15)) { $classWhy = 'exclusive-short needs HeavySlotEtaMinutes above 0 and at most 15 (heavy-slot promotes no longer unit)' }
+        }
+    } catch { $classWhy = 'HeavySlotClass or HeavySlotEtaMinutes is not readable: ' + $_.Exception.Message }
+    if ($classWhy) {
+        Write-BuildGuardTyped ('BUILD_HEAVY_SLOT_REFUSED label={0} reason=invalid-option HeavySlotWaitMinutes={1} HeavySlotEtaMinutes={2} HeavySlotClass={3} ({4}) utc={5}' -f $Label, $Options.HeavySlotWaitMinutes, $Options.HeavySlotEtaMinutes, ($classRaw -replace '\s+', ' '), ($classWhy -replace '\s+', ' '), [DateTime]::UtcNow.ToString('o'))
         exit 2
     }
     $cmd = Resolve-HeavySlotCmd $Options
@@ -1113,13 +1143,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
     $giveUp = $null
     $inv = [Globalization.CultureInfo]::InvariantCulture
     $boundNote = ''
-    # VENUE-STAGE-HEAVY-SLOT-RESERVE-FOR-VENUE-CHAINS-1: the class comes ONLY from Options.HeavySlotClass, never from an environment
-    # variable (an env value would reach every nested or sibling guard call). It is read as text and accepted only when it is, byte for
-    # byte, 'shared' or 'exclusive-short'; $classRaw is what the refusal line shows.
-    $classRaw = ''
-    $classArg = ''
     try {
-        $classRaw = [string]$Options.HeavySlotClass
         $waitMin = [double]$Options.HeavySlotWaitMinutes
         $etaMin = [double]$Options.HeavySlotEtaMinutes
         # STAGE-BUILD-HEAVY-SLOT-TIMEOUT-LOSES-TURN-1: a staging driver that has its own deadline passes it here, and the wait is what
@@ -1140,14 +1164,7 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         # calls on a value, so the text was '20000' for a 240 min wait (adversary 84f4e8af-A2). Each text is then read back with the static
         # [double]::TryParse and must be the minutes computed (within 0.01) and within the cap; anything else is a refusal.
         $waitMin = [Math]::Abs($waitMin); $etaMin = [Math]::Abs($etaMin)
-        # Ordinal, case-sensitive, no trimming: 'Exclusive-Short', ' shared' or a trailing soft hyphen (U+00AD) is a refusal, never a
-        # shared fallback. exclusive-short is promoted by heavy-slot only for an eta of 15 min or less (its $ExclusiveShortLimit), so a
-        # longer or zero eta is refused here, never clamped.
-        if ([string]::Equals($classRaw, 'shared', [StringComparison]::Ordinal)) { $classArg = 'shared' }
-        elseif ([string]::Equals($classRaw, 'exclusive-short', [StringComparison]::Ordinal)) { $classArg = 'exclusive-short' }
-        else { throw "HeavySlotClass is not 'shared' or 'exclusive-short'" }
-        if ($classArg -ceq 'exclusive-short' -and -not ($etaMin -gt 0 -and $etaMin -le 15)) { throw "exclusive-short needs HeavySlotEtaMinutes above 0 and at most 15 (heavy-slot promotes no longer unit)" }
-        $num =[string]::Format($inv, '{0:0.##########}', $waitMin)
+        $num = [string]::Format($inv, '{0:0.##########}', $waitMin)
         $back = 0.0
         if (-not ($num -cmatch '^\d+(\.\d+)?$' -and [double]::TryParse($num, [Globalization.NumberStyles]::AllowDecimalPoint, $inv, [ref]$back) -and
                 [Math]::Abs($back - $waitMin) -le 0.01 -and $back -le $maxMin)) { throw "'$num' is not the wait of $waitMin min in a form heavy-slot reads" }
@@ -1157,6 +1174,9 @@ function Enter-HeavySlot([hashtable]$Options, [string]$Label) {
         if (-not ($num -cmatch '^\d+(\.\d+)?$' -and [double]::TryParse($num, [Globalization.NumberStyles]::AllowDecimalPoint, $inv, [ref]$back) -and
                 [Math]::Abs($back - $etaMin) -le 0.01 -and $back -le $maxMin)) { throw "'$num' is not the eta of $etaMin min in a form heavy-slot reads" }
         $etaArg = [string]::Concat($num, 'm')
+        # The class was judged on the raw eta before the shim was looked for; the text heavy-slot is given must hold it too: a tiny
+        # positive eta formats as '0' (exclusive-short needs 0 < eta <= 15 as sent), never promoted on a figure it was not given.
+        if ($classArg -ceq 'exclusive-short' -and -not ($back -gt 0 -and $back -le 15)) { throw "exclusive-short eta '$num' is not above 0 and at most 15 min as sent to heavy-slot" }
         $giveUp = [TimeSpan]::FromMinutes($waitMin + $slackMin)
     } catch { $why = $_.Exception.Message }
     if ($null -eq $giveUp) {
