@@ -2545,17 +2545,36 @@ function Invoke-VenueBoundedProcess {
     $lateKind = $(if ($null -ne $StartBeforeUtc -and [DateTime]::UtcNow -ge $StartBeforeUtc) { 'DEADLINE' } elseif ($null -ne $Clock -and -not (($EndSec - $Clock.Elapsed.TotalSeconds) -gt 0)) { 'ROOM' } else { '' })   # (r6 fix A4: written as "not greater", so a NaN end is no room, never a start)
     $lateStart = [bool]$lateKind
     if ($TestAfterStartDelayMs -gt 0) { [Threading.Thread]::Sleep($TestAfterStartDelayMs) }
+    $waitSw = [Diagnostics.Stopwatch]::StartNew()   # the relative -TimeoutSec runs from here
     $waitMs = [double]$TimeoutSec * 1000.0
     if ($null -ne $Clock) { $waitMs = [Math]::Min($waitMs, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }
     $pastEnd = ($null -ne $Clock -and -not ($waitMs -gt 0))
-    if ($TestBeforeWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($TestBeforeWaitDelayMs) }   # (offline seam: a parent descheduled after the wait was computed and before it begins; $waitMs stays what it was)
-    $timedOut = $(if ($lateStart -or $pastEnd) { $true } else { -not $p.WaitForExit([int][Math]::Max(0.0, [Math]::Min([double][int]::MaxValue, $waitMs))) })
+    if ($TestBeforeWaitDelayMs -gt 0) { [Threading.Thread]::Sleep($TestBeforeWaitDelayMs) }   # (offline seam: a parent descheduled after the wait was computed and before it begins)
+    # r8 (adversary r8 pass 18 A1): a wait sized once and begun later is stale by whatever happened between (a parent descheduled after it was computed got the whole stale wait past the end). With a clock the wait is taken in
+    # slices of at most 250 ms, each sized from what is left of the sampled end and of the relative bound AT THAT MOMENT (a NaN is no room); a caller with no clock is unchanged (one wait of -TimeoutSec).
+    $timedOut = $true
+    if ($lateStart -or $pastEnd) { $timedOut = $true } elseif ($null -eq $Clock) { $timedOut = -not $p.WaitForExit([int][Math]::Max(0.0, [Math]::Min([double][int]::MaxValue, $waitMs))) } else {
+        while ($true) {
+            $leftMs = [Math]::Min([double]$TimeoutSec * 1000.0 - $waitSw.Elapsed.TotalMilliseconds, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0)
+            if (-not ($leftMs -gt 0)) { break }
+            if ($p.WaitForExit([int][Math]::Ceiling([Math]::Min(250.0, $leftMs)))) { $timedOut = $false; break }
+        }
+    }
     # r7 (adversary r7 pass 17 A2): WaitForExit is true for a child that had already exited, whenever the parent got to ask: an answer observed only after the sampled end is a timeout, never an answer (exit $null, as the
     # no-room-at-the-wait case above). The child needs no kill (it is gone), so killConfirmed reads from HasExited as for any timeout.
     if (-not $timedOut -and $null -ne $Clock -and -not (($EndSec - $Clock.Elapsed.TotalSeconds) -gt 0)) { $timedOut = $true }
     $killErrored = $false
     $cleanup = [Diagnostics.Stopwatch]::StartNew()
-    if ($timedOut) { if ($TestKillThrows) { $killErrored = $true } elseif (-not $p.HasExited) { try { $p.Kill($true) } catch { $killErrored = $true } }; [void]$p.WaitForExit($CleanupWaitMs) }   # (-TestKillThrows: the kill is not made and reads as failed; a child that already exited needs none)
+    # r8 (adversary r8 pass 18 A2, module sibling): the streams of a child that answered inside its end are still drained for up to -CleanupWaitMs (a descendant that holds the stdout keeps them open), which can run past the end:
+    # the drain is bounded by the end too, and an answer that is only in hand after the end is a timeout (its tree is killed below).
+    if (-not $timedOut) {
+        $drainMs = { $m = [double]($CleanupWaitMs - $cleanup.ElapsedMilliseconds); if ($null -ne $Clock) { $m = [Math]::Min($m, ($EndSec - $Clock.Elapsed.TotalSeconds) * 1000.0) }; if ($m -gt 0) { [int][Math]::Min($m, 2147483647.0) } else { 0 } }
+        [void]$outTask.Wait((& $drainMs)); [void]$errTask.Wait((& $drainMs))
+        if ($null -ne $Clock -and -not (($EndSec - $Clock.Elapsed.TotalSeconds) -gt 0)) { $timedOut = $true }
+    }
+    # r8 (adversary r8 pass 18 A3): the tree is killed on EVERY timeout, also when the root had already exited (a descendant that outlived it keeps running: Kill($true) of an exited root takes its surviving descendants and does not
+    # throw, measured), so killConfirmed never reads a root that merely exited as a tree that is gone. (-TestKillThrows: the kill is not made and reads as failed.)
+    if ($timedOut) { if ($TestKillThrows) { $killErrored = $true } else { try { $p.Kill($true) } catch { $killErrored = $true } }; [void]$p.WaitForExit([int][Math]::Max([Math]::Min($CleanupWaitMs, 500), $CleanupWaitMs - $cleanup.ElapsedMilliseconds)) }   # (a floor of 500 ms: a drain that used the whole budget must still leave the kill time to land)
     [void]$outTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds)); [void]$errTask.Wait([int][Math]::Max(0, $CleanupWaitMs - $cleanup.ElapsedMilliseconds))
     [pscustomobject]@{ exit = $(if ($timedOut) { $null } else { $p.ExitCode }); timedOut = $timedOut; killConfirmed = $(if ($timedOut) { (-not $killErrored) -and [bool]$p.HasExited } else { $true })
         stdout = $(if ($outTask.IsCompleted) { $outTask.Result } else { '' }); stderr = $(if ($errTask.IsCompleted) { $errTask.Result } else { '' }); notStarted = $lateStart; reason = $(if ($lateStart) { 'KILLED_AT_START' } else { '' }); lateKind = $lateKind; childPid = $p.Id }

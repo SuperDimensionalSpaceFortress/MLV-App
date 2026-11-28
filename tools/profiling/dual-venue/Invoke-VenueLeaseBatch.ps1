@@ -489,7 +489,10 @@ function Invoke-BatchBoundedChild {
     # r6 (Grok G10): reason KILLED_AT_START is a child that WAS started (childPid) and killed at once, so started stays $false (no answer) but killConfirmed and childPid say what became of it; every caller reads them
     if ($r.notStarted) { return [pscustomobject]@{ started = $false; reason = [string]$r.reason; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = [bool]$r.killConfirmed; stdout = ''; stderr = ''; lateKind = [string]$r.lateKind; childPid = $r.childPid } }
     if ($BoundedChildReturnDelaySec -gt 0) { [Threading.Thread]::Sleep($BoundedChildReturnDelaySec * 1000) }
-    [pscustomobject]@{ started = $true; reason = ''; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $r.exit; timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; stdout = $r.stdout; stderr = $r.stderr; lateKind = ''; childPid = $r.childPid }
+    # r8 (adversary r8 pass 18 A2): an answer in hand only after the SAMPLED END is a timeout, whatever -NotAfterUtc says (the run deadline can be minutes beyond a 120 s capped end): the module judges it up to its own return,
+    # and the return path above (a parent descheduled after it) is judged here, from the same stopwatch. The child needs no kill (it answered); killConfirmed stays what the module read.
+    $answered = ((-not $r.timedOut) -and ((($EndSec - $Clock.Elapsed.TotalSeconds) -gt 0)))   # (written as "greater", so a NaN end is no room)
+    [pscustomobject]@{ started = $true; reason = ''; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $(if ($answered) { $r.exit } else { $null }); timedOut = (-not $answered); killConfirmed = $r.killConfirmed; stdout = $r.stdout; stderr = $r.stderr; lateKind = ''; childPid = $r.childPid }
 }
 # r6 fix (adversary r6 pass 15 A5): a late answer that was also a timeout whose kill is unconfirmed says so (the late branch returns before the timeout branch's own wording)
 function Get-UnconfirmedKillText($Child) { if ($Child.timedOut -and -not $Child.killConfirmed) { ' (the child was also killed at its bound with the kill UNCONFIRMED: it may still be running)' } else { '' } }

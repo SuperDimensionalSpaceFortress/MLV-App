@@ -742,7 +742,8 @@ def _g11_pairs(runner_text: str) -> tuple[set, set, list]:
     for call in re.findall(r"(?<!function )\bset-stop\b[^\n]*", code, flags=re.IGNORECASE):
         if not re.match(stop_re, call, flags=re.IGNORECASE):
             odd.append(re.split(r";|\s\}", call)[0].strip())
-    for assign in re.findall(r"\$\w+\.endReason\s*=(?!=)[^\n]*", code, flags=re.IGNORECASE):
+    # (r8, adversary r8 pass 18 A4: also a scoped variable ($script:b.endReason) and an indexed one ($b['endReason'] =): every spelling of the assignment is either read or reported)
+    for assign in re.findall(r"""\$[\w:]+(?:\.endReason|\[\s*['"]endReason['"]\s*\])\s*=(?!=)[^\n]*""", code, flags=re.IGNORECASE):
         if not re.match(end_re, assign, flags=re.IGNORECASE):
             odd.append(re.split(r";|\s\}", assign)[0].strip())
     return stops, ends, sorted(set(odd))
@@ -6671,6 +6672,17 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         self._assert_g5_refused("FOUND after the deadline", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
         self.assertIn("after -DeadlineUtc", r.stderr)
 
+    def test_legspec_committed_r8_a2_a_found_answer_seen_after_the_sampled_end_is_a_timeout_with_the_run_deadline_still_ahead(self) -> None:
+        """r8 (adversary r8 pass 18 A2): the helper judged an answer late only against -NotAfterUtc (the run deadline), so a child answer in hand after the SAMPLED END (here the 120 s cap) with the deadline still ten minutes
+        ahead was accepted: FOUND passed the preflight. An answer seen after the end it was sampled for is a timeout, whatever the deadline says."""
+        child, pid = self._g5_found_child("r8-a2-return.ps1")
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(minutes=10))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildReturnDelaySec", "122", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("FOUND after the sampled end, deadline ahead", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        self.assertIn("did not answer", r.stderr)
+        self.assertNotIn("after -DeadlineUtc", r.stderr)
+
     def test_legspec_committed_r5_g5_the_export_budget_siblings_are_bounded_by_the_same_sampled_end(self) -> None:
         pid = self.case / "g5-budget.pid"
         pid.unlink(missing_ok=True)
@@ -6845,8 +6857,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         stops, ends, odd = _g11_pairs(script)
         self.assertEqual((stops, ends, odd), ({("SIBLING_STOP", 3), ("SIBLING_STOP", 9), ("DYNAMIC_STOP", 7), ("DYNAMIC_STOP", 3)}, {"SIBLING_END", "NEW_END"}, []),
                          "a double-quoted reason and a lower-case Set-Stop are read like the usual spelling")
-        _s, _e, odd = _g11_pairs(script + "Set-Stop $reason 4\n$b.endReason = $why\n$batch.endReason = 'OTHER_VARIABLE'\n")
-        self.assertEqual(odd, ["$b.endReason = $why", "$batch.endReason = 'OTHER_VARIABLE'", "Set-Stop $reason 4"], "a form the recognisers cannot read is reported, never skipped: " + repr(odd))
+        _s, _e, odd = _g11_pairs(script + "Set-Stop $reason 4\n$b.endReason = $why\n$batch.endReason = 'OTHER_VARIABLE'\n$script:b.endReason = 'SCOPED'\n$b['endReason'] = 'INDEXED'\n")
+        self.assertEqual(odd, ["$b.endReason = $why", "$b['endReason'] = 'INDEXED'", "$batch.endReason = 'OTHER_VARIABLE'", "$script:b.endReason = 'SCOPED'", "Set-Stop $reason 4"], "a form the recognisers cannot read is reported, never skipped: " + repr(odd))
         tests = ("\n    def test_sibling(self):\n"
                  "        self.assertEqual((r.returncode, res[\"stopReason\"]), (3, \"SIBLING_STOP\"))\n"
                  "        self.assertEqual(b[\"endReason\"], \"SIBLING_END\")\n"
