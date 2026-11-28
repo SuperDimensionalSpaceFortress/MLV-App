@@ -272,6 +272,11 @@ OMP_SWEEP_ARMS = {"t16": (16, 16, False), "t8": (8, 4, False), "t4": (4, 2, Fals
 OMP_SWEEP_LEGS = {f"legs/m16-1243-display-{mode}-s1-teampart-{arm}.json": f"legs/m16-1243-display-{mode}-s1-teampart.json"
                   for mode in ("fullscreen", "windowed") for arm in OMP_SWEEP_ARMS}
 SHIPPED_LEGS = (*SHIPPED_LEGS, *OMP_SWEEP_LEGS)
+# BACHELOR-1457-CPU-HEADROOM-UTIL-SPECS-1: the utilisation-sampler (generatorArgs.utilSample true) twins of the two M16-1457 unpaced s1 headroom legs (windowed and
+# fullscreen), keyed to the source each one twins. Each is its source except legId, card and utilSample (backends stay cuda + cpu, Look Assist stays forced on both);
+# both stay unpaced swap-interval-0 presentTrace LIGHT legs and carry presentTearingExpectedReason like their sources.
+HEADROOM_UTIL_1457_LEGS = {f"legs/m16-1457-headroom-unpaced-{mode}-s1-util.json": f"legs/m16-1457-headroom-unpaced-{mode}-s1.json" for mode in ("windowed", "fullscreen")}
+SHIPPED_LEGS = (*SHIPPED_LEGS, *HEADROOM_UTIL_1457_LEGS)
 # GUI-SMOKE-FOREGROUND-HANG-NOLA-1: the M16-1457 native full-screen s1 pair taken from #420 (590b0df0, card HFR-NATIVE-60FPS-FULLRES-1) without its conform
 # arm (generatorArgs.playbackConform is not in this base's schema): the Look Assist OFF arm that hung foregrounding (-nola, a classic leg) and its Look Assist
 # ON Cinematic control. Capture-free paced cuda speed legs at scale 1; LegSpecSchemaTests pins the pair.
@@ -9209,7 +9214,7 @@ class LegSpecSchemaTests(unittest.TestCase):
         """CUDA-HEADROOM-1 r2: an unpaced leg at swap interval 0 presents with SyncInterval 0, so PresentMon reports AllowsTearing=1 (the hub's
         TEARING flag). Every headroom leg says so in presentTearingExpectedReason; no other leg carries it, and the schema refuses it on any leg
         that is not unpaced at swap interval 0, so the exemption can never reach a paced or vsync leg."""
-        tearing = (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *DRIFT_LEGS,
+        tearing = (*HEADROOM_LEGS, *PARTITION_LEGS, *AGXOFF_UNPACED_LEGS, *AGXOFF_REMEASURE_LEGS, *UTIL_SAMPLE_LEGS, *UTIL_FULLSCREEN_STAGE_LEGS, *HEADROOM_UTIL_1457_LEGS, *DRIFT_LEGS,
                    CPU_S1_HEAVY_UNPACED_LEG, *EVERY_FRAME_OLDEST_FIRST_LEGS)
         for rel in tearing:
             spec = json.loads((DV / rel).read_text(encoding="utf-8"))
@@ -9226,6 +9231,43 @@ class LegSpecSchemaTests(unittest.TestCase):
                           ("short reason", dict(leg, presentTearingExpectedReason="tearing"))):
             with self.assertRaises(self.jsonschema.ValidationError, msg=name):
                 self.jsonschema.validate(bad, self.schema)
+
+    def test_each_1457_headroom_util_twin_is_its_source_plus_only_the_util_sampler(self) -> None:
+        """BACHELOR-1457-CPU-HEADROOM-UTIL-SPECS-1: the CPU headroom baseline could not report CPU utilisation, so debayer compute and core contention were not
+        separable on M16-1457. Each of the two util twins (windowed and fullscreen s1) exists, loads, validates, and equals its tracked unpaced headroom source in value
+        and key order except legId (source legId + -util, the file stem), card and generatorArgs.utilSample true (appended last). Backends stay cuda + cpu and Look
+        Assist stays forced on both (D4b, the owner shape: lookAssistForced eq true and lookFlavorReported eq cinematic on each backend, acceptance and supplementary);
+        the twin stays an unpaced swap-interval-0 presentTrace LIGHT leg, and the venue table gives its card the source card's roles."""
+        self.assertEqual(sorted(HEADROOM_UTIL_1457_LEGS), ["legs/m16-1457-headroom-unpaced-fullscreen-s1-util.json", "legs/m16-1457-headroom-unpaced-windowed-s1-util.json"])
+        venues = json.loads((DV / "venues.json").read_text(encoding="utf-8"))
+        for rel, source_rel in HEADROOM_UTIL_1457_LEGS.items():
+            with self.subTest(leg=rel):
+                twin = json.loads((DV / rel).read_text(encoding="utf-8"))
+                source = json.loads((DV / source_rel).read_text(encoding="utf-8"))
+                self.jsonschema.validate(twin, self.schema)
+                self.assertIn(source_rel, HEADROOM_LEGS)
+                self.assertEqual(twin["legId"], source["legId"] + "-util")
+                self.assertEqual(twin["legId"], Path(rel).stem)
+                self.assertEqual(twin["card"], "BACHELOR-1457-CPU-HEADROOM-UTIL-SPECS-1")
+                self.assertNotIn("utilSample", source["generatorArgs"], "the source stays the plain headroom leg")
+                ga = dict(twin["generatorArgs"])
+                self.assertIs(ga.pop("utilSample"), True)
+                self.assertEqual(ga, source["generatorArgs"], "every other generatorArgs key is the source's")
+                self.assertEqual(list(twin["generatorArgs"]), [*source["generatorArgs"], "utilSample"], "the source's keys in the source's order, utilSample last")
+                self.assertEqual(dict(twin, legId=source["legId"], card=source["card"], generatorArgs=source["generatorArgs"]), source)
+                self.assertEqual(list(twin), list(source), "the source's keys in the source's order")
+                self.assertEqual(twin["backends"], ["cuda", "cpu"])
+                self.assertEqual((twin["clipId"], twin["scaleFactor"], twin["legType"]), ("M16-1457", 1, "speed"))
+                self.assertIs(twin["generatorArgs"]["forceLookAssist"], True)   # Look Assist ON (D4b)
+                for role in ("acceptance", "supplementary"):
+                    for backend in ("cuda", "cpu"):
+                        for metric, value in (("lookAssistForced", True), ("lookFlavorReported", "cinematic")):
+                            self.assertIn({"metric": metric, "op": "eq", "value": value}, twin["criteria"][role][backend], f"{role}/{backend}/{metric}")
+                self.assertEqual((twin["generatorArgs"]["telemetryArm"], twin["generatorArgs"]["swapInterval"]), ("LIGHT", 0))
+                self.assertIs(twin["generatorArgs"]["unpaced"], True)
+                self.assertIs(twin["generatorArgs"]["presentTrace"], True)
+                self.assertGreaterEqual(len(twin["presentTearingExpectedReason"]), 12)
+                self.assertEqual(venues["roles"][twin["card"]], venues["roles"][source["card"]], "a twin plays the role of the source it twins")
 
     def test_the_hand_listed_shipped_legs_are_exactly_the_legs_directory(self) -> None:
         self.assertEqual(sorted(SHIPPED_LEGS), sorted("legs/" + p.name for p in (DV / "legs").glob("*.json")), "SHIPPED_LEGS drifted from the legs/ directory")
@@ -9315,6 +9357,12 @@ class LegSpecSchemaTests(unittest.TestCase):
                 self.assertIs(spec["generatorArgs"]["presentTrace"], True, path.name)
                 self.assertNotIn("unpaced", spec["generatorArgs"], path.name)
                 self.assertNotIn("swapInterval", spec["generatorArgs"], path.name)
+            elif spec["card"] == "BACHELOR-1457-CPU-HEADROOM-UTIL-SPECS-1":   # the utilisation-sampler twins of the two M16-1457 unpaced s1 headroom legs
+                self.assertIn("legs/" + path.name, HEADROOM_UTIL_1457_LEGS, path.name)
+                self.assertEqual(spec["legId"], path.stem, path.name)
+                self.assertRegex(spec["legId"], r"^m16-1457-headroom-unpaced-(windowed|fullscreen)-s1-util$", path.name)
+                self.assertIs(spec["generatorArgs"]["utilSample"], True, path.name)
+                self.assertIs(spec["generatorArgs"]["unpaced"], True, path.name)
             elif spec["card"] == "CUDA-HEADROOM-1":   # the unpaced throughput and stage legs, named by clip, kind and cell
                 self.assertEqual(spec["legId"], path.stem, path.name)
                 self.assertRegex(spec["legId"], r"^m16-(1243|1457)-headroom-(unpaced|stage)-(fullscreen|windowed)-s[124]$", path.name)
