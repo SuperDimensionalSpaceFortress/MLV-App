@@ -6540,6 +6540,97 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         finally:
             subprocess.run(["subst", f"{letter}:", "/d"], capture_output=True, text=True, timeout=60)
 
+    # ---- r5 (adversary r4 pass 12 A1 = Grok G5; G6 fail-closed) ----
+    # G5 (major, introduced): the committed-spec child was handed -TimeoutSec from a room sampled BEFORE the launch, and its FOUND answer was accepted with no look at -DeadlineUtc, so a parent descheduled between
+    # the sample and the launch started a child after the deadline and gave it a fresh wait. Every bounded child of the batch now goes through ONE helper that is handed the sampled stopwatch and end, starts nothing
+    # with no room left on it, and every preflight answer is refused (typed) when -DeadlineUtc has passed by the time it is judged.
+    def _g5_found_child(self, name: str) -> tuple[Path, Path]:
+        child = self.case / name
+        pid = self.case / (name + ".pid")
+        pid.unlink(missing_ok=True)
+        child.write_text("param([string]$LegScript, [string]$RepoRoot, [string]$LegSpecSha256)\n"
+                         f"Set-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT '{pid.name}') -Value $PID\n"
+                         "Write-Output 'DV_LEGSPEC_COMMITTED FOUND path=x head=0 root=x'\nexit 0\n", encoding="utf-8")
+        return child, pid
+
+    def _assert_g5_refused(self, label: str, r: subprocess.CompletedProcess, code: str) -> None:
+        out = f"{label}: " + r.stdout[-1500:] + r.stderr[-1500:]
+        self.assertEqual(r.returncode, 2, out)
+        self.assertIn(f"BATCH_USAGE {code}", r.stderr, out)
+        self.assertEqual(self.kinds(), [], out)
+        self.assertFalse(self.claim_path.exists(), out)
+        self.assertFalse((self.run_dir / "batches.jsonl").exists(), out)
+
+    def test_legspec_committed_r5_g5_a_child_that_would_start_past_the_deadline_is_not_started(self) -> None:
+        child, pid = self._g5_found_child("g5-launch.ps1")
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=16))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildLaunchDelaySec", "20", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("launch past the deadline", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        self.assertFalse(pid.exists(), "the committed-spec child was started after -DeadlineUtc")
+
+    def test_legspec_committed_r5_g5_a_found_answer_seen_after_the_deadline_is_refused(self) -> None:
+        child, pid = self._g5_found_child("g5-return.ps1")
+        self._reset_committed_case()
+        deadline = utc_iso(datetime.now(timezone.utc) + timedelta(seconds=24))
+        r = self.run_batch([self._COMMITTED_SPEC], "-CommittedSpecScript", str(child), "-BoundedChildReturnDelaySec", "28", "-DeadlineUtc", deadline, *self._hermetic_receipt_root(), OMIT_DEFAULTS=self._SKIP)
+        self._assert_g5_refused("FOUND after the deadline", r, "COMMITTED_SPEC_PREFLIGHT_TIMEOUT")
+        self.assertIn("after -DeadlineUtc", r.stderr)
+
+    def test_legspec_committed_r5_g5_the_export_budget_siblings_are_bounded_by_the_same_sampled_end(self) -> None:
+        pid = self.case / "g5-budget.pid"
+        pid.unlink(missing_ok=True)
+        fake = self.case / "g5-budget.ps1"
+        fake.write_text("param([switch]$PreflightBudgetOnly, [string]$ClipId, [string]$Format, [int]$MaxFrames)\n"
+                        f"Set-Content -LiteralPath (Join-Path $env:FAKE_LEG_ROOT '{pid.name}') -Value $PID\n[pscustomobject]@{{ jobTimeoutSec = 1 }}\n", encoding="utf-8")
+        spec = self.case / "g5-export.json"
+        spec.write_text((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"), encoding="utf-8")
+        self._reset_committed_case()
+        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-BoundedChildLaunchDelaySec", "20", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=16)))
+        self._assert_g5_refused("export budget child past the deadline", r, "EXPORT_BUDGET_PREFLIGHT_TIMEOUT")
+        self.assertFalse(pid.exists(), "the export budget child was started after -DeadlineUtc")
+        self._reset_committed_case()
+        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-BoundedChildReturnDelaySec", "28", "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=24)))
+        self._assert_g5_refused("export budget answer after the deadline", r, "EXPORT_BUDGET_PREFLIGHT_TIMEOUT")
+        self.assertIn("after -DeadlineUtc", r.stderr)
+
+    def test_legspec_committed_r5_g5_no_bounded_child_in_the_batch_is_started_outside_the_one_helper(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        start = text.index("function Invoke-BatchBoundedChild")
+        end = text.index("\nfunction ", start + 10)
+        rest = text[:start] + text[end:]
+        code = "\n".join(l for l in rest.splitlines() if not l.lstrip().startswith("#"))
+        bare = re.findall(r"Invoke-VenueBoundedProcess\b[^\n]*", code)
+        self.assertEqual(bare, [], "a bounded child is started without the one helper that re-samples its end: " + "; ".join(bare)[:600])
+        helper = text[start:end]
+        for needle in ("$EndSec - $Clock.Elapsed.TotalSeconds", "-TimeoutSec $boundSec", "Invoke-VenueBoundedProcess"):
+            self.assertIn(needle, helper)
+        self.assertGreaterEqual(len(re.findall(r"Invoke-BatchBoundedChild -FilePath", code)), 4, "the three preflight children and the leg all go through the helper")
+        self.assertEqual(len(re.findall(r"\$(?:bp|fp)\.late\b", code)), 3, "each of the three preflight answers is refused when it is late")
+
+    # G6 (improvement): a probe that is not started for lack of room (under 1 s) used to leave the stand-in accepted on the comment "every later gate refuses on the deadline". It fails closed: production-shaped, every seam refused.
+    def test_legspec_committed_r5_g6_no_room_for_the_location_probe_refuses_every_stand_in_seam(self) -> None:
+        child, pid = self._g5_found_child("g6-child.ps1")
+        for label, extra, omit, needle in (("the skip switch", (), "", self._SEAM_NEEDLE),
+                                           ("the committed-spec seam script", ("-CommittedSpecScript", str(child)), self._SKIP, "-CommittedSpecScript is an offline test seam")):
+            with self.subTest(seam=label):
+                self._reset_committed_case()
+                soon = (datetime.now(timezone.utc) + timedelta(seconds=2.5)).isoformat().replace("+00:00", "Z")
+                r = self.run_batch([self._COMMITTED_SPEC], *extra, "-DeadlineUtc", soon, *self._hermetic_receipt_root(), OMIT_DEFAULTS=omit)
+                out = r.stdout[-1200:] + r.stderr[-1200:]
+                self.assertNotEqual(r.returncode, 0, out)
+                self.assertIn(needle, r.stderr, out)
+                self.assertEqual(self.kinds(), [], "nothing claimed, leased, opened or run")
+                self.assertFalse(self.claim_path.exists(), out)
+                self.assertFalse((self.run_dir / "batches.jsonl").exists(), out)
+                self.assertFalse(pid.exists(), out)
+
+    def test_legspec_committed_r5_g6_the_probe_gate_no_longer_rests_on_a_comment_about_later_gates(self) -> None:
+        text = RUNNER.read_text(encoding="utf-8")
+        self.assertNotIn("every later gate refuses on the deadline", text)
+        gate = text[text.index("$locationCapSec = 30.0"):text.index("if ($umRunIsReal -and $LeaseBudgetWindowSec")]
+        self.assertRegex(gate, r"else \{[^}]*\$umRunIsReal = \$true")
+
     # adversary r2 pass 4 A2: the canonical-receipt teardown check counts only what this harness wrote, so another process's receipt in the same directory is not a false failure
     def test_legspec_committed_r2_the_receipt_state_check_ignores_files_another_process_wrote(self) -> None:
         base = self.case / "receipts-under-watch"
@@ -7094,9 +7185,19 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
                         "Set-Content -LiteralPath $env:FAKE_BUDGET_PID_FILE -Value $PID\n[pscustomobject]@{ jobTimeoutSec = 1 }\n", encoding="utf-8")
         spec = self.case / "export-noroom.json"
         spec.write_text((DV / "legs" / "m16-1243-export-prores.json").read_text(encoding="utf-8"), encoding="utf-8")
+        # r5 (Grok G6, forced companion): with no room for the location probe a stand-in is no longer accepted (the run is production-shaped and every offline seam, -ExportBudgetScript among them, is refused), so this
+        # case runs as a REAL run is shaped: the real um-run.ps1, no seam. It still proves the typed no-room refusal before any claim or lease; "no child was started" for a stand-in budget script is proved by
+        # test_legspec_committed_r5_g5_the_export_budget_siblings_are_bounded_by_the_same_sampled_end (a pid file) and, for the helper itself, by the source test beside it.
+        real_um_run = str(RUNNER.parent.parent / "um-run.ps1")
+
+        def real_shaped(args: list[str]) -> list[str]:
+            args[args.index("-UmRunScript") + 1] = real_um_run
+            return args
+
         for p in (self.events, self.claim_path, pid_file):
             p.unlink(missing_ok=True)
-        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=1)), FAKE_BUDGET_PID_FILE=str(pid_file))
+        args, e = self.batch_cmd([spec], "-DeadlineUtc", utc_iso(datetime.now(timezone.utc) + timedelta(seconds=1)), OMIT_DEFAULTS="-LeaseCooldownSec," + self._SKIP)
+        r = subprocess.run(real_shaped(args), capture_output=True, text=True, timeout=300, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         # r19 (adversary pass 22 A1): with no room left no spec read starts either, so the refusal can now come at the first read (SPEC_READ_TIMEOUT), before the budget's own
         noroom = r"BATCH_USAGE (EXPORT_BUDGET_PREFLIGHT_TIMEOUT|SPEC_READ_TIMEOUT) "
@@ -7108,7 +7209,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         # lost the typed refusal and the plan form reported a generic LEG_PLAN_INVALID. The room is compared as a double first.
         for p in (self.events, self.claim_path, pid_file):
             p.unlink(missing_ok=True)
-        r = self.run_batch([spec], "-ExportBudgetScript", str(fake), "-DeadlineUtc", "0001-01-01T00:00:00Z", FAKE_BUDGET_PID_FILE=str(pid_file))
+        args, e = self.batch_cmd([spec], "-DeadlineUtc", "0001-01-01T00:00:00Z", OMIT_DEFAULTS="-LeaseCooldownSec," + self._SKIP)
+        r = subprocess.run(real_shaped(args), capture_output=True, text=True, timeout=300, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         # adversary pass 22 A1: a deadline long gone starts NO read (a 1 s floor read the spec anyway and refused only at the budget): the first read is the typed refusal
         self.assertIn("BATCH_USAGE SPEC_READ_TIMEOUT ", r.stderr)
@@ -7116,7 +7218,8 @@ class VenueLeaseBatchLegPlanTests(VenueLeaseBatchRunnerTests):
         for p in (self.events, self.leg_args, self.claim_path):
             p.unlink(missing_ok=True)
         shutil.rmtree(self.run_dir, ignore_errors=True)
-        r = self.run_plan(self.write_plan([self.item(spec, "A", self.commit_a)]), "-ExportBudgetScript", str(fake), "-DeadlineUtc", "0001-01-01T00:00:00Z", FAKE_BUDGET_PID_FILE=str(pid_file))
+        args, e = self.plan_cmd(self.write_plan([self.item(spec, "A", self.commit_a)]), "-DeadlineUtc", "0001-01-01T00:00:00Z", OMIT_DEFAULTS="-LeaseCooldownSec," + self._SKIP)
+        r = subprocess.run(real_shaped(args), capture_output=True, text=True, timeout=300, env=e)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
         # (r19: the plan file's own bounded read refuses first with no room: LEG_PLAN_UNREADABLE, still typed and never LEG_PLAN_INVALID)
         self.assertRegex(r.stderr, r"LEG_PLAN_REFUSED reason=(EXPORT_BUDGET_PREFLIGHT_TIMEOUT item=1 |SPEC_READ_TIMEOUT item=1 |LEG_PLAN_UNREADABLE )")

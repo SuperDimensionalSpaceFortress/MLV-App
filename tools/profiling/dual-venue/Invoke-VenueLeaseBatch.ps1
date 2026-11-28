@@ -278,7 +278,11 @@ param(
     [string]$CommittedSpecScript = '',
     # r4 fix (adversary r4 pass 10 A2): stalls the worker that decides whether the stand-ins are outside every git work tree (Get-OfflineSeamLocationRefusal) for this many seconds, so a test can show the probe is
     # bounded by the room before -DeadlineUtc and fails CLOSED. It can only make the probe slower, which refuses more: no real-um-run refusal is needed.
-    [ValidateRange(0, 600)][int]$LocationProbeDelaySec = 0
+    [ValidateRange(0, 600)][int]$LocationProbeDelaySec = 0,
+    # r5 (adversary r4 pass 12 A1): the two seams that stand in for a parent that is descheduled (a suspended VM, a paused debugger) around a bounded child. -BoundedChildLaunchDelaySec holds the parent for that many seconds AFTER
+    # the room was sampled and BEFORE the child is started; -BoundedChildReturnDelaySec holds it AFTER the child returned and BEFORE its answer is judged. Offline only: refused with the real um-run.ps1.
+    [ValidateRange(0, 600)][int]$BoundedChildLaunchDelaySec = 0,
+    [ValidateRange(0, 600)][int]$BoundedChildReturnDelaySec = 0
 )
 $ErrorActionPreference = 'Stop'
 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r2 (adversary A3 sibling): a caller's $PSNativeCommandUseErrorActionPreference = $true is inherited by `& script`; with Stop it would turn the
@@ -386,7 +390,9 @@ if (-not $umRunIsReal) {
     # "not shown to be outside" -- the same fail-closed answer as a git that cannot say. An abandoned worker is counted, and Complete-VenueProcess in Stop-Usage ends the process at once.
     # r4 fix 2 (adversary r4 pass 11 A1): the room is sampled ONCE, on a stopwatch started just before the sample, and the bounded read is handed that stopwatch and its end (-Clock / -EndSec), so a caller
     # descheduled between the sample and the start gets no fresh wait. With less than 1 s of room (less than 3 s before -DeadlineUtc, or a deadline already past) the probe is NOT started: nothing can start
-    # in such a run -- every later gate refuses on the deadline, before any claim or lease -- so there is no location left to decide.
+    # in such a run, so there is no location left to decide.
+    # r5 (Grok G6): a probe that is not started is NOT an acceptance. The stand-ins were accepted then on the argument that a later gate refuses on the deadline; that was an argument about gates this code does not own here.
+    # The location is "not shown to be a stand-in", exactly as for a probe that did not answer: $umRunIsReal is true, so every offline seam and -SkipCommittedSpecPreflight below is refused with the reason.
     $locationClock = [Diagnostics.Stopwatch]::StartNew()
     $locationCapSec = 30.0
     $locationDeadline = [DateTimeOffset]::MinValue
@@ -401,6 +407,9 @@ if (-not $umRunIsReal) {
                          elseif (@($probe.value).Count -ne 1) { 'its location could not be established (the probe gave no single answer)' }
                          else { [string]@($probe.value)[0] })
     if ($locationRefusal) { $umRunIsReal = $true }   # not shown to be a stand-in by location: production-shaped, whatever its bytes are (every seam below, the skip switch among them, is refused)
+    } else {
+        $locationRefusal = "its location was not examined: $([Math]::Round([Math]::Max(0.0, $locationCapSec + 2.0), 1)) s were left before -DeadlineUtc, less than the 3 s the location probe needs"
+        $umRunIsReal = $true   # r5 (G6): fail closed, as for a probe that did not answer
     }
 }
 if ($umRunIsReal -and $LeaseBudgetWindowSec -lt 10800) {
@@ -410,6 +419,7 @@ if ($umRunIsReal -and ($StagedBuildProbeScript -or $ArtifactProbeScript)) { Stop
 if ($umRunIsReal -and $ExportBudgetScript) { Stop-Usage '-ExportBudgetScript is an offline test seam: with the real um-run.ps1 the export budget is always read from the real export generator' }
 if ($umRunIsReal -and $ExportBudgetSpecReadFault) { Stop-Usage '-ExportBudgetSpecReadFault is an offline test seam: with the real um-run.ps1 the export budget preflight reads the spec as it is' }
 if ($umRunIsReal -and $ExportBudgetSpecReadDelaySec -gt 0) { Stop-Usage '-ExportBudgetSpecReadDelaySec is an offline test seam: with the real um-run.ps1 the export budget preflight reads the spec as it is' }
+if ($umRunIsReal -and ($BoundedChildLaunchDelaySec -gt 0 -or $BoundedChildReturnDelaySec -gt 0)) { Stop-Usage '-BoundedChildLaunchDelaySec and -BoundedChildReturnDelaySec are offline test seams: with the real um-run.ps1 no bounded child is ever held before its launch or after its return' }
 if ($umRunIsReal -and $CommittedSpecRepoRoot) { Stop-Usage '-CommittedSpecRepoRoot is an offline test seam: with the real um-run.ps1 the committed-spec preflight reads this checkout''s own HEAD' }
 if ($SkipCommittedSpecPreflight -and $CommittedSpecRepoRoot) { Stop-Usage '-SkipCommittedSpecPreflight contradicts -CommittedSpecRepoRoot: that seam asks for the committed-spec preflight' }
 # VENUE-LEASE-BATCH-LEGSPEC-COMMITTED-PREFLIGHT-1 r4 (Grok CoS G4): the two path seams (-CommittedSpecRepoRoot, -CommittedSpecScript) are made absolute below with .NET (lexically, no file-system work before -DeadlineUtc) and
@@ -451,6 +461,23 @@ if (-not $ExportBudgetScript) { $ExportBudgetScript = Join-Path $here '..\bachel
 $script:ExportBudgetPreflightCapSec = 120
 $script:ExportBudgetPreflightReserveSec = 2
 $script:ExportBudgetPreflightCleanupMs = 1500   # (adversary r11 A6: the one budget the killed child's kill wait and stream waits share, taken out of the room before the bound is set)
+# r5 (adversary r4 pass 12 A1 = Grok G5): the ONE route for every bounded child this script starts. A caller samples the room ONCE, on a stopwatch started just before the sample, and hands the helper that stopwatch and the
+# END of the room on it (-Clock / -EndSec, as the location probe is handed its own). The helper takes the child's bound from what is left on that stopwatch AT THE LAUNCH, so a parent descheduled between the sample and the
+# launch gets no fresh wait; with under 1 s left it starts NOTHING (started=$false; -AtLeastOneSec is the leg's, whose end is the lease's and whose launch the lease-room checks already guard). -NotAfterUtc is the
+# run's deadline: an answer that is in hand only after it is returned with late=$true, and the caller refuses it (typed) rather than accept it. -BoundedChildLaunchDelaySec / -BoundedChildReturnDelaySec are the offline seams
+# that stand in for a descheduled parent (refused with the real um-run.ps1). A raw Invoke-VenueBoundedProcess call anywhere else in this file is a defect: the source test pins that.
+function Invoke-BatchBoundedChild {
+    param([Parameter(Mandatory)][string]$FilePath, [Parameter(Mandatory)][string[]]$ArgumentList, [Parameter(Mandatory)][Diagnostics.Stopwatch]$Clock, [Parameter(Mandatory)][double]$EndSec,
+          [int]$CleanupWaitMs = 15000, [double]$CapSec = 86400, [switch]$AtLeastOneSec, [Nullable[DateTime]]$NotAfterUtc = $null)
+    if ($BoundedChildLaunchDelaySec -gt 0) { [Threading.Thread]::Sleep($BoundedChildLaunchDelaySec * 1000) }
+    $leftSec = $EndSec - $Clock.Elapsed.TotalSeconds
+    $boundSec = $(if ([double]::IsNaN($leftSec)) { 0 } else { [int][Math]::Min($CapSec, [Math]::Floor([Math]::Max(0.0, $leftSec))) })
+    if ($boundSec -lt 1 -and $AtLeastOneSec) { $boundSec = 1 }
+    if ($boundSec -lt 1) { return [pscustomobject]@{ started = $false; late = $false; boundSec = 0; leftSec = $leftSec; exit = $null; timedOut = $false; killConfirmed = $true; stdout = ''; stderr = '' } }
+    $r = Invoke-VenueBoundedProcess -FilePath $FilePath -ArgumentList $ArgumentList -TimeoutSec $boundSec -CleanupWaitMs $CleanupWaitMs
+    if ($BoundedChildReturnDelaySec -gt 0) { [Threading.Thread]::Sleep($BoundedChildReturnDelaySec * 1000) }
+    [pscustomobject]@{ started = $true; late = ($null -ne $NotAfterUtc -and [DateTime]::UtcNow -ge $NotAfterUtc); boundSec = $boundSec; leftSec = $leftSec; exit = $r.exit; timedOut = $r.timedOut; killConfirmed = $r.killConfirmed; stdout = $r.stdout; stderr = $r.stderr }
+}
 # r19 (sol r18 B1): the sha256 of the leg spec bytes the export-budget preflight judged, by spec path (Get-ExportBudgetRefusal records it). Every later read of that spec before a
 # lease or a leg is compared with it (Get-InputContentRefusal, and the leg itself through -ExpectSpecSha256), so a lease is never spent on bytes the budget did not judge.
 # DV-PLANNED-SPEC-HASH-BIND-CHAIN-BATCH-1 r3 (adversary pass 2 A2): ORDINAL keys. A PowerShell @{} folds case, so on a case-sensitive directory two distinct files A.json and
@@ -1775,11 +1802,15 @@ function Get-ExportBudgetRefusal([string]$Path) {
     # turn into an exit 2 before any claim or lease. A clip that merely cannot be resolved stays what it was (the generator refuses it later, typed): only the HANG is refused here.
     # (adversary r11 A4: the room is compared as a DOUBLE before any Int32 narrowing: a -DeadlineUtc far in the past is a room of billions of negative seconds, which no [int] holds; A6: the child's
     # post-bound cleanup waits (kill, both streams) share $script:ExportBudgetPreflightCleanupMs, which is taken out of the room too, so the whole call ends before -DeadlineUtc)
+    # r5 (adversary r4 pass 12 A1): the room is sampled on a stopwatch started just before the sample, and the child is started by Invoke-BatchBoundedChild, handed that stopwatch and the end of the room on it
+    $boundClock = [Diagnostics.Stopwatch]::StartNew()
     $room = ($deadline - [DateTime]::UtcNow).TotalSeconds - $script:ExportBudgetPreflightReserveSec - ($script:ExportBudgetPreflightCleanupMs / 1000.0)
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
-    $boundSec = [int]$boundFloor   # (in range: the floor is between 1 and the 120 s cap)
-    $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+    $bp = Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-PreflightBudgetOnly', '-ClipId', $clipId, '-Format', $format, '-MaxFrames', [string][int]$frames) -Clock $boundClock -EndSec $boundFloor -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -NotAfterUtc $deadline
+    if (-not $bp.started) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight was not started, the room sampled for it ended before its launch ($([Math]::Round([Math]::Max(0.0, $bp.leftSec), 1)) s were left of it); no claim or lease is taken on it" }
+    $boundSec = $bp.boundSec
+    if ($bp.late) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted; no claim or lease is taken on it" }
     if ($bp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the export budget preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $text = (@($bp.stdout, $bp.stderr) | Where-Object { $_ }) -join "`n"
     if ($text -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: $($Matches[0] -replace '\s+', ' ')" }
@@ -1788,11 +1819,14 @@ function Get-ExportBudgetRefusal([string]$Path) {
     # unknowable, but the clip-INDEPENDENT floor is not: the generator's -DescribeTimeBudgetBytes 0 (no identity read; the same Get-ExportJobTimeBudget) still holds the export wait of
     # max(900, 4 x maxFrames) s, so maxFrames=100000 is past the agent's cap whatever the clip. A window whose floor alone is refused is refused HERE, before any claim or lease; a
     # window whose floor fits is left to the leg's generator, which refuses the unresolvable clip typed, as before. The same bounded child, under what is left of the same room.
+    $boundClock = [Diagnostics.Stopwatch]::StartNew()
     $room = ($deadline - [DateTime]::UtcNow).TotalSeconds - $script:ExportBudgetPreflightReserveSec - ($script:ExportBudgetPreflightCleanupMs / 1000.0)
     $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
     if ($boundFloor -lt 1) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s)" }
-    $boundSec = [int]$boundFloor
-    $fp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+    $fp = Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList @('-NoProfile', '-File', $ExportBudgetScript, '-DescribeTimeBudgetBytes', '0', '-MaxFrames', [string][int]$frames) -Clock $boundClock -EndSec $boundFloor -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -NotAfterUtc $deadline
+    if (-not $fp.started) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor was not started, the room sampled for it ended before its launch ($([Math]::Round([Math]::Max(0.0, $fp.leftSec), 1)) s were left of it); no claim or lease is taken on it" }
+    $boundSec = $fp.boundSec
+    if ($fp.late) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip-independent export budget floor's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted; no claim or lease is taken on it" }
     if ($fp.timedOut) { return 'EXPORT_BUDGET_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the clip did not resolve here and the clip-independent export budget floor did not answer in $boundSec s and was killed ($(if ($fp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' }))" }
     $floorText = (@($fp.stdout, $fp.stderr) | Where-Object { $_ }) -join "`n"
     if ($floorText -match '(?m)DUAL_VENUE_EXPORT_TIME_BUDGET_EXCEEDED[^\r\n]*') { return 'EXPORT_TIME_BUDGET_EXCEEDED', "'$Path' cannot be run: the clip did not resolve here, and the clip-independent floor alone (a 0-byte clip) is refused: $($Matches[0] -replace '\s+', ' ')" }
@@ -1829,14 +1863,19 @@ function Get-LegSpecCommittedRefusal([string]$Path) {
         # r2 (adversary A2/A3/A4): the lookup (HEAD, then every blob under legs/: about 15 s cold) runs in a BOUNDED child, Test-LegSpecCommitted.ps1, on the room left before -DeadlineUtc, as the export
         # budget generator does, and every git call in it is the module's hardened Invoke-DvGit (no inherited GIT_DIR / GIT_TRACE* override), never a raw git here. No room, or a child still running
         # at its bound (killed with its tree), is the typed COMMITTED_SPEC_PREFLIGHT_TIMEOUT; every caller turns any code into an exit 2 before any claim or lease.
+        # r5 (adversary r4 pass 12 A1 = Grok G5): the room is sampled ONCE on a stopwatch started just before the sample; the child is started by Invoke-BatchBoundedChild, handed that stopwatch and the end of the room on it
+        # (as the location probe is), so a parent descheduled between the sample and the launch gets no fresh wait and starts no child after -DeadlineUtc; and an answer in hand only after -DeadlineUtc (FOUND included) is refused
+        $boundClock = [Diagnostics.Stopwatch]::StartNew()
         $room = ($deadline - [DateTime]::UtcNow).TotalSeconds - $script:ExportBudgetPreflightReserveSec - ($script:ExportBudgetPreflightCleanupMs / 1000.0)
         $boundFloor = [Math]::Floor([Math]::Min([double]$script:ExportBudgetPreflightCapSec, $room))
         if ($boundFloor -lt 1) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight was not started, $([Math]::Round([Math]::Max(0.0, $room), 1)) s were left before -DeadlineUtc (less $($script:ExportBudgetPreflightReserveSec) s); no claim or lease is taken on it" }
-        $boundSec = [int]$boundFloor
         $pwshExe = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         $childArgs = @('-NoProfile', '-File', $script:CommittedSpecScript, '-LegScript', $script:CommittedSpecLegScript, '-LegSpecSha256', $normSha)
         if ($script:CommittedSpecRepoRoot) { $childArgs += @('-RepoRoot', $script:CommittedSpecRepoRoot) }
-        $bp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $childArgs -TimeoutSec $boundSec -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs
+        $bp = Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList $childArgs -Clock $boundClock -EndSec $boundFloor -CleanupWaitMs $script:ExportBudgetPreflightCleanupMs -NotAfterUtc $deadline
+        if (-not $bp.started) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight was not started, the room sampled for it ended before its launch ($([Math]::Round([Math]::Max(0.0, $bp.leftSec), 1)) s were left of it); no claim or lease is taken on it" }
+        $boundSec = $bp.boundSec
+        if ($bp.late) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight's answer was in hand only after -DeadlineUtc, and an answer that late is not accepted; no claim or lease is taken on it" }
         if ($bp.timedOut) { return 'COMMITTED_SPEC_PREFLIGHT_TIMEOUT', "'$Path' cannot be run: the committed-spec preflight did not answer in $boundSec s and was killed ($(if ($bp.killConfirmed) { 'kill confirmed' } else { 'kill UNCONFIRMED: the child may still be running' })); no claim or lease is taken on it" }
         $answer = [string]$bp.stdout
         if ($bp.exit -eq 0 -and $answer -match '(?m)^DV_LEGSPEC_COMMITTED FOUND ') { return '', '' }
@@ -3240,10 +3279,11 @@ while ($pending.Count -gt 0 -and $null -eq $stopReason) {
                 $tLeg = [DateTime]::UtcNow; $tLegTs = [Diagnostics.Stopwatch]::GetTimestamp()
                 # r3 (sol r2 B2): the leg runs only while the lease does. It is a bounded child: still running at the lease's end, it is killed with its whole
                 # process tree (Kill($true), Invoke-VenueBoundedProcess) and typed LEASE_EXPIRED below. The agent stops its job at the same bound (lease-batch r3).
+                $legClock = [Diagnostics.Stopwatch]::StartNew()   # r5: the leg is started by the one helper too, handed the stopwatch and the lease's end sampled on it
                 $legBoundSec = [int][Math]::Max(1, [Math]::Floor(($leaseEnd - [DateTime]::UtcNow).TotalSeconds))
                 # adversary r7 A2: Process.Start failing (a command line past 32767 characters, a missing exe) throws a Win32Exception before any child exists: the leg stays NOT_RUN.
                 $inFlightLeg = $leg   # adversary r5 pass 2 A2: marked at the launch itself, so a throw while the RUN line was logged leaves a leg that never started NOT_RUN
-                try { $lp = Invoke-VenueBoundedProcess -FilePath $pwshExe -ArgumentList $lArgs -TimeoutSec $legBoundSec } catch {
+                try { $lp = Invoke-BatchBoundedChild -FilePath $pwshExe -ArgumentList $lArgs -Clock $legClock -EndSec $legBoundSec -AtLeastOneSec } catch {
                     if ($_.Exception -is [ComponentModel.Win32Exception] -or $_.Exception.InnerException -is [ComponentModel.Win32Exception]) { $inFlightLeg = $null }
                     throw
                 }
